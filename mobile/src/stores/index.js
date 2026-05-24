@@ -83,7 +83,8 @@ export const useCredentialsStore = defineStore('credentials', {
 
   getters: {
     hasCredentials: (state) => state.items.length > 0,
-    cryptoItems: (state) => state.items.filter((item) => !['ibkr', 'mt5'].includes(item.exchange_id))
+    kisItems: (state) => state.items.filter((item) => item.exchange_id === 'kis'),
+    kiwoomItems: (state) => state.items.filter((item) => item.exchange_id === 'kiwoom')
   },
 
   actions: {
@@ -326,6 +327,62 @@ export const useQuickTradeStore = defineStore('quickTrade', {
 
     setLoading(val) {
       this.loading = val
+    }
+  }
+})
+
+// 브로커 연결 상태 스토어
+export const useBrokerStore = defineStore('broker', {
+  state: () => ({
+    activeBroker: localStorage.getItem('activeBroker') || 'kis',
+    balance: null,
+    positions: [],
+    loading: false
+  }),
+
+  getters: {
+    totalEquityKrw: (state) => Number(state.balance?.total_eval_krw || 0),
+    cashKrw: (state) => Number(state.balance?.cash_krw || 0),
+    cashUsd: (state) => Number(state.balance?.cash_usd || 0)
+  },
+
+  actions: {
+    setActiveBroker(broker) {
+      this.activeBroker = broker || 'kis'
+      localStorage.setItem('activeBroker', this.activeBroker)
+    },
+    setBalance(data) {
+      this.balance = data || null
+    },
+    setPositions(list) {
+      this.positions = Array.isArray(list) ? list : []
+    },
+    setLoading(val) {
+      this.loading = val
+    }
+  }
+})
+
+// WebSocket 연결 상태 스토어
+export const useWebSocketStore = defineStore('websocket', {
+  state: () => ({
+    connected: false,
+    lastMessage: null,
+    priceMap: {}  // symbol → current price
+  }),
+
+  actions: {
+    setConnected(val) {
+      this.connected = !!val
+    },
+    setLastMessage(msg) {
+      this.lastMessage = msg
+    },
+    updatePrice(symbol, price) {
+      this.priceMap[symbol] = price
+    },
+    updatePrices(map) {
+      Object.assign(this.priceMap, map)
     }
   }
 })

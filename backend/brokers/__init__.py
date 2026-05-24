@@ -1,12 +1,8 @@
 from .models import Balance, Order, OrderSide, OrderStatus, OrderType, Position
 from .base import BrokerAdapter
-from .kis import KISBroker
-from .kiwoom import KiwoomBroker
 
 __all__ = [
     "BrokerAdapter",
-    "KISBroker",
-    "KiwoomBroker",
     "Balance",
     "Order",
     "OrderSide",
@@ -14,3 +10,13 @@ __all__ = [
     "OrderType",
     "Position",
 ]
+
+
+def __getattr__(name):
+    if name == "KISBroker":
+        from .kis import KISBroker
+        return KISBroker
+    if name == "KiwoomBroker":
+        from .kiwoom import KiwoomBroker
+        return KiwoomBroker
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
