@@ -4,6 +4,9 @@ Deliverable 4: 전략 스코어링 모델 — Signal Fusion.
 여러 SignalBase 모듈의 출력을 가중합산해 최종 신호 생성.
 각 신호의 weight × strength × direction 을 합산.
 threshold 이상이면 매수, 이하이면 매도.
+
+레짐 인식: RegimeDetector를 이용해 TREND/RANGE/STRESS에 따라
+전략 가중치를 자동 조정.
 """
 import logging
 from dataclasses import dataclass, field
@@ -135,4 +138,47 @@ def default_fusion() -> SignalFusion:
     fusion.add(MomentumSignal(), weight=0.4)
     fusion.add(VolatilityBreakoutSignal(), weight=0.2)
     fusion.set_regime_filter(regime_ok)
+    return fusion
+
+
+def regime_aware_fusion(df_market: pd.DataFrame,
+                        buy_threshold: float = 0.25,
+                        sell_threshold: float = -0.25) -> SignalFusion:
+    """
+    레짐 인식 자동 가중치 조정 팩토리.
+
+    TREND  → TrendCTA 50% + Momentum 30% + TrendFollowing 20%
+    RANGE  → MeanReversion 60% + VolExpansion 40%
+    STRESS → 신호 없음 (빈 fusion 반환)
+    """
+    from backend.quant.signals.regime import RegimeDetector
+    from backend.quant.signals.trend_following import TrendFollowingSignal
+    from backend.quant.signals.momentum import MomentumSignal
+    from backend.quant.signals.trend_cta import TrendCTASignal
+    from backend.quant.signals.vol_expansion import VolExpansionSignal
+    from backend.quant.signals.mean_reversion import MeanReversionSignal
+
+    detector = RegimeDetector()
+    regime_out = detector.detect(df_market)
+    logger.info("레짐 탐지: %s (score=%.3f)", regime_out.regime, regime_out.score)
+
+    fusion = SignalFusion(buy_threshold=buy_threshold, sell_threshold=sell_threshold)
+
+    if regime_out.regime == RegimeDetector.STRESS:
+        # 모든 신호 비활성화 — 빈 fusion
+        logger.warning("STRESS 레짐: 신규 매수 전면 차단")
+        fusion.set_regime_filter(lambda _: False)
+        return fusion
+
+    if regime_out.regime == RegimeDetector.TREND:
+        fusion.add(TrendCTASignal(), weight=0.5)
+        fusion.add(MomentumSignal(), weight=0.3)
+        fusion.add(TrendFollowingSignal(), weight=0.2)
+    else:  # RANGE
+        try:
+            fusion.add(MeanReversionSignal(), weight=0.6)
+        except Exception:
+            pass
+        fusion.add(VolExpansionSignal(), weight=0.4)
+
     return fusion

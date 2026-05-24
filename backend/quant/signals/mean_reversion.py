@@ -29,6 +29,68 @@ def cointegration_test(s1: pd.Series, s2: pd.Series, pvalue_threshold: float = 0
         return False
 
 
+class MeanReversionSignal(SignalBase):
+    """
+    단일 종목 평균회귀 신호 — RSI 과매도/과매수 + 볼린저 밴드 반전.
+
+    RANGE 레짐에서 사용. 추세장에서는 신호 품질 저하.
+    """
+
+    def __init__(self, rsi_period: int = 14, bb_period: int = 20,
+                 rsi_oversold: float = 35, rsi_overbought: float = 65):
+        self._rsi_period = rsi_period
+        self._bb_period = bb_period
+        self._rsi_oversold = rsi_oversold
+        self._rsi_overbought = rsi_overbought
+
+    def name(self) -> str:
+        return "MeanReversion"
+
+    def compute(self, df: pd.DataFrame, symbol: str = "") -> SignalOutput:
+        min_bars = max(self._rsi_period, self._bb_period) + 10
+        if len(df) < min_bars:
+            return SignalOutput(symbol=symbol, signal=0, strength=0.0)
+
+        close = df["Close"]
+
+        # RSI (순수 pandas)
+        delta = close.diff()
+        gain = delta.clip(lower=0).rolling(self._rsi_period).mean()
+        loss = (-delta.clip(upper=0)).rolling(self._rsi_period).mean()
+        rs = gain / (loss + 1e-9)
+        rsi = 100 - 100 / (1 + rs)
+
+        # Bollinger Bands
+        sma = close.rolling(self._bb_period).mean()
+        std = close.rolling(self._bb_period).std()
+        bb_upper = sma + 2 * std
+        bb_lower = sma - 2 * std
+
+        # 전봉 기준 (no-lookahead)
+        rsi_prev = rsi.iloc[-2]
+        close_prev = close.iloc[-2]
+        bb_low_prev = bb_lower.iloc[-2]
+        bb_hi_prev = bb_upper.iloc[-2]
+
+        if pd.isna(rsi_prev) or pd.isna(bb_low_prev):
+            return SignalOutput(symbol=symbol, signal=0, strength=0.0)
+
+        # 매수: RSI 과매도 + 하단 밴드 근접
+        if rsi_prev < self._rsi_oversold and close_prev <= bb_low_prev * 1.02:
+            strength = min((self._rsi_oversold - rsi_prev) / self._rsi_oversold, 1.0)
+            return SignalOutput(symbol=symbol, signal=1, strength=round(strength, 4),
+                                indicators={"rsi": round(rsi_prev, 2)})
+
+        # 매도: RSI 과매수 + 상단 밴드 근접
+        if rsi_prev > self._rsi_overbought and close_prev >= bb_hi_prev * 0.98:
+            strength = min((rsi_prev - self._rsi_overbought) / (100 - self._rsi_overbought), 1.0)
+            return SignalOutput(symbol=symbol, signal=-1, strength=round(strength, 4),
+                                indicators={"rsi": round(rsi_prev, 2)})
+
+        return SignalOutput(symbol=symbol, signal=0, strength=0.0,
+                            indicators={"rsi": round(rsi_prev, 2)})
+
+
 class PairsSignal(SignalBase):
     """
     두 종목의 공적분 관계를 이용한 평균회귀 신호.
