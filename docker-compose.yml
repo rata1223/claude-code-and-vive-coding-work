@@ -1,13 +1,17 @@
 version: "3.9"
 
+# QuantDinger 공식 구조 + KIS 봇 통합
+# 최초 실행 전: scripts/setup_oracle_cloud.sh 실행 필수 (QuantDinger 소스 클론)
+
 services:
   postgres:
-    image: postgres:15-alpine
+    image: postgres:16-alpine
     restart: unless-stopped
+    container_name: quantdinger-db
     environment:
       POSTGRES_DB: quantdinger
       POSTGRES_USER: quantdinger
-      POSTGRES_PASSWORD: quantdinger
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-quantdinger123}
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -19,6 +23,7 @@ services:
   redis:
     image: redis:7-alpine
     restart: unless-stopped
+    container_name: quantdinger-redis
     volumes:
       - redis_data:/data
     healthcheck:
@@ -27,21 +32,48 @@ services:
       timeout: 5s
       retries: 5
 
-  quantdinger:
-    image: brokermr810/quantdinger:latest
+  quantdinger-backend:
+    build:
+      context: ./quantdinger/backend_api_python
+      dockerfile: Dockerfile
+      args:
+        BUILD_REGION: global
     restart: unless-stopped
-    ports:
-      - "8080:8080"
+    container_name: quantdinger-backend
     environment:
-      DATABASE_URL: postgresql://quantdinger:quantdinger@postgres:5432/quantdinger
-      REDIS_URL: redis://redis:6379
-      SECRET_KEY: ${QUANTDINGER_SECRET_KEY:-changeme-set-in-env}
-      TELEGRAM_TOKEN: ${TELEGRAM_TOKEN:-}
-      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      SECRET_KEY: ${QUANTDINGER_SECRET_KEY}
+      DATABASE_URL: postgresql://quantdinger:${POSTGRES_PASSWORD:-quantdinger123}@postgres:5432/quantdinger
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      FRONTEND_URL: http://localhost:8888
+      ADMIN_USER: ${QUANTDINGER_ADMIN_USER:-admin}
+      ADMIN_PASSWORD: ${QUANTDINGER_ADMIN_PASSWORD:-changeme}
+      TZ: Asia/Seoul
+      GUNICORN_WORKERS: "1"
+      GUNICORN_THREADS: "8"
+      STRATEGY_MAX_THREADS: "64"
+      ALLOW_LOCAL_DESKTOP_BROKERS: "false"
     depends_on:
       postgres:
         condition: service_healthy
       redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/api/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+
+  quantdinger-frontend:
+    image: ghcr.io/brokermr810/quantdinger-frontend:latest
+    restart: unless-stopped
+    container_name: quantdinger-frontend
+    ports:
+      - "8888:8888"
+    environment:
+      BACKEND_URL: http://quantdinger-backend:5000
+    depends_on:
+      quantdinger-backend:
         condition: service_healthy
 
   kis-bot:
@@ -49,6 +81,7 @@ services:
       context: .
       dockerfile: Dockerfile.kis-bot
     restart: unless-stopped
+    container_name: kis-bot
     environment:
       KIS_APP_KEY: ${KIS_APP_KEY}
       KIS_APP_SECRET: ${KIS_APP_SECRET}
@@ -58,10 +91,12 @@ services:
       TELEGRAM_TOKEN: ${TELEGRAM_TOKEN:-}
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
       REDIS_URL: redis://redis:6379
-      DB_URL: ${DB_URL:-postgresql://quantdinger:quantdinger@postgres:5432/quantdinger}
+      DB_URL: postgresql://quantdinger:${POSTGRES_PASSWORD:-quantdinger123}@postgres:5432/quantdinger
       DAILY_LOSS_LIMIT_PCT: ${DAILY_LOSS_LIMIT_PCT:-0.03}
       MDD_LIMIT_PCT: ${MDD_LIMIT_PCT:-0.15}
       STOP_LOSS_PCT: ${STOP_LOSS_PCT:-0.07}
+    volumes:
+      - kis_data:/app/data
     depends_on:
       postgres:
         condition: service_healthy
@@ -71,3 +106,4 @@ services:
 volumes:
   postgres_data:
   redis_data:
+  kis_data:
