@@ -1,6 +1,7 @@
 import logging
 import uuid
 from datetime import datetime
+from typing import Optional
 
 from backend.brokers.base import BrokerAdapter
 from backend.brokers.models import Balance, Order, OrderStatus, Position
@@ -37,6 +38,9 @@ class SimulatedBroker(BrokerAdapter):
 
     def get_positions(self) -> list[Position]:
         return self._tracker.all_positions()
+
+    def get_position(self, symbol: str) -> Optional[Position]:
+        return self._tracker.get_position(symbol)
 
     def place_order(self, symbol: str, side: str, qty: int, price: float, order_type: str = "limit") -> Order:
         order_id = str(uuid.uuid4())[:12]
