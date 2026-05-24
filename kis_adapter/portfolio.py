@@ -58,7 +58,7 @@ class KISPortfolio:
         summary = data.get("output2", {})
         return {"positions": positions, "summary": summary}
 
-    def get_total_asset_krw(self) -> float:
+    def get_total_asset_krw(self) -> tuple[float, float]:
         kr = self.get_kr_balance()
         us = self.get_us_balance()
         kr_eval = float(kr["summary"].get("tot_evlu_amt", 0))

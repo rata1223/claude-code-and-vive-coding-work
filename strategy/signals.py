@@ -26,10 +26,15 @@ SECTOR_MAP = {
 }
 
 
+# KIS API 코드 → yfinance 티커 매핑 (한국 ETF는 .KS 접미사 필요)
+_YF_TICKER = {k: k + ".KS" for k in KR_ETF}
+
+
 def _fetch(symbol: str, period: str = "2y", interval: str = "1d") -> pd.DataFrame:
-    df = yf.Ticker(symbol).history(period=period, interval=interval, auto_adjust=True)
+    yf_symbol = _YF_TICKER.get(symbol, symbol)
+    df = yf.Ticker(yf_symbol).history(period=period, interval=interval, auto_adjust=True)
     if df.empty:
-        raise ValueError(f"No data: {symbol}")
+        raise ValueError(f"No data: {symbol} (yf={yf_symbol})")
     return df
 
 

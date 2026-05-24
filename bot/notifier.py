@@ -31,9 +31,7 @@ def send_alert(message: str):
         return
 
     try:
-        asyncio.get_event_loop().run_until_complete(
-            bot.send_message(chat_id=chat_id, text=message, parse_mode="HTML")
-        )
+        asyncio.run(bot.send_message(chat_id=chat_id, text=message, parse_mode="HTML"))
     except Exception as e:
         logger.error("텔레그램 전송 실패: %s", e)
 
