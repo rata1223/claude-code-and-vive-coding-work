@@ -103,6 +103,76 @@ services:
       redis:
         condition: service_healthy
 
+  kis-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.kis-bot
+    restart: unless-stopped
+    container_name: kis-api
+    command: python -m backend.api.server
+    ports:
+      - "5001:5001"
+    environment:
+      KIS_APP_KEY: ${KIS_APP_KEY}
+      KIS_APP_SECRET: ${KIS_APP_SECRET}
+      KIS_ACCOUNT_NO: ${KIS_ACCOUNT_NO}
+      KIS_ENV: ${KIS_ENV:-paper}
+      REDIS_URL: redis://redis:6379
+      DB_URL: postgresql://quantdinger:${POSTGRES_PASSWORD:-quantdinger123}@postgres:5432/quantdinger
+      API_PORT: "5001"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5001/api/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+
+  kis-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.kis-bot
+    restart: unless-stopped
+    container_name: kis-worker
+    command: python -m backend.worker.runner
+    environment:
+      KIS_APP_KEY: ${KIS_APP_KEY}
+      KIS_APP_SECRET: ${KIS_APP_SECRET}
+      KIS_ACCOUNT_NO: ${KIS_ACCOUNT_NO}
+      KIS_ENV: ${KIS_ENV:-paper}
+      REDIS_URL: redis://redis:6379
+      DB_URL: postgresql://quantdinger:${POSTGRES_PASSWORD:-quantdinger123}@postgres:5432/quantdinger
+      DAILY_LOSS_LIMIT_PCT: ${DAILY_LOSS_LIMIT_PCT:-0.03}
+      MDD_LIMIT_PCT: ${MDD_LIMIT_PCT:-0.15}
+      STOP_LOSS_PCT: ${STOP_LOSS_PCT:-0.07}
+    volumes:
+      - kis_data:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  kis-ws:
+    build:
+      context: .
+      dockerfile: Dockerfile.kis-bot
+    restart: unless-stopped
+    container_name: kis-ws
+    command: python -m backend.websocket.server
+    ports:
+      - "5002:5002"
+    environment:
+      REDIS_URL: redis://redis:6379
+      QUANTDINGER_SECRET_KEY: ${QUANTDINGER_SECRET_KEY}
+      WS_PORT: "5002"
+    depends_on:
+      redis:
+        condition: service_healthy
+
 volumes:
   postgres_data:
   redis_data:
