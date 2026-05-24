@@ -3,6 +3,12 @@ name: Deploy to Oracle Cloud
 on:
   push:
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: "수동 배포 사유"
+        required: false
+        default: "수동 실행"
 
 jobs:
   deploy:
