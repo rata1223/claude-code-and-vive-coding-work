@@ -11,7 +11,7 @@ services:
     environment:
       POSTGRES_DB: quantdinger
       POSTGRES_USER: quantdinger
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-quantdinger123}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -42,12 +42,12 @@ services:
     container_name: quantdinger-backend
     environment:
       SECRET_KEY: ${QUANTDINGER_SECRET_KEY}
-      DATABASE_URL: postgresql://quantdinger:${POSTGRES_PASSWORD:-quantdinger123}@postgres:5432/quantdinger
+      DATABASE_URL: postgresql://quantdinger:${POSTGRES_PASSWORD}@postgres:5432/quantdinger
       REDIS_HOST: redis
       REDIS_PORT: 6379
       FRONTEND_URL: http://localhost:8888
       ADMIN_USER: ${QUANTDINGER_ADMIN_USER:-admin}
-      ADMIN_PASSWORD: ${QUANTDINGER_ADMIN_PASSWORD:-changeme}
+      ADMIN_PASSWORD: ${QUANTDINGER_ADMIN_PASSWORD}
       TZ: Asia/Seoul
       GUNICORN_WORKERS: "1"
       GUNICORN_THREADS: "8"
@@ -91,7 +91,7 @@ services:
       TELEGRAM_TOKEN: ${TELEGRAM_TOKEN:-}
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
       REDIS_URL: redis://redis:6379
-      DB_URL: postgresql://quantdinger:${POSTGRES_PASSWORD:-quantdinger123}@postgres:5432/quantdinger
+      DB_URL: postgresql://quantdinger:${POSTGRES_PASSWORD}@postgres:5432/quantdinger
       DAILY_LOSS_LIMIT_PCT: ${DAILY_LOSS_LIMIT_PCT:-0.03}
       MDD_LIMIT_PCT: ${MDD_LIMIT_PCT:-0.15}
       STOP_LOSS_PCT: ${STOP_LOSS_PCT:-0.07}
