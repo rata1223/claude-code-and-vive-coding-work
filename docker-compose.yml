@@ -27,17 +27,32 @@ services:
       timeout: 5s
       retries: 5
 
-  quantdinger:
-    image: brokermr810/quantdinger:latest
+  # Vue 3 모바일 프론트엔드
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
     restart: unless-stopped
     ports:
-      - "8080:8080"
+      - "5173:5173"
+    environment:
+      VITE_API_TARGET: http://api:8000
+    depends_on:
+      - api
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
     environment:
       DATABASE_URL: postgresql://quantdinger:quantdinger@postgres:5432/quantdinger
-      REDIS_URL: redis://redis:6379
-      SECRET_KEY: ${QUANTDINGER_SECRET_KEY:-changeme-set-in-env}
-      TELEGRAM_TOKEN: ${TELEGRAM_TOKEN:-}
-      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      REDIS_URL: redis://redis:6379/0
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-change-me-in-production}
+      JWT_EXPIRE_MINUTES: ${JWT_EXPIRE_MINUTES:-10080}
+      KIS_CREDENTIAL_KEY: ${KIS_CREDENTIAL_KEY:-}
     depends_on:
       postgres:
         condition: service_healthy

@@ -1,7 +1,13 @@
 import logging
 import pandas as pd
-import pandas_ta as ta
 import yfinance as yf
+
+try:
+    import pandas_ta as ta
+    _HAS_PANDAS_TA = True
+except ImportError:
+    ta = None
+    _HAS_PANDAS_TA = False
 
 logger = logging.getLogger(__name__)
 
@@ -25,13 +31,30 @@ class TradingSignals:
             raise ValueError(f"No data for {symbol}")
         return df
 
+    @staticmethod
+    def _sma(series: pd.Series, length: int) -> pd.Series:
+        return series.rolling(window=length).mean()
+
+    @staticmethod
+    def _rsi(series: pd.Series, length: int = 14) -> pd.Series:
+        delta = series.diff()
+        gain = delta.clip(lower=0).rolling(window=length).mean()
+        loss = (-delta.clip(upper=0)).rolling(window=length).mean()
+        rs = gain / loss.replace(0, float("nan"))
+        return 100 - (100 / (1 + rs))
+
     def buy_signal(self, df: pd.DataFrame) -> bool:
         close = df["Close"]
         volume = df["Volume"]
 
-        sma200 = ta.sma(close, length=200)
-        rsi = ta.rsi(close, length=14)
-        vol_ma20 = ta.sma(volume, length=20)
+        if _HAS_PANDAS_TA:
+            sma200 = ta.sma(close, length=200)
+            rsi = ta.rsi(close, length=14)
+            vol_ma20 = ta.sma(volume, length=20)
+        else:
+            sma200 = self._sma(close, 200)
+            rsi = self._rsi(close, 14)
+            vol_ma20 = self._sma(volume, 20)
 
         if sma200 is None or rsi is None or vol_ma20 is None:
             return False
@@ -56,8 +79,12 @@ class TradingSignals:
 
     def sell_signal(self, df: pd.DataFrame, entry_price: float) -> bool:
         close = df["Close"]
-        sma200 = ta.sma(close, length=200)
-        rsi = ta.rsi(close, length=14)
+        if _HAS_PANDAS_TA:
+            sma200 = ta.sma(close, length=200)
+            rsi = ta.rsi(close, length=14)
+        else:
+            sma200 = self._sma(close, 200)
+            rsi = self._rsi(close, 14)
 
         if sma200 is None or rsi is None:
             return False
