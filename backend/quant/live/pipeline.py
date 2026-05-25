@@ -1,8 +1,7 @@
 """
 라이브 트레이딩 파이프라인 (프로덕션).
 
-기존 BrokerAdapter + OrderStateMachine + PositionTracker를 그대로 사용.
-DataLoader → RegimeDetector → SignalFusion → FundamentalFilter → PositionSizer → BrokerAdapter
+DataLoader → BinaryRegimeEngine(SPY) → SignalFusion → PositionSizer → BrokerAdapter
 
 킬스위치:
 - 일일 손실이 daily_loss_limit_pct(기본 3%) 초과 시 당일 매수 전면 차단
@@ -19,6 +18,7 @@ from typing import Optional
 from backend.brokers.base import BrokerAdapter
 from backend.quant.data.loader import DataLoader
 from backend.quant.signals.fusion import SignalFusion, FusionResult, default_fusion
+from backend.quant.signals.regime import BinaryRegimeEngine, RegimeOutput
 from backend.quant.risk.position_sizer import PositionSizer
 from backend.quant.risk.portfolio import PortfolioAllocator
 
@@ -39,6 +39,7 @@ class LiveConfig:
     daily_loss_limit_pct: float = 0.03     # 일일 손실 한도 3%
     max_consecutive_losses: int = 5        # 연속 손실 → 운영 중단
     cooldown_days: int = 3                 # 동일 종목 재진입 금지 기간
+    regime_symbol: str = "SPY"            # 레짐 탐지용 시장 프록시
 
 
 @dataclass
@@ -69,6 +70,8 @@ class LivePipeline:
         self.fusion = fusion or default_fusion()
         self.loader = DataLoader()
         self.risk_state = RiskState()
+        self._regime_engine = BinaryRegimeEngine()
+        self._prev_regime_state: str = "risk_on"  # 히스테리시스 유지
 
     def run_cycle(self) -> dict:
         """
@@ -105,6 +108,23 @@ class LivePipeline:
         if not dfs:
             logger.error("데이터 로드 실패")
             return {"error": "no_data"}
+
+        # ── 1-B. 레짐 탐지 (SPY 시장 프록시) ─────────────────────────
+        regime: Optional[RegimeOutput] = None
+        try:
+            df_spy = self.loader.fetch(cfg.regime_symbol, period="1y")
+            regime = self._regime_engine.detect(df_spy, prev_state=self._prev_regime_state)
+            self._prev_regime_state = regime.meta.get("state", self._prev_regime_state)
+            logger.info(
+                "레짐: %s (risk_on=%s, vol=%.1f%%, sma_pct=%.2f%%)",
+                regime.regime, regime.risk_on,
+                regime.vol_ann * 100, regime.sma_pct * 100,
+            )
+        except Exception as e:
+            logger.warning("레짐 탐지 실패 — risk_on 가정: %s", e)
+
+        # STRESS 레짐: 신규 매수 전면 차단
+        buy_blocked_by_regime = regime is not None and not regime.risk_on
 
         # ── 2. 신호 평가 ──────────────────────────────────────────────
         scan_results: list[FusionResult] = self.fusion.scan(dfs)
@@ -150,6 +170,20 @@ class LivePipeline:
                 "buys_executed": [],
                 "available_cash": available_cash,
                 "blocked_reason": "daily_loss_limit",
+                "regime": regime.regime if regime else "unknown",
+                "dry_run": cfg.dry_run,
+            }
+
+        if buy_blocked_by_regime:
+            logger.warning("레짐 차단 (%s) — 신규 매수 전면 금지", regime.regime)
+            return {
+                "buy_signals": buy_candidates,
+                "sell_signals": sell_candidates,
+                "sells_executed": sells_executed,
+                "buys_executed": [],
+                "available_cash": available_cash,
+                "blocked_reason": f"regime_{regime.regime}",
+                "regime": regime.regime,
                 "dry_run": cfg.dry_run,
             }
 
@@ -223,6 +257,8 @@ class LivePipeline:
             "buys_executed": buys_executed,
             "sells_executed": sells_executed,
             "available_cash": available_cash,
+            "regime": regime.regime if regime else "unknown",
+            "regime_risk_on": regime.risk_on if regime else True,
             "dry_run": cfg.dry_run,
             "kill_switch": False,
         }

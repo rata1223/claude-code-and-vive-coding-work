@@ -120,18 +120,19 @@ class SignalFusion:
 def default_fusion() -> SignalFusion:
     """
     기본 합산 설정: 추세추종 40% + 모멘텀 40% + 변동성돌파 20%.
-    Ichimoku 레짐 필터 포함.
+    종목별 SMA200 기반 레짐 필터 (Ichimoku 대체 — 파라미터 1개).
     """
     from backend.quant.signals.trend_following import TrendFollowingSignal
     from backend.quant.signals.momentum import MomentumSignal
     from backend.quant.signals.volatility_breakout import VolatilityBreakoutSignal
-    from backend.quant.indicators.trend import ichimoku_regime
 
     def regime_ok(df):
-        ichi = ichimoku_regime(df)
-        if ichi.signal.empty or ichi.signal.dropna().empty:
-            return True  # 데이터 부족 시 허용
-        return ichi.signal.dropna().iloc[-1] >= 0  # 약세 구름 아래면 신규 매수 차단
+        """종목 자체의 SMA200 위에 있을 때만 신규 매수 허용."""
+        if len(df) < 200:
+            return True
+        close = df["Close"]
+        sma200 = close.rolling(200).mean().iloc[-1]
+        return float(close.iloc[-1]) > float(sma200)
 
     fusion = SignalFusion(buy_threshold=0.25, sell_threshold=-0.25)
     fusion.add(TrendFollowingSignal(), weight=0.4)
