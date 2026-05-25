@@ -21,6 +21,10 @@ from backend.quant.signals.fusion import SignalFusion, FusionResult, default_fus
 from backend.quant.signals.regime import BinaryRegimeEngine, RegimeOutput
 from backend.quant.risk.position_sizer import PositionSizer
 from backend.quant.risk.portfolio import PortfolioAllocator
+from backend.quant.risk.engine import TrailingStopManager, LossTracker, RiskConfig, ExposureManager
+from backend.quant.live.safeguards import (
+    SignalDeduplicator, PartialFillTracker, OHLCVRecovery, APIThrottleGuard
+)
 
 logger = logging.getLogger(__name__)
 
@@ -64,14 +68,33 @@ class LivePipeline:
     """
 
     def __init__(self, broker: BrokerAdapter, config: LiveConfig,
-                 fusion: Optional[SignalFusion] = None):
+                 fusion: Optional[SignalFusion] = None,
+                 risk_config: Optional[RiskConfig] = None):
         self.broker = broker
         self.config = config
         self.fusion = fusion or default_fusion()
         self.loader = DataLoader()
         self.risk_state = RiskState()
         self._regime_engine = BinaryRegimeEngine()
-        self._prev_regime_state: str = "risk_on"  # 히스테리시스 유지
+        self._prev_regime_state: str = "risk_on"
+
+        # 고급 리스크 엔진
+        rc = risk_config or RiskConfig(
+            daily_loss_limit_pct=config.daily_loss_limit_pct,
+            max_position_pct=config.max_position_pct,
+        )
+        self._trailing_stops = TrailingStopManager(rc)
+        self._loss_tracker = LossTracker(config=rc, peak_equity=config.initial_capital,
+                                         current_equity=config.initial_capital)
+        self._exposure_mgr = ExposureManager(rc)
+
+        # 라이브 안전장치
+        self._deduplicator = SignalDeduplicator(window_minutes=120)
+        self._fill_tracker = PartialFillTracker(timeout_minutes=30)
+        self._ohlcv_recovery = OHLCVRecovery()
+
+        # equity 추적 (드로다운 기반 사이징용)
+        self._equity_history: list[float] = [config.initial_capital]
 
     def run_cycle(self) -> dict:
         """
@@ -136,21 +159,50 @@ class LivePipeline:
         # ── 3. 기존 포지션 매도 처리 ──────────────────────────────────
         sells_executed = []
         positions = self.broker.get_positions()
+
+        # 현재 가격 수집 (트레일링 스탑 갱신용)
+        price_map = {}
         for pos in positions:
-            if pos.symbol in sell_candidates:
-                if cfg.dry_run:
-                    logger.info("[DRY RUN] SELL %s qty=%d", pos.symbol, pos.qty)
-                    # 드라이런에서도 쿨다운 기록
-                    state.last_sell_date[pos.symbol] = today
-                else:
-                    try:
-                        price = self.broker.get_price(pos.symbol)
+            try:
+                price_map[pos.symbol] = self.broker.get_price(pos.symbol)
+            except Exception:
+                pass
+
+        # 트레일링 스탑 갱신 + 발동 확인
+        self._trailing_stops.update(price_map)
+        ts_triggered = {sym for sym, _ in self._trailing_stops.check_stops(price_map)}
+        ts_reasons = {sym: reason for sym, reason in self._trailing_stops.check_stops(price_map)}
+
+        # 타임아웃 주문 취소
+        self._fill_tracker.cancel_timed_out(
+            cancel_fn=None if cfg.dry_run else self.broker.cancel_order
+        )
+
+        for pos in positions:
+            should_sell = pos.symbol in sell_candidates or pos.symbol in ts_triggered
+            if not should_sell:
+                continue
+
+            reason = ts_reasons.get(pos.symbol, "signal")
+            if cfg.dry_run:
+                logger.info("[DRY RUN] SELL %s qty=%d reason=%s", pos.symbol, pos.qty, reason)
+                state.last_sell_date[pos.symbol] = today
+                self._trailing_stops.close(pos.symbol)
+            else:
+                try:
+                    price = price_map.get(pos.symbol) or self.broker.get_price(pos.symbol)
+                    if not self._deduplicator.is_duplicate(pos.symbol, "sell"):
                         order = self.broker.place_order(pos.symbol, "sell", pos.qty, price)
-                        sells_executed.append({"symbol": pos.symbol, "order_id": order.id})
+                        self._fill_tracker.register(order.id, pos.symbol, "sell", pos.qty)
+                        sells_executed.append({
+                            "symbol": pos.symbol, "order_id": order.id, "reason": reason
+                        })
                         state.last_sell_date[pos.symbol] = today
-                        logger.info("매도 주문: %s qty=%d price=%.2f", pos.symbol, pos.qty, price)
-                    except Exception as e:
-                        logger.error("매도 실패 %s: %s", pos.symbol, e)
+                        self._trailing_stops.close(pos.symbol)
+                        logger.info("매도 주문: %s qty=%d price=%.2f (%s)",
+                                    pos.symbol, pos.qty, price, reason)
+                except Exception as e:
+                    logger.error("매도 실패 %s: %s", pos.symbol, e)
 
         # ── 4. 일일 손실 한도 점검 ────────────────────────────────────
         try:
@@ -242,9 +294,14 @@ class LivePipeline:
             if cfg.dry_run:
                 logger.info("[DRY RUN] BUY %s qty=%d @ %.2f", symbol, qty, price)
                 buys_executed.append({"symbol": symbol, "qty": qty, "price": price, "dry": True})
+                self._trailing_stops.open(symbol, qty, price)
             else:
+                if self._deduplicator.is_duplicate(symbol, "buy"):
+                    continue
                 try:
                     order = self.broker.place_order(symbol, "buy", qty, price)
+                    self._fill_tracker.register(order.id, symbol, "buy", qty)
+                    self._trailing_stops.open(symbol, qty, price)
                     buys_executed.append({"symbol": symbol, "qty": qty,
                                           "price": price, "order_id": order.id})
                     logger.info("매수 주문: %s qty=%d price=%.2f", symbol, qty, price)
