@@ -9,3 +9,9 @@ python-telegram-bot==20.7
 APScheduler==3.10.4
 python-dotenv==1.2.2
 websocket-client==1.7.0
+# Stage 4+
+flask==3.1.3
+flask-socketio==5.3.6
+sqlalchemy==2.0.30
+# Stage 6
+RestrictedPython==7.1
