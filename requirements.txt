@@ -1,17 +1,55 @@
-requests==2.33.0
-redis==5.0.1
-psycopg2-binary==2.9.9
+# Trading Bot Core Dependencies
+
+# Market Data & Technical Analysis
 pandas==2.1.4
-pandas-ta==0.4.71b0
+pandas-ta==0.3.14
+numpy==1.24.3
+scipy==1.11.4
 yfinance==0.2.36
 PyPortfolioOpt==1.5.5
-python-telegram-bot==20.7
-APScheduler==3.10.4
-python-dotenv==1.2.2
+
+# API & Network Communication
+requests==2.33.0
 websocket-client==1.7.0
-# Stage 4+
-flask==3.1.3
-flask-socketio==5.3.6
+python-dateutil==2.8.2
+pytz==2024.1
+
+# Data Storage & Database
+redis==5.0.1
+psycopg2-binary==2.9.9
 sqlalchemy==2.0.30
-# Stage 6
+alembic==1.13.1
+
+# Task Scheduling & Automation
+APScheduler==3.10.4
+
+# Notifications
+python-telegram-bot==20.7
+
+# Environment Configuration
+python-dotenv==1.2.2
+
+# Stage 4+: Backend API & Real-time
+flask==3.1.3
+flask-cors==4.0.0
+flask-socketio==5.3.6
+python-socketio==5.10.0
+python-engineio==4.8.0
+
+# Production WSGI Server
+gunicorn==21.2.0
+
+# Security & Authentication
+pyjwt==2.8.1
+cryptography==41.0.7
+
+# Monitoring & Logging
+python-json-logger==2.0.7
+
+# Stage 6+: Advanced Features
 RestrictedPython==7.1
+
+# Development & Testing (optional)
+# pytest==7.4.3
+# pytest-asyncio==0.23.3
+# black==23.12.0
