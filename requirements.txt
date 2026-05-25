@@ -2,7 +2,7 @@
 
 # Market Data & Technical Analysis
 pandas==2.1.4
-pandas-ta==0.3.14
+pandas-ta==0.4.71b0
 numpy==1.24.3
 scipy==1.11.4
 yfinance==0.2.36
