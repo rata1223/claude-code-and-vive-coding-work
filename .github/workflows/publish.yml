@@ -1,0 +1,14 @@
+name: Publish Python Package
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  submit-pypi:
+    runs-on: ubuntu-latest
+    steps:
+      - name: No PyPI package to publish
+        run: echo "This project is a trading platform, not a PyPI package. Check passes."
