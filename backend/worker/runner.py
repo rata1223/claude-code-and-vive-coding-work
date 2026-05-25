@@ -26,7 +26,7 @@ from backend.strategy.indicator.strategy import IndicatorStrategy
 logger = logging.getLogger(__name__)
 
 _REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:6379")
-_DB_URL = os.environ.get("DB_URL", "postgresql://quantdinger:quantdinger123@postgres:5432/quantdinger")
+_DB_URL = os.environ.get("DB_URL", "postgresql://quantdinger:quantdinger@postgres:5432/quantdinger")
 
 
 class WorkerSession:

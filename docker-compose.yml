@@ -47,7 +47,7 @@ services:
       context: .
       dockerfile: Dockerfile.api
     restart: unless-stopped
-    container_name: kis-api
+    container_name: quantdinger-api
     ports:
       - "8000:8000"
     environment:
@@ -109,7 +109,7 @@ services:
       KIS_ACCOUNT_NO: ${KIS_ACCOUNT_NO}
       KIS_ENV: ${KIS_ENV:-paper}
       REDIS_URL: redis://redis:6379
-      DB_URL: postgresql://quantdinger:${POSTGRES_PASSWORD:-quantdinger123}@postgres:5432/quantdinger
+      DB_URL: postgresql://quantdinger:${POSTGRES_PASSWORD:-quantdinger}@postgres:5432/quantdinger
       API_PORT: "5001"
     depends_on:
       postgres:
@@ -135,7 +135,7 @@ services:
       KIS_ACCOUNT_NO: ${KIS_ACCOUNT_NO}
       KIS_ENV: ${KIS_ENV:-paper}
       REDIS_URL: redis://redis:6379
-      DB_URL: postgresql://quantdinger:${POSTGRES_PASSWORD:-quantdinger123}@postgres:5432/quantdinger
+      DB_URL: postgresql://quantdinger:${POSTGRES_PASSWORD:-quantdinger}@postgres:5432/quantdinger
       DAILY_LOSS_LIMIT_PCT: ${DAILY_LOSS_LIMIT_PCT:-0.03}
       MDD_LIMIT_PCT: ${MDD_LIMIT_PCT:-0.15}
       STOP_LOSS_PCT: ${STOP_LOSS_PCT:-0.07}
