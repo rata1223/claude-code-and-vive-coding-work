@@ -35,7 +35,7 @@ def test_price_us():
     from kis_adapter.market_data import KISMarketData
     md = KISMarketData()
     try:
-        price = md.get_price_us("SPY", "AMEX")
+        price = md.get_price_us("SPY", "NYSE")
         print(f"✅ 미국 시세 조회 성공: SPY = ${price:.2f}")
     except Exception as e:
         print(f"❌ 미국 시세 조회 실패: {e}")
