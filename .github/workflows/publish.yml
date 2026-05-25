@@ -11,4 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: No PyPI package to publish
-        run: echo "This project is a trading platform, not a PyPI package. Check passes."
+        run: |
+          echo "This project is a KIS/Kiwoom trading platform, not a PyPI package."
+          echo "submit-pypi check: PASS"
+          exit 0
