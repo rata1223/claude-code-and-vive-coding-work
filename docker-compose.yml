@@ -1,8 +1,5 @@
 version: "3.9"
 
-# QuantDinger 공식 구조 + KIS 봇 통합
-# 최초 실행 전: scripts/setup_oracle_cloud.sh 실행 필수 (QuantDinger 소스 클론)
-
 services:
   postgres:
     image: postgres:16-alpine
@@ -11,7 +8,7 @@ services:
     environment:
       POSTGRES_DB: quantdinger
       POSTGRES_USER: quantdinger
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-quantdinger}
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -32,49 +29,43 @@ services:
       timeout: 5s
       retries: 5
 
-  quantdinger-backend:
+  # Vue 3 모바일 프론트엔드
+  frontend:
     build:
-      context: ./quantdinger/backend_api_python
+      context: ./frontend
       dockerfile: Dockerfile
-      args:
-        BUILD_REGION: global
     restart: unless-stopped
-    container_name: quantdinger-backend
+    ports:
+      - "5173:5173"
     environment:
-      SECRET_KEY: ${QUANTDINGER_SECRET_KEY}
-      DATABASE_URL: postgresql://quantdinger:${POSTGRES_PASSWORD}@postgres:5432/quantdinger
-      REDIS_HOST: redis
-      REDIS_PORT: 6379
-      FRONTEND_URL: http://localhost:8888
-      ADMIN_USER: ${QUANTDINGER_ADMIN_USER:-admin}
-      ADMIN_PASSWORD: ${QUANTDINGER_ADMIN_PASSWORD}
-      TZ: Asia/Seoul
-      GUNICORN_WORKERS: "1"
-      GUNICORN_THREADS: "8"
-      STRATEGY_MAX_THREADS: "64"
-      ALLOW_LOCAL_DESKTOP_BROKERS: "false"
+      VITE_API_TARGET: http://api:8000
+    depends_on:
+      - api
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    restart: unless-stopped
+    container_name: quantdinger-api
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql://quantdinger:${POSTGRES_PASSWORD:-quantdinger}@postgres:5432/quantdinger
+      REDIS_URL: redis://redis:6379/0
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-change-me-in-production}
+      JWT_EXPIRE_MINUTES: ${JWT_EXPIRE_MINUTES:-10080}
+      KIS_CREDENTIAL_KEY: ${KIS_CREDENTIAL_KEY:-}
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:5000/api/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 15s
       timeout: 10s
       retries: 5
-
-  quantdinger-frontend:
-    image: ghcr.io/brokermr810/quantdinger-frontend:latest
-    restart: unless-stopped
-    container_name: quantdinger-frontend
-    ports:
-      - "8888:8888"
-    environment:
-      BACKEND_URL: http://quantdinger-backend:5000
-    depends_on:
-      quantdinger-backend:
-        condition: service_healthy
 
   kis-bot:
     build:
@@ -91,7 +82,7 @@ services:
       TELEGRAM_TOKEN: ${TELEGRAM_TOKEN:-}
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
       REDIS_URL: redis://redis:6379
-      DB_URL: postgresql://quantdinger:${POSTGRES_PASSWORD}@postgres:5432/quantdinger
+      DB_URL: postgresql://quantdinger:${POSTGRES_PASSWORD:-quantdinger}@postgres:5432/quantdinger
       DAILY_LOSS_LIMIT_PCT: ${DAILY_LOSS_LIMIT_PCT:-0.03}
       MDD_LIMIT_PCT: ${MDD_LIMIT_PCT:-0.15}
       STOP_LOSS_PCT: ${STOP_LOSS_PCT:-0.07}
@@ -118,7 +109,7 @@ services:
       KIS_ACCOUNT_NO: ${KIS_ACCOUNT_NO}
       KIS_ENV: ${KIS_ENV:-paper}
       REDIS_URL: redis://redis:6379
-      DB_URL: postgresql://quantdinger:${POSTGRES_PASSWORD:-quantdinger123}@postgres:5432/quantdinger
+      DB_URL: postgresql://quantdinger:${POSTGRES_PASSWORD:-quantdinger}@postgres:5432/quantdinger
       API_PORT: "5001"
     depends_on:
       postgres:
@@ -144,7 +135,7 @@ services:
       KIS_ACCOUNT_NO: ${KIS_ACCOUNT_NO}
       KIS_ENV: ${KIS_ENV:-paper}
       REDIS_URL: redis://redis:6379
-      DB_URL: postgresql://quantdinger:${POSTGRES_PASSWORD:-quantdinger123}@postgres:5432/quantdinger
+      DB_URL: postgresql://quantdinger:${POSTGRES_PASSWORD:-quantdinger}@postgres:5432/quantdinger
       DAILY_LOSS_LIMIT_PCT: ${DAILY_LOSS_LIMIT_PCT:-0.03}
       MDD_LIMIT_PCT: ${MDD_LIMIT_PCT:-0.15}
       STOP_LOSS_PCT: ${STOP_LOSS_PCT:-0.07}

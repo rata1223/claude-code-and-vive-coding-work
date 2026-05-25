@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 def _get_db():
     from backend.database.models import init_db
-    db_url = os.environ.get("DB_URL", "postgresql://quantdinger:quantdinger123@postgres:5432/quantdinger")
+    db_url = os.environ.get("DB_URL", "postgresql://quantdinger:quantdinger@postgres:5432/quantdinger")
     return init_db(db_url)
 
 

@@ -1,7 +1,14 @@
 import logging
+import os
 import pandas as pd
-import pandas_ta as ta
 import yfinance as yf
+
+try:
+    import pandas_ta as ta
+    _HAS_PANDAS_TA = True
+except ImportError:
+    ta = None
+    _HAS_PANDAS_TA = False
 
 logger = logging.getLogger(__name__)
 
@@ -14,7 +21,6 @@ UNIVERSE = US_ETF + US_LARGE + KR_ETF
 EXCD_MAP = {s: "NASD" for s in ["AAPL", "NVDA", "MSFT", "GOOGL", "AMZN", "META", "TSLA", "AVGO", "QQQ", "XLK", "XLRE"]}
 EXCD_MAP.update({s: "NYSE" for s in ["SPY", "XLF", "XLE", "XLV", "XLI", "XLY", "XLP", "XLU", "JPM", "V"]})
 
-# 섹터 매핑 (동일 섹터 중복 매수 차단용)
 SECTOR_MAP = {
     "SPY": "broad", "QQQ": "tech", "XLK": "tech", "XLF": "finance",
     "XLE": "energy", "XLV": "health", "XLI": "industrial", "XLY": "consumer_disc",
@@ -25,8 +31,6 @@ SECTOR_MAP = {
     "069500": "broad_kr", "360750": "broad_kr", "091160": "tech_kr",
 }
 
-
-# KIS API 코드 → yfinance 티커 매핑 (한국 ETF는 .KS 접미사 필요)
 _YF_TICKER = {k: k + ".KS" for k in KR_ETF}
 
 
@@ -44,15 +48,32 @@ class TradingSignals:
     def fetch_ohlcv(self, symbol: str, period: str = "2y") -> pd.DataFrame:
         return _fetch(symbol, period)
 
+    @staticmethod
+    def _sma(series: pd.Series, length: int) -> pd.Series:
+        return series.rolling(window=length).mean()
+
+    @staticmethod
+    def _rsi(series: pd.Series, length: int = 14) -> pd.Series:
+        delta = series.diff()
+        gain = delta.clip(lower=0).rolling(window=length).mean()
+        loss = (-delta.clip(upper=0)).rolling(window=length).mean()
+        rs = gain / loss.replace(0, float("nan"))
+        return 100 - (100 / (1 + rs))
+
     def buy_signal(self, df: pd.DataFrame) -> bool:
         close = df["Close"]
         volume = df["Volume"]
         if len(close) < 200:
             return False
 
-        sma200 = ta.sma(close, length=200)
-        rsi = ta.rsi(close, length=14)
-        vol_ma20 = ta.sma(volume, length=20)
+        if _HAS_PANDAS_TA:
+            sma200 = ta.sma(close, length=200)
+            rsi = ta.rsi(close, length=14)
+            vol_ma20 = ta.sma(volume, length=20)
+        else:
+            sma200 = self._sma(close, 200)
+            rsi = self._rsi(close, 14)
+            vol_ma20 = self._sma(volume, 20)
 
         if sma200 is None or rsi is None or vol_ma20 is None:
             return False
@@ -63,7 +84,6 @@ class TradingSignals:
         last_vol = volume.iloc[-1]
         last_vol_ma = vol_ma20.iloc[-1]
 
-        # 3개월(63 거래일) 모멘텀 — 데이터 부족 시 None 처리
         if len(close) < 63:
             return False
         momentum = (last_close - close.iloc[-63]) / close.iloc[-63]
@@ -81,14 +101,18 @@ class TradingSignals:
         if len(close) < 200:
             return False, ""
 
-        sma200 = ta.sma(close, length=200)
-        rsi = ta.rsi(close, length=14)
+        if _HAS_PANDAS_TA:
+            sma200 = ta.sma(close, length=200)
+            rsi = ta.rsi(close, length=14)
+        else:
+            sma200 = self._sma(close, 200)
+            rsi = self._rsi(close, 14)
 
         if sma200 is None or rsi is None:
             return False, ""
 
         last_close = close.iloc[-1]
-        stop_pct = float(__import__("os").environ.get("STOP_LOSS_PCT", 0.07))
+        stop_pct = float(os.environ.get("STOP_LOSS_PCT", 0.07))
 
         if last_close <= entry_price * (1 - stop_pct):
             return True, f"손절 (진입가 {entry_price:.2f} → 현재 {last_close:.2f})"
@@ -99,19 +123,13 @@ class TradingSignals:
         return False, ""
 
     def scan_universe(self, portfolio_positions: dict = None) -> dict:
-        """
-        매수/매도 신호 스캔.
-        portfolio_positions: {symbol: entry_price} 형태의 현재 보유 포지션.
-        """
         buy_candidates = []
-        sell_candidates = []  # (symbol, reason)
+        sell_candidates = []
         portfolio_positions = portfolio_positions or {}
 
         for symbol in UNIVERSE:
             try:
                 df = self.fetch_ohlcv(symbol)
-
-                # 보유 중인 종목 → 매도 신호 체크
                 if symbol in portfolio_positions:
                     entry = portfolio_positions[symbol]
                     should_sell, reason = self.sell_signal(df, entry)
@@ -119,8 +137,6 @@ class TradingSignals:
                         sell_candidates.append((symbol, reason))
                         logger.info("SELL signal: %s — %s", symbol, reason)
                     continue
-
-                # 미보유 종목 → 매수 신호 체크
                 if self.buy_signal(df):
                     buy_candidates.append(symbol)
                     logger.info("BUY signal: %s", symbol)
@@ -131,10 +147,7 @@ class TradingSignals:
 
 
 class MultiTimeframeSignals:
-    """
-    전문 전략: 일봉 + 주봉 다중 타임프레임 + 시장 레짐 탐지.
-    3중 확인을 통과한 종목만 매수 후보로 올림.
-    """
+    """전문 전략: 일봉 + 주봉 다중 타임프레임 + 시장 레짐 탐지."""
 
     def __init__(self):
         self._base = TradingSignals()
@@ -146,17 +159,14 @@ class MultiTimeframeSignals:
             close = df_w["Close"]
             if len(close) < 20:
                 return False
-            sma20w = ta.sma(close, length=20)
+            sma20w = ta.sma(close, length=20) if _HAS_PANDAS_TA else self._base._sma(close, 20)
             return sma20w is not None and close.iloc[-1] > sma20w.iloc[-1]
         except Exception as e:
             logger.warning("Weekly trend check failed %s: %s", symbol, e)
             return False
 
     def regime_is_bullish(self) -> bool:
-        """
-        시장 레짐 탐지: SPY 20일 실현변동성 < 25% = 정상 시장.
-        변동성 폭발(VIX 대리) 시 신규 매수 차단.
-        """
+        """SPY 20일 실현변동성 < 25% = 정상 시장."""
         try:
             df = _fetch("SPY", period="60d", interval="1d")
             returns = df["Close"].pct_change().dropna()
@@ -169,7 +179,7 @@ class MultiTimeframeSignals:
             return True
 
     def momentum_factor(self, df: pd.DataFrame) -> float:
-        """12-1 모멘텀 팩터: 12개월 수익률 - 1개월 수익률."""
+        """12-1 모멘텀 팩터."""
         close = df["Close"]
         if len(close) < 252:
             return 0.0
@@ -178,20 +188,17 @@ class MultiTimeframeSignals:
         return ret_12m - ret_1m
 
     def atr_position_size(self, df: pd.DataFrame, capital: float, risk_pct: float = 0.01) -> float:
-        """
-        ATR 기반 포지션 크기: 자본의 risk_pct를 1ATR 손실로 제한.
-        반환값: 해당 종목에 투자할 금액(원화).
-        """
+        """ATR 기반 포지션 크기: 자본의 risk_pct를 1ATR 손실로 제한."""
         close = df["Close"]
-        atr = ta.atr(df["High"], df["Low"], close, length=14)
+        if _HAS_PANDAS_TA:
+            atr = ta.atr(df["High"], df["Low"], close, length=14)
+        else:
+            atr = (df["High"] - df["Low"]).rolling(14).mean()
         if atr is None or atr.iloc[-1] == 0:
             return capital * 0.05
         risk_amount = capital * risk_pct
-        price = close.iloc[-1]
-        atr_val = atr.iloc[-1]
-        shares = risk_amount / atr_val
-        position_value = shares * price
-        # 최대 5% 상한 유지
+        shares = risk_amount / atr.iloc[-1]
+        position_value = shares * close.iloc[-1]
         return min(position_value, capital * 0.05)
 
     def sector_diversified(self, candidate: str, already_selected: list) -> bool:
@@ -203,10 +210,7 @@ class MultiTimeframeSignals:
         return count < 2
 
     def scan_universe(self, portfolio_positions: dict = None) -> dict:
-        """
-        3중 필터: 일봉 신호 AND 주봉 추세 AND 시장 레짐.
-        추가: 12-1 모멘텀 정렬, 섹터 분산, ATR 포지션 사이징.
-        """
+        """3중 필터: 일봉 신호 AND 주봉 추세 AND 시장 레짐."""
         portfolio_positions = portfolio_positions or {}
         base_result = self._base.scan_universe(portfolio_positions)
 
@@ -214,7 +218,6 @@ class MultiTimeframeSignals:
             logger.warning("시장 레짐 비관적 — 신규 매수 차단 (매도 신호는 유지)")
             return {"buy": [], "sell": base_result["sell"], "regime": "bearish"}
 
-        # 주봉 추세 필터 적용
         filtered = []
         for symbol in base_result["buy"]:
             if self.weekly_trend_ok(symbol):
@@ -222,7 +225,6 @@ class MultiTimeframeSignals:
             else:
                 logger.info("WEEKLY FILTER blocked: %s", symbol)
 
-        # 모멘텀 팩터로 정렬 (강한 순)
         ranked = []
         for symbol in filtered:
             try:
@@ -233,14 +235,9 @@ class MultiTimeframeSignals:
                 ranked.append((symbol, 0.0))
         ranked.sort(key=lambda x: x[1], reverse=True)
 
-        # 섹터 분산 필터
         selected = []
         for symbol, _ in ranked:
             if self.sector_diversified(symbol, selected):
                 selected.append(symbol)
 
-        return {
-            "buy": selected,
-            "sell": base_result["sell"],
-            "regime": "bullish",
-        }
+        return {"buy": selected, "sell": base_result["sell"], "regime": "bullish"}

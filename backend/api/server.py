@@ -21,7 +21,7 @@ _db = None  # lazy init
 def get_db():
     global _db
     if _db is None:
-        db_url = os.environ.get("DB_URL", "postgresql://quantdinger:quantdinger123@postgres:5432/quantdinger")
+        db_url = os.environ.get("DB_URL", "postgresql://quantdinger:quantdinger@postgres:5432/quantdinger")
         _db = init_db(db_url)
     return _db
 
