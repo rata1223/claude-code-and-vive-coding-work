@@ -19,25 +19,37 @@ def _calc_atr(high: pd.Series, low: pd.Series, close: pd.Series, length: int = 1
     return tr.rolling(length).mean()
 
 
-# 기본 거래 비용 (KIS 수수료 0.015% + 슬리피지 0.02%)
-DEFAULT_COMMISSION = 0.00015
-DEFAULT_SLIPPAGE = 0.0002
+# ── 비용 모델 ────────────────────────────────────────────────────────────────
+# KIS 수수료 0.015%. 슬리피지 0.10%.
+# 한국 ETF 매도 시 증권거래세 0.20% 추가 (매수에는 없음).
+# 실질 왕복 비용: 매수 0.115% + 매도 0.315% = ~0.43% round-trip.
+DEFAULT_COMMISSION = 0.00015        # 편도 수수료
+DEFAULT_SLIPPAGE   = 0.0010        # 편도 슬리피지 (0.10%)
+KR_SECURITIES_TAX  = 0.0020        # 한국 ETF 매도 증권거래세 0.20%
 
 
 def transaction_cost(price: float, qty: int,
                      commission: float = DEFAULT_COMMISSION,
-                     slippage: float = DEFAULT_SLIPPAGE) -> float:
-    """총 거래비용 계산 (수수료 + 슬리피지)."""
+                     slippage: float = DEFAULT_SLIPPAGE,
+                     side: str = "buy",
+                     is_kr: bool = True) -> float:
+    """
+    총 거래비용 (수수료 + 슬리피지 + 한국 증권거래세).
+    is_kr=True: 매도 시 KR_SECURITIES_TAX 추가.
+    """
     gross = price * qty
-    return gross * (commission + slippage)
+    tax = (KR_SECURITIES_TAX if side == "sell" and is_kr else 0.0)
+    return gross * (commission + slippage + tax)
 
 
 def effective_price(price: float, side: str,
-                    slippage: float = DEFAULT_SLIPPAGE) -> float:
-    """슬리피지 적용 체결가."""
+                    slippage: float = DEFAULT_SLIPPAGE,
+                    is_kr: bool = True) -> float:
+    """슬리피지 + 증권거래세 반영 실체결가."""
     if side == "buy":
         return price * (1 + slippage)
-    return price * (1 - slippage)
+    tax = KR_SECURITIES_TAX if is_kr else 0.0
+    return price * (1 - slippage - tax)
 
 
 class PositionSizer:
@@ -121,6 +133,63 @@ class PositionSizer:
             "entry_price": round(effective_price(price, "buy", self.slippage), 2),
             "method": "fixed_fraction",
         }
+
+    def volatility_target(self, df: pd.DataFrame, target_vol: float = 0.10,
+                          vol_window: int = 21, is_kr: bool = True) -> dict:
+        """
+        변동성 타겟팅 사이징.
+        포지션 크기 = (target_vol / realized_vol) × capital × max_position_pct.
+        target_vol: 연환산 목표 변동성 (기본 10%).
+        """
+        import numpy as np
+        close = df["Close"]
+        if len(close) < vol_window + 1:
+            return self._fallback()
+        log_ret = np.log(close / close.shift(1)).dropna()
+        realized_vol = log_ret.iloc[-vol_window:].std() * np.sqrt(252)
+        if realized_vol <= 0:
+            return self._fallback()
+
+        vol_scale = min(target_vol / realized_vol, 1.5)  # 최대 1.5× 레버리지 제한
+        position_pct = min(vol_scale * self.max_position_pct, self.max_position_pct)
+        price = close.iloc[-2]
+        position_value = self.capital * position_pct
+        qty = int(position_value / price) if price > 0 else 1
+
+        return {
+            "qty": max(1, qty),
+            "position_value": round(position_value),
+            "entry_price": round(effective_price(price, "buy", self.slippage, is_kr), 2),
+            "realized_vol_ann": round(realized_vol, 4),
+            "vol_scale": round(vol_scale, 4),
+            "method": "vol_target",
+        }
+
+    def drawdown_scaled(self, df: pd.DataFrame, equity_curve: "pd.Series",
+                        base_method: str = "atr", dd_floor: float = 0.5) -> dict:
+        """
+        드로다운 비례 사이징 축소.
+        현재 MDD 대비 포지션 크기를 비례 감소 (dd_floor가 최소 배율).
+        MDD=0 → 1.0×, MDD=15% → dd_floor× (선형 보간).
+        """
+        import numpy as np
+        if equity_curve is None or len(equity_curve) < 2:
+            return self.atr_based(df) if base_method == "atr" else self.fixed_fraction(df)
+
+        peak = equity_curve.cummax().iloc[-1]
+        current = equity_curve.iloc[-1]
+        current_dd = (current - peak) / peak if peak > 0 else 0.0  # 음수
+
+        mdd_cap = 0.15  # 15% MDD에서 dd_floor로 감소
+        dd_ratio = max(0.0, min(abs(current_dd) / mdd_cap, 1.0))
+        scale = 1.0 - dd_ratio * (1.0 - dd_floor)
+
+        base = self.atr_based(df) if base_method == "atr" else self.fixed_fraction(df)
+        base["qty"] = max(1, int(base["qty"] * scale))
+        base["position_value"] = round(base.get("position_value", 0) * scale)
+        base["dd_scale"] = round(scale, 4)
+        base["current_dd_pct"] = round(current_dd * 100, 2)
+        return base
 
     def _fallback(self) -> dict:
         return {

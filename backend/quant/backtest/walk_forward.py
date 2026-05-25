@@ -151,6 +151,85 @@ class WalkForwardOptimizer:
         )
 
 
+def lookahead_bias_check(
+    signal_fn,
+    df: pd.DataFrame,
+    params: dict,
+    future_window: int = 5,
+) -> dict:
+    """
+    룩어헤드 바이어스 탐지기.
+
+    방법: 마지막 future_window 봉을 제거한 데이터로 신호를 재계산.
+    신호 값이 전체 데이터 기준과 다르면 해당 신호가 미래 데이터를 사용한 것.
+
+    NaN 마스킹 방식 대신 데이터 절단(truncation)을 사용해
+    rolling window 의 부작용(false positive)을 방지.
+    """
+    try:
+        if len(df) <= future_window + 1:
+            return {"error": "insufficient_data"}
+
+        sig_full = signal_fn(df, params)
+
+        # 마지막 future_window 봉 제거 후 재계산
+        df_truncated = df.iloc[:-future_window]
+        sig_truncated = signal_fn(df_truncated, params)
+
+        # 절단 데이터의 마지막 신호 vs 전체 데이터의 같은 위치 신호 비교
+        check_idx = min(len(sig_truncated), len(sig_full) - future_window)
+        if check_idx <= 0:
+            return {"error": "insufficient_overlap"}
+
+        # 전체에서 마지막 future_window 이전의 신호들과 비교
+        full_tail = sig_full.iloc[-future_window - 1:-future_window]
+        trunc_tail = sig_truncated.iloc[-1:]
+
+        mismatch = 0
+        for a, b in zip(full_tail.values, trunc_tail.values):
+            if a != a or b != b:  # nan-safe
+                continue
+            if a != b:
+                mismatch += 1
+
+        bias_detected = mismatch > 0
+
+        return {
+            "lookahead_bias_detected": bias_detected,
+            "mismatch_bars": mismatch,
+            "future_window": future_window,
+            "warning": "룩어헤드 바이어스 의심" if bias_detected else "정상",
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def reject_overfitting(
+    is_score: float,
+    oos_score: float,
+    degradation_threshold: float = 0.5,
+) -> dict:
+    """
+    IS vs OOS 성과 비교로 과적합 탐지.
+    OOS 성과가 IS 대비 degradation_threshold 이하이면 과적합 의심.
+
+    예: IS Sharpe=2.0, OOS Sharpe=0.4 → 0.4/2.0 = 0.2 < 0.5 → 과적합
+    """
+    if is_score == 0:
+        return {"overfitting": False, "ratio": None, "warning": "IS score=0"}
+
+    ratio = oos_score / is_score if is_score > 0 else 0.0
+    overfit = ratio < degradation_threshold
+
+    return {
+        "overfitting": overfit,
+        "is_score": round(is_score, 4),
+        "oos_score": round(oos_score, 4),
+        "ratio": round(ratio, 4),
+        "warning": f"과적합 의심 (OOS/IS={ratio:.2f} < {degradation_threshold})" if overfit else "정상",
+    }
+
+
 def _chain_equity(equities: list[pd.Series], initial: float) -> pd.Series:
     """OOS 구간별 equity curve를 연속으로 이어붙임."""
     parts = []

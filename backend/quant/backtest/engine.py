@@ -11,7 +11,9 @@ import numpy as np
 import pandas as pd
 
 from backend.quant.backtest.metrics import summarize
-from backend.quant.risk.position_sizer import DEFAULT_COMMISSION, DEFAULT_SLIPPAGE, effective_price
+from backend.quant.risk.position_sizer import (
+    DEFAULT_COMMISSION, DEFAULT_SLIPPAGE, KR_SECURITIES_TAX, effective_price
+)
 
 logger = logging.getLogger(__name__)
 
@@ -19,11 +21,13 @@ logger = logging.getLogger(__name__)
 @dataclass
 class BacktestConfig:
     initial_capital: float = 2_000_000.0
-    commission: float = DEFAULT_COMMISSION   # 0.015%
-    slippage: float = DEFAULT_SLIPPAGE       # 0.02%
-    max_position_pct: float = 0.05           # 종목당 최대 5%
-    stop_loss_pct: float = 0.07              # 7% 손절
-    take_profit_pct: Optional[float] = None  # None = 신호 기반 청산
+    commission: float = DEFAULT_COMMISSION     # 0.015%
+    slippage: float = DEFAULT_SLIPPAGE         # 0.10% (실질적 슬리피지)
+    is_kr: bool = True                         # 한국 ETF → 매도 시 증권거래세 포함
+    max_position_pct: float = 0.05             # 종목당 최대 5%
+    stop_loss_pct: float = 0.07                # 7% 하드 손절
+    trailing_stop_pct: Optional[float] = 0.07  # 트레일링 스탑 (None=비활성)
+    take_profit_pct: Optional[float] = None    # None = 신호 기반 청산
     allow_short: bool = False
 
 
@@ -74,28 +78,39 @@ class BacktestEngine:
 
         position_qty = 0
         position_price = 0.0
+        peak_price = 0.0       # 트레일링 스탑용 고점
         entry_date = ""
 
         # 신호를 1봉 뒤에 실행 (현재 봉 종가로 신호 → 다음 봉 시가로 체결)
-        signals = signal_series.shift(1).fillna(0)  # 한 번 더 shift = 체결 지연
+        signals = signal_series.shift(1).fillna(0)
 
         for i in range(1, len(df)):
             row = df.iloc[i]
-            prev_row = df.iloc[i - 1]
-            date = str(df.index[i].date())
+            date_str = str(df.index[i].date())
             sig = int(signals.iloc[i])
             open_price = row["Open"]
 
-            # ── 보유 중 청산 조건 체크 ─────────────────────────────────
+            # ── 보유 중 청산 조건 체크 ──────────────────────────────────
             if position_qty > 0:
                 exit_price = None
                 exit_reason = ""
 
-                # 손절 (당일 저가 기준)
-                stop_price = position_price * (1 - cfg.stop_loss_pct)
-                if row["Low"] <= stop_price:
-                    exit_price = stop_price
-                    exit_reason = "stop_loss"
+                # 트레일링 스탑 고점 갱신
+                if row["High"] > peak_price:
+                    peak_price = row["High"]
+
+                # 하드 손절 (진입가 기준, 당일 저가 체크)
+                hard_stop = position_price * (1 - cfg.stop_loss_pct)
+                if row["Low"] <= hard_stop:
+                    exit_price = hard_stop
+                    exit_reason = "hard_stop"
+
+                # 트레일링 스탑 (고점 기준)
+                elif cfg.trailing_stop_pct and peak_price > 0:
+                    ts_price = peak_price * (1 - cfg.trailing_stop_pct)
+                    if row["Low"] <= ts_price:
+                        exit_price = max(ts_price, row["Low"])
+                        exit_reason = "trailing_stop"
 
                 # 익절
                 elif cfg.take_profit_pct and row["High"] >= position_price * (1 + cfg.take_profit_pct):
@@ -104,16 +119,19 @@ class BacktestEngine:
 
                 # 매도 신호
                 elif sig == -1:
-                    exit_price = effective_price(open_price, "sell", cfg.slippage)
+                    exit_price = effective_price(open_price, "sell", cfg.slippage, cfg.is_kr)
                     exit_reason = "signal"
 
                 if exit_price:
                     gross = exit_price * position_qty
-                    cost = gross * cfg.commission
-                    pnl = (exit_price - position_price) * position_qty - cost
-                    capital += gross - cost
+                    # 매도 비용: 수수료 + 증권거래세(한국) + 슬리피지
+                    sell_cost_rate = cfg.commission + (KR_SECURITIES_TAX if cfg.is_kr else 0.0)
+                    sell_cost = gross * sell_cost_rate
+                    # 진입 시 이미 슬리피지 반영됨 → 손익 계산에서 비용만 차감
+                    pnl = (exit_price - position_price) * position_qty - sell_cost
+                    capital += gross - sell_cost
                     trades.append(Trade(
-                        symbol=symbol, entry_date=entry_date, exit_date=date,
+                        symbol=symbol, entry_date=entry_date, exit_date=date_str,
                         side="long", qty=position_qty,
                         entry_price=round(position_price, 4),
                         exit_price=round(exit_price, 4),
@@ -121,20 +139,22 @@ class BacktestEngine:
                     ))
                     position_qty = 0
                     position_price = 0.0
+                    peak_price = 0.0
 
-            # ── 신규 진입 ─────────────────────────────────────────────
+            # ── 신규 진입 ──────────────────────────────────────────────
             if position_qty == 0 and sig == 1:
-                buy_price = effective_price(open_price, "buy", cfg.slippage)
+                buy_price = effective_price(open_price, "buy", cfg.slippage, cfg.is_kr)
                 max_invest = capital * cfg.max_position_pct
                 qty = int(max_invest / buy_price)
                 if qty > 0:
-                    cost = buy_price * qty * cfg.commission
-                    total_cost = buy_price * qty + cost
+                    buy_cost = buy_price * qty * cfg.commission
+                    total_cost = buy_price * qty + buy_cost
                     if total_cost <= capital:
                         capital -= total_cost
                         position_qty = qty
                         position_price = buy_price
-                        entry_date = date
+                        peak_price = buy_price
+                        entry_date = date_str
 
             # 평가 자산 = 현금 + 보유 포지션 현재가
             if position_qty > 0:

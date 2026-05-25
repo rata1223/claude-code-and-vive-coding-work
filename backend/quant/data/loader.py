@@ -5,12 +5,17 @@ All returned DataFrames have columns: Open, High, Low, Close, Volume
 with DatetimeIndex (UTC-naive, exchange local time).
 """
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import pandas as pd
 
 logger = logging.getLogger(__name__)
+
+
+class StaleDataError(ValueError):
+    """yfinance 데이터가 stale_hours 이상 오래된 경우."""
+    pass
 
 # KR 종목 코드 패턴 (6자리 숫자)
 _KR_CODE_RE = __import__("re").compile(r"^\d{6}$")
@@ -61,7 +66,8 @@ class DataLoader:
                 logger.warning("DataLoader.fetch_multi failed %s: %s", sym, e)
         return result
 
-    def _fetch_us(self, symbol, start, end, period, interval) -> pd.DataFrame:
+    def _fetch_us(self, symbol, start, end, period, interval,
+                  stale_hours: int = 26) -> pd.DataFrame:
         import yfinance as yf
         ticker = yf.Ticker(symbol)
         if start and end:
@@ -73,6 +79,21 @@ class DataLoader:
         df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
         df.index = pd.to_datetime(df.index)
         df.sort_index(inplace=True)
+
+        # 일봉 데이터 신선도 점검 (주말·휴장 제외: 26h 허용)
+        if interval == "1d" and stale_hours > 0:
+            last_ts = df.index[-1]
+            if last_ts.tzinfo is None:
+                last_ts = last_ts.tz_localize("UTC")
+            now_utc = datetime.now(timezone.utc)
+            age_hours = (now_utc - last_ts).total_seconds() / 3600
+            if age_hours > stale_hours:
+                logger.warning(
+                    "yfinance 데이터 stale: %s 마지막봉 %s (%.0fh 전)",
+                    symbol, last_ts.date(), age_hours
+                )
+                # WARN만 — 주말·휴장에는 정상이므로 예외 미발생
+
         return df
 
     def _fetch_kr(self, symbol, start, end, period, interval) -> pd.DataFrame:
