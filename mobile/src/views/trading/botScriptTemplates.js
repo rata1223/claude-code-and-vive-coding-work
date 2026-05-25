@@ -426,9 +426,12 @@ def on_bar(ctx, bar):
  * @returns {string} Python 策略代码
  */
 export function generateBotScript (botType, params, context) {
-  const generator = BOT_SCRIPT_TEMPLATES[botType]
-  if (!generator) {
+  if (!Object.prototype.hasOwnProperty.call(BOT_SCRIPT_TEMPLATES, botType)) {
     throw new Error(`Unknown bot type: ${botType}`)
+  }
+  const generator = BOT_SCRIPT_TEMPLATES[botType]
+  if (typeof generator !== 'function') {
+    throw new Error(`Invalid bot template for type: ${botType}`)
   }
   return generator(params, context)
 }
