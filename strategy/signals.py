@@ -60,6 +60,18 @@ class TradingSignals:
         rs = gain / loss.replace(0, float("nan"))
         return 100 - (100 / (1 + rs))
 
+    @staticmethod
+    def _sma(series: pd.Series, length: int) -> pd.Series:
+        return series.rolling(window=length).mean()
+
+    @staticmethod
+    def _rsi(series: pd.Series, length: int = 14) -> pd.Series:
+        delta = series.diff()
+        gain = delta.clip(lower=0).rolling(window=length).mean()
+        loss = (-delta.clip(upper=0)).rolling(window=length).mean()
+        rs = gain / loss.replace(0, float("nan"))
+        return 100 - (100 / (1 + rs))
+
     def buy_signal(self, df: pd.DataFrame) -> bool:
         close = df["Close"]
         volume = df["Volume"]
