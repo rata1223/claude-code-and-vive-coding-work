@@ -1,11 +1,31 @@
 import os
 import logging
+import threading
+import time
 from .base import BrokerAdapter
 from .models import Balance, Order, OrderStatus, Position
 from kis_adapter import KISClient, KISMarketData, KISOrders, KISPortfolio
 from strategy.signals import KR_ETF, EXCD_MAP
 
 logger = logging.getLogger(__name__)
+
+_FX_CACHE_LOCK = threading.Lock()
+_FX_CACHE: dict = {"rate": 1350.0, "ts": 0.0}
+_FX_TTL = 3600  # 1 hour
+
+# Process-level singleton — rate-limit tracking must be shared across all callers
+_KIS_BROKER_INSTANCE: "KISBroker | None" = None
+_KIS_BROKER_LOCK = threading.Lock()
+
+
+def get_kis_broker() -> "KISBroker":
+    """Return the process-level KISBroker singleton. Thread-safe."""
+    global _KIS_BROKER_INSTANCE
+    if _KIS_BROKER_INSTANCE is None:
+        with _KIS_BROKER_LOCK:
+            if _KIS_BROKER_INSTANCE is None:
+                _KIS_BROKER_INSTANCE = KISBroker()
+    return _KIS_BROKER_INSTANCE
 
 
 class KISBroker(BrokerAdapter):
@@ -87,8 +107,89 @@ class KISBroker(BrokerAdapter):
             )
 
     def cancel_order(self, order_id: str) -> bool:
-        logger.warning("KIS cancel_order: 개별 취소는 cancel_us만 지원 (order_id=%s)", order_id)
-        return False
+        """주문 취소. KIS TR: TTTC0803U (실전) / VTTC0803U (모의)."""
+        try:
+            tr_id = "VTTC0803U" if self._paper else "TTTC0803U"
+            body = {
+                "CANO": self._account[:8],
+                "ACNT_PRDT_CD": self._account[8:],
+                "KRX_FWDG_ORD_ORGNO": "",
+                "ORGN_ODNO": order_id,
+                "ORD_DVSN": "00",
+                "RVSE_CNCL_DVSN_CD": "02",  # 취소
+                "ORD_QTY": "0",
+                "ORD_UNPR": "0",
+                "QTY_ALL_ORD_YN": "Y",
+            }
+            resp = self._client.post("/uapi/domestic-stock/v1/trading/order-rvsecncl", body, tr_id=tr_id)
+            rt_cd = resp.get("rt_cd", "1")
+            if rt_cd == "0":
+                logger.info("주문 취소 성공: %s", order_id)
+                return True
+            logger.warning("주문 취소 실패 (rt_cd=%s): %s", rt_cd, resp.get("msg1"))
+            return False
+        except Exception as e:
+            logger.error("주문 취소 예외 %s: %s", order_id, e)
+            return False
+
+    def get_order_status(self, order_id: str) -> Order | None:
+        """
+        단건 주문 조회. KIS TR: TTTC8036R (실전) / VTTC8036R (모의).
+        반환 None = 조회 실패 또는 주문 미존재.
+        """
+        try:
+            tr_id = "VTTC8036R" if self._paper else "TTTC8036R"
+            params = {
+                "CANO": self._account[:8],
+                "ACNT_PRDT_CD": self._account[8:],
+                "INQR_STRT_DT": "",
+                "INQR_END_DT": "",
+                "SLL_BUY_DVSN_CD": "00",
+                "INQR_DVSN": "01",
+                "PDNO": "",
+                "ORD_GNO_BRNO": "",
+                "ODNO": order_id,
+                "INQR_DVSN_3": "00",
+                "INQR_DVSN_1": "",
+                "CTX_AREA_FK100": "",
+                "CTX_AREA_NK100": "",
+            }
+            resp = self._client.get("/uapi/domestic-stock/v1/trading/inquire-order", params, tr_id=tr_id)
+            output = resp.get("output1") or resp.get("output", [])
+            if not output:
+                return None
+            row = output[0] if isinstance(output, list) else output
+            filled_qty = int(row.get("tot_ccld_qty", 0))
+            ord_qty = int(row.get("ord_qty", 0))
+            avg_price = float(row.get("avg_prvs", 0))
+            ord_stat = row.get("ord_stts_name", "")
+
+            if filled_qty >= ord_qty > 0:
+                status = OrderStatus.FILLED
+            elif filled_qty > 0:
+                status = OrderStatus.PARTIAL_FILLED
+            elif "취소" in ord_stat:
+                status = OrderStatus.CANCELED
+            elif "거부" in ord_stat:
+                status = OrderStatus.REJECTED
+            else:
+                status = OrderStatus.SUBMITTED
+
+            symbol = row.get("pdno", "")
+            side = "buy" if row.get("sll_buy_dvsn_cd") == "02" else "sell"
+            return Order(
+                id=order_id,
+                symbol=symbol,
+                side=side,
+                qty=ord_qty,
+                price=float(row.get("ord_unpr", 0)),
+                status=status,
+                filled_qty=filled_qty,
+                avg_fill_price=avg_price,
+            )
+        except Exception as e:
+            logger.warning("주문 조회 실패 %s: %s", order_id, e)
+            return None
 
     def get_price(self, symbol: str) -> float:
         if symbol in KR_ETF or (len(symbol) == 6 and symbol.isdigit()):
@@ -97,11 +198,17 @@ class KISBroker(BrokerAdapter):
         return self._market.get_price_us(symbol, excd)
 
     def _get_fx(self) -> float:
+        with _FX_CACHE_LOCK:
+            if time.monotonic() - _FX_CACHE["ts"] < _FX_TTL:
+                return _FX_CACHE["rate"]
         try:
             import yfinance as yf
             rate = yf.Ticker("KRW=X").fast_info["last_price"]
             if rate and 900 < rate < 2000:
+                with _FX_CACHE_LOCK:
+                    _FX_CACHE["rate"] = float(rate)
+                    _FX_CACHE["ts"] = time.monotonic()
                 return float(rate)
         except Exception:
             pass
-        return 1350.0
+        return _FX_CACHE["rate"]

@@ -1,11 +1,14 @@
 import logging
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from typing import Optional
 
 from backend.brokers.models import Position
 from backend.execution.order_machine import OrderStateMachine
 
 logger = logging.getLogger(__name__)
+
+_PENDING_LOCK_TTL = 1800  # 30 minutes — auto-release stale locks
 
 
 # Fill 데이터클래스가 brokers/models.py에 없으므로 여기서 정의
@@ -29,7 +32,7 @@ class PositionTracker:
     def __init__(self, machine: OrderStateMachine):
         self._machine = machine
         self._positions: dict[str, Position] = {}  # symbol → Position
-        self._pending_symbols: set[str] = set()    # 활성 주문 중인 symbol
+        self._pending_symbols: dict[str, float] = {}  # symbol → lock_timestamp
 
     # ── 포지션 조회 ────────────────────────────────────────────────────────
     def get_position(self, symbol: str) -> Optional[Position]:
@@ -40,14 +43,21 @@ class PositionTracker:
 
     # ── 중복 주문 방지 ────────────────────────────────────────────────────
     def can_place_order(self, symbol: str) -> bool:
-        return symbol not in self._pending_symbols
+        ts = self._pending_symbols.get(symbol)
+        if ts is None:
+            return True
+        if time.monotonic() - ts > _PENDING_LOCK_TTL:
+            logger.warning("pending 락 자동 해제 (TTL 초과): %s", symbol)
+            del self._pending_symbols[symbol]
+            return True
+        return False
 
     def mark_pending(self, symbol: str, order_id: str):
-        self._pending_symbols.add(symbol)
+        self._pending_symbols[symbol] = time.monotonic()
         logger.debug("pending 등록: %s (order_id=%s)", symbol, order_id)
 
     def unmark_pending(self, symbol: str):
-        self._pending_symbols.discard(symbol)
+        self._pending_symbols.pop(symbol, None)
 
     # ── 체결 처리 ─────────────────────────────────────────────────────────
     def on_fill(self, fill: Fill):

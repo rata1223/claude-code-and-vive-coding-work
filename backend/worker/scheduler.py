@@ -13,17 +13,19 @@ logger = logging.getLogger(__name__)
 
 
 def _get_db():
-    from backend.database.models import init_db
+    from backend.database.models import init_db_factory
     db_url = os.environ.get("DB_URL", "postgresql://quantdinger:quantdinger@postgres:5432/quantdinger")
-    return init_db(db_url)
+    factory = init_db_factory(db_url)
+    return factory()
 
 
 def _save_equity_snapshot():
     """자산 스냅샷을 DB에 저장 (일 1회 결산용)."""
+    db = None
     try:
-        from backend.brokers.kis import KISBroker
+        from backend.brokers.kis import get_kis_broker
         from backend.database.models import EquitySnapshot
-        broker = KISBroker()
+        broker = get_kis_broker()
         bal = broker.get_balance()
         db = _get_db()
         snap = EquitySnapshot(
@@ -36,17 +38,41 @@ def _save_equity_snapshot():
         logger.info("자산 스냅샷 저장: %.0f원", bal.total_eval_krw)
     except Exception as e:
         logger.warning("자산 스냅샷 실패: %s", e)
+    finally:
+        if db is not None:
+            db.close()
 
 
 def _reset_daily_risk():
-    """일일 리스크 카운터 Redis 초기화."""
+    """일일 리스크 카운터 Redis + DB 초기화."""
     try:
         import redis as _redis
         r = _redis.from_url(os.environ.get("REDIS_URL", "redis://redis:6379"))
         r.delete("risk:daily_loss_pct", "risk:trading_halted")
-        logger.info("일일 리스크 카운터 리셋")
+        # Also purge today's PnL key so PersistentLossTracker starts fresh
+        from datetime import date
+        r.delete(f"risk:daily_pnl:{date.today().isoformat()}")
+        logger.info("일일 리스크 카운터 리셋 (Redis)")
     except Exception as e:
-        logger.warning("리스크 리셋 실패: %s", e)
+        logger.warning("리스크 Redis 리셋 실패: %s", e)
+
+    db = None
+    try:
+        from datetime import date
+        from backend.database.models import DailyRiskState
+        db = _get_db()
+        row = db.get(DailyRiskState, date.today())
+        if row:
+            row.daily_pnl = 0.0
+            row.kill_switch = False
+            row.kill_reason = None
+            db.commit()
+        logger.info("일일 리스크 카운터 리셋 (DB)")
+    except Exception as e:
+        logger.warning("리스크 DB 리셋 실패: %s", e)
+    finally:
+        if db is not None:
+            db.close()
 
 
 def _trigger_kr_session():

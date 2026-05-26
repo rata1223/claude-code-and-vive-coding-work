@@ -70,8 +70,14 @@ class IndicatorStrategy(StrategyBase):
             balance = self._broker.get_balance()
             capital = balance.total_eval_krw
             price = self._broker.get_price(symbol)
+            if price <= 0:
+                logger.warning("[%s] 가격 0 — 매수 스킵: %s", self.name, symbol)
+                return
             amount_krw = capital * self._pos_size_pct
-            qty = max(1, int(amount_krw / price))
+            qty = int(amount_krw / price)
+            if qty <= 0:
+                logger.info("[%s] 매수 수량 0 — 자본 부족 스킵: %s (capital=%.0f)", self.name, symbol, capital)
+                return
             order = self.buy(symbol, qty, price)
             self._tracker.mark_pending(symbol, order.id)
             logger.info("[%s] 매수 실행: %s qty=%d @%.2f", self.name, symbol, qty, price)
