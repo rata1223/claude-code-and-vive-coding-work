@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import threading
+import time
 
 import redis
 from flask import Flask
@@ -43,20 +44,29 @@ def on_subscribe(data):
 
 # ── Redis → WebSocket 브리지 ─────────────────────────────────────────────
 def _redis_listener():
-    pubsub = _r.pubsub()
-    pubsub.subscribe("order:update", "position:update", "equity:update", "alert")
-    logger.info("Redis 리스너 시작 (order/position/equity/alert)")
-
-    for message in pubsub.listen():
-        if message["type"] != "message":
-            continue
-        channel = message["channel"].decode()
+    _CHANNELS = ["order:update", "position:update", "equity:update", "alert"]
+    backoff = 2.0
+    while True:
         try:
-            data = json.loads(message["data"])
-        except Exception:
-            data = {"raw": message["data"].decode()}
+            pubsub = _r.pubsub()
+            pubsub.subscribe(*_CHANNELS)
+            logger.info("Redis 리스너 시작 (%s)", _CHANNELS)
+            backoff = 2.0
 
-        socketio.emit(channel, data)
+            for message in pubsub.listen():
+                if message["type"] != "message":
+                    continue
+                channel = message["channel"].decode()
+                try:
+                    data = json.loads(message["data"])
+                except Exception:
+                    data = {"raw": message["data"].decode()}
+                socketio.emit(channel, data)
+
+        except Exception as e:
+            logger.error("Redis 리스너 끊김: %s — %.1fs 후 재연결", e, backoff)
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 60.0)
 
 
 def start_redis_listener():

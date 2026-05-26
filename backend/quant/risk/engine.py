@@ -243,19 +243,17 @@ class LossTracker:
         # 일일 손실 한도
         if self.daily_pnl / capital < -self.config.daily_loss_limit_pct:
             self.kill_switch = True
-            self.kill_reason = (
-                f"일일 손실 한도 초과 ({self.daily_pnl/capital:.2%})"
-            )
+            self.kill_reason = f"일일 손실 한도 초과 ({self.daily_pnl/capital:.2%})"
             logger.error("킬스위치 [일일] %s", self.kill_reason)
+            self._fire_kill_switch_alert(self.kill_reason)
             return
 
         # 주간 손실 한도
         if self.weekly_pnl / capital < -self.config.weekly_loss_limit_pct:
             self.kill_switch = True
-            self.kill_reason = (
-                f"주간 손실 한도 초과 ({self.weekly_pnl/capital:.2%})"
-            )
+            self.kill_reason = f"주간 손실 한도 초과 ({self.weekly_pnl/capital:.2%})"
             logger.error("킬스위치 [주간] %s", self.kill_reason)
+            self._fire_kill_switch_alert(self.kill_reason)
             return
 
         # MDD 한도
@@ -265,6 +263,20 @@ class LossTracker:
                 self.kill_switch = True
                 self.kill_reason = f"MDD 한도 초과 ({mdd:.2%})"
                 logger.error("킬스위치 [MDD] %s", self.kill_reason)
+                self._fire_kill_switch_alert(self.kill_reason)
+
+    def _fire_kill_switch_alert(self, reason: str) -> None:
+        """Telegram + WebSocket 동시 발행 — 실패해도 킬스위치 자체는 영향 없음."""
+        try:
+            from bot.notifier import alert_emergency
+            alert_emergency(f"킬스위치 발동\n{reason}")
+        except Exception as e:
+            logger.warning("Telegram 킬스위치 알림 실패: %s", e)
+        try:
+            from backend.websocket.server import publish_alert
+            publish_alert(reason, level="critical")
+        except Exception as e:
+            logger.warning("WebSocket 킬스위치 알림 실패: %s", e)
 
     def can_buy(self) -> tuple[bool, str]:
         if self.kill_switch:

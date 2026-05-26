@@ -228,8 +228,9 @@ class StartupRecovery:
         if self._broker is None:
             return True
         try:
-            from backend.database.models import Order as DBOrder
+            from backend.database.models import Order as DBOrder, Fill as DBFill
             from backend.execution.order_poller import OrderFillPoller
+            from backend.brokers.models import Order as BOrder, OrderStatus
             db = self._factory()
             pending = (db.query(DBOrder)
                        .filter(DBOrder.status.in_(["pending", "submitted", "partial_filled"]))
@@ -240,7 +241,28 @@ class StartupRecovery:
                 logger.info("미체결 주문 %d개 발견 — OrderFillPoller에 재등록", len(pending))
                 poller = OrderFillPoller(self._broker)
                 poller.start()
-                from backend.brokers.models import Order as BOrder, OrderStatus
+
+                def _make_recovery_fill_cb(db_order_pk: int, broker_order_id: str):
+                    """Persist fill to DB on recovery; in-memory state updated when strategies restart."""
+                    def on_filled(order: BOrder):
+                        try:
+                            sess = self._factory()
+                            row = sess.get(DBOrder, db_order_pk)
+                            if row:
+                                row.status = order.status.value
+                                row.filled_qty = order.filled_qty or order.qty
+                                row.avg_fill_price = order.avg_fill_price or order.price
+                                fill = DBFill(order_id=db_order_pk,
+                                              qty=order.filled_qty or order.qty,
+                                              price=order.avg_fill_price or order.price)
+                                sess.add(fill)
+                                sess.commit()
+                                logger.info("복구 체결 DB 업데이트: %s → FILLED", broker_order_id)
+                            sess.close()
+                        except Exception as e:
+                            logger.warning("복구 체결 DB 저장 실패: %s", e)
+                    return on_filled
+
                 for row in pending:
                     try:
                         status = OrderStatus(row.status)
@@ -254,12 +276,30 @@ class StartupRecovery:
                         price=row.price or 0,
                         status=status,
                     )
-                    poller.register(border, on_filled=lambda o: None)
+                    poller.register(
+                        border,
+                        on_filled=_make_recovery_fill_cb(row.id, row.broker_order_id),
+                    )
         except Exception as e:
             logger.warning("미체결 주문 복원 실패: %s", e)
         return True
 
     def _step_enable_trading(self) -> bool:
+        import os
+        if os.environ.get("KIS_ENV") == "real":
+            try:
+                from backend.worker.promotion_guard import LivePromotionGuard
+                ok, failed = LivePromotionGuard(self._factory, self._redis).check()
+                if not ok:
+                    logger.critical("실전 매매 프로모션 체크 실패: %s — SafeMode 유지", failed)
+                    SAFE_MODE.disable(f"실전 프로모션 미완: {failed}")
+                    return False
+                logger.info("실전 매매 프로모션 체크 통과")
+            except Exception as e:
+                logger.warning("LivePromotionGuard 로드 실패: %s — 실전 차단", e)
+                SAFE_MODE.disable("LivePromotionGuard 오류")
+                return False
+
         SAFE_MODE.enable()
         logger.info("복구 완료 — 매매 허용. reconcile actions=%d", len(self._actions))
         return True

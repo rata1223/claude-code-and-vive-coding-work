@@ -20,11 +20,12 @@ def _get_db():
 
 
 def _save_equity_snapshot():
-    """자산 스냅샷을 DB에 저장 (일 1회 결산용)."""
+    """자산 스냅샷을 DB에 저장 + Telegram 일일 결산 발송."""
     db = None
     try:
         from backend.brokers.kis import get_kis_broker
-        from backend.database.models import EquitySnapshot
+        from backend.database.models import EquitySnapshot, DailyRiskState
+        from datetime import date
         broker = get_kis_broker()
         bal = broker.get_balance()
         db = _get_db()
@@ -36,6 +37,29 @@ def _save_equity_snapshot():
         db.add(snap)
         db.commit()
         logger.info("자산 스냅샷 저장: %.0f원", bal.total_eval_krw)
+
+        # Collect daily risk state for Telegram summary
+        risk_row = db.get(DailyRiskState, date.today())
+        daily_pnl_pct = 0.0
+        kill_switch = False
+        kill_reason = ""
+        if risk_row and risk_row.peak_equity > 0:
+            daily_pnl_pct = risk_row.daily_pnl / risk_row.peak_equity * 100
+            kill_switch = risk_row.kill_switch
+            kill_reason = risk_row.kill_reason or ""
+
+        try:
+            from bot.notifier import alert_daily_summary
+            alert_daily_summary({
+                "total_equity": bal.total_eval_krw,
+                "daily_pnl_pct": daily_pnl_pct,
+                "position_count": len(broker.get_positions()),
+                "kill_switch": kill_switch,
+                "kill_reason": kill_reason,
+            })
+        except Exception as e:
+            logger.warning("Telegram 일일 결산 알림 실패: %s", e)
+
     except Exception as e:
         logger.warning("자산 스냅샷 실패: %s", e)
     finally:
@@ -73,6 +97,15 @@ def _reset_daily_risk():
     finally:
         if db is not None:
             db.close()
+
+    # Re-arm SAFE_MODE so strategies can trade the new day
+    try:
+        from backend.worker.recovery import SAFE_MODE
+        if not SAFE_MODE.can_trade:
+            SAFE_MODE.enable()
+            logger.info("일일 리셋 후 SAFE_MODE 재활성화")
+    except Exception as e:
+        logger.warning("SAFE_MODE 재활성화 실패: %s", e)
 
 
 def _trigger_kr_session():

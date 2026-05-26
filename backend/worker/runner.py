@@ -19,11 +19,14 @@ from datetime import datetime
 
 import redis
 
-from backend.brokers.kis import KISBroker
+from backend.brokers.kis import KISBroker, get_kis_broker
+from backend.brokers.models import Order, OrderStatus
 from backend.database.models import (
-    Order as DBOrder, Position as DBPosition, StrategyRun, init_db_factory,
+    Fill as DBFill, Order as DBOrder, Position as DBPosition,
+    StrategyRun, init_db_factory,
 )
-from backend.execution.order_machine import OrderStateMachine
+from backend.execution.order_machine import FillEvent, OrderStateMachine
+from backend.execution.order_poller import OrderFillPoller
 from backend.execution.position_tracker import Fill, PositionTracker
 from backend.strategy.base import StrategyBase
 from backend.strategy.indicator.strategy import IndicatorStrategy
@@ -35,7 +38,6 @@ _DB_URL = os.environ.get("DB_URL", "postgresql://quantdinger:quantdinger@postgre
 
 _SUBSCRIBE_CHANNELS = ["strategy:start", "strategy:stop", "session:kr_open", "session:us_open"]
 
-# Process-level sessionmaker — each call to _session() yields an isolated Session
 _SessionFactory = None
 
 
@@ -116,6 +118,16 @@ class StrategyWorker:
         self._redis = redis.from_url(_REDIS_URL)
         self._sessions: dict[int, WorkerSession] = {}
         self._lock = threading.Lock()
+        self._last_market_open: dict[str, float] = {}  # market → monotonic ts; dedup gate
+
+        # Process-level OrderFillPoller — shared across all strategy sessions
+        try:
+            self._poller = OrderFillPoller(get_kis_broker())
+            self._poller.start()
+            logger.info("OrderFillPoller 시작")
+        except Exception as e:
+            logger.warning("OrderFillPoller 초기화 실패: %s — 폴링 비활성화", e)
+            self._poller = None
 
     def run(self):
         self._restore_active()
@@ -163,7 +175,6 @@ class StrategyWorker:
         logger.warning("DB 폴링 모드 전환 (Redis 불가)")
         while True:
             try:
-                # try Redis first — if it comes back, exit polling mode
                 self._redis.ping()
                 logger.info("Redis 재연결 성공 — 폴링 모드 종료")
                 return
@@ -222,7 +233,14 @@ class StrategyWorker:
             logger.warning("중단할 세션 없음: run_id=%d", run_id)
 
     def _handle_market_open(self, market: str):
-        """Broadcast on_market_open() to all active strategy sessions."""
+        """Broadcast on_market_open() to all active strategy sessions with dedup."""
+        now = time.monotonic()
+        last = self._last_market_open.get(market, 0.0)
+        if now - last < 300:  # 5-minute dedup window
+            logger.warning("중복 market_open 무시: %s (마지막 %.0fs 전)", market, now - last)
+            return
+        self._last_market_open[market] = now
+
         with self._lock:
             sessions = list(self._sessions.values())
         logger.info("장 시작 브로드캐스트: market=%s sessions=%d", market, len(sessions))
@@ -259,10 +277,22 @@ class StrategyWorker:
 
     # ── 전략 팩토리 ──────────────────────────────────────────────────────
     def _build_strategy(self, data: dict) -> StrategyBase | None:
-        from backend.brokers.kis import get_kis_broker
-        broker = get_kis_broker()
+        try:
+            broker = get_kis_broker()
+        except Exception as e:
+            logger.error("KISBroker 획득 실패: %s", e)
+            return None
+
         machine = OrderStateMachine(on_state_change=lambda o: self._persist_order(o))
         tracker = PositionTracker(machine)
+        run_id = data.get("run_id", 0)
+
+        on_filled_cb = self._make_fill_callback(tracker, machine, run_id)
+        on_timeout_cb = lambda o: (
+            logger.error("주문 타임아웃 — 수동 확인 필요: %s %s %s", o.id, o.side, o.symbol),
+            tracker.unmark_pending(o.symbol),
+        )
+
         self._restore_positions(tracker, broker=data.get("broker", "kis"))
 
         stype = data.get("strategy_type", "indicator")
@@ -271,8 +301,13 @@ class StrategyWorker:
 
         try:
             if stype == "indicator":
-                return IndicatorStrategy(broker=broker, tracker=tracker,
-                                         machine=machine, name=name, config=config)
+                return IndicatorStrategy(
+                    broker=broker, tracker=tracker, machine=machine,
+                    name=name, config=config,
+                    poller=self._poller,
+                    on_filled_cb=on_filled_cb,
+                    on_timeout_cb=on_timeout_cb,
+                )
             elif stype == "script":
                 from backend.strategy.script.strategy import ScriptStrategy
                 script_src = config.get("script", "")
@@ -285,8 +320,50 @@ class StrategyWorker:
             logger.error("전략 생성 실패: %s", e)
             return None
 
+    # ── Fill 파이프라인 ───────────────────────────────────────────────────
+    def _make_fill_callback(self, tracker: PositionTracker,
+                             machine: OrderStateMachine, run_id: int):
+        """
+        Returns a callback: Order → (machine → tracker → DB → WebSocket).
+        This is the single integration point that closes the fill lifecycle loop.
+        """
+        def on_filled(order: Order):
+            is_kr = len(order.symbol) == 6 and order.symbol.isdigit()
+            fill = Fill(
+                order_id=order.id,
+                symbol=order.symbol,
+                side=order.side,
+                qty=order.filled_qty or order.qty,
+                price=order.avg_fill_price or order.price,
+                market="KR" if is_kr else "US",
+            )
+            # 1. State machine
+            try:
+                if machine.get(order.id) is not None:
+                    event = FillEvent(
+                        order_id=order.id,
+                        filled_qty=fill.qty,
+                        fill_price=fill.price,
+                    )
+                    machine.process_fill(event)
+            except Exception as e:
+                logger.warning("machine.process_fill 오류: %s", e)
+            # 2. Position tracker
+            try:
+                tracker.on_fill(fill)
+            except Exception as e:
+                logger.warning("tracker.on_fill 오류: %s", e)
+            # 3. Persist fill + update order
+            self._persist_fill(fill, order)
+            # 4. WebSocket push
+            self._publish_order_update(order)
+            logger.info("체결 파이프라인 완료: %s %s qty=%d @ %.4f",
+                        order.id, order.symbol, fill.qty, fill.price)
+
+        return on_filled
+
     # ── DB 연동 ───────────────────────────────────────────────────────────
-    def _persist_order(self, order):
+    def _persist_order(self, order: Order):
         try:
             with _session() as db:
                 existing = db.query(DBOrder).filter(
@@ -314,6 +391,24 @@ class StrategyWorker:
         except Exception as e:
             logger.warning("주문 DB 저장 실패: %s", e)
 
+    def _persist_fill(self, fill: Fill, order: Order):
+        try:
+            with _session() as db:
+                db_order = db.query(DBOrder).filter(
+                    DBOrder.broker_order_id == order.id
+                ).first()
+                if db_order is None:
+                    logger.warning("체결 DB 저장 스킵: 미등록 주문 %s", order.id)
+                    return
+                row = DBFill(order_id=db_order.id, qty=fill.qty, price=fill.price)
+                db.add(row)
+                db_order.status = order.status.value
+                db_order.filled_qty = order.filled_qty or fill.qty
+                db_order.avg_fill_price = order.avg_fill_price or fill.price
+                db.commit()
+        except Exception as e:
+            logger.warning("체결 DB 저장 실패: %s", e)
+
     def _restore_positions(self, tracker: PositionTracker, broker: str = "kis"):
         try:
             from backend.brokers.models import Position as BPosition
@@ -327,6 +422,23 @@ class StrategyWorker:
         except Exception as e:
             logger.warning("포지션 복원 실패: %s", e)
 
+    # ── WebSocket 발행 ────────────────────────────────────────────────────
+    def _publish_order_update(self, order: Order):
+        try:
+            from backend.websocket.server import publish_order_update
+            publish_order_update({
+                "id": order.id,
+                "symbol": order.symbol,
+                "side": order.side,
+                "status": order.status.value,
+                "qty": order.qty,
+                "filled_qty": order.filled_qty,
+                "price": order.price,
+                "avg_fill_price": order.avg_fill_price,
+            })
+        except Exception as e:
+            logger.debug("WebSocket 주문 발행 실패: %s", e)
+
 
 def main():
     logging.basicConfig(level=logging.INFO,
@@ -334,7 +446,6 @@ def main():
 
     # ── 시작 복구 시퀀스 ───────────────────────────────────────────────────
     from backend.worker.recovery import StartupRecovery
-    from backend.brokers.kis import get_kis_broker
     factory = _get_session_factory()
     r_client = redis.from_url(_REDIS_URL)
     try:
@@ -343,7 +454,11 @@ def main():
         logger.error("KISBroker 초기화 실패: %s — SafeMode 유지", e)
         broker = None
 
-    recovery = StartupRecovery(db_session_factory=factory, redis_client=r_client, broker=broker)
+    recovery = StartupRecovery(
+        db_session_factory=factory,
+        redis_client=r_client,
+        broker=broker,
+    )
     if not recovery.run():
         logger.critical("복구 실패 — Worker SafeMode로 계속 실행")
 

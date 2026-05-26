@@ -5,6 +5,7 @@ Flask REST API — 포트 5000
 import json
 import logging
 import os
+from datetime import datetime
 
 import redis
 from flask import Flask, jsonify, request
@@ -18,6 +19,23 @@ _redis = redis.from_url(os.environ.get("REDIS_URL", "redis://redis:6379"))
 _db = None  # lazy init
 
 
+def _redis_ok() -> bool:
+    try:
+        _redis.ping()
+        return True
+    except Exception:
+        return False
+
+
+def _db_ok() -> bool:
+    try:
+        from sqlalchemy import text
+        get_db().execute(text("SELECT 1"))
+        return True
+    except Exception:
+        return False
+
+
 def get_db():
     global _db
     if _db is None:
@@ -26,10 +44,54 @@ def get_db():
     return _db
 
 
-# ── 헬스 ─────────────────────────────────────────────────────────────────
+# ── 헬스 / 상태 ───────────────────────────────────────────────────────────
 @app.get("/api/health")
 def health():
     return jsonify({"status": "ok"})
+
+
+@app.get("/api/status")
+def get_status():
+    """Operational status: safe mode, kill-switch, infrastructure connectivity."""
+    safe_mode_ok, safe_mode_reason = True, "worker not running"
+    kill_switch, kill_reason = False, ""
+
+    try:
+        from backend.worker.recovery import SAFE_MODE
+        safe_mode_ok = SAFE_MODE.can_trade
+        safe_mode_reason = SAFE_MODE._reason
+    except Exception:
+        pass
+
+    try:
+        from backend.database.models import DailyRiskState
+        from datetime import date
+        row = get_db().get(DailyRiskState, date.today())
+        if row:
+            kill_switch = row.kill_switch
+            kill_reason = row.kill_reason or ""
+    except Exception:
+        pass
+
+    try:
+        pending_orders = get_db().query(Order).filter(
+            Order.status.in_(["pending", "submitted", "partial_filled"])
+        ).count()
+    except Exception:
+        pending_orders = -1
+
+    return jsonify({
+        "timestamp": datetime.utcnow().isoformat(),
+        "safe_mode": safe_mode_ok,
+        "safe_mode_reason": safe_mode_reason,
+        "kill_switch": kill_switch,
+        "kill_reason": kill_reason,
+        "pending_orders": pending_orders,
+        "redis": _redis_ok(),
+        "db": _db_ok(),
+        "kis_env": os.environ.get("KIS_ENV", "unknown"),
+        "live_trading_enabled": os.environ.get("ENABLE_LIVE_TRADING", "false"),
+    })
 
 
 # ── 포지션 ───────────────────────────────────────────────────────────────
@@ -70,8 +132,16 @@ def list_strategies():
     ])
 
 
+_strategy_start_calls: list[float] = []
+
 @app.post("/api/strategies/start")
 def start_strategy():
+    import time
+    now = time.monotonic()
+    _strategy_start_calls[:] = [t for t in _strategy_start_calls if now - t < 60]
+    if len(_strategy_start_calls) >= 5:
+        return jsonify({"error": "전략 시작 요청 과다 (분당 5회 제한)"}), 429
+    _strategy_start_calls.append(now)
     body = request.json or {}
     required = {"name", "strategy_type", "config"}
     missing = required - body.keys()
