@@ -107,8 +107,9 @@ class StartupRecovery:
 
     def _step_db(self) -> bool:
         try:
+            from sqlalchemy import text
             db = self._factory()
-            db.execute("SELECT 1")
+            db.execute(text("SELECT 1"))
             db.close()
             return True
         except Exception as e:
