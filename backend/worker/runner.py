@@ -140,6 +140,18 @@ class StrategyWorker:
                 db_session=_db_sess,
             )
             logger.info("PersistentLossTracker 초기화 완료 (kill_switch=%s)", self._loss_tracker.kill_switch)
+
+            # Bootstrap peak_equity from live balance if not previously persisted
+            if self._loss_tracker.peak_equity == 0:
+                try:
+                    bal = get_kis_broker().get_balance()
+                    if bal.total_eval_krw > 0:
+                        self._loss_tracker.peak_equity = bal.total_eval_krw
+                        self._loss_tracker._persist()
+                        logger.info("peak_equity 초기화: %.0f원", bal.total_eval_krw)
+                except Exception as _e:
+                    logger.warning("peak_equity 초기화 실패: %s", _e)
+
         except Exception as e:
             logger.warning("PersistentLossTracker 초기화 실패: %s", e)
 

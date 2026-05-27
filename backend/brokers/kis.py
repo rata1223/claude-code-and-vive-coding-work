@@ -5,7 +5,7 @@ import time
 from .base import BrokerAdapter
 from .models import Balance, Order, OrderStatus, Position
 from kis_adapter import KISClient, KISMarketData, KISOrders, KISPortfolio
-from strategy.signals import KR_ETF, EXCD_MAP
+from backend.quant.data.universe import EXCD_MAP, KR_ETF
 
 logger = logging.getLogger(__name__)
 
@@ -132,11 +132,18 @@ class KISBroker(BrokerAdapter):
             logger.error("주문 취소 예외 %s: %s", order_id, e)
             return False
 
-    def get_order_status(self, order_id: str) -> Order | None:
+    def get_order_status(self, order_id: str, symbol: str = "") -> Order | None:
         """
-        단건 주문 조회. KIS TR: TTTC8036R (실전) / VTTC8036R (모의).
+        단건 주문 조회. symbol로 KR/US 라우팅.
         반환 None = 조회 실패 또는 주문 미존재.
         """
+        is_us = symbol and not (symbol in KR_ETF or (len(symbol) == 6 and symbol.isdigit()))
+        if is_us:
+            return self._get_us_order_status(order_id, symbol)
+        return self._get_kr_order_status(order_id)
+
+    def _get_kr_order_status(self, order_id: str) -> Order | None:
+        """KIS TR: TTTC8036R (실전) / VTTC8036R (모의)."""
         try:
             tr_id = "VTTC8036R" if self._paper else "TTTC8036R"
             params = {
@@ -175,20 +182,69 @@ class KISBroker(BrokerAdapter):
             else:
                 status = OrderStatus.SUBMITTED
 
-            symbol = row.get("pdno", "")
+            sym = row.get("pdno", "")
             side = "buy" if row.get("sll_buy_dvsn_cd") == "02" else "sell"
             return Order(
-                id=order_id,
-                symbol=symbol,
-                side=side,
-                qty=ord_qty,
-                price=float(row.get("ord_unpr", 0)),
-                status=status,
-                filled_qty=filled_qty,
-                avg_fill_price=avg_price,
+                id=order_id, symbol=sym, side=side, qty=ord_qty,
+                price=float(row.get("ord_unpr", 0)), status=status,
+                filled_qty=filled_qty, avg_fill_price=avg_price,
             )
         except Exception as e:
-            logger.warning("주문 조회 실패 %s: %s", order_id, e)
+            logger.warning("KR 주문 조회 실패 %s: %s", order_id, e)
+            return None
+
+    def _get_us_order_status(self, order_id: str, symbol: str) -> Order | None:
+        """KIS 해외주식 주문 조회. TR: TTTS3035R (실전) / VTTS3035R (모의)."""
+        try:
+            tr_id = "VTTS3035R" if self._paper else "TTTS3035R"
+            excd = EXCD_MAP.get(symbol, "NASD")
+            params = {
+                "CANO": self._account[:8],
+                "ACNT_PRDT_CD": self._account[8:],
+                "OVRS_EXCG_CD": excd,
+                "PDNO": symbol,
+                "ORD_STRT_DT": "",
+                "ORD_END_DT": "",
+                "SLL_BUY_DVSN_CD": "00",
+                "CCL_NCCS_DVSN": "00",
+                "INQR_DVSN": "00",
+                "INQR_DVSN_1": "0",
+                "CTX_AREA_FK200": "",
+                "CTX_AREA_NK200": "",
+            }
+            resp = self._client.get("/uapi/overseas-stock/v1/trading/inquire-order", params, tr_id=tr_id)
+            output = resp.get("output") or []
+            if not output:
+                return None
+            # Match the specific order_id
+            row = next((r for r in output if r.get("odno") == order_id), None)
+            if row is None:
+                row = output[0]  # fallback to first row
+
+            filled_qty = int(row.get("ft_ccld_qty", 0))
+            ord_qty = int(row.get("ft_ord_qty", 0))
+            avg_price = float(row.get("avg_prvs", 0))
+            ord_stat = row.get("ord_stts_name", "")
+
+            if filled_qty >= ord_qty > 0:
+                status = OrderStatus.FILLED
+            elif filled_qty > 0:
+                status = OrderStatus.PARTIAL_FILLED
+            elif "취소" in ord_stat or "cancel" in ord_stat.lower():
+                status = OrderStatus.CANCELED
+            elif "거부" in ord_stat or "reject" in ord_stat.lower():
+                status = OrderStatus.REJECTED
+            else:
+                status = OrderStatus.SUBMITTED
+
+            side = "buy" if row.get("sll_buy_dvsn_cd") == "02" else "sell"
+            return Order(
+                id=order_id, symbol=symbol, side=side, qty=ord_qty,
+                price=float(row.get("ft_ord_unpr3", 0)), status=status,
+                filled_qty=filled_qty, avg_fill_price=avg_price,
+            )
+        except Exception as e:
+            logger.warning("US 주문 조회 실패 %s: %s", order_id, e)
             return None
 
     def get_price(self, symbol: str) -> float:

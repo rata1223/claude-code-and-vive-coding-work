@@ -113,7 +113,7 @@ class OrderFillPoller:
 
     def _poll_one(self, entry: _PollEntry) -> None:
         try:
-            updated = self._broker.get_order_status(entry.order.id)
+            updated = self._broker.get_order_status(entry.order.id, entry.order.symbol)
         except Exception as e:
             logger.warning("폴링 실패 %s: %s", entry.order.id, e)
             entry.advance()

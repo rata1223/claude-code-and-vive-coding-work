@@ -22,6 +22,24 @@ app = Flask(__name__)
 _redis = redis.from_url(os.environ.get("REDIS_URL", "redis://redis:6379"))
 _db_factory = None
 
+# API key auth — set KIS_API_KEY env var to enable. Unset = open (dev mode, logged warning).
+_API_KEY = os.environ.get("KIS_API_KEY", "")
+_OPEN_ROUTES = {"/api/health", "/api/status"}
+
+if not _API_KEY:
+    logger.warning("KIS_API_KEY not set — API running without authentication (dev mode)")
+
+
+@app.before_request
+def _check_api_key():
+    if request.path in _OPEN_ROUTES or request.method == "OPTIONS":
+        return None
+    if not _API_KEY:
+        return None  # auth disabled
+    provided = request.headers.get("X-API-Key", "")
+    if provided != _API_KEY:
+        return jsonify({"error": "인증 실패"}), 401
+
 
 def _get_factory():
     global _db_factory
