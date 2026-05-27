@@ -5,18 +5,44 @@ Flask REST API — 포트 5000
 import json
 import logging
 import os
+from contextlib import contextmanager
 from datetime import datetime
 
 import redis
-from flask import Flask, jsonify, request
+from flask import Flask, g, jsonify, request
 
-from backend.database.models import Order, Position, StrategyRun, init_db
+from backend.database.models import (
+    Command, Order, Position, StrategyRun,
+    init_db_factory,
+)
 
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 _redis = redis.from_url(os.environ.get("REDIS_URL", "redis://redis:6379"))
-_db = None  # lazy init
+_db_factory = None
+
+
+def _get_factory():
+    global _db_factory
+    if _db_factory is None:
+        db_url = os.environ.get("DB_URL", "postgresql://quantdinger:quantdinger@postgres:5432/quantdinger")
+        _db_factory = init_db_factory(db_url)
+    return _db_factory
+
+
+def get_db():
+    """Per-request DB session — auto-closed at request teardown via Flask's g."""
+    if "db" not in g:
+        g.db = _get_factory()()
+    return g.db
+
+
+@app.teardown_appcontext
+def _close_db(exc=None):
+    db = g.pop("db", None)
+    if db is not None:
+        db.close()
 
 
 def _redis_ok() -> bool:
@@ -36,14 +62,6 @@ def _db_ok() -> bool:
         return False
 
 
-def get_db():
-    global _db
-    if _db is None:
-        db_url = os.environ.get("DB_URL", "postgresql://quantdinger:quantdinger@postgres:5432/quantdinger")
-        _db = init_db(db_url)
-    return _db
-
-
 # ── 헬스 / 상태 ───────────────────────────────────────────────────────────
 @app.get("/api/health")
 def health():
@@ -52,38 +70,30 @@ def health():
 
 @app.get("/api/status")
 def get_status():
-    """Operational status: safe mode, kill-switch, infrastructure connectivity."""
-    safe_mode_ok, safe_mode_reason = True, "worker not running"
-    kill_switch, kill_reason = False, ""
+    """Operational status: kill-switch, infrastructure connectivity.
 
-    try:
-        from backend.worker.recovery import SAFE_MODE
-        safe_mode_ok = SAFE_MODE.can_trade
-        safe_mode_reason = SAFE_MODE._reason
-    except Exception:
-        pass
+    NOTE: safe_mode is inferred from DB state — the worker process owns
+    the in-memory SafeModeState object and it cannot be read cross-process.
+    """
+    kill_switch, kill_reason = False, ""
+    pending_orders = -1
 
     try:
         from backend.database.models import DailyRiskState
         from datetime import date
-        row = get_db().get(DailyRiskState, date.today())
+        db = get_db()
+        row = db.get(DailyRiskState, date.today())
         if row:
             kill_switch = row.kill_switch
             kill_reason = row.kill_reason or ""
-    except Exception:
-        pass
-
-    try:
-        pending_orders = get_db().query(Order).filter(
+        pending_orders = db.query(Order).filter(
             Order.status.in_(["pending", "submitted", "partial_filled"])
         ).count()
-    except Exception:
-        pending_orders = -1
+    except Exception as e:
+        logger.debug("status DB 조회 실패: %s", e)
 
     return jsonify({
         "timestamp": datetime.utcnow().isoformat(),
-        "safe_mode": safe_mode_ok,
-        "safe_mode_reason": safe_mode_reason,
         "kill_switch": kill_switch,
         "kill_reason": kill_reason,
         "pending_orders": pending_orders,
@@ -97,8 +107,7 @@ def get_status():
 # ── 포지션 ───────────────────────────────────────────────────────────────
 @app.get("/api/positions")
 def get_positions():
-    db = get_db()
-    rows = db.query(Position).all()
+    rows = get_db().query(Position).all()
     return jsonify([
         {"symbol": r.symbol, "qty": r.qty, "avg_price": r.avg_price,
          "market": r.market, "broker": r.broker}
@@ -109,9 +118,8 @@ def get_positions():
 # ── 주문 ─────────────────────────────────────────────────────────────────
 @app.get("/api/orders")
 def get_orders():
-    db = get_db()
     limit = int(request.args.get("limit", 50))
-    rows = db.query(Order).order_by(Order.created_at.desc()).limit(limit).all()
+    rows = get_db().query(Order).order_by(Order.created_at.desc()).limit(limit).all()
     return jsonify([
         {"id": r.id, "symbol": r.symbol, "side": r.side,
          "qty": r.qty, "price": r.price, "status": r.status,
@@ -123,8 +131,7 @@ def get_orders():
 # ── 전략 ─────────────────────────────────────────────────────────────────
 @app.get("/api/strategies")
 def list_strategies():
-    db = get_db()
-    rows = db.query(StrategyRun).order_by(StrategyRun.started_at.desc()).limit(50).all()
+    rows = get_db().query(StrategyRun).order_by(StrategyRun.started_at.desc()).limit(50).all()
     return jsonify([
         {"id": r.id, "name": r.name, "type": r.strategy_type,
          "is_active": r.is_active, "started_at": r.started_at.isoformat()}
@@ -134,6 +141,7 @@ def list_strategies():
 
 _strategy_start_calls: list[float] = []
 
+
 @app.post("/api/strategies/start")
 def start_strategy():
     import time
@@ -142,6 +150,7 @@ def start_strategy():
     if len(_strategy_start_calls) >= 5:
         return jsonify({"error": "전략 시작 요청 과다 (분당 5회 제한)"}), 429
     _strategy_start_calls.append(now)
+
     body = request.json or {}
     required = {"name", "strategy_type", "config"}
     missing = required - body.keys()
@@ -157,17 +166,24 @@ def start_strategy():
         is_active=True,
     )
     db.add(run)
-    db.commit()
-    db.refresh(run)
+    db.flush()  # get run.id without committing yet
 
-    # Worker에 시작 신호
-    _redis.publish("strategy:start", json.dumps({
+    # Write command to DB before Redis publish — survives Redis outage
+    payload = json.dumps({
         "run_id": run.id,
         "name": run.name,
         "strategy_type": run.strategy_type,
         "config": body.get("config", {}),
         "broker": run.broker,
-    }))
+    })
+    db.add(Command(channel="strategy:start", payload=payload))
+    db.commit()
+
+    try:
+        _redis.publish("strategy:start", payload)
+    except Exception as e:
+        logger.warning("Redis 시작 신호 실패 (Worker가 DB 폴링으로 처리): %s", e)
+
     logger.info("전략 시작 요청: id=%d name=%s", run.id, run.name)
     return jsonify({"run_id": run.id, "status": "starting"}), 201
 
@@ -179,9 +195,16 @@ def stop_strategy(run_id: int):
     if run is None:
         return jsonify({"error": "전략 없음"}), 404
     run.is_active = False
+
+    payload = json.dumps({"run_id": run_id})
+    db.add(Command(channel="strategy:stop", payload=payload))
     db.commit()
 
-    _redis.publish("strategy:stop", json.dumps({"run_id": run_id}))
+    try:
+        _redis.publish("strategy:stop", payload)
+    except Exception as e:
+        logger.warning("Redis 중단 신호 실패 (Worker가 DB 폴링으로 처리): %s", e)
+
     logger.info("전략 중단 요청: id=%d", run_id)
     return jsonify({"run_id": run_id, "status": "stopping"})
 
@@ -191,9 +214,8 @@ def stop_strategy(run_id: int):
 def get_balance():
     """KIS 실시간 잔고 조회."""
     try:
-        from backend.brokers.kis import KISBroker
-        broker = KISBroker()
-        bal = broker.get_balance()
+        from backend.brokers.kis import get_kis_broker
+        bal = get_kis_broker().get_balance()
         return jsonify({
             "cash_krw": bal.cash_krw,
             "cash_usd": bal.cash_usd,
