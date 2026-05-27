@@ -53,7 +53,8 @@ services:
     environment:
       DATABASE_URL: postgresql://quantdinger:${POSTGRES_PASSWORD:-quantdinger}@postgres:5432/quantdinger
       REDIS_URL: redis://redis:6379/0
-      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-change-me-in-production}
+      # JWT_SECRET_KEY has no default — must be set in .env to prevent insecure deployments.
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:?JWT_SECRET_KEY must be set to a secure random value (see .env.example)}
       JWT_EXPIRE_MINUTES: ${JWT_EXPIRE_MINUTES:-10080}
       KIS_CREDENTIAL_KEY: ${KIS_CREDENTIAL_KEY:-}
     depends_on:
@@ -67,32 +68,36 @@ services:
       timeout: 10s
       retries: 5
 
-  kis-bot:
-    build:
-      context: .
-      dockerfile: Dockerfile.kis-bot
-    restart: unless-stopped
-    container_name: kis-bot
-    environment:
-      KIS_APP_KEY: ${KIS_APP_KEY}
-      KIS_APP_SECRET: ${KIS_APP_SECRET}
-      KIS_ACCOUNT_NO: ${KIS_ACCOUNT_NO}
-      KIS_ENV: ${KIS_ENV:-paper}
-      KIS_HTS_ID: ${KIS_HTS_ID:-}
-      TELEGRAM_TOKEN: ${TELEGRAM_TOKEN:-}
-      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
-      REDIS_URL: redis://redis:6379
-      DB_URL: postgresql://quantdinger:${POSTGRES_PASSWORD:-quantdinger}@postgres:5432/quantdinger
-      DAILY_LOSS_LIMIT_PCT: ${DAILY_LOSS_LIMIT_PCT:-0.03}
-      MDD_LIMIT_PCT: ${MDD_LIMIT_PCT:-0.15}
-      STOP_LOSS_PCT: ${STOP_LOSS_PCT:-0.07}
-    volumes:
-      - kis_data:/app/data
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
+  # DISABLED: kis-bot is the legacy trading engine (bot/main.py).
+  # Running it simultaneously with kis-worker would place duplicate orders on the same KIS account.
+  # Uncomment ONLY if kis-worker is fully stopped and you need the legacy engine for diagnostics.
+  #
+  # kis-bot:
+  #   build:
+  #     context: .
+  #     dockerfile: Dockerfile.kis-bot
+  #   restart: unless-stopped
+  #   container_name: kis-bot
+  #   environment:
+  #     KIS_APP_KEY: ${KIS_APP_KEY}
+  #     KIS_APP_SECRET: ${KIS_APP_SECRET}
+  #     KIS_ACCOUNT_NO: ${KIS_ACCOUNT_NO}
+  #     KIS_ENV: ${KIS_ENV:-paper}
+  #     KIS_HTS_ID: ${KIS_HTS_ID:-}
+  #     TELEGRAM_TOKEN: ${TELEGRAM_TOKEN:-}
+  #     TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+  #     REDIS_URL: redis://redis:6379
+  #     DB_URL: postgresql://quantdinger:${POSTGRES_PASSWORD:-quantdinger}@postgres:5432/quantdinger
+  #     DAILY_LOSS_LIMIT_PCT: ${DAILY_LOSS_LIMIT_PCT:-0.03}
+  #     MDD_LIMIT_PCT: ${MDD_LIMIT_PCT:-0.15}
+  #     STOP_LOSS_PCT: ${STOP_LOSS_PCT:-0.07}
+  #   volumes:
+  #     - kis_data:/app/data
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #     redis:
+  #       condition: service_healthy
 
   kis-api:
     build:
@@ -111,6 +116,7 @@ services:
       REDIS_URL: redis://redis:6379
       DB_URL: postgresql://quantdinger:${POSTGRES_PASSWORD:-quantdinger}@postgres:5432/quantdinger
       API_PORT: "5001"
+      KIS_API_KEY: ${KIS_API_KEY:-}
     depends_on:
       postgres:
         condition: service_healthy

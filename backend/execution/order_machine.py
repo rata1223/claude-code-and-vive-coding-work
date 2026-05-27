@@ -1,4 +1,5 @@
 import logging
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Callable, Optional
@@ -35,41 +36,45 @@ class OrderStateMachine:
     def __init__(self, on_state_change: Optional[Callable[[Order], None]] = None):
         self._orders: dict[str, Order] = {}
         self._on_change = on_state_change or (lambda o: None)
+        self._lock = threading.RLock()
 
     # ── 등록 ──────────────────────────────────────────────────────────────
     def register(self, order: Order) -> Order:
-        self._orders[order.id] = order
+        with self._lock:
+            self._orders[order.id] = order
         logger.info("주문 등록: id=%s symbol=%s side=%s qty=%d", order.id, order.symbol, order.side, order.qty)
         return order
 
     # ── 상태 전환 ──────────────────────────────────────────────────────────
     def transition(self, order_id: str, new_status: OrderStatus) -> Order:
-        order = self._get(order_id)
-        self._assert_valid(order, new_status)
-        order.status = new_status
+        with self._lock:
+            order = self._get(order_id)
+            self._assert_valid(order, new_status)
+            order.status = new_status
         logger.info("상태 전환: id=%s → %s", order_id, new_status.value)
         self._on_change(order)
         return order
 
     def process_fill(self, event: FillEvent) -> Order:
-        order = self._get(event.order_id)
-        order.filled_qty += event.filled_qty
-        if order.filled_qty > 0:
-            # 가중평균 체결가 계산
-            prev_val = order.avg_fill_price * (order.filled_qty - event.filled_qty)
-            new_val = event.fill_price * event.filled_qty
-            order.avg_fill_price = (prev_val + new_val) / order.filled_qty
+        with self._lock:
+            order = self._get(event.order_id)
+            order.filled_qty += event.filled_qty
+            if order.filled_qty > 0:
+                # 가중평균 체결가 계산
+                prev_val = order.avg_fill_price * (order.filled_qty - event.filled_qty)
+                new_val = event.fill_price * event.filled_qty
+                order.avg_fill_price = (prev_val + new_val) / order.filled_qty
 
-        if order.filled_qty >= order.qty:
-            new_status = OrderStatus.FILLED
-        elif order.filled_qty > 0:
-            new_status = OrderStatus.PARTIAL_FILLED
-        else:
-            new_status = order.status
+            if order.filled_qty >= order.qty:
+                new_status = OrderStatus.FILLED
+            elif order.filled_qty > 0:
+                new_status = OrderStatus.PARTIAL_FILLED
+            else:
+                new_status = order.status
 
-        if new_status != order.status:
-            self._assert_valid(order, new_status)
-            order.status = new_status
+            if new_status != order.status:
+                self._assert_valid(order, new_status)
+                order.status = new_status
 
         logger.info(
             "체결 처리: id=%s filled=%d/%d avg=%.4f status=%s",
@@ -79,11 +84,13 @@ class OrderStateMachine:
         return order
 
     def submit(self, order_id: str, broker_order_id: str = "") -> Order:
-        order = self._get(order_id)
-        if broker_order_id:
-            order.id = broker_order_id
-            self._orders[broker_order_id] = order
-        return self.transition(order_id if not broker_order_id else broker_order_id, OrderStatus.SUBMITTED)
+        with self._lock:
+            order = self._get(order_id)
+            if broker_order_id:
+                order.id = broker_order_id
+                self._orders[broker_order_id] = order
+            target_id = broker_order_id if broker_order_id else order_id
+        return self.transition(target_id, OrderStatus.SUBMITTED)
 
     def cancel(self, order_id: str) -> Order:
         return self.transition(order_id, OrderStatus.CANCELED)
@@ -93,11 +100,13 @@ class OrderStateMachine:
 
     # ── 조회 ──────────────────────────────────────────────────────────────
     def get(self, order_id: str) -> Optional[Order]:
-        return self._orders.get(order_id)
+        with self._lock:
+            return self._orders.get(order_id)
 
     def active_orders(self) -> list[Order]:
-        return [o for o in self._orders.values()
-                if o.status in (OrderStatus.PENDING, OrderStatus.SUBMITTED, OrderStatus.PARTIAL_FILLED)]
+        with self._lock:
+            return [o for o in self._orders.values()
+                    if o.status in (OrderStatus.PENDING, OrderStatus.SUBMITTED, OrderStatus.PARTIAL_FILLED)]
 
     # ── 내부 ──────────────────────────────────────────────────────────────
     def _get(self, order_id: str) -> Order:

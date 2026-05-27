@@ -22,6 +22,24 @@ app = Flask(__name__)
 _redis = redis.from_url(os.environ.get("REDIS_URL", "redis://redis:6379"))
 _db_factory = None
 
+# API key auth — set KIS_API_KEY env var to enable. Unset = open (dev mode, logged warning).
+_API_KEY = os.environ.get("KIS_API_KEY", "")
+_OPEN_ROUTES = {"/api/health", "/api/status"}
+
+if not _API_KEY:
+    logger.warning("KIS_API_KEY not set — API running without authentication (dev mode)")
+
+
+@app.before_request
+def _check_api_key():
+    if request.path in _OPEN_ROUTES or request.method == "OPTIONS":
+        return None
+    if not _API_KEY:
+        return None  # auth disabled
+    provided = request.headers.get("X-API-Key", "")
+    if provided != _API_KEY:
+        return jsonify({"error": "인증 실패"}), 401
+
 
 def _get_factory():
     global _db_factory
@@ -250,6 +268,63 @@ def run_backtest():
     except Exception as e:
         logger.error("백테스트 오류: %s", e)
         return jsonify({"error": str(e)}), 500
+
+
+# ── 관리 (운영자 전용) ────────────────────────────────────────────────────
+
+@app.post("/api/admin/reconcile")
+def trigger_reconcile():
+    """포지션·주문 수동 조정 트리거. X-API-Key 필수."""
+    try:
+        from backend.execution.reconciler import PositionReconciler
+        from backend.brokers.kis import get_kis_broker
+        import redis as _redis_mod
+        r = _redis_mod.from_url(os.environ.get("REDIS_URL", "redis://redis:6379"))
+        reconciler = PositionReconciler(
+            broker=get_kis_broker(),
+            db_factory=_get_factory(),
+            redis_client=r,
+        )
+        result = reconciler.reconcile("manual")
+        return jsonify(result.to_dict())
+    except Exception as e:
+        logger.error("수동 조정 실패: %s", e)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.post("/api/admin/flatten")
+def trigger_flatten():
+    """비상 청산 트리거 (전체 포지션 시장가 매도). X-API-Key + confirm=true 필수."""
+    body = request.json or {}
+    if not body.get("confirm"):
+        return jsonify({"error": "confirm=true 필요"}), 400
+    try:
+        from backend.worker.emergency import EmergencyFlattenManager
+        from backend.brokers.kis import get_kis_broker
+        dry_run = os.environ.get("ENABLE_LIVE_TRADING", "false").lower() != "true"
+        mgr = EmergencyFlattenManager(
+            broker=get_kis_broker(),
+            db_factory=_get_factory(),
+            dry_run=dry_run,
+        )
+        result = mgr.flatten_all(reason=body.get("reason", "수동 비상청산"))
+        return jsonify(result)
+    except Exception as e:
+        logger.error("비상청산 실패: %s", e)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.get("/api/admin/heartbeat")
+def worker_heartbeat_status():
+    """Worker 하트비트 상태 조회."""
+    try:
+        from backend.worker.heartbeat import HeartbeatMonitor
+        alive = HeartbeatMonitor.is_alive(_redis)
+        last = HeartbeatMonitor.last_beat(_redis)
+        ttl = HeartbeatMonitor.ttl_seconds(_redis)
+        return jsonify({"alive": alive, "last_beat": last, "ttl_seconds": ttl})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 503
 
 
 if __name__ == "__main__":
