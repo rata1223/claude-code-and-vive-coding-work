@@ -327,8 +327,23 @@ def worker_heartbeat_status():
         return jsonify({"error": str(e)}), 503
 
 
+def _start_watchdog():
+    """Start WorkerWatchdog in this process (kis-api), which is separate from kis-worker.
+    This is the correct process boundary: crash detection only works cross-process.
+    Call this from gunicorn's post_fork hook or main() below."""
+    try:
+        import redis as _redis_mod
+        r = _redis_mod.from_url(os.environ.get("REDIS_URL", "redis://redis:6379"))
+        from backend.worker.heartbeat import WorkerWatchdog
+        WorkerWatchdog(r).start()
+        logger.info("WorkerWatchdog 시작 (kis-api 프로세스)")
+    except Exception as e:
+        logger.warning("WorkerWatchdog 시작 실패: %s", e)
+
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    _start_watchdog()
     port = int(os.environ.get("API_PORT", 5001))
     app.run(host="0.0.0.0", port=port, debug=False)

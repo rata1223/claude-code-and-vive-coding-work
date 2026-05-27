@@ -106,8 +106,23 @@ class KISBroker(BrokerAdapter):
                 status=OrderStatus.REJECTED, raw={"error": str(e)},
             )
 
-    def cancel_order(self, order_id: str) -> bool:
-        """주문 취소. KIS TR: TTTC0803U (실전) / VTTC0803U (모의)."""
+    def cancel_order(self, order_id: str, symbol: str = "", qty: int = 0, price: float = 0.0) -> bool:
+        """주문 취소. US 종목은 cancel_us() 라우팅. KR: TTTC0803U/VTTC0803U."""
+        is_us = bool(symbol) and not (symbol in KR_ETF or (len(symbol) == 6 and symbol.isdigit()))
+        if is_us:
+            excd = EXCD_MAP.get(symbol, "NASD")
+            try:
+                resp = self._orders.cancel_us(order_id, symbol, excd, qty, price)
+                rt_cd = resp.get("rt_cd", "1")
+                if rt_cd == "0":
+                    logger.info("US 주문 취소 성공: %s %s", order_id, symbol)
+                    return True
+                logger.warning("US 주문 취소 실패 (rt_cd=%s): %s", rt_cd, resp.get("msg1"))
+                return False
+            except Exception as e:
+                logger.error("US 주문 취소 예외 %s: %s", order_id, e)
+                return False
+
         try:
             tr_id = "VTTC0803U" if self._paper else "TTTC0803U"
             body = {
@@ -121,7 +136,7 @@ class KISBroker(BrokerAdapter):
                 "ORD_UNPR": "0",
                 "QTY_ALL_ORD_YN": "Y",
             }
-            resp = self._client.post("/uapi/domestic-stock/v1/trading/order-rvsecncl", body, tr_id=tr_id)
+            resp = self._client.post("/uapi/domestic-stock/v1/trading/order-rvsecncl", tr_id, body)
             rt_cd = resp.get("rt_cd", "1")
             if rt_cd == "0":
                 logger.info("주문 취소 성공: %s", order_id)
@@ -161,7 +176,7 @@ class KISBroker(BrokerAdapter):
                 "CTX_AREA_FK100": "",
                 "CTX_AREA_NK100": "",
             }
-            resp = self._client.get("/uapi/domestic-stock/v1/trading/inquire-order", params, tr_id=tr_id)
+            resp = self._client.get("/uapi/domestic-stock/v1/trading/inquire-order", tr_id, params)
             output = resp.get("output1") or resp.get("output", [])
             if not output:
                 return None
@@ -212,7 +227,7 @@ class KISBroker(BrokerAdapter):
                 "CTX_AREA_FK200": "",
                 "CTX_AREA_NK200": "",
             }
-            resp = self._client.get("/uapi/overseas-stock/v1/trading/inquire-order", params, tr_id=tr_id)
+            resp = self._client.get("/uapi/overseas-stock/v1/trading/inquire-order", tr_id, params)
             output = resp.get("output") or []
             if not output:
                 return None

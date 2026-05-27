@@ -158,10 +158,11 @@ def build_scheduler() -> BackgroundScheduler:
         id="kr_session", name="한국주식 매매",
     )
 
-    # 미국 시장 22:35 KST
+    # 미국 시장 09:30 Eastern — APScheduler가 DST 자동 처리
+    # 서머타임: 22:30 KST / 겨울: 23:30 KST
     scheduler.add_job(
         _trigger_us_session,
-        CronTrigger(day_of_week="mon-fri", hour=22, minute=35, timezone="Asia/Seoul"),
+        CronTrigger(day_of_week="mon-fri", hour=9, minute=30, timezone="America/New_York"),
         id="us_session", name="미국주식 매매",
     )
 
