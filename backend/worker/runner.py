@@ -260,7 +260,7 @@ class StrategyWorker:
         self._last_market_open[market] = now
 
         with self._lock:
-            sessions = list(self._sessions.values())
+            sessions = [s for s in self._sessions.values() if s is not None]
         logger.info("장 시작 브로드캐스트: market=%s sessions=%d", market, len(sessions))
         for session in sessions:
             t = threading.Thread(
