@@ -107,6 +107,31 @@ class Command(Base):
     processed_at = Column(DateTime, nullable=True)
 
 
+class ReconciliationLog(Base):
+    """Immutable record of each reconciliation run."""
+    __tablename__ = "reconciliation_logs"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    trigger = Column(String(20), nullable=False, index=True)  # startup/periodic/manual
+    started_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    completed_at = Column(DateTime, nullable=True)
+    gaps_found = Column(Integer, nullable=False, default=0)
+    repairs_made = Column(Integer, nullable=False, default=0)
+    error = Column(Text, nullable=True)
+    detail = Column(Text, nullable=True)  # JSON summary
+
+
+class AuditLog(Base):
+    """Append-only audit trail — every order action, risk event, and operator intervention."""
+    __tablename__ = "audit_logs"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    event_type = Column(String(50), nullable=False, index=True)
+    symbol = Column(String(20), nullable=True, index=True)
+    order_id = Column(String(50), nullable=True, index=True)
+    actor = Column(String(50), nullable=True)  # worker/api/scheduler/operator
+    detail = Column(Text, nullable=True)  # JSON
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+
+
 def init_db(db_url: str) -> Session:
     engine = create_engine(db_url, echo=False)
     Base.metadata.create_all(engine)

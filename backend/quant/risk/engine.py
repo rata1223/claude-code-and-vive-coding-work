@@ -351,10 +351,18 @@ class PersistentLossTracker(LossTracker):
     _REDIS_KEY_TEMPLATE = "risk:daily_pnl:{date}"
     _REDIS_TTL_SEC = 25 * 3600  # 25 hours covers overnight restarts
 
-    def __init__(self, config: RiskConfig, redis_client=None, db_session=None):
+    def __init__(self, config: RiskConfig, redis_client=None,
+                 db_session=None, db_factory=None):
         super().__init__(config=config)
         self._redis = redis_client
-        self._db = db_session
+        # Prefer db_factory (creates per-op sessions) over a long-lived db_session.
+        # Long-lived sessions cause stale connections and pool exhaustion on 24h+ processes.
+        if db_factory is not None:
+            self._db_factory = db_factory
+            self._db = None  # unused when factory is available
+        else:
+            self._db_factory = None
+            self._db = db_session  # legacy: long-lived session, kept for compat
         self._restore_state()
 
     def _redis_key(self) -> str:
@@ -408,27 +416,49 @@ class PersistentLossTracker(LossTracker):
             logger.warning("Redis PnL 기록 실패: %s", e)
 
     def _write_db(self) -> None:
-        if self._db is None:
-            return
-        try:
-            from backend.database.models import DailyRiskState
-            today = date.today()
-            row = self._db.get(DailyRiskState, today)
-            if row is None:
-                row = DailyRiskState(trade_date=today)
-                self._db.add(row)
-            row.daily_pnl = self.daily_pnl
-            row.weekly_pnl = self.weekly_pnl
-            row.peak_equity = self.peak_equity
-            row.kill_switch = self.kill_switch
-            row.kill_reason = self.kill_reason or None
-            self._db.commit()
-        except Exception as e:
-            logger.warning("DB PnL 기록 실패: %s", e)
+        from backend.database.models import DailyRiskState
+        today = date.today()
+        # Snapshot values under RLock so we don't race against record_pnl
+        daily_pnl, weekly_pnl, peak_eq = self.daily_pnl, self.weekly_pnl, self.peak_equity
+        ks, kr = self.kill_switch, (self.kill_reason or None)
+
+        if self._db_factory is not None:
+            sess = self._db_factory()
             try:
-                self._db.rollback()
-            except Exception:
-                pass
+                row = sess.get(DailyRiskState, today)
+                if row is None:
+                    row = DailyRiskState(trade_date=today)
+                    sess.add(row)
+                row.daily_pnl = daily_pnl
+                row.weekly_pnl = weekly_pnl
+                row.peak_equity = peak_eq
+                row.kill_switch = ks
+                row.kill_reason = kr
+                sess.commit()
+            except Exception as e:
+                logger.warning("DB PnL 기록 실패: %s", e)
+                sess.rollback()
+            finally:
+                sess.close()
+        elif self._db is not None:
+            # Legacy: long-lived session path
+            try:
+                row = self._db.get(DailyRiskState, today)
+                if row is None:
+                    row = DailyRiskState(trade_date=today)
+                    self._db.add(row)
+                row.daily_pnl = daily_pnl
+                row.weekly_pnl = weekly_pnl
+                row.peak_equity = peak_eq
+                row.kill_switch = ks
+                row.kill_reason = kr
+                self._db.commit()
+            except Exception as e:
+                logger.warning("DB PnL 기록 실패 (legacy): %s", e)
+                try:
+                    self._db.rollback()
+                except Exception:
+                    pass
 
     def _load_redis(self, today: date) -> Optional[float]:
         if self._redis is None:
@@ -445,13 +475,21 @@ class PersistentLossTracker(LossTracker):
         return row.daily_pnl if row else None
 
     def _load_db_full(self, today: date):
-        if self._db is None:
-            return None
-        try:
-            from backend.database.models import DailyRiskState
-            return self._db.get(DailyRiskState, today)
-        except Exception:
-            return None
+        from backend.database.models import DailyRiskState
+        if self._db_factory is not None:
+            sess = self._db_factory()
+            try:
+                return sess.get(DailyRiskState, today)
+            except Exception:
+                return None
+            finally:
+                sess.close()
+        elif self._db is not None:
+            try:
+                return self._db.get(DailyRiskState, today)
+            except Exception:
+                return None
+        return None
 
 
 def redundant_pairs(corr: pd.DataFrame, threshold: float = 0.80) -> list[tuple[str, str, float]]:

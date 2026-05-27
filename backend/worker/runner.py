@@ -28,6 +28,8 @@ from backend.database.models import (
 from backend.execution.order_machine import FillEvent, OrderStateMachine
 from backend.execution.order_poller import OrderFillPoller
 from backend.execution.position_tracker import Fill, PositionTracker
+from backend.execution.reconciler import PositionReconciler
+from backend.worker.heartbeat import WorkerHeartbeat
 from backend.strategy.base import StrategyBase
 from backend.strategy.indicator.strategy import IndicatorStrategy
 
@@ -129,19 +131,18 @@ class StrategyWorker:
             logger.warning("OrderFillPoller 초기화 실패: %s — 폴링 비활성화", e)
             self._poller = None
 
-        # Process-level PersistentLossTracker — records realized P&L from fill callbacks
+        # Process-level PersistentLossTracker — uses db_factory for per-op sessions (P1-3 fix)
         self._loss_tracker = None
         try:
             from backend.quant.risk.engine import PersistentLossTracker, RiskConfig
-            _db_sess = _get_session_factory()()
             self._loss_tracker = PersistentLossTracker(
                 config=RiskConfig(),
                 redis_client=self._redis,
-                db_session=_db_sess,
+                db_factory=_get_session_factory(),  # per-op sessions, not long-lived
             )
             logger.info("PersistentLossTracker 초기화 완료 (kill_switch=%s)", self._loss_tracker.kill_switch)
 
-            # Bootstrap peak_equity from live balance if not previously persisted
+            # Bootstrap peak_equity from live balance on cold start
             if self._loss_tracker.peak_equity == 0:
                 try:
                     bal = get_kis_broker().get_balance()
@@ -155,8 +156,25 @@ class StrategyWorker:
         except Exception as e:
             logger.warning("PersistentLossTracker 초기화 실패: %s", e)
 
+        # Heartbeat — lets watchdog / monitoring know the worker is alive
+        self._heartbeat = WorkerHeartbeat(self._redis)
+        self._heartbeat.start()
+
+        # Reconciler — startup + periodic position/order reconciliation
+        self._reconciler = PositionReconciler(
+            broker=get_kis_broker(),
+            db_factory=_get_session_factory(),
+            redis_client=self._redis,
+            poller=self._poller,
+        )
+
     def run(self):
         self._restore_active()
+        # Startup reconciliation: broker is ground truth on boot
+        try:
+            self._reconciler.reconcile("startup")
+        except Exception as e:
+            logger.warning("시작 조정 실패 (계속 진행): %s", e)
         self._run_with_pubsub()
 
     def _run_with_pubsub(self):
@@ -270,6 +288,14 @@ class StrategyWorker:
             logger.warning("중복 market_open 무시: %s (마지막 %.0fs 전)", market, now - last)
             return
         self._last_market_open[market] = now
+
+        # Periodic reconciliation on each market open (catches overnight drift)
+        threading.Thread(
+            target=self._reconciler.reconcile,
+            args=("periodic",),
+            daemon=True,
+            name=f"reconcile-{market}",
+        ).start()
 
         with self._lock:
             sessions = [s for s in self._sessions.values() if s is not None]
