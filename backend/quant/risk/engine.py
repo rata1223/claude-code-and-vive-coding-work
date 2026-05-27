@@ -52,15 +52,16 @@ class PositionStop:
     symbol: str
     entry_price: float
     entry_date: str
-    peak_price: float          # 고점 (트레일링 스탑 기준)
-    trailing_stop: float       # 현재 트레일링 스탑 가격
-    hard_stop: float           # 하드 스탑 가격 (진입가 기반)
+    peak_price: float
+    trailing_stop: float
+    hard_stop: float
     qty: int
+    trailing_stop_pct: float = 0.07  # instance-level; avoids global state corruption
 
     def update_peak(self, current_price: float) -> None:
         if current_price > self.peak_price:
             self.peak_price = current_price
-            self.trailing_stop = current_price * (1 - _config_trailing_pct)
+            self.trailing_stop = current_price * (1 - self.trailing_stop_pct)
 
     def is_stopped(self, current_price: float) -> tuple[bool, str]:
         if current_price <= self.hard_stop:
@@ -68,10 +69,6 @@ class PositionStop:
         if current_price <= self.trailing_stop:
             return True, "trailing_stop"
         return False, ""
-
-
-# 전역 기본 트레일링 pct (PositionStop 클래스 내 참조용)
-_config_trailing_pct = 0.07
 
 
 class TrailingStopManager:
@@ -88,8 +85,6 @@ class TrailingStopManager:
     def __init__(self, config: RiskConfig):
         self.config = config
         self._positions: dict[str, PositionStop] = {}
-        global _config_trailing_pct
-        _config_trailing_pct = config.trailing_stop_pct
 
     def open(self, symbol: str, qty: int, entry_price: float,
              entry_date: Optional[str] = None) -> None:
@@ -103,6 +98,7 @@ class TrailingStopManager:
             trailing_stop=ts,
             hard_stop=hs,
             qty=qty,
+            trailing_stop_pct=self.config.trailing_stop_pct,
         )
         logger.debug("TS 오픈 %s entry=%.2f ts=%.2f hs=%.2f", symbol, entry_price, ts, hs)
 
@@ -247,19 +243,17 @@ class LossTracker:
         # 일일 손실 한도
         if self.daily_pnl / capital < -self.config.daily_loss_limit_pct:
             self.kill_switch = True
-            self.kill_reason = (
-                f"일일 손실 한도 초과 ({self.daily_pnl/capital:.2%})"
-            )
+            self.kill_reason = f"일일 손실 한도 초과 ({self.daily_pnl/capital:.2%})"
             logger.error("킬스위치 [일일] %s", self.kill_reason)
+            self._fire_kill_switch_alert(self.kill_reason)
             return
 
         # 주간 손실 한도
         if self.weekly_pnl / capital < -self.config.weekly_loss_limit_pct:
             self.kill_switch = True
-            self.kill_reason = (
-                f"주간 손실 한도 초과 ({self.weekly_pnl/capital:.2%})"
-            )
+            self.kill_reason = f"주간 손실 한도 초과 ({self.weekly_pnl/capital:.2%})"
             logger.error("킬스위치 [주간] %s", self.kill_reason)
+            self._fire_kill_switch_alert(self.kill_reason)
             return
 
         # MDD 한도
@@ -269,6 +263,26 @@ class LossTracker:
                 self.kill_switch = True
                 self.kill_reason = f"MDD 한도 초과 ({mdd:.2%})"
                 logger.error("킬스위치 [MDD] %s", self.kill_reason)
+                self._fire_kill_switch_alert(self.kill_reason)
+
+    def _fire_kill_switch_alert(self, reason: str) -> None:
+        """Telegram + WebSocket 동시 발행 — 실패해도 킬스위치 자체는 영향 없음."""
+        # Disable SAFE_MODE first so all subsequent buy()/sell() calls are blocked
+        try:
+            from backend.worker.recovery import SAFE_MODE
+            SAFE_MODE.disable(f"킬스위치: {reason}")
+        except Exception as e:
+            logger.warning("SAFE_MODE 비활성화 실패: %s", e)
+        try:
+            from bot.notifier import alert_emergency
+            alert_emergency(f"킬스위치 발동\n{reason}")
+        except Exception as e:
+            logger.warning("Telegram 킬스위치 알림 실패: %s", e)
+        try:
+            from backend.websocket.server import publish_alert
+            publish_alert(reason, level="critical")
+        except Exception as e:
+            logger.warning("WebSocket 킬스위치 알림 실패: %s", e)
 
     def can_buy(self) -> tuple[bool, str]:
         if self.kill_switch:
@@ -324,6 +338,120 @@ def correlation_matrix(price_histories: dict[str, pd.DataFrame],
         return pd.DataFrame()
     df_rets = pd.DataFrame(rets).dropna()
     return df_rets.corr()
+
+
+class PersistentLossTracker(LossTracker):
+    """
+    LossTracker with Redis TTL + DB dual-write so daily PnL survives restarts.
+
+    Restore priority: min(redis_val, db_val) — take the more pessimistic number
+    to avoid loss under-reporting across crashes.
+    """
+
+    _REDIS_KEY_TEMPLATE = "risk:daily_pnl:{date}"
+    _REDIS_TTL_SEC = 25 * 3600  # 25 hours covers overnight restarts
+
+    def __init__(self, config: RiskConfig, redis_client=None, db_session=None):
+        super().__init__(config=config)
+        self._redis = redis_client
+        self._db = db_session
+        self._restore_state()
+
+    def _redis_key(self) -> str:
+        return self._REDIS_KEY_TEMPLATE.format(date=date.today().isoformat())
+
+    def _restore_state(self) -> None:
+        today = date.today()
+        redis_val = self._load_redis(today)
+        db_val = self._load_db(today)
+
+        if redis_val is not None or db_val is not None:
+            candidates = [v for v in [redis_val, db_val] if v is not None]
+            self.daily_pnl = min(candidates)  # most pessimistic
+            logger.info(
+                "PersistentLossTracker 복원: daily_pnl=%.4f (redis=%s db=%s)",
+                self.daily_pnl, redis_val, db_val,
+            )
+
+        db_state = self._load_db_full(today)
+        if db_state:
+            self.weekly_pnl = db_state.weekly_pnl
+            self.peak_equity = db_state.peak_equity
+            if db_state.kill_switch:
+                self.kill_switch = True
+                self.kill_reason = db_state.kill_reason or ""
+                logger.warning("킬스위치 복원: %s", self.kill_reason)
+
+    def record_pnl(self, pnl: float, current_equity: float) -> None:
+        super().record_pnl(pnl, current_equity)
+        self._persist()
+
+    def reset_daily(self) -> None:
+        super().reset_daily()
+        self._persist()
+
+    def manual_reset(self) -> None:
+        super().manual_reset()
+        self._persist()
+
+    def _persist(self) -> None:
+        self._write_redis()
+        self._write_db()
+
+    def _write_redis(self) -> None:
+        if self._redis is None:
+            return
+        try:
+            key = self._redis_key()
+            self._redis.setex(key, self._REDIS_TTL_SEC, str(self.daily_pnl))
+        except Exception as e:
+            logger.warning("Redis PnL 기록 실패: %s", e)
+
+    def _write_db(self) -> None:
+        if self._db is None:
+            return
+        try:
+            from backend.database.models import DailyRiskState
+            today = date.today()
+            row = self._db.get(DailyRiskState, today)
+            if row is None:
+                row = DailyRiskState(trade_date=today)
+                self._db.add(row)
+            row.daily_pnl = self.daily_pnl
+            row.weekly_pnl = self.weekly_pnl
+            row.peak_equity = self.peak_equity
+            row.kill_switch = self.kill_switch
+            row.kill_reason = self.kill_reason or None
+            self._db.commit()
+        except Exception as e:
+            logger.warning("DB PnL 기록 실패: %s", e)
+            try:
+                self._db.rollback()
+            except Exception:
+                pass
+
+    def _load_redis(self, today: date) -> Optional[float]:
+        if self._redis is None:
+            return None
+        try:
+            key = self._REDIS_KEY_TEMPLATE.format(date=today.isoformat())
+            val = self._redis.get(key)
+            return float(val) if val is not None else None
+        except Exception:
+            return None
+
+    def _load_db(self, today: date) -> Optional[float]:
+        row = self._load_db_full(today)
+        return row.daily_pnl if row else None
+
+    def _load_db_full(self, today: date):
+        if self._db is None:
+            return None
+        try:
+            from backend.database.models import DailyRiskState
+            return self._db.get(DailyRiskState, today)
+        except Exception:
+            return None
 
 
 def redundant_pairs(corr: pd.DataFrame, threshold: float = 0.80) -> list[tuple[str, str, float]]:

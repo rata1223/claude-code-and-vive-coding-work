@@ -3,6 +3,8 @@ from .models import Balance, Position, Order
 
 
 class BrokerAdapter(ABC):
+    is_live: bool = True  # False for SimulatedBroker — gates SAFE_MODE and shadow mode checks
+
     @abstractmethod
     def get_balance(self) -> Balance: ...
 

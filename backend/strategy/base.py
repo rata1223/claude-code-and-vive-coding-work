@@ -1,4 +1,5 @@
 import logging
+import os
 from abc import ABC
 from typing import Optional, TYPE_CHECKING
 
@@ -7,6 +8,36 @@ if TYPE_CHECKING:
     from backend.execution.position_tracker import Fill
 
 logger = logging.getLogger(__name__)
+
+
+def _live_trade_allowed(broker, name: str, symbol: str, side: str):
+    """
+    Returns (allowed: bool, rejected_order_or_None).
+    Only enforced when broker.is_live is True (KISBroker).
+    Skipped entirely for SimulatedBroker (backtests, dry-runs).
+    """
+    from backend.brokers.models import Order, OrderStatus
+    if not getattr(broker, "is_live", True):
+        return True, None
+
+    # 1. SAFE_MODE gate (startup recovery must complete first)
+    try:
+        from backend.worker.recovery import SAFE_MODE
+        if not SAFE_MODE.can_trade:
+            logger.warning("[%s] SAFE_MODE — %s 차단: %s (%s)",
+                           name, side, symbol, SAFE_MODE._reason)
+            return False, Order(id="", symbol=symbol, side=side, qty=0,
+                                price=0, status=OrderStatus.REJECTED)
+    except ImportError:
+        pass  # not running in worker context
+
+    # 2. Shadow execution gate (ENABLE_LIVE_TRADING env var)
+    if os.environ.get("ENABLE_LIVE_TRADING", "false").lower() != "true":
+        logger.info("[SHADOW] %s %s — ENABLE_LIVE_TRADING=false (주문 미제출)", side, symbol)
+        return False, Order(id="", symbol=symbol, side=side, qty=0,
+                            price=0, status=OrderStatus.REJECTED)
+
+    return True, None
 
 
 class StrategyBase(ABC):
@@ -47,6 +78,9 @@ class StrategyBase(ABC):
 
     # ── 매매 편의 메서드 ─────────────────────────────────────────────────
     def buy(self, symbol: str, qty: int, price: Optional[float] = None, order_type: str = "limit"):
+        allowed, rejected = _live_trade_allowed(self._broker, self.name, symbol, "buy")
+        if not allowed:
+            return rejected
         if price is None:
             price = self._broker.get_price(symbol)
             order_type = "market"
@@ -54,6 +88,9 @@ class StrategyBase(ABC):
         return self._broker.place_order(symbol, "buy", qty, price, order_type)
 
     def sell(self, symbol: str, qty: int, price: Optional[float] = None, order_type: str = "limit"):
+        allowed, rejected = _live_trade_allowed(self._broker, self.name, symbol, "sell")
+        if not allowed:
+            return rejected
         if price is None:
             price = self._broker.get_price(symbol)
             order_type = "market"

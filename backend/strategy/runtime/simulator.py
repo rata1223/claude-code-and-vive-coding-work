@@ -10,19 +10,22 @@ from backend.execution.position_tracker import Fill, PositionTracker
 
 logger = logging.getLogger(__name__)
 
-KIS_COMMISSION = 0.00015  # KIS 수수료 0.015%
+# Import canonical cost constants to stay in sync with live execution
+from backend.quant.risk.position_sizer import DEFAULT_COMMISSION, DEFAULT_SLIPPAGE, KR_SECURITIES_TAX
 
 
 class SimulatedBroker(BrokerAdapter):
     """
     백테스트 및 드라이런용 시뮬레이션 브로커.
     BrokerAdapter 동일 인터페이스 — 전략 코드는 실전/모의 구분 없음.
-    체결은 즉시 완료(슬리피지 없음). 수수료만 차감.
+    실전 비용 모델: 수수료 0.015% + 슬리피지 0.10% + 한국 ETF 매도세 0.20%.
+    Round-trip KR ETF ~0.43%. 이전 수수료만 차감 방식(0.03% RT)은 14× 과소 추정.
     """
+
+    is_live: bool = False  # disables SAFE_MODE and ENABLE_LIVE_TRADING gates
 
     def __init__(self, initial_cash_krw: float = 2_000_000.0):
         self._cash = initial_cash_krw
-        self._commission_rate = KIS_COMMISSION
         self._machine = OrderStateMachine(on_state_change=self._persist)
         self._tracker = PositionTracker(self._machine)
         self._prices: dict[str, float] = {}
@@ -49,17 +52,27 @@ class SimulatedBroker(BrokerAdapter):
         self._machine.register(order)
         self._machine.transition(order_id, OrderStatus.SUBMITTED)
 
-        # 즉시 체결
-        commission = price * qty * self._commission_rate
+        # 즉시 체결 — 실전과 동일한 비용 모델 적용
+        is_kr = len(symbol) == 6 and symbol.isdigit()
+        commission = price * qty * DEFAULT_COMMISSION
+        slippage = price * qty * DEFAULT_SLIPPAGE
+        tax = price * qty * KR_SECURITIES_TAX if (is_kr and side == "sell") else 0.0
+
         if side == "buy":
-            cost = price * qty + commission
+            # 매수: 슬리피지만큼 가격이 높아짐 (시장충격)
+            fill_price = price * (1 + DEFAULT_SLIPPAGE)
+            cost = fill_price * qty + commission
             if cost > self._cash:
                 logger.warning("잔고 부족: 필요=%.0f 보유=%.0f", cost, self._cash)
                 self._machine.reject(order_id)
                 return self._machine.get(order_id)
             self._cash -= cost
+            price = fill_price  # 실제 체결가에 슬리피지 반영
         elif side == "sell":
-            self._cash += price * qty - commission
+            # 매도: 슬리피지만큼 가격이 낮아짐
+            fill_price = price * (1 - DEFAULT_SLIPPAGE)
+            self._cash += fill_price * qty - commission - tax
+            price = fill_price
 
         fill_event = FillEvent(order_id=order_id, filled_qty=qty, fill_price=price)
         self._machine.process_fill(fill_event)

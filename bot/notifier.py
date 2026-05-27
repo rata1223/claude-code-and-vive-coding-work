@@ -53,10 +53,14 @@ def alert_emergency(message: str):
 
 
 def alert_daily_summary(summary: dict):
+    kill_line = ""
+    if summary.get("kill_switch"):
+        kill_line = f"\n🚨 킬스위치: {summary.get('kill_reason', '활성')}"
     msg = (
         f"📊 <b>일일 결산</b>\n"
         f"총 자산: {summary.get('total_equity', 0):,.0f}원\n"
         f"일 수익률: {summary.get('daily_pnl_pct', 0):.2f}%\n"
         f"포지션 수: {summary.get('position_count', 0)}개"
+        f"{kill_line}"
     )
     send_alert(msg)

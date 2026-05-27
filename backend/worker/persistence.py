@@ -51,9 +51,11 @@ class DBPersistence:
             db_order = self._db.query(DBOrder).filter(
                 DBOrder.broker_order_id == fill.order_id
             ).first()
-            order_pk = db_order.id if db_order else None
+            if db_order is None:
+                logger.warning("체결 DB 저장 스킵: 미등록 order_id=%s", fill.order_id)
+                return
             row = DBFill(
-                order_id=order_pk or 0,
+                order_id=db_order.id,
                 qty=fill.qty,
                 price=fill.price,
             )
@@ -64,7 +66,10 @@ class DBPersistence:
             self._db.rollback()
 
     def sync_positions(self, positions):
-        """포지션 목록을 DB와 동기화 (upsert)."""
+        """포지션 목록을 DB와 동기화 (upsert). 빈 리스트일 때는 삭제하지 않는다."""
+        if not positions:
+            logger.debug("sync_positions: 빈 포지션 리스트 — 삭제 스킵")
+            return
         try:
             symbols = {p.symbol for p in positions}
             for pos in positions:

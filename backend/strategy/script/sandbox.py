@@ -1,11 +1,16 @@
 """
 ScriptStrategy 샌드박스.
-RestrictedPython + AST 화이트리스트 검사 + 타임아웃으로 위험 코드 차단.
+AST 화이트리스트 검사 + 스레드 타임아웃으로 위험 코드 차단.
+
+signal.alarm/SIGALRM은 사용하지 않는다 — daemon 스레드에서 호출하면
+SIGALRM이 메인 스레드로 전달되어 Worker 프로세스 전체가 크래시된다.
+대신 daemon=True 스레드 + join(timeout)으로 실행 시간을 제한한다.
+스레드는 완전히 종료되지 않을 수 있으나 메인 프로세스는 보호된다.
 """
 import ast
 import logging
-import signal
 import textwrap
+import threading
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -104,10 +109,6 @@ class _ASTChecker(ast.NodeVisitor):
         self.generic_visit(node)
 
 
-def _timeout_handler(signum, frame):
-    raise TimeoutError("스크립트 실행 시간 초과")
-
-
 def validate_script(source: str) -> None:
     """
     소스 코드 정적 검사. 위반 시 SandboxViolation 발생.
@@ -129,22 +130,33 @@ def execute_script(
     검증된 스크립트를 제한된 환경에서 실행.
     context: 전략에서 사용할 변수 (self=strategy, bar=bar_data 등)
     반환: 실행 후 context 상태
+
+    타임아웃은 daemon 스레드 + join(timeout)으로 구현한다.
+    스레드가 종료되지 않으면 TimeoutError를 발생시키고 메인 스레드는 계속 진행한다.
     """
     validate_script(source)
 
+    builtins_src = __builtins__ if isinstance(__builtins__, dict) else vars(__builtins__)
     safe_globals = {
-        "__builtins__": {k: __builtins__[k] for k in _ALLOWED_BUILTINS if k in __builtins__}
-        if isinstance(__builtins__, dict)
-        else {k: getattr(__builtins__, k) for k in _ALLOWED_BUILTINS if hasattr(__builtins__, k)},
+        "__builtins__": {k: builtins_src[k] for k in _ALLOWED_BUILTINS if k in builtins_src},
     }
     safe_globals.update(context)
 
-    old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
-    signal.alarm(timeout_sec)
-    try:
-        exec(compile(ast.parse(textwrap.dedent(source)), "<strategy>", "exec"), safe_globals)
-    finally:
-        signal.alarm(0)
-        signal.signal(signal.SIGALRM, old_handler)
+    result: dict[str, Any] = {"globals": None, "exc": None}
 
-    return safe_globals
+    def _run():
+        try:
+            exec(compile(ast.parse(textwrap.dedent(source)), "<strategy>", "exec"), safe_globals)
+            result["globals"] = safe_globals
+        except Exception as e:
+            result["exc"] = e
+
+    t = threading.Thread(target=_run, daemon=True, name="sandbox-exec")
+    t.start()
+    t.join(timeout=timeout_sec)
+
+    if t.is_alive():
+        raise TimeoutError(f"스크립트 실행 시간 초과 ({timeout_sec}s)")
+    if result["exc"] is not None:
+        raise result["exc"]
+    return result["globals"]
