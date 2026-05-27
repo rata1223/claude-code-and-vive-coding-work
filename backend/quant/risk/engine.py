@@ -267,6 +267,12 @@ class LossTracker:
 
     def _fire_kill_switch_alert(self, reason: str) -> None:
         """Telegram + WebSocket 동시 발행 — 실패해도 킬스위치 자체는 영향 없음."""
+        # Disable SAFE_MODE first so all subsequent buy()/sell() calls are blocked
+        try:
+            from backend.worker.recovery import SAFE_MODE
+            SAFE_MODE.disable(f"킬스위치: {reason}")
+        except Exception as e:
+            logger.warning("SAFE_MODE 비활성화 실패: %s", e)
         try:
             from bot.notifier import alert_emergency
             alert_emergency(f"킬스위치 발동\n{reason}")

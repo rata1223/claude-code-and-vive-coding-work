@@ -129,6 +129,20 @@ class StrategyWorker:
             logger.warning("OrderFillPoller 초기화 실패: %s — 폴링 비활성화", e)
             self._poller = None
 
+        # Process-level PersistentLossTracker — records realized P&L from fill callbacks
+        self._loss_tracker = None
+        try:
+            from backend.quant.risk.engine import PersistentLossTracker, RiskConfig
+            _db_sess = _get_session_factory()()
+            self._loss_tracker = PersistentLossTracker(
+                config=RiskConfig(),
+                redis_client=self._redis,
+                db_session=_db_sess,
+            )
+            logger.info("PersistentLossTracker 초기화 완료 (kill_switch=%s)", self._loss_tracker.kill_switch)
+        except Exception as e:
+            logger.warning("PersistentLossTracker 초기화 실패: %s", e)
+
     def run(self):
         self._restore_active()
         self._run_with_pubsub()
@@ -213,9 +227,13 @@ class StrategyWorker:
             if run_id in self._sessions:
                 logger.warning("이미 실행 중: run_id=%d", run_id)
                 return
+            # Reserve slot under lock to prevent a concurrent duplicate start
+            self._sessions[run_id] = None
 
         strategy = self._build_strategy(data)
         if strategy is None:
+            with self._lock:
+                self._sessions.pop(run_id, None)  # release reservation
             return
 
         session = WorkerSession(run_id, strategy)
@@ -324,7 +342,7 @@ class StrategyWorker:
     def _make_fill_callback(self, tracker: PositionTracker,
                              machine: OrderStateMachine, run_id: int):
         """
-        Returns a callback: Order → (machine → tracker → DB → WebSocket).
+        Returns a callback: Order → (machine → tracker → P&L → DB → WebSocket).
         This is the single integration point that closes the fill lifecycle loop.
         """
         def on_filled(order: Order):
@@ -337,6 +355,13 @@ class StrategyWorker:
                 price=order.avg_fill_price or order.price,
                 market="KR" if is_kr else "US",
             )
+            # Capture avg entry price before tracker modifies the position (needed for P&L)
+            entry_price = None
+            if fill.side == "sell":
+                pos = tracker.get_position(fill.symbol)
+                if pos is not None:
+                    entry_price = pos.avg_price
+
             # 1. State machine
             try:
                 if machine.get(order.id) is not None:
@@ -348,14 +373,35 @@ class StrategyWorker:
                     machine.process_fill(event)
             except Exception as e:
                 logger.warning("machine.process_fill 오류: %s", e)
+
             # 2. Position tracker
             try:
                 tracker.on_fill(fill)
             except Exception as e:
                 logger.warning("tracker.on_fill 오류: %s", e)
-            # 3. Persist fill + update order
+
+            # 3. Record realized P&L for sell fills → feeds kill-switch evaluation
+            if fill.side == "sell" and entry_price is not None and self._loss_tracker is not None:
+                realized_pnl = (fill.price - entry_price) * fill.qty
+                try:
+                    current_equity = self._loss_tracker.peak_equity
+                    try:
+                        current_equity = get_kis_broker().get_balance().total_eval_krw
+                    except Exception:
+                        pass
+                    self._loss_tracker.record_pnl(realized_pnl, current_equity)
+                    logger.info("손익 기록: %s %.0f원 (entry=%.4f fill=%.4f qty=%d)",
+                                fill.symbol, realized_pnl, entry_price, fill.price, fill.qty)
+                except Exception as e:
+                    logger.warning("P&L 기록 실패: %s", e)
+
+            # 4. Persist fill + update order status
             self._persist_fill(fill, order)
-            # 4. WebSocket push
+
+            # 5. Upsert position in DB to reflect fill
+            self._upsert_position_db(fill.symbol, fill.market, tracker.get_position(fill.symbol))
+
+            # 6. WebSocket push
             self._publish_order_update(order)
             logger.info("체결 파이프라인 완료: %s %s qty=%d @ %.4f",
                         order.id, order.symbol, fill.qty, fill.price)
@@ -422,6 +468,31 @@ class StrategyWorker:
         except Exception as e:
             logger.warning("포지션 복원 실패: %s", e)
 
+    def _upsert_position_db(self, symbol: str, market: str, pos):
+        """Upsert or delete position row in DB after a fill."""
+        try:
+            with _session() as db:
+                row = db.query(DBPosition).filter(
+                    DBPosition.symbol == symbol,
+                    DBPosition.broker == "kis",
+                ).first()
+                if pos is None or pos.qty <= 0:
+                    if row is not None:
+                        db.delete(row)
+                else:
+                    if row is not None:
+                        row.qty = pos.qty
+                        row.avg_price = pos.avg_price
+                        row.updated_at = datetime.utcnow()
+                    else:
+                        db.add(DBPosition(
+                            symbol=symbol, qty=pos.qty,
+                            avg_price=pos.avg_price, market=market, broker="kis",
+                        ))
+                db.commit()
+        except Exception as e:
+            logger.warning("포지션 DB 갱신 실패 (%s): %s", symbol, e)
+
     # ── WebSocket 발행 ────────────────────────────────────────────────────
     def _publish_order_update(self, order: Order):
         try:
@@ -444,6 +515,10 @@ def main():
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
+    # Create Worker first so its single poller can be shared with recovery
+    # (prevents dual-poller situation where recovery creates its own poller)
+    worker = StrategyWorker()
+
     # ── 시작 복구 시퀀스 ───────────────────────────────────────────────────
     from backend.worker.recovery import StartupRecovery
     factory = _get_session_factory()
@@ -458,6 +533,7 @@ def main():
         db_session_factory=factory,
         redis_client=r_client,
         broker=broker,
+        poller=worker._poller,
     )
     if not recovery.run():
         logger.critical("복구 실패 — Worker SafeMode로 계속 실행")
@@ -467,7 +543,6 @@ def main():
     scheduler.start()
     logger.info("스케줄러 시작")
 
-    worker = StrategyWorker()
     worker.run()  # blocking
 
 

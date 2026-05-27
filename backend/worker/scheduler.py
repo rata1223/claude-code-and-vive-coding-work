@@ -88,8 +88,7 @@ def _reset_daily_risk():
         row = db.get(DailyRiskState, date.today())
         if row:
             row.daily_pnl = 0.0
-            row.kill_switch = False
-            row.kill_reason = None
+            # kill_switch intentionally NOT cleared — requires manual operator reset
             db.commit()
         logger.info("일일 리스크 카운터 리셋 (DB)")
     except Exception as e:
@@ -98,10 +97,27 @@ def _reset_daily_risk():
         if db is not None:
             db.close()
 
-    # Re-arm SAFE_MODE so strategies can trade the new day
+    # Re-arm SAFE_MODE for the new day — skip if kill-switch fired yesterday
     try:
+        from datetime import date, timedelta
+        from backend.database.models import DailyRiskState
         from backend.worker.recovery import SAFE_MODE
-        if not SAFE_MODE.can_trade:
+        kill_active = False
+        db_check = None
+        try:
+            yesterday = date.today() - timedelta(days=1)
+            db_check = _get_db()
+            prev_row = db_check.get(DailyRiskState, yesterday)
+            if prev_row and prev_row.kill_switch:
+                kill_active = True
+        except Exception:
+            pass
+        finally:
+            if db_check is not None:
+                db_check.close()
+        if kill_active:
+            logger.warning("어제 킬스위치 활성 — SAFE_MODE 재활성화 차단. 수동 해제 필요.")
+        elif not SAFE_MODE.can_trade:
             SAFE_MODE.enable()
             logger.info("일일 리셋 후 SAFE_MODE 재활성화")
     except Exception as e:

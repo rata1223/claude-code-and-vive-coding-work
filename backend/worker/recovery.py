@@ -68,10 +68,11 @@ class StartupRecovery:
     완료 후 SAFE_MODE.enable() 호출.
     """
 
-    def __init__(self, db_session_factory, redis_client=None, broker=None):
+    def __init__(self, db_session_factory, redis_client=None, broker=None, poller=None):
         self._factory = db_session_factory
         self._redis = redis_client
         self._broker = broker
+        self._shared_poller = poller  # Worker's poller — avoid creating a second one
         self._actions: list[ReconcileAction] = []
 
     def run(self) -> bool:
@@ -138,7 +139,9 @@ class StartupRecovery:
             )
             db.close()
             if tracker.kill_switch:
-                logger.warning("킬스위치 복원됨: %s", tracker.kill_reason)
+                logger.warning("킬스위치 복원됨: %s — 매매 차단 유지", tracker.kill_reason)
+                self._kill_switch_active = True
+                self._kill_reason = tracker.kill_reason
             return True
         except Exception as e:
             logger.warning("리스크 상태 복원 실패: %s — 기본값 사용", e)
@@ -239,8 +242,12 @@ class StartupRecovery:
             db.close()
             if pending:
                 logger.info("미체결 주문 %d개 발견 — OrderFillPoller에 재등록", len(pending))
-                poller = OrderFillPoller(self._broker)
-                poller.start()
+                # Reuse Worker's shared poller to avoid duplicate polling threads
+                if self._shared_poller is not None:
+                    poller = self._shared_poller
+                else:
+                    poller = OrderFillPoller(self._broker)
+                    poller.start()
 
                 def _make_recovery_fill_cb(db_order_pk: int, broker_order_id: str):
                     """Persist fill to DB on recovery; in-memory state updated when strategies restart."""
@@ -299,6 +306,13 @@ class StartupRecovery:
                 logger.warning("LivePromotionGuard 로드 실패: %s — 실전 차단", e)
                 SAFE_MODE.disable("LivePromotionGuard 오류")
                 return False
+
+        # Block trading if kill-switch was active from the previous session
+        if getattr(self, "_kill_switch_active", False):
+            reason = getattr(self, "_kill_reason", "알 수 없음")
+            SAFE_MODE.disable(f"킬스위치 복원: {reason}")
+            logger.critical("킬스위치 복원 — 매매 차단. 수동 해제 후 재시작 필요.")
+            return False
 
         SAFE_MODE.enable()
         logger.info("복구 완료 — 매매 허용. reconcile actions=%d", len(self._actions))
