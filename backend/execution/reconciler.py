@@ -16,6 +16,7 @@
 """
 import json
 import logging
+import threading
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from typing import Callable, Optional
@@ -114,9 +115,17 @@ class PositionReconciler:
         """
         result = ReconciliationResult(trigger)
         try:
-            broker_positions = self._fetch_broker_positions(result)
-            if broker_positions is None:
-                result.error("브로커 포지션 조회 실패 — 조정 중단")
+            result = ReconciliationResult(trigger)
+            try:
+                broker_positions = self._fetch_broker_positions(result)
+                if broker_positions is None:
+                    result.error("브로커 포지션 조회 실패 — 조정 중단")
+                    result.finish()
+                    self._persist_log(result)
+                    return result
+
+                self._reconcile_positions(broker_positions, result)
+                self._reconcile_pending_orders(result)
                 result.finish()
                 self._persist_log(result, dry_run)
                 return result
@@ -334,6 +343,16 @@ class PositionReconciler:
         with _session(self._factory) as db:
             row = db.get(DBOrder, db_order_id)
             if row:
+                # Attempt broker cancel with full params (US cancel requires symbol+qty+price)
+                try:
+                    self._broker.cancel_order(
+                        order_id=row.broker_order_id or "",
+                        symbol=row.symbol,
+                        qty=row.qty,
+                        price=float(row.price or 0),
+                    )
+                except Exception as e:
+                    logger.warning("reconciler cancel_order 실패 %s: %s", row.broker_order_id, e)
                 row.status = OrderStatus.CANCELED.value
                 row.error = "조정: 브로커 미조회 → 취소 처리"
                 row.updated_at = datetime.utcnow()

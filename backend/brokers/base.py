@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
-from .models import Balance, Position, Order
+from typing import Optional
+from .models import Balance, BrokerCapabilities, Order, Position
 
 
 class BrokerAdapter(ABC):
@@ -15,7 +16,10 @@ class BrokerAdapter(ABC):
     def place_order(self, symbol: str, side: str, qty: int, price: float, order_type: str = "limit") -> Order: ...
 
     @abstractmethod
-    def cancel_order(self, order_id: str) -> bool: ...
+    def cancel_order(self, order_id: str, symbol: str = "", qty: int = 0, price: float = 0.0) -> bool: ...
+
+    @abstractmethod
+    def get_order_status(self, order_id: str, symbol: str = "") -> Optional[Order]: ...
 
     @abstractmethod
     def get_price(self, symbol: str) -> float: ...
