@@ -500,6 +500,25 @@ class StrategyWorker:
                 db_order.filled_qty = order.filled_qty or fill.qty
                 db_order.avg_fill_price = order.avg_fill_price or fill.price
                 db.commit()
+
+                # Immutable audit trail for fill events
+                try:
+                    from backend.database.models import AuditLog
+                    db.add(AuditLog(
+                        event_type="fill",
+                        symbol=fill.symbol,
+                        order_id=order.id,
+                        actor="worker",
+                        detail=json.dumps({
+                            "side": fill.side,
+                            "qty": fill.qty,
+                            "price": fill.price,
+                            "market": fill.market,
+                        }),
+                    ))
+                    db.commit()
+                except Exception as _ae:
+                    logger.warning("AuditLog 체결 기록 실패: %s", _ae)
         except Exception as e:
             logger.warning("체결 DB 저장 실패: %s", e)
 
