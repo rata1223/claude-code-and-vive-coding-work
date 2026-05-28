@@ -31,6 +31,7 @@ class _PollEntry:
     registered_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     poll_index: int = 0
     next_poll_at: float = field(default_factory=time.monotonic)
+    last_reported_qty: int = 0  # tracks cumulative filled qty to prevent double-counting
 
     @property
     def is_timed_out(self) -> bool:

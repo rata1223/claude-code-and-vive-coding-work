@@ -402,6 +402,32 @@ class PersistentLossTracker(LossTracker):
         super().manual_reset()
         self._persist()
 
+    def _fire_kill_switch_alert(self, reason: str) -> None:
+        super()._fire_kill_switch_alert(reason)
+        self._write_kill_switch_audit(reason)
+
+    def _write_kill_switch_audit(self, reason: str) -> None:
+        if self._db_factory is None:
+            return
+        try:
+            import json
+            from backend.database.models import AuditLog
+            sess = self._db_factory()
+            sess.add(AuditLog(
+                event_type="kill_switch",
+                actor="worker",
+                detail=json.dumps({
+                    "reason": reason,
+                    "daily_pnl": round(self.daily_pnl, 4),
+                    "weekly_pnl": round(self.weekly_pnl, 4),
+                    "peak_equity": round(self.peak_equity, 2),
+                }),
+            ))
+            sess.commit()
+            sess.close()
+        except Exception as e:
+            logger.warning("AuditLog 킬스위치 기록 실패: %s", e)
+
     def _persist(self) -> None:
         self._write_redis()
         self._write_db()

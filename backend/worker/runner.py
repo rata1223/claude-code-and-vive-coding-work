@@ -344,10 +344,20 @@ class StrategyWorker:
         run_id = data.get("run_id", 0)
 
         on_filled_cb = self._make_fill_callback(tracker, machine, run_id)
-        on_timeout_cb = lambda o: (
-            logger.error("주문 타임아웃 — 수동 확인 필요: %s %s %s", o.id, o.side, o.symbol),
-            tracker.unmark_pending(o.symbol),
-        )
+
+        def on_timeout_cb(o):
+            logger.warning("주문 타임아웃 — 브로커 취소 시도: %s %s %s", o.id, o.side, o.symbol)
+            try:
+                broker.cancel_order(
+                    order_id=o.id,
+                    symbol=o.symbol,
+                    qty=o.qty,
+                    price=float(o.price or 0),
+                )
+            except Exception as _e:
+                logger.error("타임아웃 취소 예외 %s: %s", o.id, _e)
+            finally:
+                tracker.unmark_pending(o.symbol)
 
         self._restore_positions(tracker, broker=data.get("broker", "kis"))
 

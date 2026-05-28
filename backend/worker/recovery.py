@@ -131,13 +131,11 @@ class StartupRecovery:
     def _step_risk(self) -> bool:
         try:
             from backend.quant.risk.engine import PersistentLossTracker, RiskConfig
-            db = self._factory()
             tracker = PersistentLossTracker(
                 config=RiskConfig(),
                 redis_client=self._redis,
-                db_session=db,
+                db_factory=self._factory,  # per-op sessions, not long-lived
             )
-            db.close()
             if tracker.kill_switch:
                 logger.warning("킬스위치 복원됨: %s — 매매 차단 유지", tracker.kill_reason)
                 self._kill_switch_active = True
@@ -250,21 +248,27 @@ class StartupRecovery:
                     poller.start()
 
                 def _make_recovery_fill_cb(db_order_pk: int, broker_order_id: str):
-                    """Persist fill to DB on recovery; in-memory state updated when strategies restart."""
+                    """Persist fill + update positions table so restored strategies see correct state."""
                     def on_filled(order: BOrder):
                         try:
                             sess = self._factory()
                             row = sess.get(DBOrder, db_order_pk)
                             if row:
+                                fill_qty = order.filled_qty or order.qty
+                                fill_price = order.avg_fill_price or order.price
                                 row.status = order.status.value
-                                row.filled_qty = order.filled_qty or order.qty
-                                row.avg_fill_price = order.avg_fill_price or order.price
+                                row.filled_qty = fill_qty
+                                row.avg_fill_price = fill_price
                                 fill = DBFill(order_id=db_order_pk,
-                                              qty=order.filled_qty or order.qty,
-                                              price=order.avg_fill_price or order.price)
+                                              qty=fill_qty,
+                                              price=fill_price)
                                 sess.add(fill)
+                                # Update positions table so _restore_positions() picks up the fill
+                                self._apply_fill_to_position_db(
+                                    sess, row.symbol, row.side, fill_qty, fill_price,
+                                )
                                 sess.commit()
-                                logger.info("복구 체결 DB 업데이트: %s → FILLED", broker_order_id)
+                                logger.info("복구 체결 DB 업데이트: %s → FILLED (qty=%d)", broker_order_id, fill_qty)
                             sess.close()
                         except Exception as e:
                             logger.warning("복구 체결 DB 저장 실패: %s", e)
@@ -319,6 +323,33 @@ class StartupRecovery:
         return True
 
     # ── DB helpers ─────────────────────────────────────────────────────────
+
+    def _apply_fill_to_position_db(self, sess, symbol: str, side: str,
+                                    fill_qty: int, fill_price: float) -> None:
+        """Update positions table after a recovery fill so restored strategies see correct state."""
+        try:
+            from backend.database.models import Position as DBPosition
+            from backend.quant.data.universe import KR_ETF
+            is_kr = symbol in KR_ETF or (len(symbol) == 6 and symbol.isdigit())
+            market = "KR" if is_kr else "US"
+            row = sess.query(DBPosition).filter(
+                DBPosition.symbol == symbol, DBPosition.broker == "kis"
+            ).first()
+            if side == "buy":
+                if row is None:
+                    sess.add(DBPosition(symbol=symbol, qty=fill_qty,
+                                        avg_price=fill_price, market=market, broker="kis"))
+                else:
+                    total_qty = row.qty + fill_qty
+                    row.avg_price = (row.avg_price * row.qty + fill_price * fill_qty) / total_qty
+                    row.qty = total_qty
+            elif side == "sell":
+                if row is not None:
+                    row.qty -= fill_qty
+                    if row.qty <= 0:
+                        sess.delete(row)
+        except Exception as e:
+            logger.warning("복구 포지션 DB 갱신 실패 %s: %s", symbol, e)
 
     def _write_position_to_db(self, pos) -> None:
         try:
