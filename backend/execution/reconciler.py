@@ -310,6 +310,10 @@ class PositionReconciler:
             return
 
         for db_order in open_orders:
+            if not db_order.broker_order_id:
+                result.gap("missing_broker_id", db_order.symbol,
+                           f"broker_order_id 없음 — 조정 스킵 (id={db_order.id})")
+                continue
             try:
                 broker_order = self._broker.get_order_status(
                     db_order["broker_order_id"] or "",
@@ -344,15 +348,18 @@ class PositionReconciler:
             row = db.get(DBOrder, db_order_id)
             if row:
                 # Attempt broker cancel with full params (US cancel requires symbol+qty+price)
-                try:
-                    self._broker.cancel_order(
-                        order_id=row.broker_order_id or "",
-                        symbol=row.symbol,
-                        qty=row.qty,
-                        price=float(row.price or 0),
-                    )
-                except Exception as e:
-                    logger.warning("reconciler cancel_order 실패 %s: %s", row.broker_order_id, e)
+                if row.broker_order_id:
+                    try:
+                        self._broker.cancel_order(
+                            order_id=row.broker_order_id,
+                            symbol=row.symbol,
+                            qty=row.qty,
+                            price=float(row.price or 0),
+                        )
+                    except Exception as e:
+                        logger.warning("reconciler cancel_order 실패 %s: %s", row.broker_order_id, e)
+                else:
+                    logger.warning("broker_order_id 없음 — 취소 스킵 (db_id=%d)", row.id)
                 row.status = OrderStatus.CANCELED.value
                 row.error = "조정: 브로커 미조회 → 취소 처리"
                 row.updated_at = datetime.utcnow()

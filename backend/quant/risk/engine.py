@@ -375,10 +375,10 @@ class PersistentLossTracker(LossTracker):
         self._restore_state()
 
     def _redis_key(self) -> str:
-        return self._REDIS_KEY_TEMPLATE.format(date=date.today().isoformat())
+        return self._REDIS_KEY_TEMPLATE.format(date=_seoul_today().isoformat())
 
     def _restore_state(self) -> None:
-        today = date.today()
+        today = _seoul_today()
         redis_val = self._load_redis(today)
         db_val = self._load_db(today)
 

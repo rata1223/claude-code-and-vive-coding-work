@@ -11,7 +11,7 @@ from backend.quant.data.universe import EXCD_MAP, KR_ETF
 logger = logging.getLogger(__name__)
 
 _FX_CACHE_LOCK = threading.Lock()
-_FX_CACHE: dict = {"rate": 1350.0, "ts": 0.0}
+_FX_CACHE: dict = {"rate": 1350.0, "ts": time.monotonic()}
 _FX_TTL = 3600  # 1 hour
 
 # Process-level singleton — rate-limit tracking must be shared across all callers
