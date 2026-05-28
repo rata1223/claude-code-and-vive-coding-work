@@ -373,10 +373,10 @@ class PersistentLossTracker(LossTracker):
         self._restore_state()
 
     def _redis_key(self) -> str:
-        return self._REDIS_KEY_TEMPLATE.format(date=date.today().isoformat())
+        return self._REDIS_KEY_TEMPLATE.format(date=_seoul_today().isoformat())
 
     def _restore_state(self) -> None:
-        today = date.today()
+        today = _seoul_today()
         redis_val = self._load_redis(today)
         db_val = self._load_db(today)
 
@@ -450,7 +450,7 @@ class PersistentLossTracker(LossTracker):
 
     def _write_db(self) -> None:
         from backend.database.models import DailyRiskState
-        today = date.today()
+        today = _seoul_today()
         # Snapshot values under RLock so we don't race against record_pnl
         daily_pnl, weekly_pnl, peak_eq = self.daily_pnl, self.weekly_pnl, self.peak_equity
         ks, kr = self.kill_switch, (self.kill_reason or None)

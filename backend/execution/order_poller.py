@@ -127,14 +127,20 @@ class OrderFillPoller:
         entry.order = updated
 
         if updated.status == OrderStatus.FILLED:
-            logger.info("체결 확인 %s: %s qty=%d avg=%.4f",
-                        updated.id, updated.symbol, updated.filled_qty, updated.avg_fill_price or 0)
+            incremental = updated.filled_qty - entry.last_reported_qty
+            entry.last_reported_qty = updated.filled_qty
+            logger.info("체결 확인 %s: %s qty=%d (증분=%d) avg=%.4f",
+                        updated.id, updated.symbol, updated.filled_qty,
+                        incremental, updated.avg_fill_price or 0)
             with self._lock:
                 self._entries.pop(updated.id, None)
-            try:
-                entry.on_filled(updated)
-            except Exception as e:
-                logger.error("on_filled 콜백 오류: %s", e)
+            if incremental > 0:
+                try:
+                    entry.on_filled(updated)
+                except Exception as e:
+                    logger.error("on_filled 콜백 오류: %s", e)
+            else:
+                logger.warning("체결 중복 감지 — 콜백 스킵: %s", updated.id)
 
         elif updated.status in (OrderStatus.CANCELED, OrderStatus.REJECTED):
             logger.warning("주문 취소/거부: %s status=%s", updated.id, updated.status)
@@ -142,7 +148,11 @@ class OrderFillPoller:
                 self._entries.pop(updated.id, None)
 
         elif updated.status == OrderStatus.PARTIAL_FILLED:
-            logger.info("부분체결 %s: %d/%d", updated.id, updated.filled_qty, updated.qty)
+            incremental = updated.filled_qty - entry.last_reported_qty
+            if incremental > 0:
+                entry.last_reported_qty = updated.filled_qty
+                logger.info("부분체결 %s: 증분=%d (누적=%d/%d)",
+                            updated.id, incremental, updated.filled_qty, updated.qty)
             entry.advance()
 
         else:
