@@ -10,13 +10,20 @@
 import logging
 import threading
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime, timezone, timedelta
 from typing import Optional
 
 import numpy as np
 import pandas as pd
 
 logger = logging.getLogger(__name__)
+
+_SEOUL_TZ = timezone(timedelta(hours=9))
+
+
+def _seoul_today() -> date:
+    """Return today's date in Asia/Seoul timezone (UTC+9)."""
+    return datetime.now(_SEOUL_TZ).date()
 
 
 # ── 설정 ──────────────────────────────────────────────────────────────────────
@@ -94,7 +101,7 @@ class TrailingStopManager:
         self._positions[symbol] = PositionStop(
             symbol=symbol,
             entry_price=entry_price,
-            entry_date=entry_date or str(date.today()),
+            entry_date=entry_date or str(_seoul_today()),
             peak_price=entry_price,
             trailing_stop=ts,
             hard_stop=hs,
@@ -212,19 +219,19 @@ class LossTracker:
     current_equity: float = 0.0
     kill_switch: bool = False
     kill_reason: str = ""
-    trade_date: date = field(default_factory=date.today)
-    week_start: date = field(default_factory=date.today)
+    trade_date: date = field(default_factory=_seoul_today)
+    week_start: date = field(default_factory=_seoul_today)
 
     def reset_daily(self) -> None:
         self.daily_pnl = 0.0
-        self.trade_date = date.today()
+        self.trade_date = _seoul_today()
 
     def reset_weekly(self) -> None:
         self.weekly_pnl = 0.0
-        self.week_start = date.today()
+        self.week_start = _seoul_today()
 
     def record_pnl(self, pnl: float, current_equity: float) -> None:
-        today = date.today()
+        today = _seoul_today()
         if today != self.trade_date:
             self.reset_daily()
         if (today - self.week_start).days >= 7:

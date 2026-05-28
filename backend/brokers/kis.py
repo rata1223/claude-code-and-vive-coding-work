@@ -30,6 +30,12 @@ def get_kis_broker() -> "KISBroker":
 
 
 class KISBroker(BrokerAdapter):
+
+    @staticmethod
+    def _is_kr(symbol: str) -> bool:
+        """Return True for KR domestic symbols (6-digit code or in KR_ETF list)."""
+        return symbol in KR_ETF or (len(symbol) == 6 and symbol.isdigit())
+
     def __init__(self):
         self._client = KISClient()
         self._market = KISMarketData(self._client)
@@ -126,7 +132,7 @@ class KISBroker(BrokerAdapter):
 
     def cancel_order(self, order_id: str, symbol: str = "", qty: int = 0, price: float = 0.0) -> bool:
         """주문 취소. US 종목은 cancel_us() 라우팅. KR: TTTC0803U/VTTC0803U."""
-        is_us = bool(symbol) and not (symbol in KR_ETF or (len(symbol) == 6 and symbol.isdigit()))
+        is_us = bool(symbol) and not self._is_kr(symbol)
         if is_us:
             excd = EXCD_MAP.get(symbol, "NASD")
             try:
@@ -170,7 +176,7 @@ class KISBroker(BrokerAdapter):
         단건 주문 조회. symbol로 KR/US 라우팅.
         반환 None = 조회 실패 또는 주문 미존재.
         """
-        is_us = symbol and not (symbol in KR_ETF or (len(symbol) == 6 and symbol.isdigit()))
+        is_us = bool(symbol) and not self._is_kr(symbol)
         if is_us:
             return self._get_us_order_status(order_id, symbol)
         return self._get_kr_order_status(order_id)
@@ -309,4 +315,7 @@ class KISBroker(BrokerAdapter):
                 return float(rate)
         except Exception:
             pass
+        age_min = (time.monotonic() - _FX_CACHE["ts"]) / 60
+        if age_min > 30:
+            logger.warning("FX 환율 오래됨 (%.0f분) — 킬스위치 계산 부정확 가능 (fallback=%.0f)", age_min, _FX_CACHE["rate"])
         return _FX_CACHE["rate"]
