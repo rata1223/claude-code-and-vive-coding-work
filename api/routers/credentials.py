@@ -18,10 +18,10 @@ def _credential_to_dict(cred: Credential) -> dict:
         "exchange_id": cred.exchange_id,
         "env": cred.env,
         "created_at": cred.created_at.isoformat() if cred.created_at else None,
-        # Return masked versions of sensitive fields
+        # Return masked versions of all sensitive fields — never return plaintext secrets
         "app_key": "****" if cred.app_key_enc else None,
         "account_no": "****" if cred.account_no_enc else None,
-        "hts_id": decrypt(cred.hts_id_enc) if cred.hts_id_enc else None,
+        "hts_id": "****" if cred.hts_id_enc else None,
     }
 
 

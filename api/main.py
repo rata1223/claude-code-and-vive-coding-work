@@ -43,10 +43,16 @@ app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # ── CORS ─────────────────────────────────────────────────────────────────
+# allow_origins="*" + allow_credentials=True is rejected by browsers (CORS spec).
+# CORS_ORIGINS env var should list actual origins (comma-separated) in production.
+# Example: CORS_ORIGINS=https://app.example.com,capacitor://localhost,http://localhost:5173
+_cors_env = os.environ.get("CORS_ORIGINS", "")
+_cors_origins = [o.strip() for o in _cors_env.split(",") if o.strip()] if _cors_env else []
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=_cors_origins if _cors_origins else ["*"],
+    allow_credentials=bool(_cors_origins),  # credentials only when origins are explicit
     allow_methods=["*"],
     allow_headers=["*"],
 )

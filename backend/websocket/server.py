@@ -10,24 +10,62 @@ import threading
 import time
 
 import redis
-from flask import Flask
-from flask_socketio import SocketIO, emit
+from flask import Flask, request
+from flask_socketio import SocketIO, emit, disconnect
 
 logger = logging.getLogger(__name__)
 
 _REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:6379")
 
+_ws_secret = os.environ.get("QUANTDINGER_SECRET_KEY", "")
+if not _ws_secret:
+    raise RuntimeError(
+        "QUANTDINGER_SECRET_KEY environment variable is not set. "
+        "Generate one with: python -c \"import secrets; print(secrets.token_hex(32))\""
+    )
+
 app = Flask(__name__)
-app.config["SECRET_KEY"] = os.environ.get("QUANTDINGER_SECRET_KEY", "dev-secret")
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
+app.config["SECRET_KEY"] = _ws_secret
+
+# Restrict CORS to explicit origins when WS_CORS_ORIGINS is set.
+_ws_cors = os.environ.get("WS_CORS_ORIGINS", "*")
+socketio = SocketIO(app, cors_allowed_origins=_ws_cors, async_mode="threading")
 
 _r = redis.from_url(_REDIS_URL)
+
+
+def _verify_ws_token() -> bool:
+    """Validate JWT token passed as query param ?token=<jwt>.
+    Returns True if valid, False otherwise.
+    """
+    token = request.args.get("token", "")
+    if not token:
+        return False
+    try:
+        # Import here to avoid circular dependency
+        import sys
+        import importlib
+        # Try api.auth first (FastAPI stack), then fallback
+        for mod_name in ("api.auth", "backend.api.auth"):
+            try:
+                mod = importlib.import_module(mod_name)
+                payload = mod.decode_access_token(token)
+                return payload is not None
+            except (ImportError, AttributeError):
+                continue
+        return False
+    except Exception:
+        return False
 
 
 # ── 클라이언트 이벤트 ─────────────────────────────────────────────────────
 @socketio.on("connect")
 def on_connect():
-    logger.info("WS 클라이언트 연결")
+    if not _verify_ws_token():
+        logger.warning("WS 인증 실패 — 연결 거부: %s", request.remote_addr)
+        disconnect()
+        return False
+    logger.info("WS 클라이언트 연결: %s", request.remote_addr)
     emit("connected", {"status": "ok"})
 
 

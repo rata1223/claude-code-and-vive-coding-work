@@ -102,6 +102,10 @@ class _ASTChecker(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_Attribute(self, node):
+        # Block any dunder attribute access — prevents subclass traversal attacks
+        # e.g. ().__class__.__bases__[0].__subclasses__()
+        if node.attr.startswith("__") and node.attr.endswith("__"):
+            raise SandboxViolation(f"__dunder__ 속성 접근 차단: {node.attr}")
         # os.*, sys.*, subprocess.* 등 모듈 속성 접근 차단
         BLOCKED_MODULES = {"os", "sys", "subprocess", "socket", "shutil", "pathlib", "io"}
         if isinstance(node.value, ast.Name) and node.value.id in BLOCKED_MODULES:
