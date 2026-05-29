@@ -15,11 +15,15 @@ Worker 프로세스가 시작될 때 이 모듈의 StartupRecovery를 먼저 실
   7. 미체결 주문 확인 → OrderFillPoller에 등록
   8. 정상 모드 진입 (can_trade = True)
 """
+import concurrent.futures as _cf
 import json
 import logging
+import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from typing import Optional
+
+_BROKER_STARTUP_TIMEOUT = int(os.environ.get("BROKER_STARTUP_TIMEOUT", "30"))
 
 logger = logging.getLogger(__name__)
 
@@ -150,9 +154,13 @@ class StartupRecovery:
             logger.warning("브로커 없음 — 잔고 단계 스킵")
             return True
         try:
-            bal = self._broker.get_balance()
+            with _cf.ThreadPoolExecutor(max_workers=1) as ex:
+                bal = ex.submit(self._broker.get_balance).result(timeout=_BROKER_STARTUP_TIMEOUT)
             logger.info("잔고 확인: 총평가 %.0f원", bal.total_eval_krw)
             return True
+        except _cf.TimeoutError:
+            logger.error("잔고 조회 타임아웃 (%ds) — KIS API 응답 없음", _BROKER_STARTUP_TIMEOUT)
+            return False
         except Exception as e:
             logger.error("잔고 조회 실패: %s", e)
             return False
@@ -161,11 +169,15 @@ class StartupRecovery:
         if self._broker is None:
             return True
         try:
-            positions = self._broker.get_positions()
+            with _cf.ThreadPoolExecutor(max_workers=1) as ex:
+                positions = ex.submit(self._broker.get_positions).result(timeout=_BROKER_STARTUP_TIMEOUT)
             self._broker_positions = {p.symbol: p for p in positions}
             logger.info("브로커 포지션: %d개 %s",
                         len(positions), [p.symbol for p in positions])
             return True
+        except _cf.TimeoutError:
+            logger.error("포지션 조회 타임아웃 (%ds) — KIS API 응답 없음", _BROKER_STARTUP_TIMEOUT)
+            return False
         except Exception as e:
             logger.error("포지션 조회 실패: %s", e)
             return False

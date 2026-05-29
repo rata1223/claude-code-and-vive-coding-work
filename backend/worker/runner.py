@@ -617,6 +617,24 @@ def main():
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
+    # Validate KIS_ENV / ENABLE_LIVE_TRADING consistency before anything starts.
+    # KIS_ENV routes TR_IDs (paper vs real); ENABLE_LIVE_TRADING gates order submission.
+    # A mismatch means orders are either silently blocked or routed to the wrong API.
+    import sys as _sys
+    _kis_env = os.environ.get("KIS_ENV", "paper")
+    _live_enabled = os.environ.get("ENABLE_LIVE_TRADING", "false").lower() == "true"
+    if _kis_env == "real" and not _live_enabled:
+        logger.critical(
+            "설정 불일치: KIS_ENV=real이지만 ENABLE_LIVE_TRADING=false — "
+            "실전 TR_ID 사용 중 주문이 차단됩니다. 시작 거부."
+        )
+        _sys.exit(1)
+    if _kis_env == "paper" and _live_enabled:
+        logger.warning(
+            "KIS_ENV=paper이지만 ENABLE_LIVE_TRADING=true — "
+            "모의투자 TR_ID로 주문이 전송됩니다. 의도한 설정인지 확인하세요."
+        )
+
     # Create Worker first so its single poller can be shared with recovery
     # (prevents dual-poller situation where recovery creates its own poller)
     worker = StrategyWorker()
