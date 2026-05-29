@@ -17,15 +17,13 @@ logger = logging.getLogger(__name__)
 
 _REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:6379")
 
-_ws_secret = os.environ.get("QUANTDINGER_SECRET_KEY", "")
-if not _ws_secret:
-    raise RuntimeError(
-        "QUANTDINGER_SECRET_KEY environment variable is not set. "
-        "Generate one with: python -c \"import secrets; print(secrets.token_hex(32))\""
-    )
-
+# Importing this module must NOT require QUANTDINGER_SECRET_KEY: worker processes
+# (e.g. kis-worker, which has no such env var) do `from backend.websocket.server import
+# publish_alert/publish_order_update`, and those helpers use only the Redis client below.
+# The secret is enforced at server-start (see _require_ws_secret / __main__) so the
+# standalone WS server still refuses to run with an insecure Flask session secret.
 app = Flask(__name__)
-app.config["SECRET_KEY"] = _ws_secret
+app.config["SECRET_KEY"] = os.environ.get("QUANTDINGER_SECRET_KEY") or None
 
 # Restrict CORS to explicit origins when WS_CORS_ORIGINS is set.
 _ws_cors = os.environ.get("WS_CORS_ORIGINS", "*")
@@ -128,9 +126,20 @@ def publish_alert(message: str, level: str = "info"):
     _r.publish("alert", json.dumps({"message": message, "level": level}))
 
 
+def _require_ws_secret() -> None:
+    """Fail fast if the WS server would run with an insecure/empty Flask session secret.
+    Enforced only when starting the server process — never on import."""
+    if not app.config.get("SECRET_KEY"):
+        raise RuntimeError(
+            "QUANTDINGER_SECRET_KEY environment variable is not set. "
+            "Generate one with: python -c \"import secrets; print(secrets.token_hex(32))\""
+        )
+
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    _require_ws_secret()
     start_redis_listener()
     port = int(os.environ.get("WS_PORT", 5002))
     socketio.run(app, host="0.0.0.0", port=port, debug=False)

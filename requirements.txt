@@ -1,10 +1,18 @@
 # Trading Bot Core Dependencies
 
 # Market Data & Technical Analysis
-pandas==2.1.4
-pandas-ta==0.4.71b0
-numpy==1.24.3
-scipy==1.11.4
+# 2.2.2 (was 2.1.4): pandas-ta-openbb 0.4.24 requires pandas>=2.2.0.
+pandas==2.2.2
+# pandas-ta-openbb: maintained PyPI fork of pandas-ta. The original `pandas-ta` only
+# publishes 0.4.x betas requiring numpy>=2.2.6, which collides with PyPortfolioOpt 1.5.5
+# (numpy<2.0.0). The openbb fork pins numpy>=1.26.4 (no upper bound), so it co-resolves
+# with PyPortfolioOpt at numpy 1.26.x. Installs as top-level `pandas_ta` (same import name
+# as the original), so `import pandas_ta` works unchanged.
+pandas-ta-openbb==0.4.24
+# 1.26.4 (was 1.24.3): 1.24.3 has no cp312 wheel and pandas 2.1.4 needs numpy>=1.26 on 3.12.
+numpy==1.26.4
+# 1.17.1 (was 1.11.4): pandas-ta-openbb 0.4.24 requires scipy>=1.15.3.
+scipy==1.17.1
 yfinance==0.2.36
 PyPortfolioOpt==1.5.5
 
@@ -34,13 +42,15 @@ flask==3.1.3
 flask-cors==6.0.0
 flask-socketio==5.3.6
 python-socketio==5.14.0
-python-engineio==4.8.0
+# 4.12.2 (was 4.8.0): python-socketio 5.14.0 requires python-engineio>=4.11.0.
+python-engineio==4.12.2
 
 # Production WSGI Server
 gunicorn==22.0.0
 
 # Security & Authentication
-pyjwt==2.8.1
+# 2.8.0 (was 2.8.1): 2.8.1 was never published to PyPI (versions go 2.8.0 → 2.9.0).
+pyjwt==2.8.0
 cryptography==46.0.7
 
 # Monitoring & Logging
