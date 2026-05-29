@@ -68,8 +68,15 @@ class EmergencyFlattenManager:
         for pos in positions:
             try:
                 price = self._broker.get_price(pos.symbol)
-            except Exception:
-                price = pos.avg_price  # fallback
+            except RuntimeError as e:
+                if "circuit breaker" in str(e).lower():
+                    logger.warning("[flatten] 회로차단 — %s 평균단가 사용 (%.4f)", pos.symbol, pos.avg_price)
+                else:
+                    logger.warning("[flatten] get_price 실패 %s — 평균단가 사용: %s", pos.symbol, e)
+                price = pos.avg_price
+            except Exception as e:
+                logger.warning("[flatten] get_price 오류 %s — 평균단가 사용: %s", pos.symbol, e)
+                price = pos.avg_price
 
             if self._dry_run:
                 logger.critical("[DRY RUN] 비상청산: %s qty=%d @%.2f", pos.symbol, pos.qty, price)

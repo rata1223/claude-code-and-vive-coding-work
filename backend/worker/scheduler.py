@@ -11,12 +11,20 @@ from apscheduler.triggers.cron import CronTrigger
 
 logger = logging.getLogger(__name__)
 
+_DB_FACTORY = None
+
+
+def _get_db_factory():
+    global _DB_FACTORY
+    if _DB_FACTORY is None:
+        from backend.database.models import init_db_factory
+        db_url = os.environ.get("DB_URL", "postgresql://quantdinger:quantdinger@postgres:5432/quantdinger")
+        _DB_FACTORY = init_db_factory(db_url)
+    return _DB_FACTORY
+
 
 def _get_db():
-    from backend.database.models import init_db_factory
-    db_url = os.environ.get("DB_URL", "postgresql://quantdinger:quantdinger@postgres:5432/quantdinger")
-    factory = init_db_factory(db_url)
-    return factory()
+    return _get_db_factory()()
 
 
 def _save_equity_snapshot():
@@ -124,28 +132,60 @@ def _reset_daily_risk():
         logger.warning("SAFE_MODE 재활성화 실패: %s", e)
 
 
-def _trigger_kr_session():
-    """한국 세션 신호 — Redis를 통해 Worker에 전달."""
+def _publish_session_signal(channel: str) -> None:
+    """Redis Pub/Sub 세션 신호 발행 + DB fallback.
+
+    DB에 먼저 기록해 Redis 장애 중에도 Worker의 DB 폴링이 처리할 수 있도록 한다.
+    """
+    import json
+    import redis as _redis
+    payload = json.dumps({"ts": datetime.utcnow().isoformat()})
+    db = None
     try:
-        import json
-        import redis as _redis
-        r = _redis.from_url(os.environ.get("REDIS_URL", "redis://redis:6379"))
-        r.publish("session:kr_open", json.dumps({"ts": datetime.utcnow().isoformat()}))
-        logger.info("한국 세션 신호 발행")
+        from backend.database.models import Command
+        db = _get_db()
+        db.add(Command(channel=channel, payload=payload))
+        db.commit()
     except Exception as e:
-        logger.warning("한국 세션 신호 실패: %s", e)
+        logger.warning("세션 신호 DB 기록 실패 [%s]: %s", channel, e)
+    finally:
+        if db is not None:
+            db.close()
+    try:
+        r = _redis.from_url(os.environ.get("REDIS_URL", "redis://redis:6379"))
+        r.publish(channel, payload)
+        logger.info("세션 신호 발행: %s", channel)
+    except Exception as e:
+        logger.warning("Redis 세션 신호 실패 (DB 폴링으로 처리): %s", e)
+
+
+def _trigger_kr_session():
+    """한국 세션 신호 — Redis Pub/Sub + DB fallback."""
+    _publish_session_signal("session:kr_open")
 
 
 def _trigger_us_session():
-    """미국 세션 신호 — Redis를 통해 Worker에 전달."""
+    """미국 세션 신호 — Redis Pub/Sub + DB fallback."""
+    _publish_session_signal("session:us_open")
+
+
+def _periodic_reconcile():
+    """30분 주기 포지션·주문 조정 — 장중 브로커 desync 감지."""
+    db_url = os.environ.get("DB_URL", "postgresql://quantdinger:quantdinger@postgres:5432/quantdinger")
     try:
-        import json
+        from backend.execution.reconciler import PositionReconciler
+        from backend.brokers.kis import get_kis_broker
+        from backend.database.models import init_db_factory
         import redis as _redis
         r = _redis.from_url(os.environ.get("REDIS_URL", "redis://redis:6379"))
-        r.publish("session:us_open", json.dumps({"ts": datetime.utcnow().isoformat()}))
-        logger.info("미국 세션 신호 발행")
+        result = PositionReconciler(
+            broker=get_kis_broker(),
+            db_factory=init_db_factory(db_url),
+            redis_client=r,
+        ).reconcile("periodic")
+        logger.info("주기 조정 완료: 갭=%d 수정=%d", len(result.gaps), len(result.repairs))
     except Exception as e:
-        logger.warning("미국 세션 신호 실패: %s", e)
+        logger.warning("주기 조정 실패: %s", e)
 
 
 def build_scheduler() -> BackgroundScheduler:
@@ -177,6 +217,21 @@ def build_scheduler() -> BackgroundScheduler:
         _save_equity_snapshot,
         CronTrigger(hour=23, minute=50, timezone="Asia/Seoul"),
         id="equity_snapshot", name="자산 스냅샷",
+    )
+
+    # 30분 주기 포지션·주문 조정 — 한국 장중 09:05~15:30, 미국 장중 22:35~06:00 KST
+    scheduler.add_job(
+        _periodic_reconcile,
+        CronTrigger(
+            day_of_week="mon-fri",
+            hour="9-15,22-23",
+            minute="*/30",
+            timezone="Asia/Seoul",
+        ),
+        id="periodic_reconcile",
+        name="주기 포지션 조정",
+        max_instances=1,
+        coalesce=True,
     )
 
     return scheduler

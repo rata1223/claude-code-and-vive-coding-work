@@ -77,6 +77,9 @@ class EquitySnapshot(Base):
 
 class Position(Base):
     __tablename__ = "positions"
+    __table_args__ = (
+        UniqueConstraint("symbol", "broker", name="uq_position_symbol_broker"),
+    )
     id = Column(Integer, primary_key=True, autoincrement=True)
     symbol = Column(String(20), nullable=False, index=True)
     qty = Column(Integer, nullable=False)
@@ -112,6 +115,7 @@ class ReconciliationLog(Base):
     __tablename__ = "reconciliation_logs"
     id = Column(Integer, primary_key=True, autoincrement=True)
     trigger = Column(String(20), nullable=False, index=True)  # startup/periodic/manual
+    broker = Column(String(10), nullable=True, index=True)    # "kis" / "kiwoom"
     started_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     completed_at = Column(DateTime, nullable=True)
     gaps_found = Column(Integer, nullable=False, default=0)

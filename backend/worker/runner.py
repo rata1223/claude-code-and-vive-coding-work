@@ -64,6 +64,25 @@ def _session():
         sess.close()
 
 
+def _audit(event_type: str, symbol: str = None, order_id: str = None,
+           actor: str = "worker", detail: dict = None):
+    """Fire-and-forget append-only audit log write. Never raises."""
+    try:
+        import json
+        from backend.database.models import AuditLog
+        with _session() as db:
+            db.add(AuditLog(
+                event_type=event_type,
+                symbol=symbol,
+                order_id=order_id,
+                actor=actor,
+                detail=json.dumps(detail, ensure_ascii=False) if detail else None,
+            ))
+            db.commit()
+    except Exception as e:
+        logger.warning("감사 로그 실패 (event=%s): %s", event_type, e)
+
+
 class WorkerSession:
     """하나의 전략 실행 세션."""
 
@@ -217,6 +236,7 @@ class StrategyWorker:
         """Redis 불가 시 DB commands 테이블을 30초마다 폴링."""
         from backend.database.models import Command
         logger.warning("DB 폴링 모드 전환 (Redis 불가)")
+        _audit("redis_failover", actor="worker", detail={"mode": "db_polling"})
         while True:
             try:
                 self._redis.ping()
@@ -239,6 +259,9 @@ class StrategyWorker:
                                 self._handle_start(data)
                             elif cmd.channel == "strategy:stop":
                                 self._handle_stop(data)
+                            elif cmd.channel in ("session:kr_open", "session:us_open"):
+                                market = "KR" if cmd.channel == "session:kr_open" else "US"
+                                self._handle_market_open(market)
                             cmd.status = "processed"
                             cmd.processed_at = datetime.utcnow()
                         except Exception as e:
@@ -270,6 +293,7 @@ class StrategyWorker:
         with self._lock:
             self._sessions[run_id] = session
         session.start()
+        _audit("strategy_start", detail={"run_id": run_id, "strategy_type": data.get("strategy_type")})
 
     def _handle_stop(self, data: dict):
         run_id = data["run_id"]
@@ -277,6 +301,7 @@ class StrategyWorker:
             session = self._sessions.pop(run_id, None)
         if session:
             session.stop()
+            _audit("strategy_stop", detail={"run_id": run_id})
         else:
             logger.warning("중단할 세션 없음: run_id=%d", run_id)
 
@@ -350,6 +375,7 @@ class StrategyWorker:
         )
 
         self._restore_positions(tracker, broker=data.get("broker", "kis"))
+        self._restore_pending_to_tracker(tracker, broker=data.get("broker", "kis"))
 
         stype = data.get("strategy_type", "indicator")
         config = data.get("config", {})
@@ -422,6 +448,7 @@ class StrategyWorker:
             if fill.side == "sell" and entry_price is not None and self._loss_tracker is not None:
                 realized_pnl = (fill.price - entry_price) * fill.qty
                 try:
+                    ks_before = self._loss_tracker.kill_switch
                     current_equity = self._loss_tracker.peak_equity
                     try:
                         current_equity = get_kis_broker().get_balance().total_eval_krw
@@ -430,6 +457,10 @@ class StrategyWorker:
                     self._loss_tracker.record_pnl(realized_pnl, current_equity)
                     logger.info("손익 기록: %s %.0f원 (entry=%.4f fill=%.4f qty=%d)",
                                 fill.symbol, realized_pnl, entry_price, fill.price, fill.qty)
+                    if not ks_before and self._loss_tracker.kill_switch:
+                        _audit("kill_switch_triggered", symbol=fill.symbol,
+                               detail={"reason": self._loss_tracker.kill_reason,
+                                       "realized_pnl": realized_pnl})
                 except Exception as e:
                     logger.warning("P&L 기록 실패: %s", e)
 
@@ -448,6 +479,14 @@ class StrategyWorker:
 
     # ── DB 연동 ───────────────────────────────────────────────────────────
     def _persist_order(self, order: Order):
+        # Derive a deterministic idempotency key from broker order id + date.
+        # KIS ODNO is unique per trading day per account, so this composite key
+        # prevents duplicate DB rows when the same order is processed twice.
+        from datetime import date as _date
+        idem_key = (
+            f"{order.id}:{order.symbol}:{order.side}:{_date.today().isoformat()}"
+            if order.id else None
+        )
         try:
             with _session() as db:
                 existing = db.query(DBOrder).filter(
@@ -459,9 +498,17 @@ class StrategyWorker:
                     existing.avg_fill_price = order.avg_fill_price or None
                     existing.updated_at = datetime.utcnow()
                 else:
+                    if idem_key:
+                        dup = db.query(DBOrder).filter(
+                            DBOrder.idempotency_key == idem_key
+                        ).first()
+                        if dup:
+                            logger.warning("중복 주문 감지 (idempotency_key=%s) — 저장 스킵", idem_key)
+                            return
                     market = "US" if (len(order.symbol) < 6 or not order.symbol.isdigit()) else "KR"
                     row = DBOrder(
                         broker_order_id=order.id,
+                        idempotency_key=idem_key,
                         symbol=order.symbol,
                         side=order.side,
                         qty=order.qty,
@@ -505,6 +552,23 @@ class StrategyWorker:
             tracker.restore_positions(positions)
         except Exception as e:
             logger.warning("포지션 복원 실패: %s", e)
+
+    def _restore_pending_to_tracker(self, tracker: PositionTracker, broker: str = "kis"):
+        """Re-mark pending orders in tracker so duplicate orders are blocked after restart."""
+        try:
+            with _session() as db:
+                rows = db.query(DBOrder).filter(
+                    DBOrder.status.in_(["pending", "submitted", "partial_filled"]),
+                    DBOrder.broker_order_id.isnot(None),
+                ).all()
+                pending = [(r.symbol, r.broker_order_id) for r in rows]
+            for symbol, order_id in pending:
+                tracker.mark_pending(symbol, order_id)
+            if pending:
+                logger.info("미체결 주문 tracker 복원: %d개 %s",
+                            len(pending), [s for s, _ in pending])
+        except Exception as e:
+            logger.warning("pending tracker 복원 실패: %s", e)
 
     def _upsert_position_db(self, symbol: str, market: str, pos):
         """Upsert or delete position row in DB after a fill."""
@@ -552,6 +616,24 @@ class StrategyWorker:
 def main():
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+
+    # Validate KIS_ENV / ENABLE_LIVE_TRADING consistency before anything starts.
+    # KIS_ENV routes TR_IDs (paper vs real); ENABLE_LIVE_TRADING gates order submission.
+    # A mismatch means orders are either silently blocked or routed to the wrong API.
+    import sys as _sys
+    _kis_env = os.environ.get("KIS_ENV", "paper")
+    _live_enabled = os.environ.get("ENABLE_LIVE_TRADING", "false").lower() == "true"
+    if _kis_env == "real" and not _live_enabled:
+        logger.critical(
+            "설정 불일치: KIS_ENV=real이지만 ENABLE_LIVE_TRADING=false — "
+            "실전 TR_ID 사용 중 주문이 차단됩니다. 시작 거부."
+        )
+        _sys.exit(1)
+    if _kis_env == "paper" and _live_enabled:
+        logger.warning(
+            "KIS_ENV=paper이지만 ENABLE_LIVE_TRADING=true — "
+            "모의투자 TR_ID로 주문이 전송됩니다. 의도한 설정인지 확인하세요."
+        )
 
     # Create Worker first so its single poller can be shared with recovery
     # (prevents dual-poller situation where recovery creates its own poller)
