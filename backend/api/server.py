@@ -27,6 +27,15 @@ _API_KEY = os.environ.get("KIS_API_KEY", "")
 _OPEN_ROUTES = {"/api/health", "/api/status"}
 
 if not _API_KEY:
+    _live_trading = os.environ.get("ENABLE_LIVE_TRADING", "false").lower() == "true"
+    _flask_prod = os.environ.get("FLASK_ENV", "").lower() == "production"
+    if _live_trading or _flask_prod:
+        import sys as _sys
+        logger.critical(
+            "KIS_API_KEY is not set while ENABLE_LIVE_TRADING=true or FLASK_ENV=production "
+            "— refusing to start. Set KIS_API_KEY to a cryptographically random value."
+        )
+        _sys.exit(1)
     logger.warning("KIS_API_KEY not set — API running without authentication (dev mode)")
 
 
@@ -158,6 +167,18 @@ def list_strategies():
 
 
 _strategy_start_calls: list[float] = []
+_admin_calls: dict[str, list] = {"flatten": [], "reconcile": []}
+
+
+def _check_admin_rate_limit(op: str, max_calls: int = 3, window_secs: float = 300.0) -> bool:
+    import time
+    now = time.monotonic()
+    calls = _admin_calls.setdefault(op, [])
+    _admin_calls[op] = [t for t in calls if now - t < window_secs]
+    if len(_admin_calls[op]) >= max_calls:
+        return False
+    _admin_calls[op].append(now)
+    return True
 
 
 @app.post("/api/strategies/start")
@@ -275,6 +296,8 @@ def run_backtest():
 @app.post("/api/admin/reconcile")
 def trigger_reconcile():
     """포지션·주문 수동 조정 트리거. X-API-Key 필수."""
+    if not _check_admin_rate_limit("reconcile"):
+        return jsonify({"error": "수동 조정 요청 과다 (5분 내 3회 제한)"}), 429
     try:
         from backend.execution.reconciler import PositionReconciler
         from backend.brokers.kis import get_kis_broker
@@ -295,6 +318,8 @@ def trigger_reconcile():
 @app.post("/api/admin/flatten")
 def trigger_flatten():
     """비상 청산 트리거 (전체 포지션 시장가 매도). X-API-Key + confirm=true 필수."""
+    if not _check_admin_rate_limit("flatten"):
+        return jsonify({"error": "비상청산 요청 과다 (5분 내 3회 제한)"}), 429
     body = request.json or {}
     if not body.get("confirm"):
         return jsonify({"error": "confirm=true 필요"}), 400

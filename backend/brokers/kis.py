@@ -5,6 +5,7 @@ import time
 from .base import BrokerAdapter
 from .models import Balance, Order, OrderStatus, Position
 from kis_adapter import KISClient, KISMarketData, KISOrders, KISPortfolio
+from backend.execution.circuit_breaker import ConsecutiveFailureBreaker
 from backend.quant.data.universe import EXCD_MAP, KR_ETF
 
 logger = logging.getLogger(__name__)
@@ -36,20 +37,29 @@ class KISBroker(BrokerAdapter):
         self._portfolio = KISPortfolio(self._client)
         self._account = os.environ["KIS_ACCOUNT_NO"]
         self._paper = self._client.auth.env == "paper"
+        # Shared breaker for all KIS API calls — trips after 5 consecutive failures
+        self._breaker = ConsecutiveFailureBreaker(threshold=5, cooldown_minutes=10)
         logger.info("KISBroker 초기화 (env=%s)", "paper" if self._paper else "real")
 
     def get_balance(self) -> Balance:
-        kr = self._portfolio.get_kr_balance()
-        us = self._portfolio.get_us_balance()
-        kr_cash = float(kr["summary"].get("dnca_tot_amt", 0))
-        us_cash = float(us["summary"].get("frcr_dncl_amt_2", 0))
-        kr_eval = float(kr["summary"].get("tot_evlu_amt", 0))
-        us_eval_usd = float(us["summary"].get("tot_evlu_amt", 0))
-        return Balance(
-            cash_krw=kr_cash,
-            cash_usd=us_cash,
-            total_eval_krw=kr_eval + us_eval_usd * self._get_fx(),
-        )
+        if self._breaker.is_open():
+            raise RuntimeError("KIS circuit breaker open — get_balance 차단")
+        try:
+            kr = self._portfolio.get_kr_balance()
+            us = self._portfolio.get_us_balance()
+            kr_cash = float(kr["summary"].get("dnca_tot_amt", 0))
+            us_cash = float(us["summary"].get("frcr_dncl_amt_2", 0))
+            kr_eval = float(kr["summary"].get("tot_evlu_amt", 0))
+            us_eval_usd = float(us["summary"].get("tot_evlu_amt", 0))
+            self._breaker.record_success()
+            return Balance(
+                cash_krw=kr_cash,
+                cash_usd=us_cash,
+                total_eval_krw=kr_eval + us_eval_usd * self._get_fx(),
+            )
+        except Exception:
+            self._breaker.record_failure()
+            raise
 
     def get_positions(self) -> list[Position]:
         positions: list[Position] = []
@@ -87,6 +97,12 @@ class KISBroker(BrokerAdapter):
         return positions
 
     def place_order(self, symbol: str, side: str, qty: int, price: float, order_type: str = "limit") -> Order:
+        if self._breaker.is_open():
+            logger.error("주문 차단 — circuit breaker open: %s %s", side, symbol)
+            return Order(
+                id="", symbol=symbol, side=side, qty=qty, price=price,
+                status=OrderStatus.REJECTED, raw={"error": "circuit breaker open"},
+            )
         is_kr = symbol in KR_ETF or (len(symbol) == 6 and symbol.isdigit())
         try:
             if is_kr:
@@ -95,11 +111,13 @@ class KISBroker(BrokerAdapter):
                 excd = EXCD_MAP.get(symbol, "NASD")
                 raw = (self._orders.buy_us if side == "buy" else self._orders.sell_us)(symbol, excd, qty, price)
             order_id = raw.get("output", {}).get("ODNO", "")
+            self._breaker.record_success()
             return Order(
                 id=order_id, symbol=symbol, side=side, qty=qty, price=price,
                 status=OrderStatus.SUBMITTED, raw=raw,
             )
         except Exception as e:
+            self._breaker.record_failure()
             logger.error("주문 실패 %s %s: %s", side, symbol, e)
             return Order(
                 id="", symbol=symbol, side=side, qty=qty, price=price,
@@ -248,10 +266,19 @@ class KISBroker(BrokerAdapter):
             return None
 
     def get_price(self, symbol: str) -> float:
-        if symbol in KR_ETF or (len(symbol) == 6 and symbol.isdigit()):
-            return float(self._market.get_price_kr(symbol))
-        excd = EXCD_MAP.get(symbol, "NASD")
-        return self._market.get_price_us(symbol, excd)
+        if self._breaker.is_open():
+            raise RuntimeError(f"KIS circuit breaker open — get_price 차단: {symbol}")
+        try:
+            if symbol in KR_ETF or (len(symbol) == 6 and symbol.isdigit()):
+                result = float(self._market.get_price_kr(symbol))
+            else:
+                excd = EXCD_MAP.get(symbol, "NASD")
+                result = self._market.get_price_us(symbol, excd)
+            self._breaker.record_success()
+            return result
+        except Exception:
+            self._breaker.record_failure()
+            raise
 
     def _get_fx(self) -> float:
         with _FX_CACHE_LOCK:
