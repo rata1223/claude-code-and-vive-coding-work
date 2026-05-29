@@ -171,7 +171,6 @@ class StartupRecovery:
         try:
             with _cf.ThreadPoolExecutor(max_workers=1) as ex:
                 positions = ex.submit(self._broker.get_positions).result(timeout=_BROKER_STARTUP_TIMEOUT)
-            self._broker_positions = {p.symbol: p for p in positions}
             logger.info("브로커 포지션: %d개 %s",
                         len(positions), [p.symbol for p in positions])
             return True
@@ -183,55 +182,33 @@ class StartupRecovery:
             return False
 
     def _step_reconcile(self) -> bool:
-        if self._broker is None or not hasattr(self, "_broker_positions"):
+        if self._broker is None:
             return True
         try:
-            from backend.database.models import Position as DBPosition
-            db = self._factory()
-            db_rows = db.query(DBPosition).filter(DBPosition.broker == "kis").all()
-            db_positions = {r.symbol: r.qty for r in db_rows}  # extract before close
-            db.close()
-
-            broker_syms = set(self._broker_positions)
-            db_syms = set(db_positions)
-
-            for sym in broker_syms - db_syms:
-                action = ReconcileAction(
-                    symbol=sym,
-                    action="untracked_position",
-                    broker_qty=self._broker_positions[sym].qty,
-                    db_qty=0,
-                    note="브로커에는 있지만 DB에 없음 — DB에 추가",
-                )
-                self._actions.append(action)
-                logger.warning("미추적 포지션 발견: %s qty=%d", sym, action.broker_qty)
-                self._write_position_to_db(self._broker_positions[sym])
-
-            for sym in db_syms - broker_syms:
-                action = ReconcileAction(
-                    symbol=sym,
-                    action="ghost_position",
-                    broker_qty=0,
-                    db_qty=db_positions[sym],
-                    note="DB에는 있지만 브로커에 없음 — DB에서 제거",
-                )
-                self._actions.append(action)
-                logger.warning("유령 포지션 제거: %s qty=%d", sym, action.db_qty)
-                self._remove_position_from_db(sym)
-
-            for sym in broker_syms & db_syms:
-                b_qty = self._broker_positions[sym].qty
-                d_qty = db_positions[sym]
-                if b_qty != d_qty:
-                    action = ReconcileAction(
-                        symbol=sym, action="accept_broker",
-                        broker_qty=b_qty, db_qty=d_qty,
-                        note=f"수량 불일치 → 브로커 기준으로 DB 갱신",
-                    )
-                    self._actions.append(action)
-                    logger.warning("수량 불일치 %s: broker=%d db=%d", sym, b_qty, d_qty)
-                    self._update_position_in_db(self._broker_positions[sym])
-
+            import os
+            import redis as _redis
+            from backend.execution.reconciler import PositionReconciler
+            r = None
+            try:
+                r = _redis.from_url(os.environ.get("REDIS_URL", "redis://redis:6379"))
+            except Exception:
+                pass
+            result = PositionReconciler(
+                broker=self._broker,
+                db_factory=self._factory,
+                redis_client=r,
+                broker_name="kis",
+            ).reconcile("startup")
+            # Populate _actions from reconcile result for observability
+            for gap in result.gaps:
+                self._actions.append(ReconcileAction(
+                    symbol=gap["symbol"],
+                    action=gap["kind"],
+                    note=gap["detail"],
+                ))
+            for repair in result.repairs:
+                logger.debug("스타트업 조정 수정: %s", repair)
+            logger.info("스타트업 조정 완료: 갭=%d 수정=%d", len(result.gaps), len(result.repairs))
             return True
         except Exception as e:
             logger.warning("Reconcile 실패: %s — 스킵", e)
@@ -298,6 +275,32 @@ class StartupRecovery:
                         border,
                         on_filled=_make_recovery_fill_cb(row.id, row.broker_order_id),
                     )
+
+                # After all pending orders are processed, schedule a post-recovery
+                # reconcile to sync positions once fills start arriving.
+                import threading, os
+                def _post_recovery_reconcile():
+                    try:
+                        import redis as _redis
+                        from backend.execution.reconciler import PositionReconciler
+                        r = None
+                        try:
+                            r = _redis.from_url(os.environ.get("REDIS_URL", "redis://redis:6379"))
+                        except Exception:
+                            pass
+                        PositionReconciler(
+                            broker=self._broker,
+                            db_factory=self._factory,
+                            redis_client=r,
+                            broker_name="kis",
+                        ).reconcile("post_recovery")
+                    except Exception as ex:
+                        logger.warning("post-recovery 포지션 조정 실패: %s", ex)
+                threading.Thread(
+                    target=_post_recovery_reconcile,
+                    daemon=True,
+                    name="post-recovery-reconcile",
+                ).start()
         except Exception as e:
             logger.warning("미체결 주문 복원 실패: %s", e)
         return True
@@ -336,45 +339,3 @@ class StartupRecovery:
         logger.info("복구 완료 — 매매 허용. reconcile actions=%d", len(self._actions))
         return True
 
-    # ── DB helpers ─────────────────────────────────────────────────────────
-
-    def _write_position_to_db(self, pos) -> None:
-        try:
-            from backend.database.models import Position as DBPosition
-            db = self._factory()
-            row = DBPosition(symbol=pos.symbol, qty=pos.qty,
-                             avg_price=pos.avg_price, market=pos.market, broker="kis")
-            db.merge(row)
-            db.commit()
-            db.close()
-        except Exception as e:
-            logger.warning("포지션 DB 추가 실패: %s", e)
-
-    def _remove_position_from_db(self, symbol: str) -> None:
-        try:
-            from backend.database.models import Position as DBPosition
-            db = self._factory()
-            db.query(DBPosition).filter(
-                DBPosition.symbol == symbol, DBPosition.broker == "kis"
-            ).delete()
-            db.commit()
-            db.close()
-        except Exception as e:
-            logger.warning("유령 포지션 DB 제거 실패: %s", e)
-
-    def _update_position_in_db(self, pos) -> None:
-        try:
-            from backend.database.models import Position as DBPosition
-            from datetime import datetime
-            db = self._factory()
-            row = db.query(DBPosition).filter(
-                DBPosition.symbol == pos.symbol, DBPosition.broker == "kis"
-            ).first()
-            if row:
-                row.qty = pos.qty
-                row.avg_price = pos.avg_price
-                row.updated_at = datetime.utcnow()
-            db.commit()
-            db.close()
-        except Exception as e:
-            logger.warning("포지션 DB 갱신 실패: %s", e)
