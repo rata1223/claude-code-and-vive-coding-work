@@ -11,12 +11,20 @@ from apscheduler.triggers.cron import CronTrigger
 
 logger = logging.getLogger(__name__)
 
+_DB_FACTORY = None
+
+
+def _get_db_factory():
+    global _DB_FACTORY
+    if _DB_FACTORY is None:
+        from backend.database.models import init_db_factory
+        db_url = os.environ.get("DB_URL", "postgresql://quantdinger:quantdinger@postgres:5432/quantdinger")
+        _DB_FACTORY = init_db_factory(db_url)
+    return _DB_FACTORY
+
 
 def _get_db():
-    from backend.database.models import init_db_factory
-    db_url = os.environ.get("DB_URL", "postgresql://quantdinger:quantdinger@postgres:5432/quantdinger")
-    factory = init_db_factory(db_url)
-    return factory()
+    return _get_db_factory()()
 
 
 def _save_equity_snapshot():

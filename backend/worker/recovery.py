@@ -131,13 +131,11 @@ class StartupRecovery:
     def _step_risk(self) -> bool:
         try:
             from backend.quant.risk.engine import PersistentLossTracker, RiskConfig
-            db = self._factory()
             tracker = PersistentLossTracker(
                 config=RiskConfig(),
                 redis_client=self._redis,
-                db_session=db,
+                db_factory=self._factory,
             )
-            db.close()
             if tracker.kill_switch:
                 logger.warning("킬스위치 복원됨: %s — 매매 차단 유지", tracker.kill_reason)
                 self._kill_switch_active = True
@@ -179,8 +177,8 @@ class StartupRecovery:
             from backend.database.models import Position as DBPosition
             db = self._factory()
             db_rows = db.query(DBPosition).filter(DBPosition.broker == "kis").all()
+            db_positions = {r.symbol: r.qty for r in db_rows}  # extract before close
             db.close()
-            db_positions = {r.symbol: r for r in db_rows}
 
             broker_syms = set(self._broker_positions)
             db_syms = set(db_positions)
@@ -202,7 +200,7 @@ class StartupRecovery:
                     symbol=sym,
                     action="ghost_position",
                     broker_qty=0,
-                    db_qty=db_positions[sym].qty,
+                    db_qty=db_positions[sym],
                     note="DB에는 있지만 브로커에 없음 — DB에서 제거",
                 )
                 self._actions.append(action)
@@ -211,7 +209,7 @@ class StartupRecovery:
 
             for sym in broker_syms & db_syms:
                 b_qty = self._broker_positions[sym].qty
-                d_qty = db_positions[sym].qty
+                d_qty = db_positions[sym]
                 if b_qty != d_qty:
                     action = ReconcileAction(
                         symbol=sym, action="accept_broker",
@@ -252,8 +250,8 @@ class StartupRecovery:
                 def _make_recovery_fill_cb(db_order_pk: int, broker_order_id: str):
                     """Persist fill to DB on recovery; in-memory state updated when strategies restart."""
                     def on_filled(order: BOrder):
+                        sess = self._factory()
                         try:
-                            sess = self._factory()
                             row = sess.get(DBOrder, db_order_pk)
                             if row:
                                 row.status = order.status.value
@@ -265,9 +263,10 @@ class StartupRecovery:
                                 sess.add(fill)
                                 sess.commit()
                                 logger.info("복구 체결 DB 업데이트: %s → FILLED", broker_order_id)
-                            sess.close()
                         except Exception as e:
                             logger.warning("복구 체결 DB 저장 실패: %s", e)
+                        finally:
+                            sess.close()
                     return on_filled
 
                 for row in pending:
@@ -312,6 +311,13 @@ class StartupRecovery:
             reason = getattr(self, "_kill_reason", "알 수 없음")
             SAFE_MODE.disable(f"킬스위치 복원: {reason}")
             logger.critical("킬스위치 복원 — 매매 차단. 수동 해제 후 재시작 필요.")
+            try:
+                from bot.notifier import alert_emergency
+                alert_emergency(
+                    f"[킬스위치 복원] 재시작 후에도 매매 차단 중\n사유: {reason}\n수동 해제 필요"
+                )
+            except Exception as e:
+                logger.warning("킬스위치 재시작 Telegram 알림 실패: %s", e)
             return False
 
         SAFE_MODE.enable()

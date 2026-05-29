@@ -408,6 +408,18 @@ class PersistentLossTracker(LossTracker):
         self._persist()
 
     def _fire_kill_switch_alert(self, reason: str) -> None:
+        # Called under self._lock — dispatch I/O to a daemon thread to avoid blocking
+        # record_pnl() for concurrent fills arriving at the same moment.
+        t = threading.Thread(
+            target=self._do_kill_switch_io,
+            args=(reason,),
+            daemon=True,
+            name="kill-switch-alert",
+        )
+        t.start()
+
+    def _do_kill_switch_io(self, reason: str) -> None:
+        """Telegram + WebSocket + DB audit — runs outside the lock."""
         super()._fire_kill_switch_alert(reason)
         self._write_kill_switch_audit(reason)
 

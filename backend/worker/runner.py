@@ -375,6 +375,7 @@ class StrategyWorker:
         )
 
         self._restore_positions(tracker, broker=data.get("broker", "kis"))
+        self._restore_pending_to_tracker(tracker, broker=data.get("broker", "kis"))
 
         stype = data.get("strategy_type", "indicator")
         config = data.get("config", {})
@@ -551,6 +552,23 @@ class StrategyWorker:
             tracker.restore_positions(positions)
         except Exception as e:
             logger.warning("포지션 복원 실패: %s", e)
+
+    def _restore_pending_to_tracker(self, tracker: PositionTracker, broker: str = "kis"):
+        """Re-mark pending orders in tracker so duplicate orders are blocked after restart."""
+        try:
+            with _session() as db:
+                rows = db.query(DBOrder).filter(
+                    DBOrder.status.in_(["pending", "submitted", "partial_filled"]),
+                    DBOrder.broker_order_id.isnot(None),
+                ).all()
+                pending = [(r.symbol, r.broker_order_id) for r in rows]
+            for symbol, order_id in pending:
+                tracker.mark_pending(symbol, order_id)
+            if pending:
+                logger.info("미체결 주문 tracker 복원: %d개 %s",
+                            len(pending), [s for s, _ in pending])
+        except Exception as e:
+            logger.warning("pending tracker 복원 실패: %s", e)
 
     def _upsert_position_db(self, symbol: str, market: str, pos):
         """Upsert or delete position row in DB after a fill."""

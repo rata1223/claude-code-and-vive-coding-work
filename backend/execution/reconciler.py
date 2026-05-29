@@ -187,9 +187,20 @@ class PositionReconciler:
         from backend.database.models import Order as DBOrder
 
         with _session(self._factory) as db:
-            open_orders = db.query(DBOrder).filter(
+            rows = db.query(DBOrder).filter(
                 DBOrder.status.in_(["pending", "submitted", "partial_filled"])
             ).all()
+            # Extract scalars before session closes (detached objects are fragile)
+            open_orders = [
+                {
+                    "id": r.id,
+                    "broker_order_id": r.broker_order_id,
+                    "symbol": r.symbol,
+                    "status": r.status,
+                    "created_at": r.created_at,
+                }
+                for r in rows
+            ]
 
         if not open_orders:
             return
@@ -197,28 +208,28 @@ class PositionReconciler:
         for db_order in open_orders:
             try:
                 broker_order = self._broker.get_order_status(
-                    db_order.broker_order_id or "",
-                    db_order.symbol,
+                    db_order["broker_order_id"] or "",
+                    db_order["symbol"],
                 )
             except Exception as e:
-                result.error(f"주문 조회 오류 {db_order.broker_order_id}: {e}")
+                result.error(f"주문 조회 오류 {db_order['broker_order_id']}: {e}")
                 continue
 
             if broker_order is None:
                 # KIS has no record — treat as lost/rejected if > 1h old
-                age_hours = (datetime.utcnow() - db_order.created_at).total_seconds() / 3600
+                age_hours = (datetime.utcnow() - db_order["created_at"]).total_seconds() / 3600
                 if age_hours > 1:
-                    result.gap("lost_order", db_order.symbol,
-                               f"주문 {db_order.broker_order_id} 브로커 미조회 (나이 {age_hours:.1f}h)")
-                    self._mark_order_lost(db_order.id, result)
+                    result.gap("lost_order", db_order["symbol"],
+                               f"주문 {db_order['broker_order_id']} 브로커 미조회 (나이 {age_hours:.1f}h)")
+                    self._mark_order_lost(db_order["id"], result)
                 continue
 
             # Sync broker state → DB
             new_status = broker_order.status.value
-            if new_status != db_order.status:
-                result.gap("order_status_mismatch", db_order.symbol,
-                           f"DB={db_order.status} 브로커={new_status}")
-                self._sync_order_status(db_order.id, broker_order, result)
+            if new_status != db_order["status"]:
+                result.gap("order_status_mismatch", db_order["symbol"],
+                           f"DB={db_order['status']} 브로커={new_status}")
+                self._sync_order_status(db_order["id"], broker_order, result)
 
     def _mark_order_lost(self, db_order_id: int, result: ReconciliationResult):
         from backend.database.models import Order as DBOrder

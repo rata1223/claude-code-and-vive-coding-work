@@ -2,16 +2,23 @@ import os
 import time
 import json
 import hashlib
+import logging
 import requests
 import redis
 from datetime import datetime, timedelta
 
+logger = logging.getLogger(__name__)
 
 PAPER_BASE = "https://openapivts.koreainvestment.com:9443"
 REAL_BASE = "https://openapi.koreainvestment.com:9443"
 
 TOKEN_CACHE_KEY = "kis:access_token"
 TOKEN_EXPIRY_KEY = "kis:token_expiry"
+
+# Process-level in-memory fallback when Redis is unavailable
+_MEM_TOKEN: str = ""
+_MEM_EXPIRY: float = 0.0
+_TOKEN_REFRESH_BUFFER = 900  # 15 minutes before expiry
 
 
 class KISAuth:
@@ -23,15 +30,36 @@ class KISAuth:
         self._redis = redis.from_url(os.environ.get("REDIS_URL", "redis://redis:6379"))
 
     def get_token(self) -> str:
-        cached = self._redis.get(TOKEN_CACHE_KEY)
-        if cached:
-            expiry = self._redis.get(TOKEN_EXPIRY_KEY)
-            if expiry and float(expiry) - time.time() > 3600:
-                return cached.decode()
+        global _MEM_TOKEN, _MEM_EXPIRY
 
+        # 1. Try Redis cache
+        try:
+            cached = self._redis.get(TOKEN_CACHE_KEY)
+            if cached:
+                expiry = self._redis.get(TOKEN_EXPIRY_KEY)
+                if expiry and float(expiry) - time.time() > _TOKEN_REFRESH_BUFFER:
+                    _MEM_TOKEN = cached.decode()
+                    _MEM_EXPIRY = float(expiry)
+                    return _MEM_TOKEN
+        except Exception as e:
+            logger.warning("Redis token cache read 실패 (in-memory 폴백): %s", e)
+            # Fall through to in-memory cache check
+
+        # 2. In-memory fallback (valid when Redis is down)
+        if _MEM_TOKEN and _MEM_EXPIRY - time.time() > _TOKEN_REFRESH_BUFFER:
+            logger.debug("Redis 불가 — in-memory token 사용")
+            return _MEM_TOKEN
+
+        # 3. Issue a new token
         token, expires_in = self._issue_token()
-        self._redis.set(TOKEN_CACHE_KEY, token)
-        self._redis.set(TOKEN_EXPIRY_KEY, time.time() + expires_in)
+        expiry_ts = time.time() + expires_in
+        _MEM_TOKEN = token
+        _MEM_EXPIRY = expiry_ts
+        try:
+            self._redis.set(TOKEN_CACHE_KEY, token)
+            self._redis.set(TOKEN_EXPIRY_KEY, expiry_ts)
+        except Exception as e:
+            logger.warning("Redis token cache write 실패 (in-memory のみ): %s", e)
         return token
 
     def _issue_token(self) -> tuple[str, int]:

@@ -58,6 +58,8 @@ class IndicatorStrategy(StrategyBase):
         self._scan_and_trade()
 
     def on_bar(self, bar: dict):
+        if self._is_bar_stale(bar):
+            return
         symbol = bar.get("symbol")
         if not symbol:
             return
