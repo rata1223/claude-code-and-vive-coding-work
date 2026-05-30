@@ -24,6 +24,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 _BROKER_STARTUP_TIMEOUT = int(os.environ.get("BROKER_STARTUP_TIMEOUT", "30"))
+_RECOVERY_STALE_ORDER_HOURS = float(os.environ.get("RECOVERY_STALE_ORDER_HOURS", "24"))
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +90,7 @@ class StartupRecovery:
             ("브로커 포지션 조회", self._step_positions),
             ("포지션 대조 (reconcile)", self._step_reconcile),
             ("미체결 주문 확인", self._step_pending_orders),
+            ("복구 상태 일관성 검증", self._step_validate_state),
             ("정상 모드 진입", self._step_enable_trading),
         ]
         for i, (name, fn) in enumerate(steps, 1):
@@ -304,6 +306,90 @@ class StartupRecovery:
         except Exception as e:
             logger.warning("미체결 주문 복원 실패: %s", e)
         return True
+
+    def _audit_inconsistency(self, kind: str, detail: dict) -> None:
+        """Append-only AuditLog write for a detected recovery inconsistency. Never raises."""
+        try:
+            from backend.database.models import AuditLog
+            db = self._factory()
+            try:
+                db.add(AuditLog(
+                    event_type="recovery_inconsistency",
+                    symbol=detail.get("symbol"),
+                    order_id=detail.get("order_id"),
+                    actor="recovery",
+                    detail=json.dumps({"kind": kind, **detail}, ensure_ascii=False),
+                ))
+                db.commit()
+            finally:
+                db.close()
+        except Exception as e:
+            logger.warning("일관성 감사 로그 기록 실패 [%s]: %s", kind, e)
+
+    def _step_validate_state(self) -> bool:
+        """Non-mutating consistency validation of persisted recovery state.
+
+        Detects inconsistent states that recovery should never silently tolerate and records
+        each to the append-only AuditLog. This step NEVER mutates orders or positions — it is
+        observability only — and is non-fatal (returns True) so an otherwise-recoverable
+        worker still starts; SAFE_MODE / kill-switch handle trade blocking separately.
+
+        Checks:
+          1. positions with qty <= 0 (should have been deleted on flat/close)
+          2. pending orders with NULL broker_order_id (orphaned intent — never confirmed)
+          3. pending orders older than RECOVERY_STALE_ORDER_HOURS with non-terminal status
+        """
+        try:
+            from backend.database.models import Order as DBOrder, Position as DBPosition
+            issues = 0
+            cutoff = datetime.utcnow() - timedelta(hours=_RECOVERY_STALE_ORDER_HOURS)
+            db = self._factory()
+            try:
+                bad_positions = db.query(DBPosition).filter(DBPosition.qty <= 0).all()
+                orphaned = (db.query(DBOrder)
+                            .filter(DBOrder.status.in_(["pending", "submitted", "partial_filled"]),
+                                    DBOrder.broker_order_id.is_(None))
+                            .all())
+                # Exclude orphaned (NULL broker_order_id) rows — they are already reported
+                # by the orphaned check above; avoid double-counting the same row.
+                stale = (db.query(DBOrder)
+                         .filter(DBOrder.status.in_(["pending", "submitted", "partial_filled"]),
+                                 DBOrder.broker_order_id.isnot(None),
+                                 DBOrder.created_at < cutoff)
+                         .all())
+                bad_pos_data = [{"symbol": p.symbol, "qty": p.qty, "broker": p.broker}
+                                for p in bad_positions]
+                orphaned_data = [{"order_id": str(o.id), "symbol": o.symbol, "status": o.status}
+                                 for o in orphaned]
+                stale_data = [{"order_id": o.broker_order_id or str(o.id), "symbol": o.symbol,
+                               "status": o.status, "created_at": o.created_at.isoformat()
+                               if o.created_at else None}
+                              for o in stale]
+            finally:
+                db.close()
+
+            for d in bad_pos_data:
+                logger.warning("일관성 경고 — 비정상 수량 포지션: %s qty=%d", d["symbol"], d["qty"])
+                self._audit_inconsistency("position_nonpositive_qty", d)
+                issues += 1
+            for d in orphaned_data:
+                logger.warning("일관성 경고 — 미확인(orphaned) 주문: id=%s %s", d["order_id"], d["symbol"])
+                self._audit_inconsistency("orphaned_pending_order", d)
+                issues += 1
+            for d in stale_data:
+                logger.warning("일관성 경고 — 오래된 미체결 주문(>%.0fh): %s %s",
+                               _RECOVERY_STALE_ORDER_HOURS, d["order_id"], d["symbol"])
+                self._audit_inconsistency("stale_open_order", d)
+                issues += 1
+
+            if issues:
+                logger.warning("복구 상태 일관성 검증: %d개 이슈 감지 — AuditLog 기록 완료", issues)
+            else:
+                logger.info("복구 상태 일관성 검증: 이슈 없음")
+            return True
+        except Exception as e:
+            logger.warning("일관성 검증 실패 (계속 진행): %s", e)
+            return True  # non-fatal — observability only
 
     def _step_enable_trading(self) -> bool:
         import os
