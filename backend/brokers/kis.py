@@ -3,7 +3,8 @@ import logging
 import threading
 import time
 from .base import BrokerAdapter
-from .models import Balance, Order, OrderStatus, Position
+from .capabilities import KIS_LIVE_CAPABILITIES, KIS_PAPER_CAPABILITIES
+from .models import Balance, BrokerCapabilities, Order, OrderStatus, Position
 from .semantic_mapper import KIS_DOMESTIC_MAPPER, KIS_OVERSEAS_MAPPER
 from kis_adapter import KISClient, KISMarketData, KISOrders, KISPortfolio
 from backend.execution.circuit_breaker import ConsecutiveFailureBreaker
@@ -47,6 +48,10 @@ class KISBroker(BrokerAdapter):
         # Shared breaker for all KIS API calls — trips after 5 consecutive failures
         self._breaker = ConsecutiveFailureBreaker(threshold=5, cooldown_minutes=10)
         logger.info("KISBroker 초기화 (env=%s)", "paper" if self._paper else "real")
+
+    @property
+    def capabilities(self) -> BrokerCapabilities:
+        return KIS_PAPER_CAPABILITIES if self._paper else KIS_LIVE_CAPABILITIES
 
     def get_balance(self) -> Balance:
         if self._breaker.is_open():

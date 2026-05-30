@@ -105,22 +105,48 @@ class StrategyBase(ABC):
 
     # ── 매매 편의 메서드 ─────────────────────────────────────────────────
     def buy(self, symbol: str, qty: int, price: Optional[float] = None, order_type: str = "limit"):
+        from backend.brokers.models import Order, OrderStatus
+        from backend.brokers.validator import BrokerCapabilityValidator, OrderRequest, UnsupportedCapabilityError
         allowed, rejected = _live_trade_allowed(self._broker, self.name, symbol, "buy")
         if not allowed:
             return rejected
         if price is None:
             price = self._broker.get_price(symbol)
             order_type = "market"
+        try:
+            req = BrokerCapabilityValidator(self._broker.capabilities).validate(
+                OrderRequest(symbol=symbol, side="buy", qty=float(qty),
+                             price=price, order_type=order_type)
+            )
+            price = req.price
+            order_type = req.order_type
+        except UnsupportedCapabilityError as e:
+            logger.warning("[%s] 매수 차단 — %s", self.name, e)
+            return Order(id="", symbol=symbol, side="buy", qty=qty,
+                         price=price or 0.0, status=OrderStatus.REJECTED)
         logger.info("[%s] 매수 요청: %s qty=%d price=%.4f", self.name, symbol, qty, price)
         return self._broker.place_order(symbol, "buy", qty, price, order_type)
 
     def sell(self, symbol: str, qty: int, price: Optional[float] = None, order_type: str = "limit"):
+        from backend.brokers.models import Order, OrderStatus
+        from backend.brokers.validator import BrokerCapabilityValidator, OrderRequest, UnsupportedCapabilityError
         allowed, rejected = _live_trade_allowed(self._broker, self.name, symbol, "sell")
         if not allowed:
             return rejected
         if price is None:
             price = self._broker.get_price(symbol)
             order_type = "market"
+        try:
+            req = BrokerCapabilityValidator(self._broker.capabilities).validate(
+                OrderRequest(symbol=symbol, side="sell", qty=float(qty),
+                             price=price, order_type=order_type)
+            )
+            price = req.price
+            order_type = req.order_type
+        except UnsupportedCapabilityError as e:
+            logger.warning("[%s] 매도 차단 — %s", self.name, e)
+            return Order(id="", symbol=symbol, side="sell", qty=qty,
+                         price=price or 0.0, status=OrderStatus.REJECTED)
         logger.info("[%s] 매도 요청: %s qty=%d price=%.4f", self.name, symbol, qty, price)
         return self._broker.place_order(symbol, "sell", qty, price, order_type)
 

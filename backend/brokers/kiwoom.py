@@ -1,6 +1,7 @@
 from typing import Optional
 from .base import BrokerAdapter
-from .models import Balance, Order, Position
+from .capabilities import KIWOOM_CAPABILITIES
+from .models import Balance, BrokerCapabilities, Order, Position
 
 
 class KiwoomBroker(BrokerAdapter):
@@ -8,6 +9,10 @@ class KiwoomBroker(BrokerAdapter):
     Kiwoom uses a Windows COM API (HTS Ocx), not REST. Implementation requires
     a Windows sidecar process with a COM-to-REST bridge — not compatible with Docker.
     """
+
+    @property
+    def capabilities(self) -> BrokerCapabilities:
+        return KIWOOM_CAPABILITIES
 
     def get_balance(self) -> Balance:
         raise NotImplementedError("키움증권 미구현")

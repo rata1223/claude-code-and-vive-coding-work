@@ -4,7 +4,8 @@ from datetime import datetime
 from typing import Optional
 
 from backend.brokers.base import BrokerAdapter
-from backend.brokers.models import Balance, Order, OrderStatus, Position
+from backend.brokers.capabilities import SIMULATOR_CAPABILITIES
+from backend.brokers.models import Balance, BrokerCapabilities, Order, OrderStatus, Position
 from backend.execution.order_machine import FillEvent, OrderStateMachine
 from backend.execution.position_tracker import Fill, PositionTracker
 
@@ -23,6 +24,10 @@ class SimulatedBroker(BrokerAdapter):
     """
 
     is_live: bool = False  # disables SAFE_MODE and ENABLE_LIVE_TRADING gates
+
+    @property
+    def capabilities(self) -> BrokerCapabilities:
+        return SIMULATOR_CAPABILITIES
 
     def __init__(self, initial_cash_krw: float = 2_000_000.0):
         self._cash = initial_cash_krw

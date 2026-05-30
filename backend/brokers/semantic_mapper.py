@@ -17,6 +17,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from backend.brokers.capabilities import KIS_LIVE_CAPABILITIES, KIS_PAPER_CAPABILITIES
 from backend.brokers.models import BrokerCapabilities, Market, Order, OrderStatus
 
 if TYPE_CHECKING:
@@ -47,26 +48,9 @@ def _to_float(value, default: float = 0.0) -> float:
         return default
 
 
-# ── KIS 브로커 기본 역량 선언 ────────────────────────────────────────────────
-
-KIS_CAPABILITIES = BrokerCapabilities(
-    markets=[Market.KR, Market.US],
-    supports_streaming=False,       # HTTP polling only (KIS WebSocket not integrated)
-    supports_fractional=False,      # 1주 최소 단위
-    cancel_requires_symbol=True,    # US 취소에 symbol 필수
-    cancel_requires_qty_price=True, # US 취소에 qty+price 필수
-    rate_limit_per_sec=15,          # 실전 15/s (모의: 5/s)
-    settlement_days=2,              # T+2
-    has_securities_tax=True,        # KR 매도 시 증권거래세
-    securities_tax_rate=0.002,      # ETF: 0.20%
-    price_precision={"KR": 0, "US": 2},
-    min_order_qty=1,
-)
-
-KIS_PAPER_CAPABILITIES = BrokerCapabilities(
-    **{k: v for k, v in KIS_CAPABILITIES.__dict__.items()},
-)
-KIS_PAPER_CAPABILITIES.rate_limit_per_sec = 5
+# KIS capability constants — canonical definitions live in capabilities.py.
+# Re-exported here for backwards compatibility with existing imports.
+KIS_CAPABILITIES = KIS_LIVE_CAPABILITIES
 
 
 # ── BrokerSemanticMapper: 주문 파라미터 정규화 ────────────────────────────────
