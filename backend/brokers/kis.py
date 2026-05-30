@@ -6,6 +6,7 @@ from .base import BrokerAdapter
 from .capabilities import KIS_LIVE_CAPABILITIES, KIS_PAPER_CAPABILITIES
 from .models import Balance, BrokerCapabilities, Order, OrderStatus, Position
 from .semantic_mapper import KIS_DOMESTIC_MAPPER, KIS_OVERSEAS_MAPPER
+from .validator import BrokerCapabilityValidator, OrderRequest
 from kis_adapter import KISClient, KISMarketData, KISOrders, KISPortfolio
 from backend.execution.circuit_breaker import ConsecutiveFailureBreaker
 from backend.quant.data.universe import EXCD_MAP, KR_ETF
@@ -109,6 +110,9 @@ class KISBroker(BrokerAdapter):
         return positions
 
     def place_order(self, symbol: str, side: str, qty: int, price: float, order_type: str = "limit") -> Order:
+        BrokerCapabilityValidator(self.capabilities).validate(
+            OrderRequest(symbol=symbol, side=side, qty=float(qty), price=price, order_type=order_type)
+        )
         if self._breaker.is_open():
             logger.error("주문 차단 — circuit breaker open: %s %s", side, symbol)
             return Order(
