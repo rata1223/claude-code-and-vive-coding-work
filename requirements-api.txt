@@ -14,8 +14,15 @@ requests==2.33.0
 slowapi==0.1.9
 python-dotenv==1.2.2
 pydantic[email]==2.7.1
-httpx==0.27.0
-pandas-ta>=0.3.14b0
+# 0.25.2 (was 0.27.0): python-telegram-bot==20.7 requires httpx~=0.25.2, so 0.27.0 made
+# this file unresolvable on every interpreter (broke Dockerfile.api build too). fastapi
+# 0.111 only needs httpx>=0.23.0, so 0.25.2 satisfies both.
+httpx==0.25.2
+# pandas-ta-openbb: PyPI fork of pandas-ta. The original pandas-ta only ships 0.4.x betas
+# needing numpy>=2.2.6, conflicting with PyPortfolioOpt 1.5.5 (numpy<2). The openbb fork
+# (numpy>=1.26.4) co-resolves at numpy 1.26.x and installs as top-level `pandas_ta`, so
+# `import pandas_ta` works unchanged.
+pandas-ta-openbb==0.4.24
 PyPortfolioOpt==1.5.5
 APScheduler==3.10.4
 python-telegram-bot==20.7
