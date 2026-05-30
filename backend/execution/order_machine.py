@@ -11,11 +11,15 @@ logger = logging.getLogger(__name__)
 # 허용된 상태 전환 맵
 VALID_TRANSITIONS: dict[OrderStatus, set[OrderStatus]] = {
     OrderStatus.PENDING:        {OrderStatus.SUBMITTED, OrderStatus.REJECTED, OrderStatus.CANCELED},
-    OrderStatus.SUBMITTED:      {OrderStatus.PARTIAL_FILLED, OrderStatus.FILLED, OrderStatus.CANCELED, OrderStatus.REJECTED},
-    OrderStatus.PARTIAL_FILLED: {OrderStatus.FILLED, OrderStatus.CANCELED},
+    OrderStatus.SUBMITTED:      {OrderStatus.PARTIAL_FILLED, OrderStatus.FILLED, OrderStatus.CANCELED,
+                                  OrderStatus.REJECTED, OrderStatus.EXPIRED, OrderStatus.UNKNOWN},
+    OrderStatus.PARTIAL_FILLED: {OrderStatus.FILLED, OrderStatus.CANCELED, OrderStatus.EXPIRED, OrderStatus.UNKNOWN},
+    OrderStatus.UNKNOWN:        {OrderStatus.SUBMITTED, OrderStatus.PARTIAL_FILLED, OrderStatus.FILLED,
+                                  OrderStatus.CANCELED, OrderStatus.REJECTED, OrderStatus.EXPIRED},
     OrderStatus.FILLED:         set(),
     OrderStatus.CANCELED:       set(),
     OrderStatus.REJECTED:       set(),
+    OrderStatus.EXPIRED:        set(),
 }
 
 
@@ -106,7 +110,8 @@ class OrderStateMachine:
     def active_orders(self) -> list[Order]:
         with self._lock:
             return [o for o in self._orders.values()
-                    if o.status in (OrderStatus.PENDING, OrderStatus.SUBMITTED, OrderStatus.PARTIAL_FILLED)]
+                    if o.status in (OrderStatus.PENDING, OrderStatus.SUBMITTED,
+                                    OrderStatus.PARTIAL_FILLED, OrderStatus.UNKNOWN)]
 
     # ── 내부 ──────────────────────────────────────────────────────────────
     def _get(self, order_id: str) -> Order:

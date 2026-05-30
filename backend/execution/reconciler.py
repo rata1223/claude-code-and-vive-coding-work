@@ -188,7 +188,7 @@ class PositionReconciler:
 
         with _session(self._factory) as db:
             open_orders = db.query(DBOrder).filter(
-                DBOrder.status.in_(["pending", "submitted", "partial_filled"])
+                DBOrder.status.in_(["pending", "submitted", "partial_filled", "unknown"])
             ).all()
 
         if not open_orders:

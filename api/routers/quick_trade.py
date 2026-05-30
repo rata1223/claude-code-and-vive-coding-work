@@ -12,6 +12,7 @@ from api.database import get_db
 from api.deps import get_current_user
 from api.models import Credential, Strategy, Trade, User
 from api.schemas import ClosePositionRequest, PlaceOrderRequest, Resp
+from backend.brokers.semantic_mapper import KIS_DOMESTIC_MAPPER
 
 logger = logging.getLogger(__name__)
 
@@ -149,7 +150,7 @@ def place_order(
         # We store it under a special "manual" strategy if needed – skip for simplicity.
         return Resp.ok(
             {
-                "order_id": result.get("output", {}).get("ODNO", ""),
+                "order_id": KIS_DOMESTIC_MAPPER.extract_broker_order_id(result),
                 "symbol": body.symbol,
                 "side": body.side,
                 "qty": qty,
@@ -186,7 +187,7 @@ def close_position(
 
         return Resp.ok(
             {
-                "order_id": result.get("output", {}).get("ODNO", ""),
+                "order_id": KIS_DOMESTIC_MAPPER.extract_broker_order_id(result),
                 "symbol": body.symbol,
                 "side": "sell",
                 "qty": qty,
