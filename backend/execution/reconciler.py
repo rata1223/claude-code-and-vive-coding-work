@@ -105,15 +105,21 @@ class PositionReconciler:
         self._redis = redis_client
         self._poller = poller  # OrderFillPoller: register re-discovered pending orders
         self._broker_name = broker_name
+        self._reconcile_lock = threading.Lock()
 
     # ── Public API ────────────────────────────────────────────────────────
 
     def reconcile(self, trigger: str = "periodic", dry_run: bool = False) -> ReconciliationResult:
-        """메인 조정 루틴. 브로커 → DB 방향으로 수리.
+        """메인 조정 루틴. 브로커 → DB 방향으로 수리. 동시 호출은 즉시 스킵.
 
         dry_run=True 이면 갭만 탐지, DB 수정 없음 (ReconciliationLog는 기록).
         """
-        result = ReconciliationResult(trigger)
+        if not self._reconcile_lock.acquire(blocking=False):
+            logger.warning("조정 이미 진행 중 — 스킵: %s", trigger)
+            r = ReconciliationResult(trigger)
+            r.error("조정 이미 진행 중 (스킵)")
+            r.finish()
+            return r
         try:
             result = ReconciliationResult(trigger)
             try:
@@ -121,32 +127,28 @@ class PositionReconciler:
                 if broker_positions is None:
                     result.error("브로커 포지션 조회 실패 — 조정 중단")
                     result.finish()
-                    self._persist_log(result)
+                    self._persist_log(result, dry_run)
                     return result
 
-                self._reconcile_positions(broker_positions, result)
+                self._reconcile_positions(broker_positions, result, dry_run)
                 self._reconcile_pending_orders(result)
                 result.finish()
+            except Exception as e:
+                result.error(f"조정 예외: {e}")
+                result.finish()
+                logger.exception("조정 예외")
+            finally:
                 self._persist_log(result, dry_run)
-                return result
+                self._publish_ws(result)
 
-            self._reconcile_positions(broker_positions, result, dry_run)
-            self._reconcile_pending_orders(result)
-            result.finish()
-        except Exception as e:
-            result.error(f"조정 예외: {e}")
-            result.finish()
-            logger.exception("조정 예외")
+            logger.info(
+                "조정 완료 [%s] broker=%s dry_run=%s: 갭=%d 수정=%d 오류=%d",
+                trigger, self._broker_name, dry_run,
+                len(result.gaps), len(result.repairs), len(result.errors),
+            )
+            return result
         finally:
-            self._persist_log(result, dry_run)
-            self._publish_ws(result)
-
-        logger.info(
-            "조정 완료 [%s] broker=%s dry_run=%s: 갭=%d 수정=%d 오류=%d",
-            trigger, self._broker_name, dry_run,
-            len(result.gaps), len(result.repairs), len(result.errors),
-        )
-        return result
+            self._reconcile_lock.release()
 
     # ── Position reconciliation ────────────────────────────────────────────
 
@@ -310,9 +312,9 @@ class PositionReconciler:
             return
 
         for db_order in open_orders:
-            if not db_order.broker_order_id:
-                result.gap("missing_broker_id", db_order.symbol,
-                           f"broker_order_id 없음 — 조정 스킵 (id={db_order.id})")
+            if not db_order["broker_order_id"]:
+                result.gap("missing_broker_id", db_order["symbol"],
+                           f"broker_order_id 없음 — 조정 스킵 (id={db_order['id']})")
                 continue
             try:
                 broker_order = self._broker.get_order_status(
