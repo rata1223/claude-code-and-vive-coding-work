@@ -18,6 +18,7 @@ from contextlib import contextmanager
 from datetime import datetime
 
 import redis
+from sqlalchemy.exc import IntegrityError
 
 from backend.brokers.kis import KISBroker, get_kis_broker
 from backend.brokers.models import Order, OrderStatus
@@ -375,7 +376,10 @@ class StrategyWorker:
         )
 
         self._restore_positions(tracker, broker=data.get("broker", "kis"))
-        self._restore_pending_to_tracker(tracker, broker=data.get("broker", "kis"))
+        self._restore_pending_to_tracker(
+            tracker, broker=data.get("broker", "kis"),
+            on_filled_cb=on_filled_cb, on_timeout_cb=on_timeout_cb,
+        )
 
         stype = data.get("strategy_type", "indicator")
         config = data.get("config", {})
@@ -519,6 +523,11 @@ class StrategyWorker:
                     )
                     db.add(row)
                 db.commit()
+        except IntegrityError:
+            # Unique-constraint violation on idempotency_key — another path persisted the
+            # same order concurrently (crash-replay or duplicate event). Treat as a duplicate
+            # and skip; the existing row is authoritative.
+            logger.warning("중복 주문 감지 (IntegrityError, idempotency_key=%s) — 저장 스킵", idem_key)
         except Exception as e:
             logger.warning("주문 DB 저장 실패: %s", e)
 
@@ -530,6 +539,17 @@ class StrategyWorker:
                 ).first()
                 if db_order is None:
                     logger.warning("체결 DB 저장 스킵: 미등록 주문 %s", order.id)
+                    return
+                # Idempotency: skip if a matching fill row already exists for this order.
+                # Keeps the append-only fill history correct if the same fill is delivered
+                # twice (e.g. recovery callback + re-registered poller callback racing).
+                dup = db.query(DBFill).filter(
+                    DBFill.order_id == db_order.id,
+                    DBFill.qty == fill.qty,
+                    DBFill.price == fill.price,
+                ).first()
+                if dup is not None:
+                    logger.info("중복 체결 감지 — Fill 삽입 스킵: order=%s qty=%d", order.id, fill.qty)
                     return
                 row = DBFill(order_id=db_order.id, qty=fill.qty, price=fill.price)
                 db.add(row)
@@ -553,22 +573,84 @@ class StrategyWorker:
         except Exception as e:
             logger.warning("포지션 복원 실패: %s", e)
 
-    def _restore_pending_to_tracker(self, tracker: PositionTracker, broker: str = "kis"):
-        """Re-mark pending orders in tracker so duplicate orders are blocked after restart."""
+    def _restore_pending_to_tracker(self, tracker: PositionTracker, broker: str = "kis",
+                                    on_filled_cb=None, on_timeout_cb=None):
+        """Re-mark pending orders in tracker so duplicate orders are blocked after restart.
+
+        Also re-registers each still-open order with the shared poller using the strategy's
+        full fill callback (overwriting the DB-only recovery stub registered at startup), so
+        that a post-restart fill flows through the normal pipeline and releases the pending
+        lock instead of leaving the symbol stuck until the 30-min TTL.
+
+        Queries are scoped to `broker` so a KIS strategy never restores another broker's
+        pending orders (and vice versa).
+        """
         try:
             with _session() as db:
                 rows = db.query(DBOrder).filter(
+                    DBOrder.broker == broker,
                     DBOrder.status.in_(["pending", "submitted", "partial_filled"]),
                     DBOrder.broker_order_id.isnot(None),
                 ).all()
-                pending = [(r.symbol, r.broker_order_id) for r in rows]
-            for symbol, order_id in pending:
-                tracker.mark_pending(symbol, order_id)
+                # Extract scalars before the session closes (avoid DetachedInstanceError)
+                pending = [
+                    {"symbol": r.symbol, "order_id": r.broker_order_id, "side": r.side,
+                     "qty": r.qty, "price": r.price or 0.0, "status": r.status}
+                    for r in rows
+                ]
+            for p in pending:
+                tracker.mark_pending(p["symbol"], p["order_id"])
+                if self._poller is not None and on_filled_cb is not None:
+                    self._register_recovered_order(p, tracker, on_filled_cb, on_timeout_cb)
+                _audit("recovery_restore_pending", symbol=p["symbol"], order_id=p["order_id"],
+                       detail={"broker": broker, "status": p["status"]})
             if pending:
                 logger.info("미체결 주문 tracker 복원: %d개 %s",
-                            len(pending), [s for s, _ in pending])
+                            len(pending), [p["symbol"] for p in pending])
         except Exception as e:
             logger.warning("pending tracker 복원 실패: %s", e)
+
+    def _register_recovered_order(self, p: dict, tracker: PositionTracker,
+                                  on_filled_cb, on_timeout_cb):
+        """Register a recovered pending order with the shared poller under the full pipeline.
+
+        Wrapped in a guard that skips processing if the order already reached a terminal
+        FILLED state in the DB (the startup DB-only recovery callback may have fired in the
+        narrow window between the pending query and this re-registration). In that case the
+        pending lock is simply released to avoid a stuck symbol.
+        """
+        try:
+            status = OrderStatus(p["status"])
+        except ValueError:
+            status = OrderStatus.SUBMITTED
+        border = Order(
+            id=p["order_id"], symbol=p["symbol"], side=p["side"],
+            qty=p["qty"], price=p["price"], status=status,
+        )
+
+        def _guarded_on_filled(order: Order):
+            try:
+                with _session() as db:
+                    row = db.query(DBOrder).filter(
+                        DBOrder.broker_order_id == order.id
+                    ).first()
+                    already_done = row is not None and row.status == OrderStatus.FILLED.value
+            except Exception as e:
+                # Can't confirm whether the startup recovery callback already processed this
+                # fill. Prioritise duplicate-execution safety: skip the full pipeline (which
+                # would double-record P&L) and only release the lock. The periodic / post-
+                # recovery reconcile (broker = ground truth) repairs position drift.
+                logger.warning("복구 체결 가드 조회 실패 (%s) — 중복 방지 위해 파이프라인 스킵, 락만 해제: %s",
+                               order.id, e)
+                tracker.unmark_pending(order.symbol)
+                return
+            if already_done:
+                tracker.unmark_pending(order.symbol)
+                logger.info("복구 주문 이미 체결 처리됨 — 락 해제만 수행: %s", order.id)
+                return
+            on_filled_cb(order)
+
+        self._poller.register(border, on_filled=_guarded_on_filled, on_timeout=on_timeout_cb)
 
     def _upsert_position_db(self, symbol: str, market: str, pos):
         """Upsert or delete position row in DB after a fill."""
