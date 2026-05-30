@@ -1,6 +1,5 @@
 """Fernet-based field-level encryption for sensitive credential data."""
 import os
-import base64
 from typing import Optional
 
 from cryptography.fernet import Fernet
@@ -16,17 +15,13 @@ def _get_fernet() -> Fernet:
             "Generate one with: python -c \"from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())\""
         )
     key = raw_key.strip()
-    # Accept raw 32-byte hex strings or proper Fernet keys
-    if len(key) == 44:
-        return Fernet(key.encode())
-    # Try to pad/convert
     try:
-        decoded = base64.urlsafe_b64decode(key + "==")
-        if len(decoded) == 32:
-            return Fernet(base64.urlsafe_b64encode(decoded))
-    except Exception:
-        pass
-    return Fernet(base64.urlsafe_b64encode(key[:32].encode().ljust(32, b"\x00")))
+        return Fernet(key.encode())
+    except Exception as exc:
+        raise RuntimeError(
+            f"{_KEY_ENV} is not a valid Fernet key. "
+            "Generate one with: python -c \"from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())\""
+        ) from exc
 
 
 _fernet: Optional[Fernet] = None

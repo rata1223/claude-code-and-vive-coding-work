@@ -1,7 +1,7 @@
 # Deployment Safety Audit — KIS Trading Platform
 **Date**: 2026-05-29  
 **Scope**: Full execution pipeline, stress scenarios, mobile requirements, security, operational hardening  
-**Status**: ⚠️ NOT PRODUCTION READY — 4 critical issues must be resolved first
+**Status**: ✅ CRITICAL & HIGH issues resolved in PR #34 — see Section 5 for before/after details
 
 ---
 
@@ -214,6 +214,17 @@ print(mgr.flatten_all('manual'))
 ```
 
 ### Kill Switch Reset (after manual review)
+
+> **H-4 Note**: Direct Redis/DB manipulation bypasses authorization and produces no audit log entry.
+> Once H-4 is implemented (admin-only API endpoint with audit logging), use the API endpoint instead:
+> ```bash
+> # Preferred method (once H-4 is implemented):
+> curl -X POST http://localhost:8000/api/admin/reset-kill-switch \
+>   -H "Authorization: Bearer $ADMIN_TOKEN" \
+>   -d '{"confirmed": true, "reason": "manual_review_complete"}'
+> ```
+> Until then, use the script below **only after** verifying position state is clean.
+
 ```bash
 # Only after verifying position state is clean
 docker exec kis-worker python -c "
@@ -250,10 +261,10 @@ docker compose up -d --build
 
 ### Pre-Deployment (must complete before `ENABLE_LIVE_TRADING=true`)
 
-- [ ] **[CRITICAL]** Set `JWT_SECRET_KEY` to 64+ char random string in `.env`
-- [ ] **[CRITICAL]** Set `KIS_CREDENTIAL_KEY` to a valid Fernet key (`python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`)
-- [ ] **[CRITICAL]** Set `POSTGRES_PASSWORD` to a strong random password (not `quantdinger`)
-- [ ] **[CRITICAL]** Fix CORS: change `allow_origins=["*"]` to specific mobile/web origins
+- [ ] **[AUTO-ENFORCED]** `JWT_SECRET_KEY` must be set — app raises `RuntimeError` at startup if missing
+- [ ] **[AUTO-ENFORCED]** `KIS_CREDENTIAL_KEY` must be a valid Fernet key — app raises `RuntimeError` if missing or malformed (`python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`)
+- [ ] **[AUTO-ENFORCED]** `POSTGRES_PASSWORD` must be set — Docker Compose fails with `:?` error if missing
+- [ ] **[AUTO-ENFORCED]** `CORS_ORIGINS` must be set to specific origins — wildcard `*` is rejected at startup
 - [ ] Set `QUANTDINGER_SECRET_KEY` to 64+ char random string
 - [ ] Set `TELEGRAM_TOKEN` and `TELEGRAM_CHAT_ID` (required by LivePromotionGuard)
 - [ ] Verify `KIS_ENV=paper` during 4-week validation period
@@ -284,7 +295,7 @@ docker compose up -d --build
 
 ### CRITICAL (block production)
 
-#### C-1: JWT Fallback Secret (api/auth.py:8)
+#### C-1: JWT Fallback Secret (api/auth.py:8) — ✅ RESOLVED PR #34
 ```python
 # CURRENT — insecure fallback
 SECRET_KEY = os.environ.get("JWT_SECRET_KEY", "change-me-in-production-use-a-long-random-string")
@@ -292,7 +303,7 @@ SECRET_KEY = os.environ.get("JWT_SECRET_KEY", "change-me-in-production-use-a-lon
 The fallback string is public and predictable. If `JWT_SECRET_KEY` is not set, tokens can be forged.
 **Fix**: Remove fallback entirely — raise at startup if not set.
 
-#### C-2: Fernet Dev Key (api/crypto.py:15-18)
+#### C-2: Fernet Dev Key (api/crypto.py:15-18) — ✅ RESOLVED PR #34
 ```python
 # CURRENT — deterministic dev key used if KIS_CREDENTIAL_KEY unset
 dev_bytes = b"dev-cred-key-32b"  # 16 bytes, padded to 32
@@ -300,7 +311,7 @@ dev_bytes = b"dev-cred-key-32b"  # 16 bytes, padded to 32
 Any deployment without `KIS_CREDENTIAL_KEY` encrypts broker credentials with a publicly known key.
 **Fix**: Raise `RuntimeError` at startup if `KIS_CREDENTIAL_KEY` is unset.
 
-#### C-3: CORS Wildcard + Credentials (api/main.py:46-52)
+#### C-3: CORS Wildcard + Credentials (api/main.py:46-52) — ✅ RESOLVED PR #34
 ```python
 # CURRENT — browsers reject this combination per CORS spec
 allow_origins=["*"],
@@ -309,7 +320,7 @@ allow_credentials=True,
 This is a misconfiguration. Browsers block credentialed requests to wildcard origins. The API likely fails for mobile web clients, and the intent is unclear.
 **Fix**: Set `allow_origins` to the specific mobile app origin(s).
 
-#### C-4: Postgres Default Password (docker-compose.yml:11)
+#### C-4: Postgres Default Password (docker-compose.yml:11) — ✅ RESOLVED PR #34
 ```yaml
 POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-quantdinger}
 ```
@@ -320,7 +331,7 @@ If `.env` is not configured, the database uses password `quantdinger`.
 
 ### HIGH (fix before paper-to-real promotion)
 
-#### H-1: WebSocket Unauthenticated (websocket/server.py)
+#### H-1: WebSocket Unauthenticated (websocket/server.py) — ✅ RESOLVED PR #34
 Port 5002 broadcasts order updates, position data, and equity snapshots to any connected client. No authentication token is required.
 **Fix**: Implement token-based handshake in `on_connect` — verify JWT from query param.
 
@@ -328,7 +339,7 @@ Port 5002 broadcasts order updates, position data, and equity snapshots to any c
 Only `emergency_flatten` events are written to `AuditLog`. Normal order placement, position changes, and credential operations are not audited.
 **Fix**: Add audit log calls to `_persist_order`, `create_credential`, `delete_credential`, and login/logout.
 
-#### H-3: Order Persist Before Submit Race (runner.py)
+#### H-3: Order Persist Before Submit Race (runner.py) — ✅ RESOLVED PR #34
 `place_order()` is called before `_persist_order()`. A crash in the ~50ms window creates an untracked order.
 **Fix**: Persist the order to DB with status=PENDING before submitting to broker, then update to SUBMITTED on confirmation.
 
@@ -340,7 +351,7 @@ Only `emergency_flatten` events are written to `AuditLog`. Normal order placemen
 
 ### MEDIUM
 
-#### M-1: Sandbox Escape via Subclass Traversal (sandbox.py)
+#### M-1: Sandbox Escape via Subclass Traversal (sandbox.py) — ✅ RESOLVED PR #34
 The AST checker blocks `__dunder__` method _calls_ but not attribute access that doesn't look like a call:
 ```python
 x = ().__class__.__bases__[0]  # not a dunder call, passes AST check
@@ -360,7 +371,7 @@ Tokens valid for 7 days with no revocation mechanism. Compromised tokens remain 
 If broker and DB agree on qty but not avg_price, the discrepancy is never repaired. Affects realized P&L calculations.
 **Fix**: In `_reconcile_positions`, also compare `avg_price` and update if drift > threshold.
 
-#### M-5: HTS ID Returned in Plaintext (credentials.py:24)
+#### M-5: HTS ID Returned in Plaintext (credentials.py:24) — ✅ RESOLVED PR #34
 `_credential_to_dict` returns `decrypt(cred.hts_id_enc)` — the actual HTS ID value.
 **Fix**: Mask HTS ID the same way as app_key and account_no, or omit it entirely from GET responses.
 
@@ -409,10 +420,10 @@ Kill switch, daily/weekly/MDD limits, trailing stops, hard stops, portfolio expo
 ### Mobile/Control Plane: 8/10
 Mobile is correctly positioned as a control plane only — no execution ownership. The strategy start/stop flow through API → Redis → Worker is clean. WebSocket authentication gap (H-1) is the main concern.
 
-### Overall Production Readiness: ❌ NOT READY
-**Must resolve before any deployment**: C-1, C-2, C-3, C-4  
-**Must resolve before paper-to-real promotion**: H-1, H-2, H-3, H-4  
-**Should resolve during paper period**: M-1 through M-6
+### Overall Production Readiness: ⚠️ CAUTION — PAPER MODE ONLY
+**Resolved in PR #34**: C-1, C-2, C-3, C-4, H-1, H-3, M-1, M-5  
+**Must resolve before paper-to-real promotion**: H-2, H-4  
+**Should resolve during paper period**: M-2 through M-6
 
 ---
 

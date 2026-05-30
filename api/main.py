@@ -53,6 +53,12 @@ _cors_env = (
     or "http://localhost:3000,http://localhost:5173"
 )
 _ALLOWED_ORIGINS = [o.strip() for o in _cors_env.split(",") if o.strip()]
+if "*" in _ALLOWED_ORIGINS:
+    raise RuntimeError(
+        "CORS_ORIGINS must not contain '*' when allow_credentials=True. "
+        "Set it to your specific mobile/web origins "
+        "(e.g. CORS_ORIGINS=https://app.example.com,capacitor://localhost)"
+    )
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_ALLOWED_ORIGINS,

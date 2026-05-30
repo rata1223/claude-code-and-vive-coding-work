@@ -35,25 +35,22 @@ _r = redis.from_url(_REDIS_URL)
 def _verify_ws_token() -> bool:
     """Validate JWT token passed as query param ?token=<jwt>.
     Returns True if valid, False otherwise.
+    Configuration/bootstrap errors (e.g. missing JWT_SECRET_KEY) are NOT caught
+    here — they propagate so the WS process surfaces misconfiguration rather than
+    silently rejecting every client as unauthenticated.
     """
     token = request.args.get("token", "")
     if not token:
         return False
-    try:
-        # Import here to avoid circular dependency
-        import sys
-        import importlib
-        # Try api.auth first (FastAPI stack), then fallback
-        for mod_name in ("api.auth", "backend.api.auth"):
-            try:
-                mod = importlib.import_module(mod_name)
-                payload = mod.decode_access_token(token)
-                return payload is not None
-            except (ImportError, AttributeError):
-                continue
-        return False
-    except Exception:
-        return False
+    import importlib
+    for mod_name in ("api.auth", "backend.api.auth"):
+        try:
+            mod = importlib.import_module(mod_name)
+            payload = mod.decode_access_token(token)
+            return payload is not None
+        except (ImportError, AttributeError):
+            continue
+    return False
 
 
 # ── 클라이언트 이벤트 ─────────────────────────────────────────────────────
@@ -136,10 +133,18 @@ def _require_ws_secret() -> None:
         )
 
 
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO,
-                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+def start_ws_server() -> None:
+    """Bootstrap and run the WS server.
+    Call this from any entrypoint (gunicorn WSGI app factory, __main__, etc.)
+    so the secret check is never bypassed by non-__main__ launch paths.
+    """
     _require_ws_secret()
     start_redis_listener()
     port = int(os.environ.get("WS_PORT", 5002))
     socketio.run(app, host="0.0.0.0", port=port, debug=False)
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    start_ws_server()

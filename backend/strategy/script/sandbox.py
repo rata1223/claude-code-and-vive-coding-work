@@ -13,6 +13,9 @@ import textwrap
 import threading
 from typing import Any
 
+from RestrictedPython import compile_restricted, safe_builtins
+from RestrictedPython import safe_globals as _rp_safe_globals
+
 logger = logging.getLogger(__name__)
 
 # 허용된 AST 노드 유형
@@ -140,18 +143,25 @@ def execute_script(
     """
     validate_script(source)
 
-    builtins_src = __builtins__ if isinstance(__builtins__, dict) else vars(__builtins__)
-    safe_globals = {
-        "__builtins__": {k: builtins_src[k] for k in _ALLOWED_BUILTINS if k in builtins_src},
-    }
-    safe_globals.update(context)
+    try:
+        code = compile_restricted(textwrap.dedent(source), "<strategy>", "exec")
+    except SyntaxError as e:
+        raise SandboxViolation(f"RestrictedPython 컴파일 오류: {e}")
+    if code is None:
+        raise SandboxViolation("RestrictedPython compilation failed")
+
+    # Build execution environment from RestrictedPython's safe_globals (provides _getattr_,
+    # _getiter_, _write_, etc.) then restrict builtins further to our explicit allowlist.
+    safe_env = dict(_rp_safe_globals)
+    safe_env["__builtins__"] = {k: safe_builtins[k] for k in _ALLOWED_BUILTINS if k in safe_builtins}
+    safe_env.update(context)
 
     result: dict[str, Any] = {"globals": None, "exc": None}
 
     def _run():
         try:
-            exec(compile(ast.parse(textwrap.dedent(source)), "<strategy>", "exec"), safe_globals)
-            result["globals"] = safe_globals
+            exec(code, safe_env)
+            result["globals"] = safe_env
         except Exception as e:
             result["exc"] = e
 
