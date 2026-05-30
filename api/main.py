@@ -43,18 +43,22 @@ app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # ── CORS ─────────────────────────────────────────────────────────────────
-# allow_origins="*" + allow_credentials=True is rejected by browsers (CORS spec).
-# CORS_ORIGINS env var should list actual origins (comma-separated) in production.
-# Example: CORS_ORIGINS=https://app.example.com,capacitor://localhost,http://localhost:5173
-_cors_env = os.environ.get("CORS_ORIGINS", "")
-_cors_origins = [o.strip() for o in _cors_env.split(",") if o.strip()] if _cors_env else []
-
+# Never combine "*" with credentials (rejected by browsers). Origins come from CORS_ORIGINS
+# (wired in docker-compose/.env on this branch); CORS_ALLOWED_ORIGINS is accepted as a
+# compatibility fallback (main's name). Defaults to localhost dev origins so production must
+# set origins explicitly (e.g. CORS_ORIGINS=https://app.example.com,capacitor://localhost).
+_cors_env = (
+    os.environ.get("CORS_ORIGINS")
+    or os.environ.get("CORS_ALLOWED_ORIGINS")
+    or "http://localhost:3000,http://localhost:5173"
+)
+_ALLOWED_ORIGINS = [o.strip() for o in _cors_env.split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=_cors_origins if _cors_origins else ["*"],
-    allow_credentials=bool(_cors_origins),  # credentials only when origins are explicit
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=_ALLOWED_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-API-Key"],
 )
 
 

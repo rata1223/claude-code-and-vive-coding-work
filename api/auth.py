@@ -13,6 +13,15 @@ if not _raw_secret:
     )
 SECRET_KEY = _raw_secret
 ALGORITHM = "HS256"
+# Preserve main's short-secret warning as an extra safeguard. main's "refuse to start if
+# SECRET_KEY == default placeholder in production" branch is intentionally dropped: it is
+# unreachable here because the unconditional raise above already blocks startup when the
+# secret is unset, and a configured secret can never equal the placeholder.
+if len(SECRET_KEY) < 32:
+    import logging as _log
+    _log.getLogger(__name__).warning(
+        "JWT_SECRET_KEY is shorter than 32 characters — security risk."
+    )
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.environ.get("JWT_EXPIRE_MINUTES", "1440"))  # 24 hours
 
 
