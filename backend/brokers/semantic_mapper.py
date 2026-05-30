@@ -25,6 +25,28 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+# ── 안전한 숫자 변환 헬퍼 ─────────────────────────────────────────────────────
+
+def _to_int(value, default: int = 0) -> int:
+    """KIS API는 빈 문자열("")을 반환할 수 있음 — None과 "" 모두 default로 처리."""
+    if value is None or value == "":
+        return default
+    try:
+        return int(value)
+    except (ValueError, TypeError):
+        return default
+
+
+def _to_float(value, default: float = 0.0) -> float:
+    """KIS API는 빈 문자열("")을 반환할 수 있음 — None과 "" 모두 default로 처리."""
+    if value is None or value == "":
+        return default
+    try:
+        return float(value)
+    except (ValueError, TypeError):
+        return default
+
+
 # ── KIS 브로커 기본 역량 선언 ────────────────────────────────────────────────
 
 KIS_CAPABILITIES = BrokerCapabilities(
@@ -160,13 +182,13 @@ class KISDomesticMapper(BrokerStatusMapper):
     _EXPIRE_TOKENS = ("만료", "기간만료")
 
     def extract_filled_qty(self, raw: dict) -> int:
-        return int(raw.get("tot_ccld_qty", 0))
+        return _to_int(raw.get("tot_ccld_qty"))
 
     def extract_order_qty(self, raw: dict) -> int:
-        return int(raw.get("ord_qty", 0))
+        return _to_int(raw.get("ord_qty"))
 
     def extract_avg_price(self, raw: dict) -> float:
-        return float(raw.get("avg_prvs", 0))
+        return _to_float(raw.get("avg_prvs"))
 
     def extract_broker_order_id(self, submit_response: dict) -> str:
         return submit_response.get("output", {}).get("ODNO", "")
@@ -179,18 +201,19 @@ class KISDomesticMapper(BrokerStatusMapper):
             return OrderStatus.UNKNOWN
         if filled_qty >= ord_qty:
             return OrderStatus.FILLED
-        if filled_qty > 0:
-            return OrderStatus.PARTIAL_FILLED
 
         stat = raw.get("ord_stts_name", "")
         if not stat:
-            return OrderStatus.UNKNOWN
+            # No status string: partial fill if any qty filled, else UNKNOWN
+            return OrderStatus.PARTIAL_FILLED if filled_qty > 0 else OrderStatus.UNKNOWN
         if any(t in stat for t in self._CANCEL_TOKENS):
             return OrderStatus.CANCELED
         if any(t in stat for t in self._REJECT_TOKENS):
             return OrderStatus.REJECTED
         if any(t in stat for t in self._EXPIRE_TOKENS):
             return OrderStatus.EXPIRED
+        if filled_qty > 0:
+            return OrderStatus.PARTIAL_FILLED
         return OrderStatus.SUBMITTED
 
 
@@ -214,13 +237,13 @@ class KISOverseasMapper(BrokerStatusMapper):
     _EXPIRE_TOKENS_EN = ("expired",)
 
     def extract_filled_qty(self, raw: dict) -> int:
-        return int(raw.get("ft_ccld_qty", 0))
+        return _to_int(raw.get("ft_ccld_qty"))
 
     def extract_order_qty(self, raw: dict) -> int:
-        return int(raw.get("ft_ord_qty", 0))
+        return _to_int(raw.get("ft_ord_qty"))
 
     def extract_avg_price(self, raw: dict) -> float:
-        return float(raw.get("avg_prvs", 0))
+        return _to_float(raw.get("avg_prvs"))
 
     def extract_broker_order_id(self, submit_response: dict) -> str:
         return submit_response.get("output", {}).get("ODNO", "")
@@ -233,12 +256,10 @@ class KISOverseasMapper(BrokerStatusMapper):
             return OrderStatus.UNKNOWN
         if filled_qty >= ord_qty:
             return OrderStatus.FILLED
-        if filled_qty > 0:
-            return OrderStatus.PARTIAL_FILLED
 
         raw_stat = raw.get("ord_stts_name", "")
         if not raw_stat:
-            return OrderStatus.UNKNOWN
+            return OrderStatus.PARTIAL_FILLED if filled_qty > 0 else OrderStatus.UNKNOWN
         stat_lower = raw_stat.lower()
 
         if any(t in raw_stat for t in self._CANCEL_TOKENS_KO) or \
@@ -250,6 +271,8 @@ class KISOverseasMapper(BrokerStatusMapper):
         if any(t in raw_stat for t in self._EXPIRE_TOKENS_KO) or \
                 any(t in stat_lower for t in self._EXPIRE_TOKENS_EN):
             return OrderStatus.EXPIRED
+        if filled_qty > 0:
+            return OrderStatus.PARTIAL_FILLED
         return OrderStatus.SUBMITTED
 
 
@@ -267,13 +290,13 @@ class KiwoomDomesticMapper(BrokerStatusMapper):
     _AVG_PRICE_FIELD = "avg_prvs"
 
     def extract_filled_qty(self, raw: dict) -> int:
-        return int(raw.get(self._FILLED_QTY_FIELD, 0))
+        return _to_int(raw.get(self._FILLED_QTY_FIELD))
 
     def extract_order_qty(self, raw: dict) -> int:
-        return int(raw.get(self._ORDER_QTY_FIELD, 0))
+        return _to_int(raw.get(self._ORDER_QTY_FIELD))
 
     def extract_avg_price(self, raw: dict) -> float:
-        return float(raw.get(self._AVG_PRICE_FIELD, 0))
+        return _to_float(raw.get(self._AVG_PRICE_FIELD))
 
     def extract_broker_order_id(self, submit_response: dict) -> str:
         # TBD: Kiwoom 주문 접수 응답에서 필드명 확인 필요
