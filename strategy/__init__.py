@@ -1,3 +1,8 @@
+# Workaround for the pandas-ta-openbb fork (imported as `pandas_ta`): its maps.py references
+# importlib.metadata without importing it, raising AttributeError on a clean interpreter.
+# Must run before `.signals` (which imports pandas_ta). Remove once upstream fixes maps.py.
+import importlib.metadata  # noqa: F401
+
 from .signals import TradingSignals
 from .optimizer import PortfolioOptimizer
 from .risk import RiskManager

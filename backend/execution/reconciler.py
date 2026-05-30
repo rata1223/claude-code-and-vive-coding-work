@@ -12,12 +12,13 @@
   1. DB에서 pending/submitted 인데 브로커에서 이미 filled/canceled
   2. DB 포지션 ≠ 브로커 포지션 (수량·평균단가 불일치)
   3. DB에 없는 브로커 포지션 (외부 수동 매수 등)
-  4. 브로커에 없는 DB 포지션 (외부 수동 매도 등)
+  4. 브로커에 없는 DB 포지션 (외부 수동 매도 등) — 미체결 주문 없을 때만 삭제
 """
 import json
 import logging
+import threading
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Callable, Optional
 
 from backend.brokers.base import BrokerAdapter
@@ -83,50 +84,71 @@ class PositionReconciler:
     """
     브로커와 DB 사이의 포지션·주문 상태 조정기.
 
+    broker_name 파라미터로 브로커를 구분해 DB 쿼리를 필터링한다.
+    dry_run=True 이면 갭만 탐지하고 DB를 수정하지 않는다.
+
     사용 예:
-        reconciler = PositionReconciler(broker, db_factory, redis_client)
+        reconciler = PositionReconciler(broker, db_factory, redis_client, broker_name="kis")
         result = reconciler.reconcile("startup")
     """
 
     # 포지션 수량 허용 오차: 브로커와 DB가 ±1주 이내면 무시
     _QTY_TOLERANCE = 1
 
+    # 스테일 포지션(브로커에 없는 DB 포지션) 삭제 최소 나이
+    _STALE_MIN_AGE_HOURS = 1.0
+
     def __init__(self, broker: BrokerAdapter, db_factory: Callable,
-                 redis_client=None, poller=None):
+                 redis_client=None, poller=None, broker_name: str = "kis"):
         self._broker = broker
         self._factory = db_factory
         self._redis = redis_client
         self._poller = poller  # OrderFillPoller: register re-discovered pending orders
+        self._broker_name = broker_name
+        self._reconcile_lock = threading.Lock()
 
     # ── Public API ────────────────────────────────────────────────────────
 
-    def reconcile(self, trigger: str = "periodic") -> ReconciliationResult:
-        """메인 조정 루틴. 브로커 → DB 방향으로 수리."""
-        result = ReconciliationResult(trigger)
+    def reconcile(self, trigger: str = "periodic", dry_run: bool = False) -> ReconciliationResult:
+        """메인 조정 루틴. 브로커 → DB 방향으로 수리. 동시 호출은 즉시 스킵.
+
+        dry_run=True 이면 갭만 탐지, DB 수정 없음 (ReconciliationLog는 기록).
+        """
+        if not self._reconcile_lock.acquire(blocking=False):
+            logger.warning("조정 이미 진행 중 — 스킵: %s", trigger)
+            r = ReconciliationResult(trigger)
+            r.error("조정 이미 진행 중 (스킵)")
+            r.finish()
+            return r
         try:
-            broker_positions = self._fetch_broker_positions(result)
-            if broker_positions is None:
-                result.error("브로커 포지션 조회 실패 — 조정 중단")
+            result = ReconciliationResult(trigger)
+            try:
+                broker_positions = self._fetch_broker_positions(result)
+                if broker_positions is None:
+                    result.error("브로커 포지션 조회 실패 — 조정 중단")
+                    result.finish()
+                    self._persist_log(result, dry_run)
+                    return result
+
+                self._reconcile_positions(broker_positions, result, dry_run)
+                self._reconcile_pending_orders(result)
                 result.finish()
-                self._persist_log(result)
-                return result
+            except Exception as e:
+                result.error(f"조정 예외: {e}")
+                result.finish()
+                logger.exception("조정 예외")
+            finally:
+                self._persist_log(result, dry_run)
+                self._publish_ws(result)
 
-            self._reconcile_positions(broker_positions, result)
-            self._reconcile_pending_orders(result)
-            result.finish()
-        except Exception as e:
-            result.error(f"조정 예외: {e}")
-            result.finish()
-            logger.exception("조정 예외")
+            logger.info(
+                "조정 완료 [%s] broker=%s dry_run=%s: 갭=%d 수정=%d 오류=%d",
+                trigger, self._broker_name, dry_run,
+                len(result.gaps), len(result.repairs), len(result.errors),
+            )
+            return result
         finally:
-            self._persist_log(result)
-            self._publish_ws(result)
-
-        logger.info(
-            "조정 완료 [%s]: 갭=%d 수정=%d 오류=%d",
-            trigger, len(result.gaps), len(result.repairs), len(result.errors),
-        )
-        return result
+            self._reconcile_lock.release()
 
     # ── Position reconciliation ────────────────────────────────────────────
 
@@ -134,51 +156,134 @@ class PositionReconciler:
         try:
             positions = self._broker.get_positions()
             return {p.symbol: p for p in positions}
+        except NotImplementedError:
+            result.gap("broker_unimplemented", "",
+                       f"{self._broker_name} get_positions() 미구현 — 포지션 조정 스킵")
+            return {}  # empty dict: position reconcile skipped, order reconcile proceeds
         except Exception as e:
             result.error(f"브로커 포지션 조회 오류: {e}")
-            return None
+            return None  # None: abort reconciliation entirely
 
-    def _reconcile_positions(self, broker_pos: dict[str, Position], result: ReconciliationResult):
+    def _reconcile_positions(self, broker_pos: dict[str, Position],
+                             result: ReconciliationResult, dry_run: bool):
         from backend.database.models import Position as DBPosition
 
         with _session(self._factory) as db:
-            db_rows = db.query(DBPosition).all()
-            db_pos = {r.symbol: r for r in db_rows}
+            db_rows = db.query(DBPosition).filter(
+                DBPosition.broker == self._broker_name
+            ).all()
+            # Extract scalars before any session boundary
+            db_pos_data = {
+                r.symbol: {
+                    "id": r.id,
+                    "qty": r.qty,
+                    "avg_price": r.avg_price,
+                    "updated_at": r.updated_at,
+                }
+                for r in db_rows
+            }
 
-            # Case 1: DB position ≠ broker (qty mismatch or avg_price drift)
+            # Case 1/3: broker has position
             for sym, bp in broker_pos.items():
-                dp = db_pos.get(sym)
+                dp = db_pos_data.get(sym)
                 if dp is None:
                     # Case 3: broker has it, DB doesn't (external buy)
                     result.gap("missing_in_db", sym,
                                f"브로커 qty={bp.qty} avg={bp.avg_price:.2f} — DB 없음")
-                    new_row = DBPosition(
-                        symbol=sym, qty=bp.qty, avg_price=bp.avg_price,
-                        market=bp.market, broker="kis",
-                    )
-                    db.add(new_row)
-                    result.repaired("insert_position", sym,
-                                    f"DB에 포지션 추가: qty={bp.qty}")
+                    if not dry_run:
+                        self._audit_position_change(
+                            "reconcile_insert", sym,
+                            {"broker_qty": bp.qty, "broker_avg": bp.avg_price,
+                             "broker_name": self._broker_name, "trigger": result.trigger},
+                        )
+                        new_row = DBPosition(
+                            symbol=sym, qty=bp.qty, avg_price=bp.avg_price,
+                            market=bp.market, broker=self._broker_name,
+                        )
+                        db.add(new_row)
+                        result.repaired("insert_position", sym,
+                                        f"DB에 포지션 추가: qty={bp.qty}")
                 else:
-                    qty_diff = abs(dp.qty - bp.qty)
+                    qty_diff = abs(dp["qty"] - bp.qty)
+                    price_changed = abs(dp["avg_price"] - bp.avg_price) > 0.01
+
                     if qty_diff > self._QTY_TOLERANCE:
-                        result.gap("qty_mismatch", sym,
-                                   f"DB qty={dp.qty} vs 브로커 qty={bp.qty}")
-                        dp.qty = bp.qty
-                        dp.avg_price = bp.avg_price
-                        dp.updated_at = datetime.utcnow()
-                        result.repaired("fix_qty", sym,
-                                        f"DB qty {dp.qty}→{bp.qty}")
+                        if self._has_pending_order(sym, db):
+                            result.gap("qty_mismatch_pending", sym,
+                                       f"DB qty={dp['qty']} vs 브로커 qty={bp.qty} "
+                                       f"— 미체결 주문 있음, 수정 보류")
+                        else:
+                            result.gap("qty_mismatch", sym,
+                                       f"DB qty={dp['qty']} vs 브로커 qty={bp.qty}")
+                            if not dry_run:
+                                self._audit_position_change(
+                                    "reconcile_fix_qty", sym,
+                                    {"db_qty": dp["qty"], "broker_qty": bp.qty,
+                                     "db_avg": dp["avg_price"], "broker_avg": bp.avg_price,
+                                     "broker_name": self._broker_name, "trigger": result.trigger},
+                                )
+                                row = db.get(DBPosition, dp["id"])
+                                if row:
+                                    row.qty = bp.qty
+                                    row.avg_price = bp.avg_price
+                                    row.updated_at = datetime.utcnow()
+                                result.repaired("fix_qty", sym,
+                                                f"DB qty {dp['qty']}→{bp.qty}")
+                    elif price_changed and qty_diff <= self._QTY_TOLERANCE:
+                        # avg_price drift only — always safe to fix
+                        if not dry_run:
+                            self._audit_position_change(
+                                "reconcile_fix_avg_price", sym,
+                                {"db_avg": dp["avg_price"], "broker_avg": bp.avg_price,
+                                 "broker_name": self._broker_name, "trigger": result.trigger},
+                            )
+                            row = db.get(DBPosition, dp["id"])
+                            if row:
+                                row.avg_price = bp.avg_price
+                                row.updated_at = datetime.utcnow()
+                            result.repaired("fix_avg_price", sym,
+                                            f"avg_price {dp['avg_price']:.4f}→{bp.avg_price:.4f}")
 
             # Case 4: DB has it, broker doesn't (external sell / liquidation)
-            for sym, dp in db_pos.items():
+            for sym, dp in db_pos_data.items():
                 if sym not in broker_pos:
-                    result.gap("stale_db_position", sym,
-                               f"DB qty={dp.qty} — 브로커에 없음 (청산됨)")
-                    db.delete(dp)
-                    result.repaired("delete_position", sym, "DB 스테일 포지션 삭제")
+                    age_hours = 0.0
+                    if dp["updated_at"]:
+                        age_hours = (datetime.utcnow() - dp["updated_at"]).total_seconds() / 3600
 
-            db.commit()
+                    if self._has_pending_order(sym, db):
+                        result.gap("stale_position_pending", sym,
+                                   f"DB qty={dp['qty']} 브로커에 없음 "
+                                   f"— 미체결 주문 있음, 삭제 보류")
+                    elif age_hours < self._STALE_MIN_AGE_HOURS:
+                        result.gap("stale_position_too_young", sym,
+                                   f"DB qty={dp['qty']} 브로커에 없음 "
+                                   f"— 포지션 나이 {age_hours:.1f}h < {self._STALE_MIN_AGE_HOURS}h, 삭제 보류")
+                    else:
+                        result.gap("stale_db_position", sym,
+                                   f"DB qty={dp['qty']} — 브로커에 없음 (청산됨)")
+                        if not dry_run:
+                            self._audit_position_change(
+                                "reconcile_delete", sym,
+                                {"db_qty": dp["qty"], "age_hours": age_hours,
+                                 "broker_name": self._broker_name, "trigger": result.trigger},
+                            )
+                            row = db.get(DBPosition, dp["id"])
+                            if row:
+                                db.delete(row)
+                            result.repaired("delete_position", sym, "DB 스테일 포지션 삭제")
+
+            if not dry_run:
+                db.commit()
+
+    def _has_pending_order(self, symbol: str, db) -> bool:
+        """Return True if there is any open order for this symbol and broker."""
+        from backend.database.models import Order as DBOrder
+        return db.query(DBOrder).filter(
+            DBOrder.symbol == symbol,
+            DBOrder.broker == self._broker_name,
+            DBOrder.status.in_(["pending", "submitted", "partial_filled"]),
+        ).first() is not None
 
     # ── Order reconciliation ────────────────────────────────────────────────
 
@@ -187,44 +292,76 @@ class PositionReconciler:
         from backend.database.models import Order as DBOrder
 
         with _session(self._factory) as db:
-            open_orders = db.query(DBOrder).filter(
-                DBOrder.status.in_(["pending", "submitted", "partial_filled", "unknown"])
+            rows = db.query(DBOrder).filter(
+                DBOrder.status.in_(["pending", "submitted", "partial_filled", "unknown"]),
+                DBOrder.broker == self._broker_name,
             ).all()
+            # Extract scalars before session closes (detached objects are fragile)
+            open_orders = [
+                {
+                    "id": r.id,
+                    "broker_order_id": r.broker_order_id,
+                    "symbol": r.symbol,
+                    "status": r.status,
+                    "created_at": r.created_at,
+                }
+                for r in rows
+            ]
 
         if not open_orders:
             return
 
         for db_order in open_orders:
+            if not db_order["broker_order_id"]:
+                result.gap("missing_broker_id", db_order["symbol"],
+                           f"broker_order_id 없음 — 조정 스킵 (id={db_order['id']})")
+                continue
             try:
                 broker_order = self._broker.get_order_status(
-                    db_order.broker_order_id or "",
-                    db_order.symbol,
+                    db_order["broker_order_id"] or "",
+                    db_order["symbol"],
                 )
+            except NotImplementedError:
+                logger.debug("get_order_status 미구현 (%s) — 주문 조정 스킵", self._broker_name)
+                break  # entire broker doesn't support it; skip all orders
             except Exception as e:
-                result.error(f"주문 조회 오류 {db_order.broker_order_id}: {e}")
+                result.error(f"주문 조회 오류 {db_order['broker_order_id']}: {e}")
                 continue
 
             if broker_order is None:
                 # KIS has no record — treat as lost/rejected if > 1h old
-                age_hours = (datetime.utcnow() - db_order.created_at).total_seconds() / 3600
+                age_hours = (datetime.utcnow() - db_order["created_at"]).total_seconds() / 3600
                 if age_hours > 1:
-                    result.gap("lost_order", db_order.symbol,
-                               f"주문 {db_order.broker_order_id} 브로커 미조회 (나이 {age_hours:.1f}h)")
-                    self._mark_order_lost(db_order.id, result)
+                    result.gap("lost_order", db_order["symbol"],
+                               f"주문 {db_order['broker_order_id']} 브로커 미조회 (나이 {age_hours:.1f}h)")
+                    self._mark_order_lost(db_order["id"], result)
                 continue
 
             # Sync broker state → DB
             new_status = broker_order.status.value
-            if new_status != db_order.status:
-                result.gap("order_status_mismatch", db_order.symbol,
-                           f"DB={db_order.status} 브로커={new_status}")
-                self._sync_order_status(db_order.id, broker_order, result)
+            if new_status != db_order["status"]:
+                result.gap("order_status_mismatch", db_order["symbol"],
+                           f"DB={db_order['status']} 브로커={new_status}")
+                self._sync_order_status(db_order["id"], broker_order, result)
 
     def _mark_order_lost(self, db_order_id: int, result: ReconciliationResult):
         from backend.database.models import Order as DBOrder
         with _session(self._factory) as db:
             row = db.get(DBOrder, db_order_id)
             if row:
+                # Attempt broker cancel with full params (US cancel requires symbol+qty+price)
+                if row.broker_order_id:
+                    try:
+                        self._broker.cancel_order(
+                            order_id=row.broker_order_id,
+                            symbol=row.symbol,
+                            qty=row.qty,
+                            price=float(row.price or 0),
+                        )
+                    except Exception as e:
+                        logger.warning("reconciler cancel_order 실패 %s: %s", row.broker_order_id, e)
+                else:
+                    logger.warning("broker_order_id 없음 — 취소 스킵 (db_id=%d)", row.id)
                 row.status = OrderStatus.CANCELED.value
                 row.error = "조정: 브로커 미조회 → 취소 처리"
                 row.updated_at = datetime.utcnow()
@@ -257,20 +394,41 @@ class PositionReconciler:
             result.repaired("sync_order", row.symbol,
                             f"주문 {row.broker_order_id}: {old_status}→{row.status}")
 
+    # ── Audit ──────────────────────────────────────────────────────────────
+
+    def _audit_position_change(self, event_type: str, symbol: str, detail: dict) -> None:
+        """Fire-and-forget AuditLog write. Failure does not abort reconciliation."""
+        try:
+            from backend.database.models import AuditLog
+            with _session(self._factory) as db:
+                db.add(AuditLog(
+                    event_type=event_type,
+                    symbol=symbol,
+                    actor=f"reconciler:{self._broker_name}",
+                    detail=json.dumps(detail, ensure_ascii=False),
+                ))
+                db.commit()
+        except Exception as e:
+            logger.warning("AuditLog 기록 실패 [%s %s]: %s", event_type, symbol, e)
+
     # ── Persistence / observability ────────────────────────────────────────
 
-    def _persist_log(self, result: ReconciliationResult):
+    def _persist_log(self, result: ReconciliationResult, dry_run: bool = False):
         from backend.database.models import ReconciliationLog
         try:
+            detail = result.to_dict()
+            if dry_run:
+                detail["dry_run"] = True
             with _session(self._factory) as db:
                 db.add(ReconciliationLog(
                     trigger=result.trigger,
+                    broker=self._broker_name,
                     started_at=result.started_at,
                     completed_at=result.completed_at,
                     gaps_found=len(result.gaps),
                     repairs_made=len(result.repairs),
                     error="; ".join(result.errors) if result.errors else None,
-                    detail=json.dumps(result.to_dict(), ensure_ascii=False),
+                    detail=json.dumps(detail, ensure_ascii=False),
                 ))
                 db.commit()
         except Exception as e:

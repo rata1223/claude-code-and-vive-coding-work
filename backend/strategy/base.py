@@ -1,6 +1,7 @@
 import logging
 import os
 from abc import ABC
+from datetime import datetime, timezone
 from typing import Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -40,6 +41,9 @@ def _live_trade_allowed(broker, name: str, symbol: str, side: str):
     return True, None
 
 
+_BAR_STALE_SECONDS = int(os.environ.get("BAR_STALE_SECONDS", "600"))
+
+
 class StrategyBase(ABC):
     """
     모든 전략의 기반 클래스.
@@ -72,6 +76,29 @@ class StrategyBase(ABC):
         bar = {"symbol": str, "open": float, "high": float, "low": float,
                 "close": float, "volume": float, "ts": datetime}
         """
+
+    def _is_bar_stale(self, bar: dict) -> bool:
+        """Returns True if bar['ts'] exceeds BAR_STALE_SECONDS age on a live broker.
+        Always returns False for simulated brokers (backtests use historical timestamps)."""
+        if not getattr(self._broker, "is_live", True):
+            return False
+        ts = bar.get("ts")
+        if ts is None:
+            return False
+        try:
+            now = datetime.now(timezone.utc)
+            if hasattr(ts, "tzinfo") and ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            age_secs = (now - ts).total_seconds()
+            if age_secs > _BAR_STALE_SECONDS:
+                logger.warning(
+                    "[%s] 스테일 캔들 무시: %s age=%.0fs (한도 %ds)",
+                    self.name, bar.get("symbol"), age_secs, _BAR_STALE_SECONDS,
+                )
+                return True
+        except Exception as e:
+            logger.debug("캔들 타임스탬프 파싱 오류: %s", e)
+        return False
 
     def on_fill(self, fill: "Fill"):
         """체결 이벤트 수신 시 호출."""

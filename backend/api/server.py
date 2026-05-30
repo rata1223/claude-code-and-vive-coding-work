@@ -24,9 +24,18 @@ _db_factory = None
 
 # API key auth — set KIS_API_KEY env var to enable. Unset = open (dev mode, logged warning).
 _API_KEY = os.environ.get("KIS_API_KEY", "")
-_OPEN_ROUTES = {"/api/health", "/api/status"}
+_OPEN_ROUTES = {"/api/health", "/api/status", "/api/metrics"}
 
 if not _API_KEY:
+    _live_trading = os.environ.get("ENABLE_LIVE_TRADING", "false").lower() == "true"
+    _flask_prod = os.environ.get("FLASK_ENV", "").lower() == "production"
+    if _live_trading or _flask_prod:
+        import sys as _sys
+        logger.critical(
+            "KIS_API_KEY is not set while ENABLE_LIVE_TRADING=true or FLASK_ENV=production "
+            "— refusing to start. Set KIS_API_KEY to a cryptographically random value."
+        )
+        _sys.exit(1)
     logger.warning("KIS_API_KEY not set — API running without authentication (dev mode)")
 
 
@@ -158,6 +167,18 @@ def list_strategies():
 
 
 _strategy_start_calls: list[float] = []
+_admin_calls: dict[str, list] = {"flatten": [], "reconcile": []}
+
+
+def _check_admin_rate_limit(op: str, max_calls: int = 3, window_secs: float = 300.0) -> bool:
+    import time
+    now = time.monotonic()
+    calls = _admin_calls.setdefault(op, [])
+    _admin_calls[op] = [t for t in calls if now - t < window_secs]
+    if len(_admin_calls[op]) >= max_calls:
+        return False
+    _admin_calls[op].append(now)
+    return True
 
 
 @app.post("/api/strategies/start")
@@ -275,6 +296,8 @@ def run_backtest():
 @app.post("/api/admin/reconcile")
 def trigger_reconcile():
     """포지션·주문 수동 조정 트리거. X-API-Key 필수."""
+    if not _check_admin_rate_limit("reconcile"):
+        return jsonify({"error": "수동 조정 요청 과다 (5분 내 3회 제한)"}), 429
     try:
         from backend.execution.reconciler import PositionReconciler
         from backend.brokers.kis import get_kis_broker
@@ -295,6 +318,8 @@ def trigger_reconcile():
 @app.post("/api/admin/flatten")
 def trigger_flatten():
     """비상 청산 트리거 (전체 포지션 시장가 매도). X-API-Key + confirm=true 필수."""
+    if not _check_admin_rate_limit("flatten"):
+        return jsonify({"error": "비상청산 요청 과다 (5분 내 3회 제한)"}), 429
     body = request.json or {}
     if not body.get("confirm"):
         return jsonify({"error": "confirm=true 필요"}), 400
@@ -327,8 +352,62 @@ def worker_heartbeat_status():
         return jsonify({"error": str(e)}), 503
 
 
+# ── 메트릭 ────────────────────────────────────────────────────────────────────
+@app.get("/api/metrics")
+def get_metrics():
+    """운영 메트릭 스냅샷 — 모니터링/대시보드용."""
+    from datetime import date as _date
+    metrics: dict = {
+        "timestamp": datetime.utcnow().isoformat(),
+        "worker_alive": False,
+        "worker_ttl_seconds": -2,
+        "redis_ok": _redis_ok(),
+        "db_ok": _db_ok(),
+        "pending_orders": -1,
+        "open_positions": -1,
+        "kill_switch": False,
+        "daily_pnl_pct": None,
+    }
+    try:
+        from backend.worker.heartbeat import HeartbeatMonitor
+        metrics["worker_alive"] = HeartbeatMonitor.is_alive(_redis)
+        metrics["worker_ttl_seconds"] = HeartbeatMonitor.ttl_seconds(_redis)
+    except Exception:
+        pass
+    try:
+        db = get_db()
+        metrics["pending_orders"] = db.query(Order).filter(
+            Order.status.in_(["pending", "submitted", "partial_filled"])
+        ).count()
+        metrics["open_positions"] = db.query(Position).count()
+        from backend.database.models import DailyRiskState
+        row = db.get(DailyRiskState, _date.today())
+        if row:
+            metrics["kill_switch"] = row.kill_switch
+            if row.peak_equity and row.peak_equity > 0:
+                metrics["daily_pnl_pct"] = round(row.daily_pnl / row.peak_equity * 100, 3)
+    except Exception:
+        pass
+    return jsonify(metrics)
+
+
+def _start_watchdog():
+    """Start WorkerWatchdog in this process (kis-api), which is separate from kis-worker.
+    This is the correct process boundary: crash detection only works cross-process.
+    Call this from gunicorn's post_fork hook or main() below."""
+    try:
+        import redis as _redis_mod
+        r = _redis_mod.from_url(os.environ.get("REDIS_URL", "redis://redis:6379"))
+        from backend.worker.heartbeat import WorkerWatchdog
+        WorkerWatchdog(r).start()
+        logger.info("WorkerWatchdog 시작 (kis-api 프로세스)")
+    except Exception as e:
+        logger.warning("WorkerWatchdog 시작 실패: %s", e)
+
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    _start_watchdog()
     port = int(os.environ.get("API_PORT", 5001))
     app.run(host="0.0.0.0", port=port, debug=False)

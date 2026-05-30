@@ -8,14 +8,22 @@
 5. 노출 상한 (심볼·전체 포트폴리오)
 """
 import logging
+import threading
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime, timezone, timedelta
 from typing import Optional
 
 import numpy as np
 import pandas as pd
 
 logger = logging.getLogger(__name__)
+
+_SEOUL_TZ = timezone(timedelta(hours=9))
+
+
+def _seoul_today() -> date:
+    """Return today's date in Asia/Seoul timezone (UTC+9)."""
+    return datetime.now(_SEOUL_TZ).date()
 
 
 # ── 설정 ──────────────────────────────────────────────────────────────────────
@@ -93,7 +101,7 @@ class TrailingStopManager:
         self._positions[symbol] = PositionStop(
             symbol=symbol,
             entry_price=entry_price,
-            entry_date=entry_date or str(date.today()),
+            entry_date=entry_date or str(_seoul_today()),
             peak_price=entry_price,
             trailing_stop=ts,
             hard_stop=hs,
@@ -211,19 +219,19 @@ class LossTracker:
     current_equity: float = 0.0
     kill_switch: bool = False
     kill_reason: str = ""
-    trade_date: date = field(default_factory=date.today)
-    week_start: date = field(default_factory=date.today)
+    trade_date: date = field(default_factory=_seoul_today)
+    week_start: date = field(default_factory=_seoul_today)
 
     def reset_daily(self) -> None:
         self.daily_pnl = 0.0
-        self.trade_date = date.today()
+        self.trade_date = _seoul_today()
 
     def reset_weekly(self) -> None:
         self.weekly_pnl = 0.0
-        self.week_start = date.today()
+        self.week_start = _seoul_today()
 
     def record_pnl(self, pnl: float, current_equity: float) -> None:
-        today = date.today()
+        today = _seoul_today()
         if today != self.trade_date:
             self.reset_daily()
         if (today - self.week_start).days >= 7:
@@ -354,6 +362,7 @@ class PersistentLossTracker(LossTracker):
     def __init__(self, config: RiskConfig, redis_client=None,
                  db_session=None, db_factory=None):
         super().__init__(config=config)
+        self._lock = threading.Lock()  # serialises concurrent record_pnl() calls
         self._redis = redis_client
         # Prefer db_factory (creates per-op sessions) over a long-lived db_session.
         # Long-lived sessions cause stale connections and pool exhaustion on 24h+ processes.
@@ -366,10 +375,10 @@ class PersistentLossTracker(LossTracker):
         self._restore_state()
 
     def _redis_key(self) -> str:
-        return self._REDIS_KEY_TEMPLATE.format(date=date.today().isoformat())
+        return self._REDIS_KEY_TEMPLATE.format(date=_seoul_today().isoformat())
 
     def _restore_state(self) -> None:
-        today = date.today()
+        today = _seoul_today()
         redis_val = self._load_redis(today)
         db_val = self._load_db(today)
 
@@ -391,16 +400,57 @@ class PersistentLossTracker(LossTracker):
                 logger.warning("킬스위치 복원: %s", self.kill_reason)
 
     def record_pnl(self, pnl: float, current_equity: float) -> None:
-        super().record_pnl(pnl, current_equity)
+        with self._lock:
+            super().record_pnl(pnl, current_equity)
         self._persist()
 
     def reset_daily(self) -> None:
-        super().reset_daily()
+        with self._lock:
+            super().reset_daily()
         self._persist()
 
     def manual_reset(self) -> None:
-        super().manual_reset()
+        with self._lock:
+            super().manual_reset()
         self._persist()
+
+    def _fire_kill_switch_alert(self, reason: str) -> None:
+        # Called under self._lock — dispatch I/O to a daemon thread to avoid blocking
+        # record_pnl() for concurrent fills arriving at the same moment.
+        t = threading.Thread(
+            target=self._do_kill_switch_io,
+            args=(reason,),
+            daemon=True,
+            name="kill-switch-alert",
+        )
+        t.start()
+
+    def _do_kill_switch_io(self, reason: str) -> None:
+        """Telegram + WebSocket + DB audit — runs outside the lock."""
+        super()._fire_kill_switch_alert(reason)
+        self._write_kill_switch_audit(reason)
+
+    def _write_kill_switch_audit(self, reason: str) -> None:
+        if self._db_factory is None:
+            return
+        try:
+            import json
+            from backend.database.models import AuditLog
+            sess = self._db_factory()
+            try:
+                sess.add(AuditLog(
+                    event_type="kill_switch",
+                    actor="risk_engine",
+                    detail=json.dumps({"reason": reason}, ensure_ascii=False),
+                ))
+                sess.commit()
+            except Exception as e:
+                logger.warning("킬스위치 감사 로그 저장 실패: %s", e)
+                sess.rollback()
+            finally:
+                sess.close()
+        except Exception as e:
+            logger.warning("킬스위치 감사 로그 예외: %s", e)
 
     def _persist(self) -> None:
         self._write_redis()
@@ -418,9 +468,12 @@ class PersistentLossTracker(LossTracker):
     def _write_db(self) -> None:
         from backend.database.models import DailyRiskState
         today = date.today()
-        # Snapshot values under RLock so we don't race against record_pnl
-        daily_pnl, weekly_pnl, peak_eq = self.daily_pnl, self.weekly_pnl, self.peak_equity
-        ks, kr = self.kill_switch, (self.kill_reason or None)
+        with self._lock:
+            daily_pnl = self.daily_pnl
+            weekly_pnl = self.weekly_pnl
+            peak_eq = self.peak_equity
+            ks = self.kill_switch
+            kr = self.kill_reason or None
 
         if self._db_factory is not None:
             sess = self._db_factory()

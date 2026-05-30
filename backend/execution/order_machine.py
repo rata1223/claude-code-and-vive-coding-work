@@ -47,6 +47,15 @@ class OrderStateMachine:
         with self._lock:
             self._orders[order.id] = order
         logger.info("주문 등록: id=%s symbol=%s side=%s qty=%d", order.id, order.symbol, order.side, order.qty)
+        # Persist immediately on registration so the order survives a process crash
+        # that occurs between broker submission and the first state transition.
+        # Roll back in-memory insert if persistence fails to keep state consistent.
+        try:
+            self._on_change(order)
+        except Exception:
+            with self._lock:
+                self._orders.pop(order.id, None)
+            raise
         return order
 
     # ── 상태 전환 ──────────────────────────────────────────────────────────

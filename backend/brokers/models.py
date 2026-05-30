@@ -2,6 +2,26 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 
+class Market(str, Enum):
+    KR = "KR"
+    US = "US"
+
+
+@dataclass
+class BrokerCapabilities:
+    markets: list[Market]
+    supports_streaming: bool         # True if WebSocket fills available
+    supports_fractional: bool        # True if fractional shares supported
+    cancel_requires_symbol: bool     # US cancel requires symbol+qty+price
+    cancel_requires_qty_price: bool
+    rate_limit_per_sec: int
+    settlement_days: int
+    has_securities_tax: bool         # KR sells: 0.20% tax
+    securities_tax_rate: float
+    price_precision: dict            # {"KR": 0, "US": 2} integer vs 2dp
+    min_order_qty: int = 1
+
+
 class OrderSide(str, Enum):
     BUY = "buy"
     SELL = "sell"

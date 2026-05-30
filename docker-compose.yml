@@ -8,7 +8,7 @@ services:
     environment:
       POSTGRES_DB: quantdinger
       POSTGRES_USER: quantdinger
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-quantdinger}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set to a strong random value (see .env.example)}
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -21,10 +21,19 @@ services:
     image: redis:7-alpine
     restart: unless-stopped
     container_name: quantdinger-redis
+    command: >
+      sh -c 'if [ -n "$$REDIS_PASSWORD" ];
+             then redis-server --requirepass "$$REDIS_PASSWORD";
+             else redis-server; fi'
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
     volumes:
       - redis_data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: >
+        sh -c 'if [ -n "$$REDIS_PASSWORD" ];
+               then redis-cli -a "$$REDIS_PASSWORD" ping;
+               else redis-cli ping; fi'
       interval: 10s
       timeout: 5s
       retries: 5
@@ -51,12 +60,12 @@ services:
     ports:
       - "8000:8000"
     environment:
-      DATABASE_URL: postgresql://quantdinger:${POSTGRES_PASSWORD:-quantdinger}@postgres:5432/quantdinger
-      REDIS_URL: redis://redis:6379/0
-      # JWT_SECRET_KEY has no default — must be set in .env to prevent insecure deployments.
+      DATABASE_URL: postgresql://quantdinger:${POSTGRES_PASSWORD}@postgres:5432/quantdinger
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
       JWT_SECRET_KEY: ${JWT_SECRET_KEY:?JWT_SECRET_KEY must be set to a secure random value (see .env.example)}
-      JWT_EXPIRE_MINUTES: ${JWT_EXPIRE_MINUTES:-10080}
-      KIS_CREDENTIAL_KEY: ${KIS_CREDENTIAL_KEY:-}
+      JWT_EXPIRE_MINUTES: ${JWT_EXPIRE_MINUTES:-1440}
+      KIS_CREDENTIAL_KEY: '${KIS_CREDENTIAL_KEY:?KIS_CREDENTIAL_KEY must be set. Generate: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"}'
+      CORS_ORIGINS: ${CORS_ORIGINS:-}
     depends_on:
       postgres:
         condition: service_healthy
@@ -105,7 +114,7 @@ services:
       dockerfile: Dockerfile.kis-bot
     restart: unless-stopped
     container_name: kis-api
-    command: python -m backend.api.server
+    command: gunicorn -c backend/api/gunicorn_conf.py backend.api.server:app
     ports:
       - "5001:5001"
     environment:
@@ -113,8 +122,8 @@ services:
       KIS_APP_SECRET: ${KIS_APP_SECRET}
       KIS_ACCOUNT_NO: ${KIS_ACCOUNT_NO}
       KIS_ENV: ${KIS_ENV:-paper}
-      REDIS_URL: redis://redis:6379
-      DB_URL: postgresql://quantdinger:${POSTGRES_PASSWORD:-quantdinger}@postgres:5432/quantdinger
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379}
+      DB_URL: postgresql://quantdinger:${POSTGRES_PASSWORD}@postgres:5432/quantdinger
       API_PORT: "5001"
       KIS_API_KEY: ${KIS_API_KEY:-}
     depends_on:
@@ -143,8 +152,8 @@ services:
       # Set ENABLE_LIVE_TRADING=true ONLY after completing 4-week paper run.
       # Default false = shadow execution: full signals generated but no orders submitted.
       ENABLE_LIVE_TRADING: ${ENABLE_LIVE_TRADING:-false}
-      REDIS_URL: redis://redis:6379
-      DB_URL: postgresql://quantdinger:${POSTGRES_PASSWORD:-quantdinger}@postgres:5432/quantdinger
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379}
+      DB_URL: postgresql://quantdinger:${POSTGRES_PASSWORD}@postgres:5432/quantdinger
       DAILY_LOSS_LIMIT_PCT: ${DAILY_LOSS_LIMIT_PCT:-0.03}
       MDD_LIMIT_PCT: ${MDD_LIMIT_PCT:-0.15}
       STOP_LOSS_PCT: ${STOP_LOSS_PCT:-0.07}
@@ -166,8 +175,8 @@ services:
     ports:
       - "5002:5002"
     environment:
-      REDIS_URL: redis://redis:6379
-      QUANTDINGER_SECRET_KEY: ${QUANTDINGER_SECRET_KEY}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379}
+      QUANTDINGER_SECRET_KEY: ${QUANTDINGER_SECRET_KEY:?QUANTDINGER_SECRET_KEY must be set (see .env.example)}
       WS_PORT: "5002"
     depends_on:
       redis:

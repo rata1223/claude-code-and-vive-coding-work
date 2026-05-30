@@ -5,9 +5,24 @@ from typing import Optional
 import bcrypt
 from jose import JWTError, jwt
 
-SECRET_KEY = os.environ.get("JWT_SECRET_KEY", "change-me-in-production-use-a-long-random-string")
+_raw_secret = os.environ.get("JWT_SECRET_KEY", "")
+if not _raw_secret:
+    raise RuntimeError(
+        "JWT_SECRET_KEY environment variable is not set. "
+        "Generate one with: python -c \"import secrets; print(secrets.token_hex(32))\""
+    )
+SECRET_KEY = _raw_secret
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = int(os.environ.get("JWT_EXPIRE_MINUTES", "10080"))  # 7 days
+# Preserve main's short-secret warning as an extra safeguard. main's "refuse to start if
+# SECRET_KEY == default placeholder in production" branch is intentionally dropped: it is
+# unreachable here because the unconditional raise above already blocks startup when the
+# secret is unset, and a configured secret can never equal the placeholder.
+if len(SECRET_KEY) < 32:
+    import logging as _log
+    _log.getLogger(__name__).warning(
+        "JWT_SECRET_KEY is shorter than 32 characters — security risk."
+    )
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.environ.get("JWT_EXPIRE_MINUTES", "1440"))  # 24 hours
 
 
 def hash_password(password: str) -> str:

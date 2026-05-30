@@ -10,24 +10,57 @@ import threading
 import time
 
 import redis
-from flask import Flask
-from flask_socketio import SocketIO, emit
+from flask import Flask, request
+from flask_socketio import SocketIO, emit, disconnect
 
 logger = logging.getLogger(__name__)
 
 _REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:6379")
 
+# Importing this module must NOT require QUANTDINGER_SECRET_KEY: worker processes
+# (e.g. kis-worker, which has no such env var) do `from backend.websocket.server import
+# publish_alert/publish_order_update`, and those helpers use only the Redis client below.
+# The secret is enforced at server-start (see _require_ws_secret / __main__) so the
+# standalone WS server still refuses to run with an insecure Flask session secret.
 app = Flask(__name__)
-app.config["SECRET_KEY"] = os.environ.get("QUANTDINGER_SECRET_KEY", "dev-secret")
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
+app.config["SECRET_KEY"] = os.environ.get("QUANTDINGER_SECRET_KEY") or None
+
+# Restrict CORS to explicit origins when WS_CORS_ORIGINS is set.
+_ws_cors = os.environ.get("WS_CORS_ORIGINS", "*")
+socketio = SocketIO(app, cors_allowed_origins=_ws_cors, async_mode="threading")
 
 _r = redis.from_url(_REDIS_URL)
+
+
+def _verify_ws_token() -> bool:
+    """Validate JWT token passed as query param ?token=<jwt>.
+    Returns True if valid, False otherwise.
+    Configuration/bootstrap errors (e.g. missing JWT_SECRET_KEY) are NOT caught
+    here — they propagate so the WS process surfaces misconfiguration rather than
+    silently rejecting every client as unauthenticated.
+    """
+    token = request.args.get("token", "")
+    if not token:
+        return False
+    import importlib
+    for mod_name in ("api.auth", "backend.api.auth"):
+        try:
+            mod = importlib.import_module(mod_name)
+            payload = mod.decode_access_token(token)
+            return payload is not None
+        except (ImportError, AttributeError):
+            continue
+    return False
 
 
 # ── 클라이언트 이벤트 ─────────────────────────────────────────────────────
 @socketio.on("connect")
 def on_connect():
-    logger.info("WS 클라이언트 연결")
+    if not _verify_ws_token():
+        logger.warning("WS 인증 실패 — 연결 거부: %s", request.remote_addr)
+        disconnect()
+        return False
+    logger.info("WS 클라이언트 연결: %s", request.remote_addr)
     emit("connected", {"status": "ok"})
 
 
@@ -90,9 +123,28 @@ def publish_alert(message: str, level: str = "info"):
     _r.publish("alert", json.dumps({"message": message, "level": level}))
 
 
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO,
-                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+def _require_ws_secret() -> None:
+    """Fail fast if the WS server would run with an insecure/empty Flask session secret.
+    Enforced only when starting the server process — never on import."""
+    if not app.config.get("SECRET_KEY"):
+        raise RuntimeError(
+            "QUANTDINGER_SECRET_KEY environment variable is not set. "
+            "Generate one with: python -c \"import secrets; print(secrets.token_hex(32))\""
+        )
+
+
+def start_ws_server() -> None:
+    """Bootstrap and run the WS server.
+    Call this from any entrypoint (gunicorn WSGI app factory, __main__, etc.)
+    so the secret check is never bypassed by non-__main__ launch paths.
+    """
+    _require_ws_secret()
     start_redis_listener()
     port = int(os.environ.get("WS_PORT", 5002))
     socketio.run(app, host="0.0.0.0", port=port, debug=False)
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    start_ws_server()
