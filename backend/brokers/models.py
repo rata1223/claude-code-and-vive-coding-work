@@ -39,6 +39,8 @@ class OrderStatus(str, Enum):
     FILLED = "filled"
     CANCELED = "canceled"
     REJECTED = "rejected"
+    EXPIRED = "expired"
+    UNKNOWN = "unknown"
 
 
 @dataclass

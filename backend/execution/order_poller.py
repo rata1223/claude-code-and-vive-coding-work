@@ -142,8 +142,8 @@ class OrderFillPoller:
             else:
                 logger.warning("체결 중복 감지 — 콜백 스킵: %s", updated.id)
 
-        elif updated.status in (OrderStatus.CANCELED, OrderStatus.REJECTED):
-            logger.warning("주문 취소/거부: %s status=%s", updated.id, updated.status)
+        elif updated.status in (OrderStatus.CANCELED, OrderStatus.REJECTED, OrderStatus.EXPIRED):
+            logger.warning("주문 취소/거부/만료: %s status=%s", updated.id, updated.status)
             with self._lock:
                 self._entries.pop(updated.id, None)
 

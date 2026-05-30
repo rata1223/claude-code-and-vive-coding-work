@@ -12,6 +12,7 @@ from api.database import get_db
 from api.deps import get_current_user
 from api.models import Credential, Strategy, Trade, User
 from api.schemas import ClosePositionRequest, PlaceOrderRequest, Resp
+from backend.brokers.semantic_mapper import KIS_DOMESTIC_MAPPER, KIS_OVERSEAS_MAPPER
 
 logger = logging.getLogger(__name__)
 
@@ -147,9 +148,10 @@ def place_order(
 
         # Record trade in DB (quick-trade doesn't belong to a strategy; use strategy_id=None)
         # We store it under a special "manual" strategy if needed – skip for simplicity.
+        mapper = KIS_DOMESTIC_MAPPER if body.market.lower() == "kr" else KIS_OVERSEAS_MAPPER
         return Resp.ok(
             {
-                "order_id": result.get("output", {}).get("ODNO", ""),
+                "order_id": mapper.extract_broker_order_id(result),
                 "symbol": body.symbol,
                 "side": body.side,
                 "qty": qty,
@@ -184,9 +186,10 @@ def close_position(
             exchange = body.exchange or "NASD"
             result = orders.sell_us(body.symbol, exchange, qty, body.price)
 
+        mapper = KIS_DOMESTIC_MAPPER if body.market.lower() == "kr" else KIS_OVERSEAS_MAPPER
         return Resp.ok(
             {
-                "order_id": result.get("output", {}).get("ODNO", ""),
+                "order_id": mapper.extract_broker_order_id(result),
                 "symbol": body.symbol,
                 "side": "sell",
                 "qty": qty,
