@@ -370,10 +370,20 @@ class StrategyWorker:
         run_id = data.get("run_id", 0)
 
         on_filled_cb = self._make_fill_callback(tracker, machine, run_id)
-        on_timeout_cb = lambda o: (
-            logger.error("주문 타임아웃 — 수동 확인 필요: %s %s %s", o.id, o.side, o.symbol),
-            tracker.unmark_pending(o.symbol),
-        )
+
+        def on_timeout_cb(o):
+            logger.warning("주문 타임아웃 — 브로커 취소 시도: %s %s %s", o.id, o.side, o.symbol)
+            try:
+                broker.cancel_order(
+                    order_id=o.id,
+                    symbol=o.symbol,
+                    qty=o.qty,
+                    price=float(o.price or 0),
+                )
+            except Exception as _e:
+                logger.error("타임아웃 취소 예외 %s: %s", o.id, _e)
+            finally:
+                tracker.unmark_pending(o.symbol)
 
         self._restore_positions(tracker, broker=data.get("broker", "kis"))
         self._restore_pending_to_tracker(
@@ -557,6 +567,25 @@ class StrategyWorker:
                 db_order.filled_qty = order.filled_qty or fill.qty
                 db_order.avg_fill_price = order.avg_fill_price or fill.price
                 db.commit()
+
+                # Immutable audit trail for fill events
+                try:
+                    from backend.database.models import AuditLog
+                    db.add(AuditLog(
+                        event_type="fill",
+                        symbol=fill.symbol,
+                        order_id=order.id,
+                        actor="worker",
+                        detail=json.dumps({
+                            "side": fill.side,
+                            "qty": fill.qty,
+                            "price": fill.price,
+                            "market": fill.market,
+                        }),
+                    ))
+                    db.commit()
+                except Exception as _ae:
+                    logger.warning("AuditLog 체결 기록 실패: %s", _ae)
         except Exception as e:
             logger.warning("체결 DB 저장 실패: %s", e)
 

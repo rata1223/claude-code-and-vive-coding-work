@@ -89,13 +89,16 @@ class SimulatedBroker(BrokerAdapter):
 
         return self._machine.get(order_id)
 
-    def cancel_order(self, order_id: str) -> bool:
+    def cancel_order(self, order_id: str, symbol: str = "", qty: int = 0, price: float = 0.0) -> bool:
         try:
             self._machine.cancel(order_id)
             return True
         except Exception as e:
             logger.warning("취소 실패: %s", e)
             return False
+
+    def get_order_status(self, order_id: str, symbol: str = ""):
+        return self._machine.get(order_id)
 
     def get_price(self, symbol: str) -> float:
         price = self._prices.get(symbol)

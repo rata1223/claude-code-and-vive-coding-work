@@ -239,19 +239,25 @@ class StartupRecovery:
                     poller.start()
 
                 def _make_recovery_fill_cb(db_order_pk: int, broker_order_id: str):
-                    """Persist fill to DB on recovery; in-memory state updated when strategies restart."""
+                    """Persist fill + update positions table so restored strategies see correct state."""
                     def on_filled(order: BOrder):
                         sess = self._factory()
                         try:
                             row = sess.get(DBOrder, db_order_pk)
                             if row:
+                                fill_qty = order.filled_qty or order.qty
+                                fill_price = order.avg_fill_price or order.price
                                 row.status = order.status.value
-                                row.filled_qty = order.filled_qty or order.qty
-                                row.avg_fill_price = order.avg_fill_price or order.price
+                                row.filled_qty = fill_qty
+                                row.avg_fill_price = fill_price
                                 fill = DBFill(order_id=db_order_pk,
-                                              qty=order.filled_qty or order.qty,
-                                              price=order.avg_fill_price or order.price)
+                                              qty=fill_qty,
+                                              price=fill_price)
                                 sess.add(fill)
+                                # Update positions table so _restore_positions() picks up the fill
+                                self._apply_fill_to_position_db(
+                                    sess, row.symbol, row.side, fill_qty, fill_price,
+                                )
                                 sess.commit()
                                 logger.info("복구 체결 DB 업데이트: %s → FILLED", broker_order_id)
                         except Exception as e:

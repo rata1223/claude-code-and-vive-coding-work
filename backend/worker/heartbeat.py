@@ -126,11 +126,37 @@ class WorkerWatchdog:
             self._alert_recovery()
 
     def _alert_dead_worker(self) -> None:
+        # Write kill_switch to DB — SAFE_MODE is a process-local singleton so calling
+        # SAFE_MODE.disable() here (in the API process) has no effect on the worker process.
+        # DB is the only cross-process channel available without additional infrastructure.
         try:
-            from backend.worker.recovery import SAFE_MODE
-            SAFE_MODE.disable("Worker 하트비트 없음 — 프로세스 재시작 필요")
-        except Exception:
-            pass
+            import os
+            from datetime import date
+            from backend.database.models import init_db_factory, DailyRiskState
+            db_url = os.environ.get("DB_URL", "postgresql://quantdinger:quantdinger@postgres:5432/quantdinger")
+            factory = init_db_factory(db_url)
+            sess = factory()
+            try:
+                today = date.today()
+                row = sess.get(DailyRiskState, today)
+                if row is None:
+                    row = DailyRiskState(trade_date=today)
+                    sess.add(row)
+                if not row.kill_switch:
+                    row.kill_switch = True
+                    row.kill_reason = "Worker 하트비트 없음 — 프로세스 재시작 필요"
+                    sess.commit()
+                    logger.critical("WorkerWatchdog: DB kill_switch 설정")
+            except Exception as e:
+                logger.warning("WorkerWatchdog: DB kill_switch 기록 실패: %s", e)
+                try:
+                    sess.rollback()
+                except Exception:
+                    pass
+            finally:
+                sess.close()
+        except Exception as e:
+            logger.warning("WorkerWatchdog: DB 연결 실패: %s", e)
         try:
             from bot.notifier import alert_emergency
             alert_emergency("⚠️ kis-worker 하트비트 없음 — 프로세스 확인 필요")

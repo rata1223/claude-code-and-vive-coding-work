@@ -11,7 +11,7 @@ from backend.quant.data.universe import EXCD_MAP, KR_ETF
 logger = logging.getLogger(__name__)
 
 _FX_CACHE_LOCK = threading.Lock()
-_FX_CACHE: dict = {"rate": 1350.0, "ts": 0.0}
+_FX_CACHE: dict = {"rate": 1350.0, "ts": time.monotonic()}
 _FX_TTL = 3600  # 1 hour
 
 # Process-level singleton — rate-limit tracking must be shared across all callers
@@ -30,6 +30,12 @@ def get_kis_broker() -> "KISBroker":
 
 
 class KISBroker(BrokerAdapter):
+
+    @staticmethod
+    def _is_kr(symbol: str) -> bool:
+        """Return True for KR domestic symbols (6-digit code or in KR_ETF list)."""
+        return symbol in KR_ETF or (len(symbol) == 6 and symbol.isdigit())
+
     def __init__(self):
         self._client = KISClient()
         self._market = KISMarketData(self._client)
@@ -124,8 +130,23 @@ class KISBroker(BrokerAdapter):
                 status=OrderStatus.REJECTED, raw={"error": str(e)},
             )
 
-    def cancel_order(self, order_id: str) -> bool:
-        """주문 취소. KIS TR: TTTC0803U (실전) / VTTC0803U (모의)."""
+    def cancel_order(self, order_id: str, symbol: str = "", qty: int = 0, price: float = 0.0) -> bool:
+        """주문 취소. US 종목은 cancel_us() 라우팅. KR: TTTC0803U/VTTC0803U."""
+        is_us = bool(symbol) and not self._is_kr(symbol)
+        if is_us:
+            excd = EXCD_MAP.get(symbol, "NASD")
+            try:
+                resp = self._orders.cancel_us(order_id, symbol, excd, qty, price)
+                rt_cd = resp.get("rt_cd", "1")
+                if rt_cd == "0":
+                    logger.info("US 주문 취소 성공: %s %s", order_id, symbol)
+                    return True
+                logger.warning("US 주문 취소 실패 (rt_cd=%s): %s", rt_cd, resp.get("msg1"))
+                return False
+            except Exception as e:
+                logger.error("US 주문 취소 예외 %s: %s", order_id, e)
+                return False
+
         try:
             tr_id = "VTTC0803U" if self._paper else "TTTC0803U"
             body = {
@@ -139,7 +160,7 @@ class KISBroker(BrokerAdapter):
                 "ORD_UNPR": "0",
                 "QTY_ALL_ORD_YN": "Y",
             }
-            resp = self._client.post("/uapi/domestic-stock/v1/trading/order-rvsecncl", body, tr_id=tr_id)
+            resp = self._client.post("/uapi/domestic-stock/v1/trading/order-rvsecncl", tr_id, body)
             rt_cd = resp.get("rt_cd", "1")
             if rt_cd == "0":
                 logger.info("주문 취소 성공: %s", order_id)
@@ -155,7 +176,7 @@ class KISBroker(BrokerAdapter):
         단건 주문 조회. symbol로 KR/US 라우팅.
         반환 None = 조회 실패 또는 주문 미존재.
         """
-        is_us = symbol and not (symbol in KR_ETF or (len(symbol) == 6 and symbol.isdigit()))
+        is_us = bool(symbol) and not self._is_kr(symbol)
         if is_us:
             return self._get_us_order_status(order_id, symbol)
         return self._get_kr_order_status(order_id)
@@ -179,7 +200,7 @@ class KISBroker(BrokerAdapter):
                 "CTX_AREA_FK100": "",
                 "CTX_AREA_NK100": "",
             }
-            resp = self._client.get("/uapi/domestic-stock/v1/trading/inquire-order", params, tr_id=tr_id)
+            resp = self._client.get("/uapi/domestic-stock/v1/trading/inquire-order", tr_id, params)
             output = resp.get("output1") or resp.get("output", [])
             if not output:
                 return None
@@ -230,7 +251,7 @@ class KISBroker(BrokerAdapter):
                 "CTX_AREA_FK200": "",
                 "CTX_AREA_NK200": "",
             }
-            resp = self._client.get("/uapi/overseas-stock/v1/trading/inquire-order", params, tr_id=tr_id)
+            resp = self._client.get("/uapi/overseas-stock/v1/trading/inquire-order", tr_id, params)
             output = resp.get("output") or []
             if not output:
                 return None
@@ -294,4 +315,7 @@ class KISBroker(BrokerAdapter):
                 return float(rate)
         except Exception:
             pass
+        age_min = (time.monotonic() - _FX_CACHE["ts"]) / 60
+        if age_min > 30:
+            logger.warning("FX 환율 오래됨 (%.0f분) — 킬스위치 계산 부정확 가능 (fallback=%.0f)", age_min, _FX_CACHE["rate"])
         return _FX_CACHE["rate"]
