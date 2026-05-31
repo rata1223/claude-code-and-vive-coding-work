@@ -13,7 +13,7 @@ class Market(str, Enum):
 class BrokerCapabilities:
     # Identity
     broker_id: str              # "kis" | "kiwoom" | "simulator"
-    market: str                 # "overseas" | "domestic" | "simulation"
+    market: str                 # "US" | "KR" | "simulation"  — matches Position.market values
     currency: str               # "USD" | "KRW" | "SIM"
 
     # Order type support

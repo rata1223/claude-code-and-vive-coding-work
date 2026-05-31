@@ -5,7 +5,7 @@ from .models import BrokerCapabilities
 
 KIS_LIVE_CAPABILITIES = BrokerCapabilities(
     broker_id="kis",
-    market="overseas",
+    market="US",
     currency="USD",
     supports_market_buy=False,   # ORD_DVSN="00" is hardcoded — true market orders not sent
     supports_market_sell=False,
@@ -39,7 +39,7 @@ KIS_PAPER_CAPABILITIES = dataclasses.replace(KIS_LIVE_CAPABILITIES, rate_limit_p
 
 KIWOOM_CAPABILITIES = BrokerCapabilities(
     broker_id="kiwoom",
-    market="domestic",
+    market="KR",
     currency="KRW",
     supports_market_buy=True,
     supports_market_sell=True,

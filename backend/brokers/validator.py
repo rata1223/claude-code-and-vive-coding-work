@@ -1,7 +1,12 @@
 import logging
+import os
 from dataclasses import dataclass
 
 from .models import BrokerCapabilities
+
+# When true, cross-market routing raises UnsupportedCapabilityError.
+# Default false preserves backwards compat while KR → Kiwoom migration is in progress.
+_MARKET_ENFORCEMENT: bool = os.environ.get("KIS_MARKET_ENFORCEMENT", "false").lower() == "true"
 
 logger = logging.getLogger(__name__)
 
@@ -44,11 +49,13 @@ class BrokerCapabilityValidator:
         UnsupportedCapabilityError for operations the broker cannot perform.
 
         Validation order:
-          1. Fractional qty
-          2. Short sell flag
-          3. Stop order type
-          4. Market order → limit fallback if price available, else hard error
+          1. Market routing (if req.market is set and enforcement is on)
+          2. Fractional qty
+          3. Short sell flag
+          4. Stop order type
+          5. Market order → limit fallback if price available, else hard error
         """
+        self._check_market_routing(req)
         self._check_fractional(req)
         self._check_short(req)
         self._check_stop(req)
@@ -70,6 +77,27 @@ class BrokerCapabilityValidator:
             )
 
     # ── private checks ────────────────────────────────────────────────────
+
+    def _check_market_routing(self, req: OrderRequest) -> None:
+        """Block orders where req.market doesn't match the broker's declared market.
+
+        Only runs when req.market is explicitly set (backwards compat: None skips check).
+        Behaviour is controlled by KIS_MARKET_ENFORCEMENT env var:
+          false (default) — logs a warning and allows the order through
+          true            — raises UnsupportedCapabilityError
+        """
+        if req.market is None:
+            return
+        broker_market = self.caps.market
+        if broker_market not in ("US", "KR"):
+            return  # simulation / custom market — no routing restriction
+        if req.market == broker_market:
+            return
+        detail = f"{req.symbol!r} targets {req.market!r} but broker handles {broker_market!r} only"
+        if _MARKET_ENFORCEMENT:
+            raise UnsupportedCapabilityError("market_routing", self.caps.broker_id, detail)
+        logger.warning("[%s] market routing mismatch (KIS_MARKET_ENFORCEMENT=false): %s",
+                       self.caps.broker_id, detail)
 
     def _check_fractional(self, req: OrderRequest) -> None:
         if not self.caps.supports_fractional and req.qty != int(req.qty):

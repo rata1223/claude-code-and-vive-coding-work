@@ -110,8 +110,10 @@ class KISBroker(BrokerAdapter):
         return positions
 
     def place_order(self, symbol: str, side: str, qty: int, price: float, order_type: str = "limit") -> Order:
+        detected_market = "KR" if self._is_kr(symbol) else "US"
         BrokerCapabilityValidator(self.capabilities).validate(
-            OrderRequest(symbol=symbol, side=side, qty=float(qty), price=price, order_type=order_type)
+            OrderRequest(symbol=symbol, side=side, qty=float(qty), price=price,
+                         order_type=order_type, market=detected_market)
         )
         if self._breaker.is_open():
             logger.error("주문 차단 — circuit breaker open: %s %s", side, symbol)
