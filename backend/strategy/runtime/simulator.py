@@ -6,6 +6,7 @@ from typing import Optional
 from backend.brokers.base import BrokerAdapter
 from backend.brokers.capabilities import SIMULATOR_CAPABILITIES
 from backend.brokers.models import Balance, BrokerCapabilities, Order, OrderStatus, Position
+from backend.brokers.validator import BrokerCapabilityValidator, OrderRequest
 from backend.execution.order_machine import FillEvent, OrderStateMachine
 from backend.execution.position_tracker import Fill, PositionTracker
 
@@ -24,6 +25,7 @@ class SimulatedBroker(BrokerAdapter):
     """
 
     is_live: bool = False  # disables SAFE_MODE and ENABLE_LIVE_TRADING gates
+    capabilities = SIMULATOR_CAPABILITIES
 
     @property
     def capabilities(self) -> BrokerCapabilities:
@@ -51,6 +53,9 @@ class SimulatedBroker(BrokerAdapter):
         return self._tracker.get_position(symbol)
 
     def place_order(self, symbol: str, side: str, qty: int, price: float, order_type: str = "limit") -> Order:
+        BrokerCapabilityValidator(self.capabilities).validate(
+            OrderRequest(symbol=symbol, side=side, qty=float(qty), price=price, order_type=order_type)
+        )
         order_id = str(uuid.uuid4())[:12]
         order = Order(id=order_id, symbol=symbol, side=side, qty=qty, price=price,
                       status=OrderStatus.PENDING)
