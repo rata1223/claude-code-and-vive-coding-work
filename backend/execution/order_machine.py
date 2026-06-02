@@ -98,6 +98,8 @@ class OrderStateMachine:
             if broker_order_id:
                 order.id = broker_order_id
                 self._orders[broker_order_id] = order
+                if order_id != broker_order_id:
+                    del self._orders[order_id]
             target_id = broker_order_id if broker_order_id else order_id
         return self.transition(target_id, OrderStatus.SUBMITTED)
 

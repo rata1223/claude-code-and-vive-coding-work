@@ -357,3 +357,212 @@ class TestBrokerScoping:
         log = sess.query(ReconciliationLog).first()
         sess.close()
         assert log.broker == "kis"
+
+
+# ── Req 1: Server Restart Recovery ────────────────────────────────────────────
+
+class TestStartupRecovery:
+    """startup trigger detects position drift accumulated during downtime."""
+
+    def test_startup_detects_qty_drift(self, db_factory):
+        _insert_db_position(db_factory, "005930", qty=5)
+        broker = MagicMock()
+        broker.get_positions.return_value = [_broker_position("005930", qty=10)]
+        broker.get_order_status = MagicMock(return_value=None)
+
+        result = _make_reconciler(broker, db_factory).reconcile("startup")
+
+        assert result.trigger == "startup"
+        assert any(g["kind"] == "qty_mismatch" for g in result.gaps)
+        assert _get_position(db_factory, "005930").qty == 10
+
+    def test_startup_inserts_position_acquired_during_downtime(self, db_factory):
+        broker = MagicMock()
+        broker.get_positions.return_value = [_broker_position("AAPL", qty=5, market="US")]
+        broker.get_order_status = MagicMock(return_value=None)
+
+        result = _make_reconciler(broker, db_factory).reconcile("startup")
+
+        assert any(g["kind"] == "missing_in_db" for g in result.gaps)
+        assert _count_positions(db_factory, "AAPL") == 1
+
+
+# ── Req 2: lost_order gap (pending order check) ────────────────────────────────
+
+class TestLostOrderDetection:
+    """_reconcile_pending_orders: broker no longer knows about an old order."""
+
+    def test_old_order_marked_canceled_when_broker_returns_none(self, db_factory):
+        sess = db_factory()
+        old_time = datetime.utcnow() - timedelta(hours=2)
+        order = DBOrder(
+            broker_order_id="LOST001", symbol="005930", side="buy", qty=10,
+            price=100.0, status="submitted", market="KR", broker="kis",
+            created_at=old_time,
+        )
+        sess.add(order)
+        sess.commit()
+        order_id = order.id
+        sess.close()
+
+        broker = MagicMock()
+        broker.get_positions.return_value = []
+        broker.get_order_status.return_value = None
+
+        result = _make_reconciler(broker, db_factory).reconcile("periodic")
+
+        assert any(g["kind"] == "lost_order" for g in result.gaps)
+        assert any(r["kind"] == "cancel_lost_order" for r in result.repairs)
+        sess = db_factory()
+        row = sess.get(DBOrder, order_id)
+        sess.close()
+        assert row.status == "canceled"
+
+    def test_young_order_not_marked_lost(self, db_factory):
+        """Order < 1h old is not treated as lost even when broker returns None."""
+        sess = db_factory()
+        young_time = datetime.utcnow() - timedelta(minutes=30)
+        sess.add(DBOrder(
+            broker_order_id="YOUNG001", symbol="005930", side="buy", qty=10,
+            price=100.0, status="submitted", market="KR", broker="kis",
+            created_at=young_time,
+        ))
+        sess.commit()
+        sess.close()
+
+        broker = MagicMock()
+        broker.get_positions.return_value = []
+        broker.get_order_status.return_value = None
+
+        result = _make_reconciler(broker, db_factory).reconcile("periodic")
+
+        assert not any(g["kind"] == "lost_order" for g in result.gaps)
+        assert not any(r["kind"] == "cancel_lost_order" for r in result.repairs)
+
+
+# ── Req 3: gap_kind strings ────────────────────────────────────────────────────
+
+class TestGapKindStrings:
+    """All gaps carry 'kind' and 'symbol' fields; lost_order is a valid kind."""
+
+    def test_all_gaps_have_required_fields(self, db_factory):
+        broker = MagicMock()
+        broker.get_positions.return_value = [_broker_position("005930", qty=10)]
+        broker.get_order_status = MagicMock(return_value=None)
+
+        result = _make_reconciler(broker, db_factory).reconcile("test")
+
+        for gap in result.gaps:
+            assert "kind" in gap and gap["kind"]
+            assert "symbol" in gap
+
+    def test_lost_order_gap_kind_is_produced(self, db_factory):
+        sess = db_factory()
+        old_time = datetime.utcnow() - timedelta(hours=2)
+        sess.add(DBOrder(
+            broker_order_id="LO001", symbol="005930", side="buy", qty=5,
+            price=100.0, status="submitted", market="KR", broker="kis",
+            created_at=old_time,
+        ))
+        sess.commit()
+        sess.close()
+
+        broker = MagicMock()
+        broker.get_positions.return_value = []
+        broker.get_order_status.return_value = None
+
+        result = _make_reconciler(broker, db_factory).reconcile("test")
+
+        assert any(g["kind"] == "lost_order" for g in result.gaps)
+
+
+# ── Req 4: Audit log per repair ────────────────────────────────────────────────
+
+class TestAuditLogPerRepair:
+    """One AuditLog entry is written for each position-level repair."""
+
+    def test_audit_count_matches_position_repairs(self, db_factory):
+        broker = MagicMock()
+        broker.get_positions.return_value = [
+            _broker_position("005930", qty=10),
+            _broker_position("000660", qty=5),
+        ]
+        broker.get_order_status = MagicMock(return_value=None)
+
+        result = _make_reconciler(broker, db_factory).reconcile("test")
+
+        assert len(result.repairs) == 2
+        sess = db_factory()
+        audit_count = sess.query(AuditLog).filter(
+            AuditLog.event_type == "reconcile_insert"
+        ).count()
+        sess.close()
+        assert audit_count == 2
+
+
+# ── Req 6: No duplicate position mutation (concurrent) ─────────────────────────
+
+class TestConcurrentReconciliation:
+    """Second concurrent reconcile call is skipped immediately (non-blocking lock)."""
+
+    def test_second_call_skips_while_first_runs(self, db_factory):
+        broker = MagicMock()
+        broker.get_positions.return_value = []
+        broker.get_order_status = MagicMock(return_value=None)
+
+        reconciler = _make_reconciler(broker, db_factory)
+
+        # Simulate a concurrent run already holding the lock
+        assert reconciler._reconcile_lock.acquire(blocking=False)
+        try:
+            r2 = reconciler.reconcile("concurrent")
+        finally:
+            reconciler._reconcile_lock.release()
+
+        assert any("진행 중" in e for e in r2.errors), \
+            "concurrent call must be skipped with 'in progress' error"
+        assert not r2.ok
+
+
+# ── Req 7: No silent state changes ────────────────────────────────────────────
+
+class TestSilentChangeGuard:
+    """Exceptions and state mutations are logged; nothing is swallowed silently."""
+
+    def test_cancel_order_failure_logs_warning(self, db_factory, caplog):
+        import logging
+        sess = db_factory()
+        old_time = datetime.utcnow() - timedelta(hours=2)
+        sess.add(DBOrder(
+            broker_order_id="ERR001", symbol="005930", side="buy", qty=10,
+            price=100.0, status="submitted", market="KR", broker="kis",
+            created_at=old_time,
+        ))
+        sess.commit()
+        sess.close()
+
+        broker = MagicMock()
+        broker.get_positions.return_value = []
+        broker.get_order_status.return_value = None
+        broker.cancel_order.side_effect = RuntimeError("KIS API 오류")
+
+        with caplog.at_level(logging.WARNING, logger="backend.execution.reconciler"):
+            result = _make_reconciler(broker, db_factory).reconcile("periodic")
+
+        assert any("cancel_order 실패" in m for m in caplog.messages), \
+            "cancel_order failure must produce a warning log"
+        assert any(r["kind"] == "cancel_lost_order" for r in result.repairs)
+
+    def test_stale_position_deletion_writes_audit_log(self, db_factory):
+        """Deleting a stale position is recorded in AuditLog — not a silent delete."""
+        old_time = datetime.utcnow() - timedelta(hours=2)
+        _insert_db_position(db_factory, "005930", qty=5, updated_at=old_time)
+
+        broker = MagicMock()
+        broker.get_positions.return_value = []
+        broker.get_order_status = MagicMock(return_value=None)
+
+        _make_reconciler(broker, db_factory).reconcile("test")
+
+        assert _count_audit(db_factory, "reconcile_delete") == 1, \
+            "stale position deletion must write an AuditLog entry"

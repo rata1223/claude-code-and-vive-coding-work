@@ -307,6 +307,41 @@ class StartupRecovery:
             logger.warning("미체결 주문 복원 실패: %s", e)
         return True
 
+    def _apply_fill_to_position_db(self, sess, symbol: str, side: str,
+                                    fill_qty: int, fill_price: float) -> None:
+        """Upsert or reduce position in DB for a recovery fill.
+        Uses the provided session; caller is responsible for commit.
+        """
+        from backend.database.models import Position as DBPosition
+        try:
+            row = sess.query(DBPosition).filter(
+                DBPosition.symbol == symbol,
+                DBPosition.broker == "kis",
+            ).first()
+            if side == "sell":
+                if row is not None:
+                    row.qty = max(0, row.qty - fill_qty)
+                    if row.qty <= 0:
+                        sess.delete(row)
+                    else:
+                        row.updated_at = datetime.utcnow()
+            else:  # buy
+                market = "KR" if symbol.isdigit() else "US"
+                if row is None:
+                    sess.add(DBPosition(
+                        symbol=symbol, qty=fill_qty, avg_price=fill_price,
+                        market=market, broker="kis",
+                    ))
+                else:
+                    prev_val = row.avg_price * row.qty
+                    new_val = fill_price * fill_qty
+                    total_qty = row.qty + fill_qty
+                    row.avg_price = (prev_val + new_val) / total_qty
+                    row.qty = total_qty
+                    row.updated_at = datetime.utcnow()
+        except Exception as e:
+            logger.warning("복구 포지션 DB 갱신 실패 (%s): %s", symbol, e)
+
     def _audit_inconsistency(self, kind: str, detail: dict) -> None:
         """Append-only AuditLog write for a detected recovery inconsistency. Never raises."""
         try:
