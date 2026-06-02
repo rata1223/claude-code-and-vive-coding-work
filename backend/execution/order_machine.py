@@ -63,14 +63,28 @@ class OrderStateMachine:
         with self._lock:
             order = self._get(order_id)
             self._assert_valid(order, new_status)
+            prev_status = order.status
             order.status = new_status
         logger.info("상태 전환: id=%s → %s", order_id, new_status.value)
-        self._on_change(order)
+        try:
+            self._on_change(order)
+        except Exception:
+            with self._lock:
+                if order.status == new_status:
+                    order.status = prev_status
+            raise
         return order
 
     def process_fill(self, event: FillEvent) -> Order:
         with self._lock:
             order = self._get(event.order_id)
+            if event.filled_qty <= 0:
+                raise ValueError(f"체결 수량은 양수여야 합니다: {event.filled_qty} (order_id={event.order_id})")
+            if order.filled_qty + event.filled_qty > order.qty:
+                raise ValueError(
+                    f"과체결 방지: filled={order.filled_qty}+{event.filled_qty} > qty={order.qty} "
+                    f"(order_id={event.order_id})"
+                )
             order.filled_qty += event.filled_qty
             if order.filled_qty > 0:
                 # 가중평균 체결가 계산
@@ -102,6 +116,7 @@ class OrderStateMachine:
             if broker_order_id:
                 order.id = broker_order_id
                 self._orders[broker_order_id] = order
+                self._orders.pop(order_id, None)  # F4: remove orphaned temp key
             target_id = broker_order_id if broker_order_id else order_id
         return self.transition(target_id, OrderStatus.SUBMITTED)
 

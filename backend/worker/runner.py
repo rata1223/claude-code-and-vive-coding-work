@@ -105,6 +105,9 @@ class WorkerSession:
 
     def trigger_market_open(self, market: str):
         """Scheduler calls this when a market session opens."""
+        if self._stop_event.is_set():
+            logger.info("[run_id=%d] 세션 중단 — on_market_open 스킵 (market=%s)", self.run_id, market)
+            return
         try:
             self.strategy.on_market_open()
             logger.info("[run_id=%d] on_market_open 호출 완료 (market=%s)", self.run_id, market)
@@ -175,6 +178,10 @@ class StrategyWorker:
 
         except Exception as e:
             logger.warning("PersistentLossTracker 초기화 실패: %s", e)
+
+        # Last successfully fetched live equity — used as kill-switch fallback when
+        # broker balance API is temporarily unavailable (prevents MDD = 0% masking).
+        self._last_known_equity: float | None = None
 
         # Heartbeat — lets watchdog / monitoring know the worker is alive
         self._heartbeat = WorkerHeartbeat(self._redis)
@@ -309,11 +316,15 @@ class StrategyWorker:
     def _handle_market_open(self, market: str):
         """Broadcast on_market_open() to all active strategy sessions with dedup."""
         now = time.monotonic()
-        last = self._last_market_open.get(market, 0.0)
-        if now - last < 300:  # 5-minute dedup window
-            logger.warning("중복 market_open 무시: %s (마지막 %.0fs 전)", market, now - last)
-            return
-        self._last_market_open[market] = now
+        # F5: dedup check and sessions snapshot must share the same lock acquisition
+        # to prevent two threads both passing the 5-minute guard and double-broadcasting.
+        with self._lock:
+            last = self._last_market_open.get(market, 0.0)
+            if now - last < 300:  # 5-minute dedup window
+                logger.warning("중복 market_open 무시: %s (마지막 %.0fs 전)", market, now - last)
+                return
+            self._last_market_open[market] = now
+            sessions = [s for s in self._sessions.values() if s is not None]
 
         # Periodic reconciliation on each market open (catches overnight drift)
         threading.Thread(
@@ -323,8 +334,6 @@ class StrategyWorker:
             name=f"reconcile-{market}",
         ).start()
 
-        with self._lock:
-            sessions = [s for s in self._sessions.values() if s is not None]
         logger.info("장 시작 브로드캐스트: market=%s sessions=%d", market, len(sessions))
         for session in sessions:
             t = threading.Thread(
@@ -463,18 +472,28 @@ class StrategyWorker:
                 realized_pnl = (fill.price - entry_price) * fill.qty
                 try:
                     ks_before = self._loss_tracker.kill_switch
-                    current_equity = self._loss_tracker.peak_equity
+                    # Never fall back to peak_equity: MDD = (peak - peak)/peak = 0% masks drawdown.
+                    # Use last-known-good equity; skip MDD evaluation if none available.
                     try:
                         current_equity = get_kis_broker().get_balance().total_eval_krw
-                    except Exception:
-                        pass
-                    self._loss_tracker.record_pnl(realized_pnl, current_equity)
-                    logger.info("손익 기록: %s %.0f원 (entry=%.4f fill=%.4f qty=%d)",
-                                fill.symbol, realized_pnl, entry_price, fill.price, fill.qty)
-                    if not ks_before and self._loss_tracker.kill_switch:
-                        _audit("kill_switch_triggered", symbol=fill.symbol,
-                               detail={"reason": self._loss_tracker.kill_reason,
-                                       "realized_pnl": realized_pnl})
+                        self._last_known_equity = current_equity
+                    except Exception as _be:
+                        current_equity = self._last_known_equity
+                        if current_equity is None:
+                            logger.warning("잔고 조회 실패, 기준 잔고 없음 — MDD 평가 스킵: %s", _be)
+                            _audit("balance_fetch_failed", symbol=fill.symbol,
+                                   detail={"reason": str(_be), "realized_pnl": realized_pnl})
+                        else:
+                            logger.warning("잔고 조회 실패 — 마지막 확인 잔고(%.0f원) 사용: %s",
+                                           current_equity, _be)
+                    if current_equity is not None:
+                        self._loss_tracker.record_pnl(realized_pnl, current_equity)
+                        logger.info("손익 기록: %s %.0f원 (entry=%.4f fill=%.4f qty=%d)",
+                                    fill.symbol, realized_pnl, entry_price, fill.price, fill.qty)
+                        if not ks_before and self._loss_tracker.kill_switch:
+                            _audit("kill_switch_triggered", symbol=fill.symbol,
+                                   detail={"reason": self._loss_tracker.kill_reason,
+                                           "realized_pnl": realized_pnl})
                 except Exception as e:
                     logger.warning("P&L 기록 실패: %s", e)
 

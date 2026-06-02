@@ -7,6 +7,7 @@ get_order_status()를 호출해 체결 여부를 확인한다.
 백오프 스케줄: 10s → 30s → 60s → 120s → 300s (이후 300s 고정)
 타임아웃: 30분 후 미체결 주문은 자동 취소 권고 콜백 호출.
 """
+import dataclasses
 import logging
 import threading
 import time
@@ -153,6 +154,14 @@ class OrderFillPoller:
                 entry.last_reported_qty = updated.filled_qty
                 logger.info("부분체결 %s: 증분=%d (누적=%d/%d)",
                             updated.id, incremental, updated.filled_qty, updated.qty)
+                # Report the incremental fill through the same pipeline as a full fill.
+                # Pass a copy with filled_qty=incremental so the callback records the
+                # right quantity without double-counting prior partials.
+                partial = dataclasses.replace(updated, filled_qty=incremental)
+                try:
+                    entry.on_filled(partial)
+                except Exception as e:
+                    logger.error("on_filled 콜백 오류 (부분체결): %s", e)
             entry.advance()
 
         else:
