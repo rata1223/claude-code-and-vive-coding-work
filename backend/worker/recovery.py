@@ -247,14 +247,22 @@ class StartupRecovery:
                             if row:
                                 fill_qty = order.filled_qty or order.qty
                                 fill_price = order.avg_fill_price or order.price
+                                # F7: idempotency guard — skip if a matching fill row exists
+                                existing_fill = sess.query(DBFill).filter(
+                                    DBFill.order_id == db_order_pk,
+                                    DBFill.qty == fill_qty,
+                                    DBFill.price == fill_price,
+                                ).first()
+                                if existing_fill is not None:
+                                    logger.info("복구 중복 체결 감지 — 스킵: order_id=%d", db_order_pk)
+                                    return
                                 row.status = order.status.value
                                 row.filled_qty = fill_qty
                                 row.avg_fill_price = fill_price
-                                fill = DBFill(order_id=db_order_pk,
-                                              qty=fill_qty,
-                                              price=fill_price)
-                                sess.add(fill)
-                                # Update positions table so _restore_positions() picks up the fill
+                                sess.add(DBFill(order_id=db_order_pk,
+                                               qty=fill_qty,
+                                               price=fill_price))
+                                # F1: update positions table so _restore_positions() picks up the fill
                                 self._apply_fill_to_position_db(
                                     sess, row.symbol, row.side, fill_qty, fill_price,
                                 )
@@ -312,6 +320,32 @@ class StartupRecovery:
         except Exception as e:
             logger.warning("미체결 주문 복원 실패: %s", e)
         return True
+
+    def _apply_fill_to_position_db(self, sess, symbol: str, side: str,
+                                   fill_qty: int, fill_price: float) -> None:
+        """Update DBPosition within an existing session after a recovery fill (F1 fix)."""
+        from backend.database.models import Position as DBPosition
+        is_kr = len(symbol) == 6 and symbol.isdigit()
+        market = "KR" if is_kr else "US"
+        row = sess.query(DBPosition).filter(
+            DBPosition.symbol == symbol,
+            DBPosition.broker == "kis",
+        ).first()
+        if side == "buy":
+            if row is None:
+                sess.add(DBPosition(
+                    symbol=symbol, qty=fill_qty, avg_price=fill_price,
+                    market=market, broker="kis",
+                ))
+            else:
+                total_qty = row.qty + fill_qty
+                row.avg_price = (row.avg_price * row.qty + fill_price * fill_qty) / total_qty
+                row.qty = total_qty
+        elif side == "sell":
+            if row is not None:
+                row.qty = max(0, row.qty - fill_qty)
+                if row.qty == 0:
+                    sess.delete(row)
 
     def _audit_inconsistency(self, kind: str, detail: dict) -> None:
         """Append-only AuditLog write for a detected recovery inconsistency. Never raises."""
