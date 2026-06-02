@@ -58,6 +58,15 @@ class PositionTracker:
                 return True
             return False
 
+    def try_mark_pending(self, symbol: str) -> bool:
+        """Atomically check and set pending lock. Returns False if already locked (race-safe)."""
+        with self._lock:
+            ts = self._pending_symbols.get(symbol)
+            if ts is not None and time.monotonic() - ts <= _PENDING_LOCK_TTL:
+                return False
+            self._pending_symbols[symbol] = time.monotonic()
+            return True
+
     def mark_pending(self, symbol: str, order_id: str):
         with self._lock:
             self._pending_symbols[symbol] = time.monotonic()
