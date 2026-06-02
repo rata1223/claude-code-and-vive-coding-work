@@ -247,14 +247,22 @@ class StartupRecovery:
                             if row:
                                 fill_qty = order.filled_qty or order.qty
                                 fill_price = order.avg_fill_price or order.price
+                                # F7: idempotency guard — skip if a matching fill row exists
+                                existing_fill = sess.query(DBFill).filter(
+                                    DBFill.order_id == db_order_pk,
+                                    DBFill.qty == fill_qty,
+                                    DBFill.price == fill_price,
+                                ).first()
+                                if existing_fill is not None:
+                                    logger.info("복구 중복 체결 감지 — 스킵: order_id=%d", db_order_pk)
+                                    return
                                 row.status = order.status.value
                                 row.filled_qty = fill_qty
                                 row.avg_fill_price = fill_price
-                                fill = DBFill(order_id=db_order_pk,
-                                              qty=fill_qty,
-                                              price=fill_price)
-                                sess.add(fill)
-                                # Update positions table so _restore_positions() picks up the fill
+                                sess.add(DBFill(order_id=db_order_pk,
+                                               qty=fill_qty,
+                                               price=fill_price))
+                                # F1: update positions table so _restore_positions() picks up the fill
                                 self._apply_fill_to_position_db(
                                     sess, row.symbol, row.side, fill_qty, fill_price,
                                 )
@@ -315,7 +323,7 @@ class StartupRecovery:
 
     def _apply_fill_to_position_db(self, sess, symbol: str, side: str,
                                     fill_qty: int, fill_price: float) -> None:
-        """Upsert or reduce position in DB for a recovery fill.
+        """Upsert or reduce position in DB for a recovery fill (B1/F1 fix).
         Uses the provided session; caller is responsible for commit.
         """
         from backend.database.models import Position as DBPosition

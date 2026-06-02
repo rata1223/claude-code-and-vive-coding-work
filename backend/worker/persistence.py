@@ -71,6 +71,15 @@ class DBPersistence:
                 if db_order is None:
                     logger.warning("체결 DB 저장 스킵: 미등록 order_id=%s", fill.order_id)
                     return
+                # F10: idempotency guard — mirrors runner._persist_fill dedup logic
+                dup = db.query(DBFill).filter(
+                    DBFill.order_id == db_order.id,
+                    DBFill.qty == fill.qty,
+                    DBFill.price == fill.price,
+                ).first()
+                if dup is not None:
+                    logger.info("중복 체결 감지 — Fill 삽입 스킵: order=%s qty=%d", fill.order_id, fill.qty)
+                    return
                 db.add(DBFill(order_id=db_order.id, qty=fill.qty, price=fill.price))
                 db.commit()
         except Exception as e:

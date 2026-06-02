@@ -293,7 +293,7 @@ class PositionReconciler:
 
         with _session(self._factory) as db:
             rows = db.query(DBOrder).filter(
-                DBOrder.status.in_(["pending", "submitted", "partial_filled"]),
+                DBOrder.status.in_(["pending", "submitted", "partial_filled", "unknown"]),
                 DBOrder.broker == self._broker_name,
             ).all()
             # Extract scalars before session closes (detached objects are fragile)

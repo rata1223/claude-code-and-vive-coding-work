@@ -3,7 +3,10 @@ import logging
 import threading
 import time
 from .base import BrokerAdapter
-from .models import Balance, Order, OrderStatus, Position
+from .capabilities import KIS_LIVE_CAPABILITIES, KIS_PAPER_CAPABILITIES
+from .models import Balance, BrokerCapabilities, Order, OrderStatus, Position
+from .semantic_mapper import KIS_DOMESTIC_MAPPER, KIS_OVERSEAS_MAPPER
+from .validator import BrokerCapabilityValidator, OrderRequest
 from kis_adapter import KISClient, KISMarketData, KISOrders, KISPortfolio
 from backend.execution.circuit_breaker import ConsecutiveFailureBreaker
 from backend.quant.data.universe import EXCD_MAP, KR_ETF
@@ -46,6 +49,10 @@ class KISBroker(BrokerAdapter):
         # Shared breaker for all KIS API calls — trips after 5 consecutive failures
         self._breaker = ConsecutiveFailureBreaker(threshold=5, cooldown_minutes=10)
         logger.info("KISBroker 초기화 (env=%s)", "paper" if self._paper else "real")
+
+    @property
+    def capabilities(self) -> BrokerCapabilities:
+        return KIS_PAPER_CAPABILITIES if self._paper else KIS_LIVE_CAPABILITIES
 
     def get_balance(self) -> Balance:
         if self._breaker.is_open():
@@ -103,6 +110,11 @@ class KISBroker(BrokerAdapter):
         return positions
 
     def place_order(self, symbol: str, side: str, qty: int, price: float, order_type: str = "limit") -> Order:
+        detected_market = "KR" if self._is_kr(symbol) else "US"
+        BrokerCapabilityValidator(self.capabilities).validate(
+            OrderRequest(symbol=symbol, side=side, qty=float(qty), price=price,
+                         order_type=order_type, market=detected_market)
+        )
         if self._breaker.is_open():
             logger.error("주문 차단 — circuit breaker open: %s %s", side, symbol)
             return Order(
@@ -116,7 +128,8 @@ class KISBroker(BrokerAdapter):
             else:
                 excd = EXCD_MAP.get(symbol, "NASD")
                 raw = (self._orders.buy_us if side == "buy" else self._orders.sell_us)(symbol, excd, qty, price)
-            order_id = raw.get("output", {}).get("ODNO", "")
+            mapper = KIS_DOMESTIC_MAPPER if is_kr else KIS_OVERSEAS_MAPPER
+            order_id = mapper.extract_broker_order_id(raw)
             self._breaker.record_success()
             return Order(
                 id=order_id, symbol=symbol, side=side, qty=qty, price=price,
@@ -205,24 +218,12 @@ class KISBroker(BrokerAdapter):
             if not output:
                 return None
             row = output[0] if isinstance(output, list) else output
-            filled_qty = int(row.get("tot_ccld_qty", 0))
-            ord_qty = int(row.get("ord_qty", 0))
-            avg_price = float(row.get("avg_prvs", 0))
-            ord_stat = row.get("ord_stts_name", "")
-
-            if filled_qty >= ord_qty > 0:
-                status = OrderStatus.FILLED
-            elif filled_qty > 0:
-                status = OrderStatus.PARTIAL_FILLED
-            elif "취소" in ord_stat:
-                status = OrderStatus.CANCELED
-            elif "거부" in ord_stat:
-                status = OrderStatus.REJECTED
-            else:
-                status = OrderStatus.SUBMITTED
-
+            filled_qty = KIS_DOMESTIC_MAPPER.extract_filled_qty(row)
+            ord_qty = KIS_DOMESTIC_MAPPER.extract_order_qty(row)
+            avg_price = KIS_DOMESTIC_MAPPER.extract_avg_price(row)
+            status = KIS_DOMESTIC_MAPPER.map_status(row, filled_qty, ord_qty)
             sym = row.get("pdno", "")
-            side = "buy" if row.get("sll_buy_dvsn_cd") == "02" else "sell"
+            side = KIS_DOMESTIC_MAPPER.extract_side(row)
             return Order(
                 id=order_id, symbol=sym, side=side, qty=ord_qty,
                 price=float(row.get("ord_unpr", 0)), status=status,
@@ -255,28 +256,17 @@ class KISBroker(BrokerAdapter):
             output = resp.get("output") or []
             if not output:
                 return None
-            # Match the specific order_id
+            # Match the specific order_id; never fall back to a different order's row.
             row = next((r for r in output if r.get("odno") == order_id), None)
             if row is None:
-                row = output[0]  # fallback to first row
+                logger.warning("US 주문 %s 응답에서 미매칭 — None 반환", order_id)
+                return None
 
-            filled_qty = int(row.get("ft_ccld_qty", 0))
-            ord_qty = int(row.get("ft_ord_qty", 0))
-            avg_price = float(row.get("avg_prvs", 0))
-            ord_stat = row.get("ord_stts_name", "")
-
-            if filled_qty >= ord_qty > 0:
-                status = OrderStatus.FILLED
-            elif filled_qty > 0:
-                status = OrderStatus.PARTIAL_FILLED
-            elif "취소" in ord_stat or "cancel" in ord_stat.lower():
-                status = OrderStatus.CANCELED
-            elif "거부" in ord_stat or "reject" in ord_stat.lower():
-                status = OrderStatus.REJECTED
-            else:
-                status = OrderStatus.SUBMITTED
-
-            side = "buy" if row.get("sll_buy_dvsn_cd") == "02" else "sell"
+            filled_qty = KIS_OVERSEAS_MAPPER.extract_filled_qty(row)
+            ord_qty = KIS_OVERSEAS_MAPPER.extract_order_qty(row)
+            avg_price = KIS_OVERSEAS_MAPPER.extract_avg_price(row)
+            status = KIS_OVERSEAS_MAPPER.map_status(row, filled_qty, ord_qty)
+            side = KIS_OVERSEAS_MAPPER.extract_side(row)
             return Order(
                 id=order_id, symbol=symbol, side=side, qty=ord_qty,
                 price=float(row.get("ft_ord_unpr3", 0)), status=status,
