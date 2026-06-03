@@ -279,10 +279,11 @@ class PositionReconciler:
     def _has_pending_order(self, symbol: str, db) -> bool:
         """Return True if there is any open order for this symbol and broker."""
         from backend.database.models import Order as DBOrder
+        _open = [OrderStatus.PENDING.value, OrderStatus.SUBMITTED.value, OrderStatus.PARTIAL_FILLED.value]
         return db.query(DBOrder).filter(
             DBOrder.symbol == symbol,
             DBOrder.broker == self._broker_name,
-            DBOrder.status.in_(["pending", "submitted", "partial_filled"]),
+            DBOrder.status.in_(_open),
         ).first() is not None
 
     # ── Order reconciliation ────────────────────────────────────────────────
@@ -291,9 +292,11 @@ class PositionReconciler:
         """DB에서 open 상태인 주문을 브로커에 확인해 stale 처리."""
         from backend.database.models import Order as DBOrder
 
+        _open = [OrderStatus.PENDING.value, OrderStatus.SUBMITTED.value,
+                 OrderStatus.PARTIAL_FILLED.value, "unknown"]
         with _session(self._factory) as db:
             rows = db.query(DBOrder).filter(
-                DBOrder.status.in_(["pending", "submitted", "partial_filled", "unknown"]),
+                DBOrder.status.in_(_open),
                 DBOrder.broker == self._broker_name,
             ).all()
             # Extract scalars before session closes (detached objects are fragile)
@@ -381,8 +384,11 @@ class PositionReconciler:
             row.avg_fill_price = broker_order.avg_fill_price
             row.updated_at = datetime.utcnow()
 
-            # If newly filled: insert fill record if not already there
-            if broker_order.status == OrderStatus.FILLED and old_status != "filled":
+            # If newly filled: insert fill record if not already there.
+            # Use enum value for comparison (not raw string) so an enum rename isn't silently missed.
+            # The _reconcile_lock prevents concurrent reconciler runs; this application-level
+            # check is the dedup guard against a simultaneous poller callback.
+            if broker_order.status == OrderStatus.FILLED and old_status != OrderStatus.FILLED.value:
                 existing_fill = db.query(DBFill).filter(DBFill.order_id == row.id).first()
                 if not existing_fill:
                     db.add(DBFill(
