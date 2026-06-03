@@ -116,7 +116,8 @@ class OrderStateMachine:
             if broker_order_id:
                 order.id = broker_order_id
                 self._orders[broker_order_id] = order
-                self._orders.pop(order_id, None)  # F4: remove orphaned temp key
+                if order_id != broker_order_id:
+                    self._orders.pop(order_id, None)  # F4/B2: remove orphaned temp key
             target_id = broker_order_id if broker_order_id else order_id
         return self.transition(target_id, OrderStatus.SUBMITTED)
 

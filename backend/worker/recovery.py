@@ -322,30 +322,39 @@ class StartupRecovery:
         return True
 
     def _apply_fill_to_position_db(self, sess, symbol: str, side: str,
-                                   fill_qty: int, fill_price: float) -> None:
-        """Update DBPosition within an existing session after a recovery fill (F1 fix)."""
+                                    fill_qty: int, fill_price: float) -> None:
+        """Upsert or reduce position in DB for a recovery fill (B1/F1 fix).
+        Uses the provided session; caller is responsible for commit.
+        """
         from backend.database.models import Position as DBPosition
-        is_kr = len(symbol) == 6 and symbol.isdigit()
-        market = "KR" if is_kr else "US"
-        row = sess.query(DBPosition).filter(
-            DBPosition.symbol == symbol,
-            DBPosition.broker == "kis",
-        ).first()
-        if side == "buy":
-            if row is None:
-                sess.add(DBPosition(
-                    symbol=symbol, qty=fill_qty, avg_price=fill_price,
-                    market=market, broker="kis",
-                ))
-            else:
-                total_qty = row.qty + fill_qty
-                row.avg_price = (row.avg_price * row.qty + fill_price * fill_qty) / total_qty
-                row.qty = total_qty
-        elif side == "sell":
-            if row is not None:
-                row.qty = max(0, row.qty - fill_qty)
-                if row.qty == 0:
-                    sess.delete(row)
+        try:
+            row = sess.query(DBPosition).filter(
+                DBPosition.symbol == symbol,
+                DBPosition.broker == "kis",
+            ).first()
+            if side == "sell":
+                if row is not None:
+                    row.qty = max(0, row.qty - fill_qty)
+                    if row.qty <= 0:
+                        sess.delete(row)
+                    else:
+                        row.updated_at = datetime.utcnow()
+            else:  # buy
+                market = "KR" if (len(symbol) == 6 and symbol.isdigit()) else "US"
+                if row is None:
+                    sess.add(DBPosition(
+                        symbol=symbol, qty=fill_qty, avg_price=fill_price,
+                        market=market, broker="kis",
+                    ))
+                else:
+                    prev_val = row.avg_price * row.qty
+                    new_val = fill_price * fill_qty
+                    total_qty = row.qty + fill_qty
+                    row.avg_price = (prev_val + new_val) / total_qty
+                    row.qty = total_qty
+                    row.updated_at = datetime.utcnow()
+        except Exception as e:
+            logger.warning("복구 포지션 DB 갱신 실패 (%s): %s", symbol, e)
 
     def _audit_inconsistency(self, kind: str, detail: dict) -> None:
         """Append-only AuditLog write for a detected recovery inconsistency. Never raises."""
