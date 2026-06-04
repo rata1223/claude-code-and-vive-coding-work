@@ -561,3 +561,121 @@ class TestSemanticMapperTimeout:
         poller._handle_timeout(entry)  # should not raise
 
         broker.cancel_order.assert_not_called()
+
+
+# ── D4-a: Fill loss — on_filled exception handling ───────────────────────────
+
+class TestFillLoss:
+    def test_on_filled_exception_entry_removed_for_filled(self):
+        """FILLED: if on_filled raises, the entry is still removed (no infinite re-poll)."""
+        broker = MagicMock()
+        broker.get_order_status.return_value = _order(status=OrderStatus.FILLED, filled_qty=100)
+
+        def bad_callback(o):
+            raise RuntimeError("downstream failure")
+
+        poller = _poller(broker=broker)
+        order = _order()
+        entry = _entry(order, on_filled=bad_callback)
+        poller._entries[order.id] = entry
+        poller._poll_one(entry)
+
+        assert order.id not in poller._entries  # cleaned up despite callback failure
+
+    def test_on_filled_exception_entry_kept_for_partial(self):
+        """PARTIAL_FILLED: if on_filled raises, the entry stays (polling continues)."""
+        broker = MagicMock()
+        broker.get_order_status.return_value = _order(
+            status=OrderStatus.PARTIAL_FILLED, filled_qty=50
+        )
+
+        def bad_callback(o):
+            raise RuntimeError("downstream failure")
+
+        poller = _poller(broker=broker)
+        order = _order()
+        entry = _entry(order, on_filled=bad_callback)
+        poller._entries[order.id] = entry
+        poller._poll_one(entry)
+
+        assert order.id in poller._entries  # still registered for next poll
+
+
+# ── D4-b: Broker exception ───────────────────────────────────────────────────
+
+class TestBrokerException:
+    def test_broker_exception_advances_schedule(self):
+        """get_order_status() raises → entry stays, poll_index advances for backoff."""
+        broker = MagicMock()
+        broker.get_order_status.side_effect = RuntimeError("connection timeout")
+
+        poller = _poller(broker=broker)
+        order = _order()
+        entry = _entry(order)
+        before_index = entry.poll_index
+        poller._entries[order.id] = entry
+        poller._poll_one(entry)
+
+        assert order.id in poller._entries
+        assert entry.poll_index > before_index
+
+
+# ── D4-c: Transition validation ──────────────────────────────────────────────
+
+class TestTransitionValidation:
+    def test_invalid_transition_logs_warning(self, caplog):
+        """PARTIAL_FILLED → SUBMITTED is not a valid transition and must be warned."""
+        import logging
+        broker = MagicMock()
+        # Broker regresses to SUBMITTED from PARTIAL_FILLED
+        broker.get_order_status.return_value = _order(
+            status=OrderStatus.SUBMITTED, filled_qty=0
+        )
+
+        poller = _poller(broker=broker)
+        order = _order(status=OrderStatus.PARTIAL_FILLED, filled_qty=50)
+        entry = _entry(order)
+        entry.last_reported_qty = 50
+
+        with caplog.at_level(logging.WARNING, logger="backend.execution.order_poller"):
+            poller._poll_one(entry)
+
+        assert any("예상치 못한 상태 전환" in r.message for r in caplog.records)
+
+    def test_valid_transition_no_warning(self, caplog):
+        """SUBMITTED → FILLED is a valid transition; no unexpected-transition warning."""
+        import logging
+        broker = MagicMock()
+        broker.get_order_status.return_value = _order(
+            status=OrderStatus.FILLED, filled_qty=100
+        )
+
+        poller = _poller(broker=broker)
+        order = _order(status=OrderStatus.SUBMITTED)
+        entry = _entry(order)
+        poller._entries[order.id] = entry
+
+        with caplog.at_level(logging.WARNING, logger="backend.execution.order_poller"):
+            poller._poll_one(entry)
+
+        unexpected_warns = [r for r in caplog.records
+                            if "예상치 못한 상태 전환" in r.message]
+        assert unexpected_warns == []
+
+
+# ── D4-d: Timeout cutoff property ────────────────────────────────────────────
+
+class TestTimeoutCutoff:
+    def test_is_timed_out_false_for_recent_entry(self):
+        """Fresh entry created now is not timed out."""
+        order = _order()
+        entry = _entry(order)
+        assert entry.is_timed_out is False
+
+    def test_is_timed_out_true_after_31_minutes(self):
+        """Entry with registered_at 31 minutes in the past is timed out."""
+        from datetime import timedelta, timezone
+        order = _order()
+        entry = _entry(order)
+        entry.registered_at = entry.registered_at - timedelta(minutes=31)
+        assert entry.is_timed_out is True

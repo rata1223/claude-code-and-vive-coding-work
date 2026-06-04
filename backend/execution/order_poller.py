@@ -165,7 +165,7 @@ class OrderFillPoller:
         entry.order = updated
 
         if updated.status == OrderStatus.FILLED:
-            incremental = updated.filled_qty - entry.last_reported_qty
+            incremental = (updated.filled_qty or 0) - entry.last_reported_qty
             entry.last_reported_qty = updated.filled_qty
             logger.info("체결 확인 %s: %s qty=%d (증분=%d) avg=%.4f",
                         updated.id, updated.symbol, updated.filled_qty,
@@ -195,7 +195,7 @@ class OrderFillPoller:
                          "partial_qty": entry.last_reported_qty})
 
         elif updated.status == OrderStatus.PARTIAL_FILLED:
-            incremental = updated.filled_qty - entry.last_reported_qty
+            incremental = (updated.filled_qty or 0) - entry.last_reported_qty
             if incremental > 0:
                 entry.last_reported_qty = updated.filled_qty
                 logger.info("부분체결 %s: 증분=%d (누적=%d/%d)",
