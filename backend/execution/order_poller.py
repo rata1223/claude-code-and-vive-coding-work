@@ -5,9 +5,10 @@ KIS API에는 실시간 체결 푸시가 없으므로 주문 제출 후 주기�
 get_order_status()를 호출해 체결 여부를 확인한다.
 
 백오프 스케줄: 10s → 30s → 60s → 120s → 300s (이후 300s 고정)
-타임아웃: 30분 후 미체결 주문은 자동 취소 권고 콜백 호출.
+타임아웃: 30분 후 미체결 주문은 자동 취소 시도 후 콜백 호출.
 """
 import dataclasses
+import json
 import logging
 import threading
 import time
@@ -22,6 +23,23 @@ logger = logging.getLogger(__name__)
 
 _POLL_INTERVALS = [10, 30, 60, 120, 300]
 _TIMEOUT_MINUTES = 30
+
+# Valid status transitions the poller may observe on the wire.
+# Defined locally to avoid importing from order_machine (circular-import risk).
+# Unexpected transitions are logged as warnings but never block processing —
+# the OrderStateMachine enforces hard validation at callback time.
+_VALID_POLLER_TRANSITIONS: dict[OrderStatus, frozenset] = {
+    OrderStatus.PENDING:        frozenset({OrderStatus.SUBMITTED, OrderStatus.REJECTED,
+                                           OrderStatus.CANCELED}),
+    OrderStatus.SUBMITTED:      frozenset({OrderStatus.PARTIAL_FILLED, OrderStatus.FILLED,
+                                           OrderStatus.CANCELED, OrderStatus.REJECTED,
+                                           OrderStatus.EXPIRED, OrderStatus.UNKNOWN}),
+    OrderStatus.PARTIAL_FILLED: frozenset({OrderStatus.FILLED, OrderStatus.CANCELED,
+                                           OrderStatus.EXPIRED, OrderStatus.UNKNOWN}),
+    OrderStatus.UNKNOWN:        frozenset({OrderStatus.SUBMITTED, OrderStatus.PARTIAL_FILLED,
+                                           OrderStatus.FILLED, OrderStatus.CANCELED,
+                                           OrderStatus.REJECTED, OrderStatus.EXPIRED}),
+}
 
 
 @dataclass
@@ -58,8 +76,15 @@ class OrderFillPoller:
         poller.register(order, on_filled=my_fill_handler, on_timeout=my_timeout_handler)
     """
 
-    def __init__(self, broker: BrokerAdapter):
+    def __init__(
+        self,
+        broker: BrokerAdapter,
+        db_factory: Optional[Callable] = None,
+        semantic_mapper=None,  # Optional[BrokerSemanticMapper] — avoids circular import
+    ):
         self._broker = broker
+        self._db_factory = db_factory
+        self._semantic_mapper = semantic_mapper
         self._entries: dict[str, _PollEntry] = {}  # order_id → entry
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -99,6 +124,8 @@ class OrderFillPoller:
         with self._lock:
             return len(self._entries)
 
+    # ── Internal ──────────────────────────────────────────────────────────────
+
     def _loop(self) -> None:
         while not self._stop.is_set():
             now = time.monotonic()
@@ -125,6 +152,16 @@ class OrderFillPoller:
             entry.advance()
             return
 
+        # Transition validation — warn on unexpected broker status regression.
+        prev_status = entry.order.status
+        if updated.status != prev_status:
+            valid = _VALID_POLLER_TRANSITIONS.get(prev_status, frozenset())
+            if updated.status not in valid:
+                logger.warning(
+                    "예상치 못한 상태 전환 %s → %s (order=%s)",
+                    prev_status.value, updated.status.value, updated.id,
+                )
+
         entry.order = updated
 
         if updated.status == OrderStatus.FILLED:
@@ -136,17 +173,26 @@ class OrderFillPoller:
             with self._lock:
                 self._entries.pop(updated.id, None)
             if incremental > 0:
+                self._audit("poller_filled", updated,
+                            {"incremental": incremental, "total": updated.filled_qty,
+                             "avg": updated.avg_fill_price or 0})
+                # Pass a copy with filled_qty=incremental so the callback records
+                # only the new quantity — same convention as PARTIAL_FILLED.
+                final_fill = dataclasses.replace(updated, filled_qty=incremental)
                 try:
-                    entry.on_filled(updated)
+                    entry.on_filled(final_fill)
                 except Exception as e:
                     logger.error("on_filled 콜백 오류: %s", e)
             else:
                 logger.warning("체결 중복 감지 — 콜백 스킵: %s", updated.id)
 
         elif updated.status in (OrderStatus.CANCELED, OrderStatus.REJECTED, OrderStatus.EXPIRED):
-            logger.warning("주문 취소/거부/만료: %s status=%s", updated.id, updated.status)
+            logger.warning("주문 취소/거부/만료: %s status=%s", updated.id, updated.status.value)
             with self._lock:
                 self._entries.pop(updated.id, None)
+            self._audit(f"poller_{updated.status.value}", updated,
+                        {"prev_status": prev_status.value,
+                         "partial_qty": entry.last_reported_qty})
 
         elif updated.status == OrderStatus.PARTIAL_FILLED:
             incremental = updated.filled_qty - entry.last_reported_qty
@@ -154,10 +200,11 @@ class OrderFillPoller:
                 entry.last_reported_qty = updated.filled_qty
                 logger.info("부분체결 %s: 증분=%d (누적=%d/%d)",
                             updated.id, incremental, updated.filled_qty, updated.qty)
-                # Report the incremental fill through the same pipeline as a full fill.
-                # Pass a copy with filled_qty=incremental so the callback records the
-                # right quantity without double-counting prior partials.
+                # Pass a copy with filled_qty=incremental so the callback records
+                # only the new quantity without double-counting prior partials.
                 partial = dataclasses.replace(updated, filled_qty=incremental)
+                self._audit("poller_partial_filled", updated,
+                            {"incremental": incremental, "cumulative": updated.filled_qty})
                 try:
                     entry.on_filled(partial)
                 except Exception as e:
@@ -172,10 +219,45 @@ class OrderFillPoller:
                        _TIMEOUT_MINUTES, entry.order.id, entry.order.side, entry.order.symbol)
         with self._lock:
             self._entries.pop(entry.order.id, None)
+
+        # Auto-cancel via broker using market-appropriate kwargs.
+        if self._semantic_mapper is not None:
+            try:
+                kwargs = self._semantic_mapper.cancel_kwargs(entry.order)
+                self._broker.cancel_order(**kwargs)
+                logger.info("타임아웃 자동취소 성공: %s", entry.order.id)
+            except Exception as e:
+                logger.warning("타임아웃 자동취소 실패 %s: %s", entry.order.id, e)
+
+        self._audit("poller_timeout", entry.order,
+                    {"elapsed_minutes": _TIMEOUT_MINUTES,
+                     "last_reported_qty": entry.last_reported_qty})
+
         try:
             entry.on_timeout(entry.order)
         except Exception as e:
             logger.error("on_timeout 콜백 오류: %s", e)
+
+    def _audit(self, event_type: str, order: Order, detail: dict) -> None:
+        """Fire-and-forget AuditLog write. Never raises."""
+        if self._db_factory is None:
+            return
+        try:
+            from backend.database.models import AuditLog
+            sess = self._db_factory()
+            try:
+                sess.add(AuditLog(
+                    event_type=event_type,
+                    symbol=order.symbol,
+                    order_id=order.id,
+                    actor="poller",
+                    detail=json.dumps(detail, ensure_ascii=False),
+                ))
+                sess.commit()
+            finally:
+                sess.close()
+        except Exception as e:
+            logger.warning("AuditLog 쓰기 실패 (%s): %s", event_type, e)
 
     @staticmethod
     def _default_timeout_handler(order: Order) -> None:
