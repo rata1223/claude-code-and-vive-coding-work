@@ -147,7 +147,13 @@ class StrategyWorker:
 
         # Process-level OrderFillPoller — shared across all strategy sessions
         try:
-            self._poller = OrderFillPoller(get_kis_broker())
+            from backend.brokers.semantic_mapper import BrokerSemanticMapper
+            _kis = get_kis_broker()
+            self._poller = OrderFillPoller(
+                broker=_kis,
+                db_factory=_get_session_factory(),
+                semantic_mapper=BrokerSemanticMapper(_kis.capabilities),
+            )
             self._poller.start()
             logger.info("OrderFillPoller 시작")
         except Exception as e:
@@ -583,7 +589,7 @@ class StrategyWorker:
                 row = DBFill(order_id=db_order.id, qty=fill.qty, price=fill.price)
                 db.add(row)
                 db_order.status = order.status.value
-                db_order.filled_qty = order.filled_qty or fill.qty
+                db_order.filled_qty = (db_order.filled_qty or 0) + fill.qty
                 db_order.avg_fill_price = order.avg_fill_price or fill.price
                 db.commit()
 
