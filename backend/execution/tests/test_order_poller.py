@@ -480,6 +480,19 @@ class TestAuditLog:
 
         assert _count_audit(db, "poller_rejected") == 1
 
+    def test_audit_on_expire(self):
+        db = _db()
+        broker = MagicMock()
+        broker.get_order_status.return_value = _order(status=OrderStatus.EXPIRED)
+
+        poller = _poller(broker=broker, db_factory=db)
+        order = _order()
+        entry = _entry(order)
+        poller._entries[order.id] = entry
+        poller._poll_one(entry)
+
+        assert _count_audit(db, "poller_expired") == 1
+
     def test_audit_on_timeout(self):
         db = _db()
         poller = _poller(db_factory=db)
