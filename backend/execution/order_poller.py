@@ -6,7 +6,12 @@ get_order_status()를 호출해 체결 여부를 확인한다.
 
 백오프 스케줄: 10s → 30s → 60s → 120s → 300s (이후 300s 고정)
 타임아웃: 30분 후 미체결 주문은 자동 취소 시도 후 콜백 호출.
+
+추가 기능:
+- Terminal-state callbacks: on_canceled, on_rejected, on_expired
+- PollingHealthMonitor: in-memory metrics (fills, errors, timeouts, ...)
 """
+import copy
 import dataclasses
 import json
 import logging
@@ -42,15 +47,101 @@ _VALID_POLLER_TRANSITIONS: dict[OrderStatus, frozenset] = {
 }
 
 
+# ── Health ────────────────────────────────────────────────────────────────────
+
+@dataclass
+class PollingHealth:
+    """Snapshot of poller metrics (returned by copy — safe to read without locks)."""
+    total_registered: int = 0
+    total_fills_detected: int = 0
+    total_partial_fills: int = 0
+    total_timeouts: int = 0
+    total_cancels: int = 0
+    total_rejects: int = 0
+    total_expired: int = 0
+    total_poll_errors: int = 0
+    consecutive_poll_errors: int = 0
+    last_successful_poll_at: Optional[datetime] = None
+    pending_count: int = 0
+
+    @property
+    def is_healthy(self) -> bool:
+        return self.consecutive_poll_errors < 10
+
+
+class PollingHealthMonitor:
+    """Thread-safe in-memory metrics accumulator for OrderFillPoller."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._h = PollingHealth()
+
+    def record_register(self) -> None:
+        with self._lock:
+            self._h.total_registered += 1
+
+    def record_fill(self) -> None:
+        with self._lock:
+            self._h.total_fills_detected += 1
+
+    def record_partial_fill(self) -> None:
+        with self._lock:
+            self._h.total_partial_fills += 1
+
+    def record_timeout(self) -> None:
+        with self._lock:
+            self._h.total_timeouts += 1
+
+    def record_cancel(self) -> None:
+        with self._lock:
+            self._h.total_cancels += 1
+
+    def record_reject(self) -> None:
+        with self._lock:
+            self._h.total_rejects += 1
+
+    def record_expired(self) -> None:
+        with self._lock:
+            self._h.total_expired += 1
+
+    def record_poll_success(self) -> None:
+        with self._lock:
+            self._h.consecutive_poll_errors = 0
+            self._h.last_successful_poll_at = datetime.now(timezone.utc)
+
+    def record_poll_error(self) -> None:
+        with self._lock:
+            self._h.total_poll_errors += 1
+            self._h.consecutive_poll_errors += 1
+            if self._h.consecutive_poll_errors >= 10:
+                logger.critical(
+                    "OrderFillPoller: %d 연속 폴링 실패 — 브로커 접속 점검 필요",
+                    self._h.consecutive_poll_errors,
+                )
+
+    def set_pending_count(self, n: int) -> None:
+        with self._lock:
+            self._h.pending_count = n
+
+    def get_health(self) -> PollingHealth:
+        with self._lock:
+            return copy.copy(self._h)
+
+
+# ── Poll entry ────────────────────────────────────────────────────────────────
+
 @dataclass
 class _PollEntry:
     order: Order
     on_filled: Callable[[Order], None]
     on_timeout: Callable[[Order], None]
+    on_canceled: Optional[Callable[[Order], None]] = None
+    on_rejected: Optional[Callable[[Order], None]] = None
+    on_expired: Optional[Callable[[Order], None]] = None
     registered_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     poll_index: int = 0
     next_poll_at: float = field(default_factory=time.monotonic)
-    last_reported_qty: int = 0  # tracks cumulative filled qty to prevent double-counting
+    last_reported_qty: int = 0  # prevents double-counting on replay
 
     @property
     def is_timed_out(self) -> bool:
@@ -66,14 +157,17 @@ class _PollEntry:
         return wait
 
 
+# ── Poller ────────────────────────────────────────────────────────────────────
+
 class OrderFillPoller:
     """
     백그라운드 스레드에서 pending 주문들을 주기적으로 폴링.
 
     사용 예:
-        poller = OrderFillPoller(broker)
+        poller = OrderFillPoller(broker, db_factory=session_factory)
         poller.start()
-        poller.register(order, on_filled=my_fill_handler, on_timeout=my_timeout_handler)
+        poller.register(order, on_filled=my_fill_handler,
+                        on_canceled=my_cancel_handler, on_timeout=my_timeout_handler)
     """
 
     def __init__(
@@ -89,6 +183,9 @@ class OrderFillPoller:
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        self._health = PollingHealthMonitor()
+
+    # ── public API ────────────────────────────────────────────────────────
 
     def start(self) -> None:
         self._thread = threading.Thread(target=self._loop, daemon=True, name="order-poller")
@@ -103,6 +200,9 @@ class OrderFillPoller:
         order: Order,
         on_filled: Callable[[Order], None],
         on_timeout: Optional[Callable[[Order], None]] = None,
+        on_canceled: Optional[Callable[[Order], None]] = None,
+        on_rejected: Optional[Callable[[Order], None]] = None,
+        on_expired: Optional[Callable[[Order], None]] = None,
     ) -> None:
         if not order.id:
             logger.warning("주문 ID 없음 — 폴링 등록 스킵: %s %s", order.side, order.symbol)
@@ -111,18 +211,30 @@ class OrderFillPoller:
             order=order,
             on_filled=on_filled,
             on_timeout=on_timeout or self._default_timeout_handler,
+            on_canceled=on_canceled,
+            on_rejected=on_rejected,
+            on_expired=on_expired,
         )
         with self._lock:
             self._entries[order.id] = entry
+            self._health.set_pending_count(len(self._entries))
+        self._health.record_register()
+        self._audit("poller_register", order,
+                    {"symbol": order.symbol, "side": order.side, "qty": order.qty})
         logger.info("폴링 등록: %s %s %s", order.id, order.side, order.symbol)
 
     def unregister(self, order_id: str) -> None:
         with self._lock:
             self._entries.pop(order_id, None)
+            self._health.set_pending_count(len(self._entries))
 
     def pending_count(self) -> int:
         with self._lock:
             return len(self._entries)
+
+    @property
+    def health(self) -> PollingHealth:
+        return self._health.get_health()
 
     # ── Internal ──────────────────────────────────────────────────────────────
 
@@ -131,6 +243,7 @@ class OrderFillPoller:
             now = time.monotonic()
             with self._lock:
                 due = [e for e in self._entries.values() if e.next_poll_at <= now]
+                self._health.set_pending_count(len(self._entries))
 
             for entry in due:
                 if entry.is_timed_out:
@@ -145,8 +258,11 @@ class OrderFillPoller:
             updated = self._broker.get_order_status(entry.order.id, entry.order.symbol)
         except Exception as e:
             logger.warning("폴링 실패 %s: %s", entry.order.id, e)
+            self._health.record_poll_error()
             entry.advance()
             return
+
+        self._health.record_poll_success()
 
         if updated is None:
             entry.advance()
@@ -172,7 +288,9 @@ class OrderFillPoller:
                         incremental, updated.avg_fill_price or 0)
             with self._lock:
                 self._entries.pop(updated.id, None)
+                self._health.set_pending_count(len(self._entries))
             if incremental > 0:
+                self._health.record_fill()
                 self._audit("poller_filled", updated,
                             {"incremental": incremental, "total": updated.filled_qty,
                              "avg": updated.avg_fill_price or 0})
@@ -190,21 +308,43 @@ class OrderFillPoller:
             logger.warning("주문 취소/거부/만료: %s status=%s", updated.id, updated.status.value)
             with self._lock:
                 self._entries.pop(updated.id, None)
+                self._health.set_pending_count(len(self._entries))
             self._audit(f"poller_{updated.status.value}", updated,
                         {"prev_status": prev_status.value,
                          "partial_qty": entry.last_reported_qty})
+
+            _terminal_cb = {
+                OrderStatus.CANCELED: entry.on_canceled,
+                OrderStatus.REJECTED: entry.on_rejected,
+                OrderStatus.EXPIRED:  entry.on_expired,
+            }.get(updated.status)
+
+            _health_record = {
+                OrderStatus.CANCELED: self._health.record_cancel,
+                OrderStatus.REJECTED: self._health.record_reject,
+                OrderStatus.EXPIRED:  self._health.record_expired,
+            }.get(updated.status)
+            if _health_record:
+                _health_record()
+
+            if _terminal_cb is not None:
+                try:
+                    _terminal_cb(updated)
+                except Exception as e:
+                    logger.warning("terminal callback error [%s]: %s", updated.status, e)
 
         elif updated.status == OrderStatus.PARTIAL_FILLED:
             incremental = (updated.filled_qty or 0) - entry.last_reported_qty
             if incremental > 0:
                 entry.last_reported_qty = updated.filled_qty
+                self._health.record_partial_fill()
                 logger.info("부분체결 %s: 증분=%d (누적=%d/%d)",
                             updated.id, incremental, updated.filled_qty, updated.qty)
+                self._audit("poller_partial_filled", updated,
+                            {"incremental": incremental, "cumulative": updated.filled_qty})
                 # Pass a copy with filled_qty=incremental so the callback records
                 # only the new quantity without double-counting prior partials.
                 partial = dataclasses.replace(updated, filled_qty=incremental)
-                self._audit("poller_partial_filled", updated,
-                            {"incremental": incremental, "cumulative": updated.filled_qty})
                 try:
                     entry.on_filled(partial)
                 except Exception as e:
@@ -219,6 +359,7 @@ class OrderFillPoller:
                        _TIMEOUT_MINUTES, entry.order.id, entry.order.side, entry.order.symbol)
         with self._lock:
             self._entries.pop(entry.order.id, None)
+            self._health.set_pending_count(len(self._entries))
 
         # Auto-cancel via broker using market-appropriate kwargs.
         if self._semantic_mapper is not None:
@@ -229,10 +370,10 @@ class OrderFillPoller:
             except Exception as e:
                 logger.warning("타임아웃 자동취소 실패 %s: %s", entry.order.id, e)
 
+        self._health.record_timeout()
         self._audit("poller_timeout", entry.order,
                     {"elapsed_minutes": _TIMEOUT_MINUTES,
                      "last_reported_qty": entry.last_reported_qty})
-
         try:
             entry.on_timeout(entry.order)
         except Exception as e:

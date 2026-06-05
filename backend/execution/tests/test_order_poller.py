@@ -21,9 +21,12 @@ Extra scenarios:
   12. audit_on_cancel
   13. semantic_mapper_cancel_kwargs_used_on_timeout
   14. semantic_mapper_cancel_failure_does_not_raise
+  15. terminal-state callbacks (on_canceled, on_rejected, on_expired)
+  16. health monitor metrics (in-memory counters)
 """
 import dataclasses
 import json
+from datetime import datetime, timezone, timedelta
 from unittest.mock import MagicMock, call
 
 import pytest
@@ -32,7 +35,12 @@ from sqlalchemy.orm import sessionmaker
 
 from backend.brokers.models import Order, OrderStatus
 from backend.database.models import AuditLog, Base
-from backend.execution.order_poller import OrderFillPoller, _PollEntry
+from backend.execution.order_poller import (
+    OrderFillPoller,
+    PollingHealth,
+    PollingHealthMonitor,
+    _PollEntry,
+)
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
@@ -480,6 +488,19 @@ class TestAuditLog:
 
         assert _count_audit(db, "poller_rejected") == 1
 
+    def test_audit_on_expire(self):
+        db = _db()
+        broker = MagicMock()
+        broker.get_order_status.return_value = _order(status=OrderStatus.EXPIRED)
+
+        poller = _poller(broker=broker, db_factory=db)
+        order = _order()
+        entry = _entry(order)
+        poller._entries[order.id] = entry
+        poller._poll_one(entry)
+
+        assert _count_audit(db, "poller_expired") == 1
+
     def test_audit_on_timeout(self):
         db = _db()
         poller = _poller(db_factory=db)
@@ -674,8 +695,309 @@ class TestTimeoutCutoff:
 
     def test_is_timed_out_true_after_31_minutes(self):
         """Entry with registered_at 31 minutes in the past is timed out."""
-        from datetime import timedelta, timezone
         order = _order()
         entry = _entry(order)
         entry.registered_at = entry.registered_at - timedelta(minutes=31)
         assert entry.is_timed_out is True
+
+
+# ── 15. Terminal-state callbacks ──────────────────────────────────────────────
+
+class TestTerminalCallbacks:
+    """Tests for on_canceled, on_rejected, on_expired callbacks (TASK 2-2C additions)."""
+
+    def test_on_canceled_called_when_broker_returns_canceled(self):
+        broker = MagicMock()
+        broker.get_order_status.return_value = _order(status=OrderStatus.CANCELED)
+
+        canceled_calls = []
+        poller = _poller(broker=broker)
+        order = _order()
+        poller.register(order, on_filled=MagicMock(),
+                        on_canceled=lambda o: canceled_calls.append(o.id))
+        with poller._lock:
+            entry = poller._entries[order.id]
+        poller._poll_one(entry)
+
+        assert canceled_calls == ["ORD1"]
+
+    def test_on_canceled_not_called_without_registration(self):
+        """on_canceled defaults to None — no crash when not provided."""
+        broker = MagicMock()
+        broker.get_order_status.return_value = _order(status=OrderStatus.CANCELED)
+
+        poller = _poller(broker=broker)
+        order = _order()
+        entry = _entry(order)
+        poller._entries[order.id] = entry
+        poller._poll_one(entry)  # must not raise
+
+        assert order.id not in poller._entries
+
+    def test_on_rejected_called_when_broker_returns_rejected(self):
+        broker = MagicMock()
+        broker.get_order_status.return_value = _order(status=OrderStatus.REJECTED)
+
+        rejected_calls = []
+        poller = _poller(broker=broker)
+        order = _order()
+        poller.register(order, on_filled=MagicMock(),
+                        on_rejected=lambda o: rejected_calls.append(o.id))
+        with poller._lock:
+            entry = poller._entries[order.id]
+        poller._poll_one(entry)
+
+        assert rejected_calls == ["ORD1"]
+
+    def test_on_expired_called_when_broker_returns_expired(self):
+        broker = MagicMock()
+        broker.get_order_status.return_value = _order(status=OrderStatus.EXPIRED)
+
+        expired_calls = []
+        poller = _poller(broker=broker)
+        order = _order()
+        poller.register(order, on_filled=MagicMock(),
+                        on_expired=lambda o: expired_calls.append(o.id))
+        with poller._lock:
+            entry = poller._entries[order.id]
+        poller._poll_one(entry)
+
+        assert expired_calls == ["ORD1"]
+
+    def test_on_filled_not_called_on_canceled(self):
+        broker = MagicMock()
+        broker.get_order_status.return_value = _order(status=OrderStatus.CANCELED)
+
+        fill_calls = []
+        poller = _poller(broker=broker)
+        order = _order()
+        entry = _entry(order, on_filled=fill_calls.append)
+        poller._entries[order.id] = entry
+        poller._poll_one(entry)
+
+        assert fill_calls == []
+
+    def test_on_filled_not_called_on_rejected(self):
+        broker = MagicMock()
+        broker.get_order_status.return_value = _order(status=OrderStatus.REJECTED)
+
+        fill_calls = []
+        poller = _poller(broker=broker)
+        order = _order()
+        entry = _entry(order, on_filled=fill_calls.append)
+        poller._entries[order.id] = entry
+        poller._poll_one(entry)
+
+        assert fill_calls == []
+
+    def test_terminal_callback_exception_does_not_prevent_entry_removal(self):
+        broker = MagicMock()
+        broker.get_order_status.return_value = _order(status=OrderStatus.CANCELED)
+
+        def bad_cancel(o):
+            raise RuntimeError("callback failure")
+
+        poller = _poller(broker=broker)
+        order = _order()
+        poller.register(order, on_filled=MagicMock(), on_canceled=bad_cancel)
+        with poller._lock:
+            entry = poller._entries[order.id]
+        poller._poll_one(entry)
+
+        assert order.id not in poller._entries  # cleaned up even if callback raised
+
+
+# ── 16. Health monitor ────────────────────────────────────────────────────────
+
+class TestHealthMonitorUnit:
+    """Unit tests for PollingHealthMonitor in isolation."""
+
+    def test_initial_state(self):
+        mon = PollingHealthMonitor()
+        h = mon.get_health()
+        assert h.total_registered == 0
+        assert h.is_healthy is True
+        assert h.consecutive_poll_errors == 0
+
+    def test_register_increments(self):
+        mon = PollingHealthMonitor()
+        mon.record_register()
+        mon.record_register()
+        assert mon.get_health().total_registered == 2
+
+    def test_fill_increments(self):
+        mon = PollingHealthMonitor()
+        mon.record_fill()
+        assert mon.get_health().total_fills_detected == 1
+
+    def test_consecutive_errors_tracked(self):
+        mon = PollingHealthMonitor()
+        for _ in range(5):
+            mon.record_poll_error()
+        h = mon.get_health()
+        assert h.consecutive_poll_errors == 5
+        assert h.total_poll_errors == 5
+        assert h.is_healthy is True  # < 10
+
+    def test_10_consecutive_errors_unhealthy(self):
+        mon = PollingHealthMonitor()
+        for _ in range(10):
+            mon.record_poll_error()
+        assert mon.get_health().is_healthy is False
+
+    def test_success_resets_consecutive(self):
+        mon = PollingHealthMonitor()
+        for _ in range(5):
+            mon.record_poll_error()
+        mon.record_poll_success()
+        h = mon.get_health()
+        assert h.consecutive_poll_errors == 0
+        assert h.is_healthy is True
+
+    def test_get_health_returns_copy(self):
+        mon = PollingHealthMonitor()
+        h1 = mon.get_health()
+        mon.record_fill()
+        h2 = mon.get_health()
+        assert h1.total_fills_detected == 0  # original snapshot unchanged
+        assert h2.total_fills_detected == 1
+
+    def test_last_successful_poll_at_is_timezone_aware(self):
+        """last_successful_poll_at must be comparable to datetime.now(timezone.utc)."""
+        mon = PollingHealthMonitor()
+        mon.record_poll_success()
+        h = mon.get_health()
+        assert h.last_successful_poll_at is not None
+        # Should not raise TypeError
+        delta = datetime.now(timezone.utc) - h.last_successful_poll_at
+        assert delta.total_seconds() >= 0
+
+
+class TestHealthMonitorIntegration:
+    """Health metrics observed through the poller (end-to-end)."""
+
+    def test_register_increments_health(self):
+        poller = _poller()
+        poller.register(_order(), on_filled=MagicMock())
+        assert poller.health.total_registered == 1
+
+    def test_fill_increments_health(self):
+        broker = MagicMock()
+        broker.get_order_status.return_value = _order(status=OrderStatus.FILLED, filled_qty=100)
+        poller = _poller(broker=broker)
+        order = _order()
+        entry = _entry(order)
+        poller._entries[order.id] = entry
+        poller._poll_one(entry)
+        assert poller.health.total_fills_detected == 1
+
+    def test_partial_fill_increments_health(self):
+        broker = MagicMock()
+        broker.get_order_status.return_value = _order(
+            status=OrderStatus.PARTIAL_FILLED, filled_qty=50
+        )
+        poller = _poller(broker=broker)
+        order = _order()
+        entry = _entry(order)
+        poller._entries[order.id] = entry
+        poller._poll_one(entry)
+        assert poller.health.total_partial_fills == 1
+
+    def test_cancel_increments_health(self):
+        broker = MagicMock()
+        broker.get_order_status.return_value = _order(status=OrderStatus.CANCELED)
+        poller = _poller(broker=broker)
+        order = _order()
+        entry = _entry(order)
+        poller._entries[order.id] = entry
+        poller._poll_one(entry)
+        assert poller.health.total_cancels == 1
+
+    def test_reject_increments_health(self):
+        broker = MagicMock()
+        broker.get_order_status.return_value = _order(status=OrderStatus.REJECTED)
+        poller = _poller(broker=broker)
+        order = _order()
+        entry = _entry(order)
+        poller._entries[order.id] = entry
+        poller._poll_one(entry)
+        assert poller.health.total_rejects == 1
+
+    def test_expired_increments_health(self):
+        broker = MagicMock()
+        broker.get_order_status.return_value = _order(status=OrderStatus.EXPIRED)
+        poller = _poller(broker=broker)
+        order = _order()
+        entry = _entry(order)
+        poller._entries[order.id] = entry
+        poller._poll_one(entry)
+        assert poller.health.total_expired == 1
+
+    def test_timeout_increments_health(self):
+        poller = _poller()
+        entry = _entry(_order())
+        poller._handle_timeout(entry)
+        assert poller.health.total_timeouts == 1
+
+    def test_broker_error_increments_health(self):
+        broker = MagicMock()
+        broker.get_order_status.side_effect = RuntimeError("down")
+        poller = _poller(broker=broker)
+        order = _order()
+        entry = _entry(order)
+        poller._entries[order.id] = entry
+        poller._poll_one(entry)
+        h = poller.health
+        assert h.total_poll_errors == 1
+        assert h.consecutive_poll_errors == 1
+
+    def test_consecutive_errors_reset_after_success(self):
+        broker = MagicMock()
+        broker.get_order_status.side_effect = RuntimeError("down")
+        poller = _poller(broker=broker)
+        order = _order()
+        entry = _entry(order)
+        poller._entries[order.id] = entry
+        poller._poll_one(entry)
+
+        broker.get_order_status.side_effect = None
+        broker.get_order_status.return_value = _order(status=OrderStatus.SUBMITTED)
+        poller._poll_one(entry)
+
+        assert poller.health.consecutive_poll_errors == 0
+
+    def test_10_consecutive_errors_is_unhealthy(self):
+        broker = MagicMock()
+        broker.get_order_status.side_effect = RuntimeError("down")
+        poller = _poller(broker=broker)
+        order = _order()
+        entry = _entry(order)
+        poller._entries[order.id] = entry
+
+        for _ in range(10):
+            poller._poll_one(entry)
+
+        assert poller.health.is_healthy is False
+
+    def test_pending_count_updated_on_register(self):
+        poller = _poller()
+        assert poller.health.pending_count == 0
+        poller.register(_order(), on_filled=MagicMock())
+        assert poller.health.pending_count == 1
+
+    def test_pending_count_updated_on_unregister(self):
+        poller = _poller()
+        poller.register(_order(), on_filled=MagicMock())
+        poller.unregister("ORD1")
+        assert poller.health.pending_count == 0
+
+    def test_pending_count_decremented_on_fill(self):
+        broker = MagicMock()
+        broker.get_order_status.return_value = _order(status=OrderStatus.FILLED, filled_qty=100)
+        poller = _poller(broker=broker)
+        order = _order()
+        entry = _entry(order)
+        poller._entries[order.id] = entry
+        poller._health.set_pending_count(1)
+        poller._poll_one(entry)
+        assert poller.health.pending_count == 0
