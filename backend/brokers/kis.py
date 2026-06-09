@@ -121,6 +121,16 @@ class KISBroker(BrokerAdapter):
                 id="", symbol=symbol, side=side, qty=qty, price=price,
                 status=OrderStatus.REJECTED, raw={"error": "circuit breaker open"},
             )
+
+        # Calendar gate — raises MarketClosedError (NOT RuntimeError, circuit breaker safe)
+        try:
+            from backend.data.calendar import get_calendar_service, Market as _Market
+            from datetime import datetime as _dt, timezone as _tz
+            _mkt = _Market.KRX if (symbol in KR_ETF or (len(symbol) == 6 and symbol.isdigit())) else _Market.NYSE
+            get_calendar_service().assert_tradeable(_mkt, _dt.now(_tz.utc))
+        except ImportError:
+            pass
+
         is_kr = symbol in KR_ETF or (len(symbol) == 6 and symbol.isdigit())
         try:
             if is_kr:
@@ -136,6 +146,13 @@ class KISBroker(BrokerAdapter):
                 status=OrderStatus.SUBMITTED, raw=raw,
             )
         except Exception as e:
+            # MarketClosedError must not increment the circuit breaker failure counter
+            try:
+                from backend.data.calendar import MarketClosedError as _MCE
+                if isinstance(e, _MCE):
+                    raise
+            except ImportError:
+                pass
             self._breaker.record_failure()
             logger.error("주문 실패 %s %s: %s", side, symbol, e)
             return Order(
