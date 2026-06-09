@@ -160,12 +160,34 @@ def _publish_session_signal(channel: str) -> None:
 
 
 def _trigger_kr_session():
-    """한국 세션 신호 — Redis Pub/Sub + DB fallback."""
+    """한국 세션 신호 — Redis Pub/Sub + DB fallback. 오늘이 KRX 휴장이면 생략."""
+    try:
+        from datetime import timezone as _tz
+        from backend.data.calendar import get_calendar_service, Market as _Market
+        _svc = get_calendar_service()
+        _now = datetime.now(_tz.utc)
+        if not _svc.is_trading_day(_Market.KRX, _svc.trade_date(_Market.KRX, _now)):
+            logger.info("오늘 KRX 휴장 — 한국 세션 신호 생략")
+            return
+    except Exception as _e:
+        logger.warning("Calendar gate 오류 (계속 진행): %s", _e)
+
     _publish_session_signal("session:kr_open")
 
 
 def _trigger_us_session():
-    """미국 세션 신호 — Redis Pub/Sub + DB fallback."""
+    """미국 세션 신호 — Redis Pub/Sub + DB fallback. 오늘이 NYSE 휴장이면 생략."""
+    try:
+        from datetime import timezone as _tz
+        from backend.data.calendar import get_calendar_service, Market as _Market
+        _svc = get_calendar_service()
+        _now = datetime.now(_tz.utc)
+        if not _svc.is_trading_day(_Market.NYSE, _svc.trade_date(_Market.NYSE, _now)):
+            logger.info("오늘 NYSE 휴장 — 미국 세션 신호 생략")
+            return
+    except Exception as _e:
+        logger.warning("Calendar gate 오류 (계속 진행): %s", _e)
+
     _publish_session_signal("session:us_open")
 
 
@@ -206,10 +228,10 @@ def build_scheduler() -> BackgroundScheduler:
         id="us_session", name="미국주식 매매",
     )
 
-    # 일일 리스크 카운터 리셋 00:01 KST
+    # 일일 리스크 카운터 리셋 06:01 KST — 미국 세션(22:30~05:00 KST) 종료 후 실행
     scheduler.add_job(
         _reset_daily_risk,
-        CronTrigger(hour=0, minute=1, timezone="Asia/Seoul"),
+        CronTrigger(hour=6, minute=1, timezone="Asia/Seoul"),
         id="risk_reset", name="리스크 카운터 리셋",
     )
 

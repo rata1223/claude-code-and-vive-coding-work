@@ -59,17 +59,38 @@ class KISClient:
         headers["hashkey"] = hashkey
         url = f"{self.base_url}{path}"
 
+        _CLOSED_CODES = {"-90", "-91", "-100"}
+        _CLOSED_TEXTS = ("거래가능시간", "시간외거래", "매매시간이 아님")
+
         for attempt in range(self.MAX_RETRIES):
             self._limiter.wait()
             try:
                 resp = requests.post(url, headers=headers, json=body, timeout=10)
                 resp.raise_for_status()
                 data = resp.json()
-                if data.get("rt_cd") != "0":
-                    raise RuntimeError(f"KIS API error: {data.get('msg1')}")
-                return data
             except Exception as e:
                 logger.warning("POST %s attempt %d failed: %s", path, attempt + 1, e)
                 if attempt == self.MAX_RETRIES - 1:
                     raise
                 time.sleep(1)
+                continue
+
+            if data.get("rt_cd") != "0":
+                code = data.get("rt_cd", "")
+                msg = data.get("msg1", "")
+                if code in _CLOSED_CODES or any(t in msg for t in _CLOSED_TEXTS):
+                    try:
+                        from backend.data.calendar import (
+                            MarketClosedError, Market, SessionType, BlockReason,
+                        )
+                        raise MarketClosedError(
+                            market=Market.KRX,
+                            session=SessionType.CLOSED,
+                            reason=BlockReason.WRONG_SESSION,
+                            detail=f"KIS rt_cd={code}: {msg}",
+                        )
+                    except ImportError:
+                        raise RuntimeError(f"KIS 시장 미개장 ({code}): {msg}")
+                raise RuntimeError(f"KIS API error: {msg}")
+
+            return data
