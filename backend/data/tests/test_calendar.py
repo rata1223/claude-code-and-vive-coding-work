@@ -173,8 +173,10 @@ class TestCalendarCache:
         d1, d2, d3 = date(2026, 6, 1), date(2026, 6, 2), date(2026, 6, 3)
         c.set(Market.NYSE, d1, {"v": 1})
         c.set(Market.NYSE, d2, {"v": 2})
-        # Accessing d1 makes it "recently used" by refreshing its expiry
         c.set(Market.NYSE, d3, {"v": 3})
+        # d1 has the earliest expiry so it is evicted when d3 is inserted
+        assert c.get(Market.NYSE, d1) is None
+        assert c.get(Market.NYSE, d2) == {"v": 2}
         assert c.get(Market.NYSE, d3) is not None
 
     def test_thread_safety(self):
@@ -188,8 +190,10 @@ class TestCalendarCache:
             except Exception as e:
                 errors.append(e)
         threads = [threading.Thread(target=_worker, args=(i,)) for i in range(50)]
-        for t in threads: t.start()
-        for t in threads: t.join()
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
         assert not errors
 
 
