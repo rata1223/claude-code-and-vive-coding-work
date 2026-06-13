@@ -287,6 +287,62 @@ class TestPartialFillTracker:
         assert any(o.order_id == "ORD1" for o in timed)
 
 
+class TestOHLCVRecovery:
+    def test_get_cache_empty_returns_none(self):
+        recovery = OHLCVRecovery()
+        assert recovery._get_cache("AAPL") is None
+
+    def test_update_then_get_cache_returns_data(self):
+        recovery = OHLCVRecovery()
+        df = make_df(n=10)
+        recovery._update_cache("AAPL", df)
+        cached = recovery._get_cache("AAPL")
+        pd.testing.assert_frame_equal(cached, df)
+
+    def test_get_cache_expires_after_max_age(self):
+        """Delay detection: cache older than max_cache_age_hours is rejected."""
+        recovery = OHLCVRecovery(max_cache_age_hours=1)
+        df = make_df(n=10)
+        recovery._update_cache("AAPL", df)
+        cached_df, ts = recovery._cache["AAPL"]
+        recovery._cache["AAPL"] = (cached_df, ts - timedelta(hours=2))
+        assert recovery._get_cache("AAPL") is None
+
+    def test_fetch_returns_none_when_all_sources_fail_and_no_cache(self, monkeypatch):
+        """Fail-closed: no data anywhere -> None, not a fabricated/empty DataFrame."""
+        recovery = OHLCVRecovery()
+        monkeypatch.setattr(recovery, "_try_yfinance", lambda *a, **k: None)
+        assert recovery.fetch("AAPL") is None
+
+    def test_fetch_falls_back_to_cache_when_sources_fail(self, monkeypatch):
+        recovery = OHLCVRecovery()
+        df = make_df(n=10)
+        recovery._update_cache("AAPL", df)
+        monkeypatch.setattr(recovery, "_try_yfinance", lambda *a, **k: None)
+        result = recovery.fetch("AAPL")
+        pd.testing.assert_frame_equal(result, df)
+
+    def test_fetch_prefers_broker_over_yfinance(self, monkeypatch):
+        """Source priority: broker result short-circuits yfinance."""
+        recovery = OHLCVRecovery()
+        broker_df = make_df(n=5)
+        monkeypatch.setattr(recovery, "_try_broker", lambda *a, **k: broker_df)
+        yf_calls = []
+        monkeypatch.setattr(recovery, "_try_yfinance",
+                             lambda *a, **k: yf_calls.append(1))
+        result = recovery.fetch("AAPL", broker=object())
+        pd.testing.assert_frame_equal(result, broker_df)
+        assert yf_calls == []
+
+    def test_fetch_tries_pykrx_for_kr_symbols_after_yfinance(self, monkeypatch):
+        recovery = OHLCVRecovery()
+        monkeypatch.setattr(recovery, "_try_yfinance", lambda *a, **k: None)
+        krx_df = make_df(n=5)
+        monkeypatch.setattr(recovery, "_try_pykrx", lambda *a, **k: krx_df)
+        result = recovery.fetch("005930")
+        pd.testing.assert_frame_equal(result, krx_df)
+
+
 class TestSpreadGuard:
     def test_normal_spread_allowed(self):
         g = SpreadGuard(max_spread_pct=0.005)
