@@ -53,7 +53,7 @@ gunicorn==22.0.0
 # Security & Authentication
 # pyjwt removed: codebase uses `from jose import jwt` (python-jose), not PyJWT.
 # PyJWT is unused and carries HIGH advisories (PYSEC-2025-183, GHSA-752w-5fwx-jx9f).
-cryptography==46.0.7
+cryptography==48.0.1
 
 # Monitoring & Logging
 python-json-logger==2.0.7
