@@ -1,471 +1,921 @@
 """
-Design skeleton for the consolidated failure-scenario integration suite (TASK 4-1B).
+Integration tests for M4 failure scenarios — TASK 4-1C.
 
-See docs/FAILURE_SCENARIO_TESTS.md for the full design specification: per-scenario
-expected behavior, recovery expectations, validation assertions, fail-closed rules
-([CURRENT]/[TARGET]), and audit-logging expectations.
-
-All test methods are @pytest.mark.skip(reason="TASK 4-1B design skeleton — see
-docs/FAILURE_SCENARIO_TESTS.md §4.N; not yet implemented"). Fixtures db_factory(),
-mock_broker(), and mock_redis() are implemented trivially (plain SQLite/MagicMock
-construction, no failure-injection logic, per §2's "trivial scaffolding vs. scenario
-logic" boundary). flaky_broker() and crashing_poller() are stubs.
+10 scenarios, each verifying:
+  1. 신규 주문 차단 여부 (new-order blocking)
+  2. Kill Switch 동작 여부 (kill switch activation)
+  3. Recovery 가능 여부 (recovery possible)
+  4. 상태 일관성 유지 여부 (state consistency)
+  5. Audit Log 생성 여부 (audit log creation)
 """
+import json
+import threading
+from datetime import datetime, timedelta, timezone
+
 import pytest
-from datetime import date, datetime, timedelta, timezone
-from unittest.mock import MagicMock
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
 
+import backend.worker.runner as runner
+from backend.brokers.models import Balance, Order as BOrder, OrderStatus, Position as BPosition
 from backend.database.models import (
-    Base, Order, Fill, Position, AuditLog, DailyRiskState, Command,
+    AuditLog, Base, DailyRiskState,
+    Fill as DBFill, Order as DBOrder, Position as DBPosition,
+    ReconciliationLog, StrategyRun,
 )
-from backend.execution.order_machine import OrderStateMachine
-from backend.execution.position_tracker import PositionTracker
-from backend.execution.order_poller import OrderFillPoller
 from backend.execution.circuit_breaker import ConsecutiveFailureBreaker
-from backend.worker.heartbeat import WorkerHeartbeat, HeartbeatMonitor, WorkerWatchdog
-
-
-SKIP_REASON = (
-    "TASK 4-1B design skeleton — see docs/FAILURE_SCENARIO_TESTS.md §4.{n}; "
-    "not yet implemented"
+from backend.execution.idempotency import IdempotencyKey, IdempotencyStore
+from backend.execution.order_machine import OrderStateMachine
+from backend.execution.order_poller import OrderFillPoller
+from backend.execution.position_tracker import Fill, PositionTracker
+from backend.execution.reconciler import PositionReconciler
+from backend.data.stale_detector import (
+    StaleDataDetectionService, StaleFeedError, StaleState, TradingGate,
 )
+from backend.risk.kill_switch import (
+    KillReasonLog, KillSwitch, KillTriggerEngine, NotificationHook,
+    OrderIntent, RecoveryManager, Severity, TradingState,
+)
+from backend.worker.recovery import SAFE_MODE, StartupRecovery
 
 
-# ── Shared Fixtures ────────────────────────────────────────────────────────────
-#
-# db_factory(), mock_broker(), and mock_redis() are trivial scaffolding (plain
-# SQLite/MagicMock construction with no failure-injection logic) and are
-# implemented per §2's "Trivial Scaffolding vs. Scenario Logic" boundary.
-#
-# flaky_broker() and crashing_poller() are scenario-specific failure-injection
-# helpers (§4.2/§4.5 and §4.6 respectively) and remain stubs: they raise
-# NotImplementedError if ever invoked. No stub test method below requests them
-# as fixture parameters, so they do not affect collection or skip behavior.
+_FIXED_NOW = datetime(2026, 6, 6, 9, 37, 0, tzinfo=timezone.utc)
+
+
+# ── Fixtures ────────────────────────────────────────────────────────────────
 
 
 @pytest.fixture()
 def db_factory():
-    """In-memory SQLite session factory, fresh per test (per test_reconciler.py:32-38)."""
-    engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    engine = create_engine(
+        "sqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
     Base.metadata.create_all(engine)
     return sessionmaker(bind=engine, expire_on_commit=False)
 
 
 @pytest.fixture()
-def mock_broker():
-    """MagicMock BrokerAdapter with an empty positions list by default."""
+def patched_runner_factory(db_factory, monkeypatch):
+    monkeypatch.setattr(runner, "_SessionFactory", db_factory)
+    return db_factory
+
+
+@pytest.fixture(autouse=True)
+def _reset_safe_mode():
+    """SAFE_MODE is a process-level singleton — reset before/after each test."""
+    SAFE_MODE._can_trade = False
+    SAFE_MODE._reason = "초기화 중"
+    yield
+    SAFE_MODE._can_trade = False
+    SAFE_MODE._reason = "초기화 중"
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+
+def _count_audit(factory, event_type: str) -> int:
+    sess = factory()
+    try:
+        return sess.query(AuditLog).filter(AuditLog.event_type == event_type).count()
+    finally:
+        sess.close()
+
+
+def _bare_worker(poller=None):
+    w = runner.StrategyWorker.__new__(runner.StrategyWorker)
+    w._poller = poller
+    w._loss_tracker = None
+    return w
+
+
+def _tracker():
+    return PositionTracker(OrderStateMachine())
+
+
+def _insert_order(factory, broker_order_id, symbol, broker="kis", status="submitted",
+                  side="buy", qty=10, price=70000.0, filled_qty=0, avg_fill_price=None,
+                  created_at=None):
+    sess = factory()
+    row = DBOrder(
+        broker_order_id=broker_order_id, symbol=symbol, side=side, qty=qty, price=price,
+        filled_qty=filled_qty, avg_fill_price=avg_fill_price,
+        status=status, market="KR", broker=broker,
+        created_at=created_at or datetime.utcnow(),
+    )
+    sess.add(row)
+    sess.commit()
+    oid = row.id
+    sess.close()
+    return oid
+
+
+def _broker_order(status: OrderStatus, filled_qty=0, avg_fill_price=70000.0,
+                  broker_order_id="ORD001", symbol="005930", qty=10, side="buy",
+                  price=70000.0) -> BOrder:
+    return BOrder(id=broker_order_id, symbol=symbol, side=side, qty=qty, price=price,
+                  status=status, filled_qty=filled_qty, avg_fill_price=avg_fill_price)
+
+
+def _kill_switch(*, trigger_engine=None, db_factory=None, _now=None,
+                 cooldown_seconds=300.0, validation_checks=None):
+    """Mirrors backend/risk/tests/test_kill_switch.py::_kill_switch."""
+    reason_log = KillReasonLog(db_factory=db_factory)
+    notify = NotificationHook()
+    recovery = RecoveryManager(cooldown_seconds=cooldown_seconds,
+                               validation_checks=validation_checks)
+    ks = KillSwitch(trigger_engine=trigger_engine, reason_log=reason_log,
+                    recovery_manager=recovery, notification_hook=notify,
+                    db_factory=db_factory, _now=_now)
+    return ks, reason_log, notify, recovery
+
+
+def _healthy_broker():
+    """MagicMock broker that passes startup recovery steps cleanly."""
+    from unittest.mock import MagicMock
     broker = MagicMock()
+    broker.get_balance.return_value = Balance(cash_krw=0.0, cash_usd=0.0, total_eval_krw=1_000_000.0)
     broker.get_positions.return_value = []
+    broker.get_order_status.return_value = None
     return broker
 
 
-@pytest.fixture()
-def mock_redis():
-    """MagicMock redis client that reports itself as reachable/healthy by default."""
-    redis_client = MagicMock()
-    redis_client.exists.return_value = 1
-    redis_client.ping.return_value = True
-    return redis_client
-
-
-@pytest.fixture()
-def flaky_broker():
-    """Stub — design only.
-
-    Will produce a MagicMock BrokerAdapter whose `place_order`/`get_order_status`
-    raise for the first `n_failures` calls before succeeding, for FS-02/DO-05
-    circuit-breaker scenarios (§4.2, §4.5). Not implemented in this task.
-    """
-    raise NotImplementedError(
-        "flaky_broker() is a design-only stub — see docs/FAILURE_SCENARIO_TESTS.md §2/§5"
-    )
-
-
-@pytest.fixture()
-def crashing_poller():
-    """Stub — design only.
-
-    Will produce an OrderFillPoller whose `_poll_one` raises on a configured tick,
-    for the EX-10 poller-thread-crash scenario (§4.6). Not implemented in this task.
-    """
-    raise NotImplementedError(
-        "crashing_poller() is a design-only stub — see docs/FAILURE_SCENARIO_TESTS.md §2/§5"
-    )
-
-
-# ── §4.1 Redis Down ──────────────────────────────────────────────────────────
-
-
-class TestRedisDownScenario:
-    """FS-01 (HIGH). See docs/FAILURE_SCENARIO_TESTS.md §4.1 and
-    docs/FAILURE_SCENARIO_AUDIT.md §3.1/§6."""
-
-    @pytest.mark.skip(reason=SKIP_REASON.format(n="1"))
-    def test_heartbeat_survives_redis_outage(self):
-        """WorkerHeartbeat._beat() must swallow redis.ConnectionError raised by
-        mock_redis().set without propagating, so the heartbeat loop keeps running
-        across a transient Redis outage."""
-        pass
-
-    @pytest.mark.skip(reason=SKIP_REASON.format(n="1"))
-    def test_watchdog_sets_kill_switch_on_connection_error(self):
-        """When HeartbeatMonitor.is_alive() raises (mock_redis().exists.side_effect=
-        redis.ConnectionError), WorkerWatchdog._check() must set
-        DailyRiskState.kill_switch=True and populate kill_reason for today's
-        trade_date."""
-        pass
-
-    @pytest.mark.skip(reason=SKIP_REASON.format(n="1"))
-    def test_recovery_alert_does_not_clear_kill_switch(self):
-        """[CURRENT] gap: after Redis becomes reachable again and
-        WorkerWatchdog._alert_recovery() fires its WS info alert,
-        DailyRiskState.kill_switch remains True and kill_reason is not annotated
-        with a recovery note — documents the FS-01 "set but never cleared" gap."""
-        pass
-
-
-# ── §4.2 Worker Restart ──────────────────────────────────────────────────────
-
-
-class TestWorkerRestartScenario:
-    """FS-02 (MEDIUM), F1/EX-06 (RESOLVED — regression guards). See
-    docs/FAILURE_SCENARIO_TESTS.md §4.2 and docs/FAILURE_SCENARIO_AUDIT.md §3.2/§6."""
-
-    @pytest.mark.skip(reason=SKIP_REASON.format(n="2"))
-    def test_recovery_idempotent_second_run(self):
-        """Running StartupRecovery.run() twice against the same db_factory session
-        must produce zero net change in AuditLog row count on the second run
-        (F1/EX-06 regression guard for idempotent recovery)."""
-        pass
-
-    @pytest.mark.skip(reason=SKIP_REASON.format(n="2"))
-    def test_pending_order_fill_dedup_across_restart(self):
-        """Re-running StartupRecovery's `_step_pending_orders` against an Order that
-        was already reconciled to FILLED in a prior run must not insert a second
-        Fill row for the same (order_id, qty, price) (F1 regression guard)."""
-        pass
-
-    @pytest.mark.skip(reason=SKIP_REASON.format(n="2"))
-    def test_breaker_resets_on_restart(self):
-        """[CURRENT] gap: a fresh ConsecutiveFailureBreaker() instance constructed
-        after a simulated restart starts with is_open() is False, even when the
-        pre-restart breaker was open and its cooldown had not yet elapsed
-        (FS-02 — breaker state is purely in-memory and not persisted)."""
-        pass
-
-    @pytest.mark.skip(reason=SKIP_REASON.format(n="2"))
-    def test_kill_switch_blocks_reenable_across_restart(self):
-        """When DailyRiskState.kill_switch=True is restored for today's trade_date
-        from a prior session, StartupRecovery's `_step_enable_trading` must not
-        re-enable trading (SAFE_MODE must remain in force)."""
-        pass
-
-
-# ── §4.3 Process Kill ─────────────────────────────────────────────────────────
-
-
-class TestProcessKillScenario:
-    """EX-02 (extended), CA-03/CA-04 (HIGH). See docs/FAILURE_SCENARIO_TESTS.md §4.3
-    and docs/FAILURE_SCENARIO_AUDIT.md §3.3/§6."""
-
-    @pytest.mark.skip(reason=SKIP_REASON.format(n="3"))
-    def test_kill_mid_pipeline_no_partial_db_write(self):
-        """Simulating a process kill between PositionTracker.on_fill() (in-memory
-        update) and `_persist_fill()` (DB write) must leave the DB at its
-        pre-fill state — no half-written Order/Fill rows (safe-shutdown dimension,
-        §3.1)."""
-        pass
-
-    @pytest.mark.skip(reason=SKIP_REASON.format(n="3"))
-    def test_startup_reconcile_repairs_qty_after_kill(self):
-        """After the kill above, reconcile("startup") must correct Position.qty to
-        match mock_broker().get_positions() and write a `reconcile_fix_qty`
-        AuditLog row (CA-03)."""
-        pass
-
-    @pytest.mark.skip(reason=SKIP_REASON.format(n="3"))
-    def test_missing_fill_row_after_repair_undetected(self):
-        """[TARGET] gap: after the CA-03 qty repair above, no Fill row exists for
-        the lost fill and no AuditLog entry flags the missing-Fill condition —
-        the repair silently masks the loss."""
-        pass
-
-    @pytest.mark.skip(reason=SKIP_REASON.format(n="3"))
-    def test_watchdog_correctly_flags_genuine_death(self):
-        """Regression guard: when the worker process is genuinely dead (mock_redis()
-        heartbeat key is absent/expired, no ConnectionError), WorkerWatchdog._check()
-        must still set DailyRiskState.kill_switch=True (distinguishing this from the
-        FS-01 Redis-down case)."""
-        pass
-
-
-# ── §4.4 Network Timeout ───────────────────────────────────────────────────────
-
-
-class TestNetworkTimeoutScenario:
-    """DO-01 (CRITICAL), SD-04 (MEDIUM, confirmed), FS-07 (MEDIUM-HIGH). See
-    docs/FAILURE_SCENARIO_TESTS.md §4.4 and docs/FAILURE_SCENARIO_AUDIT.md §3.4/§6."""
-
-    @pytest.mark.skip(reason=SKIP_REASON.format(n="4"))
-    def test_post_retry_after_timeout_may_duplicate_order(self):
-        """[CURRENT] gap: KISClient's retry-on-timeout for a POST order request can
-        resubmit an order whose first attempt actually reached the broker, creating
-        a second broker-side order under the same Order.idempotency_key
-        (DO-01 — broker-side duplicate is outside the DB's visibility, §3.6)."""
-        pass
-
-    @pytest.mark.skip(reason=SKIP_REASON.format(n="4"))
-    def test_auth_hashkey_timeout_fails_without_retry(self):
-        """[CURRENT] KISAuth._issue_token() and KISClient.get_hashkey() raise
-        immediately on a timeout with zero retries, unlike data/order calls which
-        retry up to 3 times (FS-07)."""
-        pass
-
-    @pytest.mark.skip(reason=SKIP_REASON.format(n="4"))
-    def test_fx_fallback_on_timeout_uses_stale_cache(self):
-        """Regression guard: when the yfinance FX-rate lookup times out, `_get_fx()`
-        must fall back to its last cached rate rather than raising or returning a
-        default value (SD-04 cross-ref to docs/STALE_DATA_AUDIT.md)."""
-        pass
-
-
-# ── §4.5 Broker API Failure ────────────────────────────────────────────────────
-
-
-class TestBrokerApiFailureScenario:
-    """DO-05 (HIGH), FS-02 cross-ref. See docs/FAILURE_SCENARIO_TESTS.md §4.5 and
-    docs/FAILURE_SCENARIO_AUDIT.md §3.5/§6."""
-
-    @pytest.mark.skip(reason=SKIP_REASON.format(n="5"))
-    def test_breaker_opens_after_threshold_failures(self):
-        """ConsecutiveFailureBreaker(threshold=5).is_open() must become True only
-        after the 5th consecutive record_failure() call, and remain False after
-        fewer than 5 (DO-05)."""
-        pass
-
-    @pytest.mark.skip(reason=SKIP_REASON.format(n="5"))
-    def test_breaker_open_short_circuits_without_broker_call(self):
-        """Once is_open() is True, the order-submission path must reject the order
-        without ever calling mock_broker().place_order (no-duplicate-orders
-        dimension, §3.6)."""
-        pass
-
-    @pytest.mark.skip(reason=SKIP_REASON.format(n="5"))
-    def test_breaker_trip_logs_but_does_not_alert(self):
-        """[TARGET] gap: when the breaker trips open, today's code path only calls
-        logger.error — no Telegram or WS alert is emitted (FS-02 cross-ref)."""
-        pass
-
-    @pytest.mark.skip(reason=SKIP_REASON.format(n="5"))
-    def test_breaker_auto_recovers_after_cooldown(self):
-        """Regression guard: ConsecutiveFailureBreaker.is_open() must return False
-        once cooldown_minutes has elapsed since the breaker opened, without any
-        explicit record_success() call."""
-        pass
-
-    @pytest.mark.skip(reason=SKIP_REASON.format(n="5"))
-    def test_get_order_status_none_keeps_entry_registered(self):
-        """When mock_broker().get_order_status returns None for several consecutive
-        polls (transient broker API failure), the corresponding _PollEntry must
-        remain registered in OrderFillPoller._entries rather than being dropped."""
-        pass
-
-
-# ── §4.6 Polling Failure ───────────────────────────────────────────────────────
-
-
-class TestPollingFailureScenario:
-    """EX-02 (CRITICAL, extended to PARTIAL_FILLED), EX-10 (HIGH). See
-    docs/FAILURE_SCENARIO_TESTS.md §4.6 and docs/FAILURE_SCENARIO_AUDIT.md §3.6/§6."""
-
-    @pytest.mark.skip(reason=SKIP_REASON.format(n="6"))
-    def test_filled_callback_exception_loses_fill(self):
-        """[CURRENT] gap: if the registered on_filled callback raises for a FILLED
-        order, OrderFillPoller still pops the order from _entries — the fill is
-        never retried and is permanently lost (EX-02)."""
-        pass
-
-    @pytest.mark.skip(reason=SKIP_REASON.format(n="6"))
-    def test_partial_filled_callback_exception_loses_increment(self):
-        """[CURRENT] gap: for a PARTIAL_FILLED update, _PollEntry.last_reported_qty
-        is advanced before the on_filled callback runs, so a raising callback
-        permanently loses that partial-fill increment (EX-02 extended)."""
-        pass
-
-    @pytest.mark.skip(reason=SKIP_REASON.format(n="6"))
-    def test_thread_crash_no_supervisor(self):
-        """[CURRENT] gap: after an injected exception inside OrderFillPoller._loop
-        (via crashing_poller()), poller._thread.is_alive() is False and no
-        supervisor restarts it — all pending fills stop being polled (EX-10)."""
-        pass
-
-    @pytest.mark.skip(reason=SKIP_REASON.format(n="6"))
-    def test_reconcile_masks_lost_fill_via_qty_repair(self):
-        """Following a lost fill (as in test_filled_callback_exception_loses_fill),
-        reconcile() repairs Position.qty via CA-03 with a `reconcile_fix_qty`
-        AuditLog row but writes no corresponding Fill row — the loss is masked at
-        the position level (§3.7 "no position damage" — DB recovers within one
-        reconcile cycle, but the Fill audit trail does not)."""
-        pass
-
-    @pytest.mark.skip(reason=SKIP_REASON.format(n="6"))
-    def test_lost_order_gap_logged_after_one_hour(self):
-        """When an Order remains unresolved for more than one hour (poller thread
-        dead per test_thread_crash_no_supervisor), reconcile()'s gap-detection must
-        record a `lost_order` entry in ReconciliationLog.detail."""
-        pass
-
-
-# ── §4.7 Reconciliation Failure ────────────────────────────────────────────────
-
-
-class TestReconciliationFailureScenario:
-    """CA-03/CA-04 (HIGH), EX-04/EX-11 (HIGH). See docs/FAILURE_SCENARIO_TESTS.md
-    §4.7 and docs/FAILURE_SCENARIO_AUDIT.md §3.7/§6."""
-
-    @pytest.mark.skip(reason=SKIP_REASON.format(n="7"))
-    def test_concurrent_reconcile_second_call_skips(self):
-        """Regression guard: when reconcile() is called while another reconcile()
-        holds the lock, the second call returns a ReconciliationResult with
-        ok is False and a lock-skip error, without mutating any Position rows."""
-        pass
-
-    @pytest.mark.skip(reason=SKIP_REASON.format(n="7"))
-    def test_lock_skip_not_distinguished_from_noop(self):
-        """[TARGET] gap: a lock-skip ReconciliationLog row and a genuine "no gaps
-        found" no-op ReconciliationLog row are structurally indistinguishable
-        without inspecting the `errors` field (CA-04 cross-ref)."""
-        pass
-
-    @pytest.mark.skip(reason=SKIP_REASON.format(n="7"))
-    def test_broker_exception_aborts_with_no_partial_writes(self):
-        """If mock_broker().get_positions() raises mid-loop, reconcile() must abort
-        the entire run such that db.query(DBPosition).all() is unchanged from
-        before the call — no partial per-symbol writes (CA-03/CA-04, safe-shutdown
-        dimension §3.1)."""
-        pass
-
-    @pytest.mark.skip(reason=SKIP_REASON.format(n="7"))
-    def test_fill_dedup_across_reconciler_and_poller(self):
-        """Regression guard: when both the reconciler and the OrderFillPoller
-        attempt to persist a Fill for the same (order_id, qty, price), only one
-        Fill row exists afterward (EX-04/EX-11)."""
-        pass
-
-    @pytest.mark.skip(reason=SKIP_REASON.format(n="7"))
-    def test_ca03_repair_has_no_reason_field(self):
-        """[CURRENT] gap: the `detail` JSON of a `reconcile_fix_qty` or
-        `reconcile_fix_avg_price` AuditLog row contains the old/new values but no
-        field explaining *why* the mismatch occurred (CA-04)."""
-        pass
-
-
-# ── §4.8 Stale Data ─────────────────────────────────────────────────────────────
-
-
-class TestStaleDataScenario:
-    """SD-01/03/04/05/06/09/12 (cross-ref docs/STALE_DATA_AUDIT.md — no new finding
-    IDs introduced here). See docs/FAILURE_SCENARIO_TESTS.md §4.8 and
-    docs/FAILURE_SCENARIO_AUDIT.md §3.8/§6."""
-
-    @pytest.mark.skip(reason=SKIP_REASON.format(n="8"))
-    def test_sd09_malformed_index_does_not_skip_symbol(self):
-        """[CURRENT] gap: when a symbol's price-history index cannot be parsed as a
-        timestamp, the staleness check's bare `except` swallows the error and
-        proceeds as if the symbol were fresh, rather than skipping that symbol
-        with a warning (SD-09, primary)."""
-        pass
-
-    @pytest.mark.skip(reason=SKIP_REASON.format(n="8"))
-    def test_sd05_heartbeat_green_does_not_imply_fresh_data(self):
-        """Documents the absence of a cross-check: HeartbeatMonitor.is_alive()
-        returning True does not imply that any symbol's market data is within its
-        staleness threshold — the two checks are independent (SD-05)."""
-        pass
-
-    @pytest.mark.skip(reason=SKIP_REASON.format(n="8"))
-    def test_sd06_order_staleness_thresholds_differ_by_caller(self):
-        """Documents the inconsistency between `_STALE_MIN_AGE_HOURS` (used by the
-        live staleness check) and `_RECOVERY_STALE_ORDER_HOURS` (used by
-        StartupRecovery) — the same Order can be considered stale by one caller
-        and fresh by the other (SD-06)."""
-        pass
-
-
-# ── §4.9 Duplicate Event ───────────────────────────────────────────────────────
-
-
-class TestDuplicateEventScenario:
-    """F5 (RESOLVED — regression guard), EX-04 (HIGH), FS-05 (MEDIUM-HIGH). See
-    docs/FAILURE_SCENARIO_TESTS.md §4.9 and docs/FAILURE_SCENARIO_AUDIT.md §3.9/§6."""
-
-    @pytest.mark.skip(reason=SKIP_REASON.format(n="9"))
-    def test_session_open_dedup_within_window(self):
-        """Regression guard: delivering the same session-open event twice within
-        the 5-minute dedup window must run the strategy's on_market_open logic
-        exactly once (F5)."""
-        pass
-
-    @pytest.mark.skip(reason=SKIP_REASON.format(n="9"))
-    def test_fill_db_dedup_on_duplicate_callback(self):
-        """Regression guard: delivering the same (order_id, qty, price) fill
-        callback twice must persist exactly one Fill row (EX-04)."""
-        pass
-
-    @pytest.mark.skip(reason=SKIP_REASON.format(n="9"))
-    def test_position_tracker_double_apply_on_duplicate_fill(self):
-        """[CURRENT] gap: calling PositionTracker.on_fill() twice with the same
-        fill (no fill-id-level idempotency check in _positions) double-applies the
-        quantity delta, which for a closing fill can delete the in-memory position
-        entirely (FS-05, primary)."""
-        pass
-
-    @pytest.mark.skip(reason=SKIP_REASON.format(n="9"))
-    def test_db_position_unaffected_by_in_memory_double_apply(self):
-        """Following the double-apply above, the DB Position row (written via
-        `_persist_fill`'s own dedup) must remain correct — the divergence is
-        confined to PositionTracker's in-memory state until the next reconcile
-        cycle (§3.7 "no position damage" definition)."""
-        pass
-
-    @pytest.mark.skip(reason=SKIP_REASON.format(n="9"))
-    def test_reconcile_propagation_to_live_tracker_unknown(self):
-        """Open question (§8): once reconcile() repairs the DB Position row after
-        the FS-05 divergence above, does that repair propagate back into a live
-        PositionTracker._positions entry, or does the in-memory divergence persist
-        until the worker restarts? Documents the open question, asserts nothing
-        yet."""
-        pass
-
-
-# ── §4.10 Server Restart ───────────────────────────────────────────────────────
-
-
-class TestServerRestartScenario:
-    """F1/EX-06 (RESOLVED — regression guards), FS-03 (LOW-MEDIUM), FS-04
-    (CRITICAL). See docs/FAILURE_SCENARIO_TESTS.md §4.10 and
-    docs/FAILURE_SCENARIO_AUDIT.md §3.10/§6."""
-
-    @pytest.mark.skip(reason=SKIP_REASON.format(n="10"))
-    def test_dual_process_startup_recovery_idempotent(self):
-        """Regression guard: simulating both `kis-api` and `kis-worker` calling
-        StartupRecovery.run() against the same DB on boot must produce no
-        duplicate Fill/Position/AuditLog rows (F1/EX-06)."""
-        pass
-
-    @pytest.mark.skip(reason=SKIP_REASON.format(n="10"))
-    def test_schema_drift_undetected_after_create_all(self):
-        """[CURRENT] gap, primary: Base.metadata.create_all(engine) against a DB
-        whose table already exists does not add columns present in the ORM model
-        but missing from the existing table — the drift is undetected at boot
-        (FS-04)."""
-        pass
-
-    @pytest.mark.skip(reason=SKIP_REASON.format(n="10"))
-    def test_command_table_rows_never_purged(self):
-        """[CURRENT] gap: across repeated poll/mark cycles, the Command table's row
-        count is non-decreasing — processed Command rows are marked but never
-        deleted or archived (FS-03)."""
-        pass
+class FakeRedis:
+    """Thread-safe dict-backed Redis stub."""
+
+    def __init__(self):
+        self._data = {}
+        self._lock = threading.Lock()
+
+    def setex(self, key, ttl, value):
+        with self._lock:
+            self._data[key] = str(value)
+
+    def get(self, key):
+        with self._lock:
+            val = self._data.get(key)
+            return val.encode() if isinstance(val, str) else val
+
+    def set(self, key, value, nx=False, ex=None):
+        with self._lock:
+            if nx and key in self._data:
+                return False
+            self._data[key] = str(value)
+            return True
+
+    def delete(self, key):
+        with self._lock:
+            self._data.pop(key, None)
+
+    def ping(self):
+        return True
+
+
+class BrokenRedis:
+    """Every call raises ConnectionError — simulates Redis Down."""
+
+    def setex(self, *a, **kw):
+        raise ConnectionError("Redis down")
+
+    def get(self, *a, **kw):
+        raise ConnectionError("Redis down")
+
+    def set(self, *a, **kw):
+        raise ConnectionError("Redis down")
+
+    def delete(self, *a, **kw):
+        raise ConnectionError("Redis down")
+
+    def ping(self):
+        raise ConnectionError("Redis down")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Scenario 1 — Redis Down
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestRedisDown:
+    """Redis Down: system degrades to DB-only mode, trading continues."""
+
+    def test_redis_down_non_fatal(self, db_factory):
+        broker = _healthy_broker()
+        rec = StartupRecovery(
+            db_session_factory=db_factory,
+            redis_client=BrokenRedis(),
+            broker=broker,
+        )
+
+        # 신규 주문 차단: Redis failure alone must NOT block trading
+        result = rec.run()
+        assert result is True
+        assert SAFE_MODE.can_trade is True
+
+        # 상태 일관성: StartupRecovery made no order/position/risk DB mutations
+        sess = db_factory()
+        try:
+            assert sess.query(DBOrder).count() == 0
+            assert sess.query(DBPosition).count() == 0
+            assert sess.query(DailyRiskState).count() == 0
+        finally:
+            sess.close()
+
+        # Kill Switch: Redis outage is not a KillTriggerEngine condition
+        ks, _, _, _ = _kill_switch(db_factory=db_factory, _now=_FIXED_NOW)
+        assert ks.state is TradingState.RUNNING
+
+        # Recovery: IdempotencyStore falls back to DB when Redis is broken
+        key = IdempotencyKey.from_order_params(
+            "005930", "buy", 10, 70000.0, _now=_FIXED_NOW
+        )
+        store = IdempotencyStore(redis_client=BrokenRedis(), db_factory=db_factory)
+        store.set(key.fingerprint, "ORD001", "submitted")
+        rec_rec = store.get(key.fingerprint)
+        assert rec_rec is not None
+        assert rec_rec.order_id == "ORD001"
+
+        # Audit Log: IdempotencyStore DB-fallback write produces an audit row
+        assert _count_audit(db_factory, "idempotency_record") == 1
+
+    def test_broken_redis_acquire_lock_fail_open(self, db_factory):
+        """IdempotencyStore.acquire_lock() fails-open when Redis is down."""
+        store = IdempotencyStore(redis_client=BrokenRedis(), db_factory=db_factory)
+        key = IdempotencyKey.from_order_params(
+            "005930", "buy", 10, 70000.0, _now=_FIXED_NOW
+        )
+        # Fail-open: lock returns True (not False) when Redis raises
+        acquired = store.acquire_lock(key.fingerprint)
+        assert acquired is True
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Scenario 2 — Worker Restart
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestWorkerRestart:
+    """Worker Restart: positions and pending orders restored; SAFE_MODE re-enabled."""
+
+    def _seed_db(self, factory):
+        sess = factory()
+        sess.add(StrategyRun(strategy_type="indicator", name="test", broker="kis", is_active=True))
+        sess.add(DBPosition(symbol="005930", qty=10, avg_price=70000.0, market="KR", broker="kis"))
+        row = DBOrder(
+            broker_order_id="KIS001", symbol="005930", side="buy", qty=10, price=70000.0,
+            status="submitted", market="KR", broker="kis",
+        )
+        sess.add(row)
+        sess.commit()
+        sess.close()
+
+    def test_pending_lock_restored(self, patched_runner_factory):
+        db_factory = patched_runner_factory
+        self._seed_db(db_factory)
+
+        w = _bare_worker(poller=None)
+        tracker = _tracker()
+
+        # 신규 주문 차단: before restore, order can be placed
+        assert tracker.can_place_order("005930") is True
+
+        w._restore_pending_to_tracker(
+            tracker, broker="kis", on_filled_cb=None, on_timeout_cb=None,
+        )
+
+        # After restore, the in-flight order's symbol is locked
+        assert tracker.can_place_order("005930") is False
+
+        # Audit Log: each restored pending order writes a row
+        assert _count_audit(db_factory, "recovery_restore_pending") == 1
+
+    def test_positions_restored(self, patched_runner_factory):
+        db_factory = patched_runner_factory
+        self._seed_db(db_factory)
+
+        w = _bare_worker()
+        tracker = _tracker()
+        w._restore_positions(tracker, broker="kis")
+
+        # 상태 일관성: position qty matches what was seeded
+        pos = tracker.get_position("005930")
+        assert pos is not None
+        assert pos.qty == 10
+        assert pos.avg_price == 70000.0
+
+    def test_startup_recovery_enables_trading(self, db_factory):
+        # Kill Switch / Recovery: clean restart re-enables SAFE_MODE
+        rec = StartupRecovery(db_session_factory=db_factory, redis_client=None, broker=None)
+        result = rec.run()
+        assert result is True
+        assert SAFE_MODE.can_trade is True
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Scenario 3 — Process Kill
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestProcessKill:
+    """Process Kill: orphaned order detected; in-flight order's lock restored."""
+
+    def _seed_db(self, factory):
+        sess = factory()
+        # Order A: orphaned — process died before broker ack
+        sess.add(DBOrder(
+            broker_order_id=None, symbol="069500", side="buy", qty=5,
+            price=30000.0, status="submitted", market="KR", broker="kis",
+        ))
+        # Order B: properly broker-acked, in flight at kill time
+        sess.add(DBOrder(
+            broker_order_id="KIS001", symbol="005930", side="buy", qty=10,
+            price=70000.0, status="submitted", market="KR", broker="kis",
+        ))
+        sess.commit()
+        sess.close()
+
+    def test_orphaned_order_detected(self, db_factory):
+        self._seed_db(db_factory)
+        rec = StartupRecovery(db_session_factory=db_factory, broker=None)
+
+        # Recovery + Kill Switch: _step_validate_state is non-fatal; run() succeeds despite orphan
+        result = rec.run()
+        assert result is True
+        assert SAFE_MODE.can_trade is True
+
+        # 상태 일관성: orphaned order row is NOT mutated by recovery
+        sess = db_factory()
+        orphan_count = sess.query(DBOrder).filter(
+            DBOrder.broker_order_id.is_(None)
+        ).count()
+        sess.close()
+        assert orphan_count == 1
+
+        # Audit Log: exactly one "recovery_inconsistency" for orphaned order
+        assert _count_audit(db_factory, "recovery_inconsistency") == 1
+        sess = db_factory()
+        row = sess.query(AuditLog).filter(
+            AuditLog.event_type == "recovery_inconsistency"
+        ).first()
+        sess.close()
+        detail = json.loads(row.detail)
+        assert detail["kind"] == "orphaned_pending_order"
+
+    def test_inflight_order_blocks_new_orders(self, patched_runner_factory):
+        db_factory = patched_runner_factory
+        self._seed_db(db_factory)
+
+        w = _bare_worker(poller=None)
+        tracker = _tracker()
+
+        # 신규 주문 차단: in-flight order (Order B) locks the symbol
+        assert tracker.can_place_order("005930") is True
+        w._restore_pending_to_tracker(
+            tracker, broker="kis", on_filled_cb=None, on_timeout_cb=None,
+        )
+        assert tracker.can_place_order("005930") is False
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Scenario 4 — Network Timeout
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestNetworkTimeout:
+    """Network Timeout: _step_balance failure disables SAFE_MODE; recovers on retry."""
+
+    def test_timeout_blocks_trading_then_recovers(self, db_factory):
+        from unittest.mock import MagicMock
+
+        broker = MagicMock()
+        broker.get_balance.side_effect = TimeoutError("KIS API timeout")
+
+        # 신규 주문 차단: balance timeout → run() fails → SAFE_MODE disabled
+        rec = StartupRecovery(db_session_factory=db_factory, broker=broker)
+        result = rec.run()
+        assert result is False
+        assert SAFE_MODE.can_trade is False
+
+        # Kill Switch: bridge explicit kill-switch signal (KillSwitch not auto-wired)
+        ks, _, _, _ = _kill_switch(
+            trigger_engine=KillTriggerEngine(broker_failure_critical=5),
+            db_factory=db_factory,
+            _now=_FIXED_NOW,
+        )
+        ks.report_broker_failure(5, detail={"step": "balance"}, _now=_FIXED_NOW)
+        assert ks.state is TradingState.HALTED
+        assert ks.check_order(OrderIntent.NEW).allowed is False
+
+        # 상태 일관성: no DB mutations from failed run()
+        sess = db_factory()
+        assert sess.query(DBOrder).count() == 0
+        sess.close()
+
+        # Recovery: resume kill switch, clear broker error → new StartupRecovery succeeds
+        outcome = ks.resume(requested_by="operator", _now=_FIXED_NOW + timedelta(seconds=301))
+        assert outcome.approved is True
+        SAFE_MODE._can_trade = False
+        broker.get_balance.side_effect = None
+        broker.get_balance.return_value = Balance(cash_krw=0, cash_usd=0, total_eval_krw=1_000_000.0)
+        broker.get_positions.return_value = []
+        broker.get_order_status.return_value = None
+        rec2 = StartupRecovery(db_session_factory=db_factory, broker=broker)
+        result2 = rec2.run()
+        assert result2 is True
+        assert SAFE_MODE.can_trade is True
+
+        # Audit Log: KillSwitch bridge writes kill_switch_event row
+        assert _count_audit(db_factory, "kill_switch_event") >= 1
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Scenario 5 — Broker API Failure
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestBrokerApiFailure:
+    """Broker API Failure: circuit breaker opens after threshold; kill switch halts."""
+
+    def test_circuit_opens_and_recovers(self, db_factory):
+        breaker = ConsecutiveFailureBreaker(threshold=5, cooldown_minutes=10)
+
+        # 신규 주문 차단: 5 failures open the circuit
+        for _ in range(5):
+            breaker.record_failure()
+        assert breaker.is_open() is True
+
+        # Kill Switch: bridge kill-switch signal
+        ks, _, _, _ = _kill_switch(
+            trigger_engine=KillTriggerEngine(broker_failure_critical=5),
+            db_factory=db_factory,
+            _now=_FIXED_NOW,
+        )
+        event = ks.report_broker_failure(5, detail={"broker": "kis"}, _now=_FIXED_NOW)
+        assert event is not None
+        assert ks.state is TradingState.HALTED
+        assert ks.check_order(OrderIntent.NEW).allowed is False
+
+        # 상태 일관성: DailyRiskState.kill_switch=True written to DB
+        sess = db_factory()
+        row = sess.query(DailyRiskState).first()
+        sess.close()
+        assert row is not None and row.kill_switch is True
+
+        # Recovery: circuit heals after one success
+        breaker.record_success()
+        assert breaker.is_open() is False
+
+        # Kill Switch recovery: resume after cooldown
+        resume_outcome = ks.resume(
+            requested_by="operator",
+            _now=_FIXED_NOW + timedelta(seconds=301),
+        )
+        assert resume_outcome.approved is True
+        assert ks.state is TradingState.RUNNING
+
+        # 상태 일관성 after resume: DailyRiskState.kill_switch=False
+        sess = db_factory()
+        row = sess.query(DailyRiskState).first()
+        sess.close()
+        assert row.kill_switch is False
+
+        # Audit Log
+        assert _count_audit(db_factory, "kill_switch_event") >= 1
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Scenario 6 — Polling Failure
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestPollingFailure:
+    """Polling Failure: 10 consecutive errors mark health as unhealthy; recovers."""
+
+    def test_poller_unhealthy_then_recovers(self, db_factory):
+        from unittest.mock import MagicMock
+
+        broker = MagicMock()
+        broker.get_order_status.side_effect = RuntimeError("connection timeout")
+
+        _insert_order(db_factory, broker_order_id="ORD001", symbol="005930",
+                      broker="kis", status="submitted", filled_qty=0)
+
+        poller = OrderFillPoller(broker=broker, db_factory=db_factory)
+        order = _broker_order(OrderStatus.SUBMITTED, broker_order_id="ORD001", symbol="005930")
+        on_filled_mock = MagicMock()
+        poller.register(order, on_filled=on_filled_mock)
+
+        entry = poller._entries["ORD001"]
+
+        # Inject 10 consecutive broker failures
+        for _ in range(10):
+            poller._poll_one(entry)
+
+        # 신규 주문 차단: poller unhealthy → bridge KillSwitch
+        assert poller.health.is_healthy is False
+
+        ks, _, _, _ = _kill_switch(db_factory=db_factory, _now=_FIXED_NOW)
+        ks.report_watchdog_failure(
+            Severity.CRITICAL,
+            "poller unhealthy: 10 consecutive errors",
+            detail={"consecutive_poll_errors": 10},
+            _now=_FIXED_NOW,
+        )
+        assert ks.check_order(OrderIntent.NEW).allowed is False
+
+        # Kill Switch: CRITICAL → HALTED
+        assert ks.state is TradingState.HALTED
+
+        # 상태 일관성: failed polls do NOT update DBOrder
+        sess = db_factory()
+        try:
+            db_order = sess.query(DBOrder).filter(DBOrder.broker_order_id == "ORD001").one()
+            assert db_order.status == "submitted"
+            assert db_order.filled_qty == 0
+            assert sess.query(DBFill).count() == 0
+        finally:
+            sess.close()
+        # poll_index increased with each failure
+        assert entry.poll_index == 10
+
+        # Recovery: one successful poll resets health
+        broker.get_order_status.side_effect = None
+        broker.get_order_status.return_value = _broker_order(
+            OrderStatus.SUBMITTED, broker_order_id="ORD001", symbol="005930"
+        )
+        poller._poll_one(entry)
+        assert poller.health.is_healthy is True
+
+        # on_filled never called during failures (and order stayed SUBMITTED so still no fill)
+        assert on_filled_mock.call_count == 0
+
+        # Audit Log: kill_switch_event from bridge
+        assert _count_audit(db_factory, "kill_switch_event") == 1
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Scenario 7 — Reconciliation Failure
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestReconciliationFailure:
+    """Reconciliation Failure: qty mismatch detected, repaired, KillSwitch escalates."""
+
+    def _seed_position(self, factory, qty=10):
+        sess = factory()
+        sess.add(DBPosition(
+            symbol="005930", qty=qty, avg_price=70000.0, market="KR", broker="kis",
+        ))
+        sess.commit()
+        sess.close()
+
+    def _mock_broker_with_qty(self, qty=15):
+        from unittest.mock import MagicMock
+        broker = MagicMock()
+        broker.get_positions.return_value = [
+            BPosition(symbol="005930", qty=qty, avg_price=70000.0, market="KR"),
+        ]
+        broker.get_order_status.return_value = None
+        return broker
+
+    def test_single_mismatch_warns_but_allows(self, db_factory):
+        self._seed_position(db_factory, qty=10)
+        broker = self._mock_broker_with_qty(qty=15)
+
+        engine = PositionReconciler(broker=broker, db_factory=db_factory, broker_name="kis")
+        result = engine.reconcile("periodic")
+
+        # 신규 주문 차단 / Kill Switch (WARNING only, NEW still allowed)
+        assert len(result.gaps) >= 1
+        assert result.gaps[0]["kind"] == "qty_mismatch"
+
+        ks, _, _, _ = _kill_switch(db_factory=db_factory, _now=_FIXED_NOW)
+        ks.report_reconciliation_mismatch(1, detail={"symbol": "005930"}, _now=_FIXED_NOW)
+        assert ks.state is TradingState.WARNING
+        assert ks.check_order(OrderIntent.NEW).allowed is True  # WARNING still allows
+
+        # 상태 일관성: position qty repaired to broker's value
+        sess = db_factory()
+        pos = sess.query(DBPosition).filter(DBPosition.symbol == "005930").first()
+        sess.close()
+        assert pos.qty == 15
+
+        # Recovery: re-reconcile after repair finds no gaps
+        result2 = engine.reconcile("periodic")
+        assert result2.gaps == []
+
+        # Audit Log: reconcile_fix_qty written + kill_switch_event
+        assert _count_audit(db_factory, "reconcile_fix_qty") == 1
+        assert _count_audit(db_factory, "kill_switch_event") == 1
+
+        # ReconciliationLog row persisted
+        sess = db_factory()
+        log_count = sess.query(ReconciliationLog).count()
+        sess.close()
+        assert log_count >= 1
+
+    def test_repeated_mismatch_halts_and_blocks(self, db_factory):
+        self._seed_position(db_factory, qty=10)
+        broker = self._mock_broker_with_qty(qty=15)
+
+        engine = PositionReconciler(broker=broker, db_factory=db_factory, broker_name="kis")
+        engine.reconcile("periodic")
+
+        # Kill Switch: 3 mismatches (critical threshold=3) → HALTED
+        ks, _, _, _ = _kill_switch(db_factory=db_factory, _now=_FIXED_NOW)
+        ks.report_reconciliation_mismatch(3, detail={"symbol": "005930"}, _now=_FIXED_NOW)
+        assert ks.state is TradingState.HALTED
+
+        # 신규 주문 차단: HALTED blocks NEW
+        assert ks.check_order(OrderIntent.NEW).allowed is False
+
+        # 상태 일관성: DailyRiskState.kill_switch=True
+        sess = db_factory()
+        risk_row = sess.query(DailyRiskState).first()
+        sess.close()
+        assert risk_row is not None and risk_row.kill_switch is True
+
+        # Recovery: resume after cooldown
+        outcome = ks.resume(
+            requested_by="operator",
+            _now=_FIXED_NOW + timedelta(seconds=301),
+        )
+        assert outcome.approved is True
+        assert ks.state is TradingState.RUNNING
+
+        # Audit Log
+        assert _count_audit(db_factory, "kill_switch_event") >= 1
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Scenario 8 — Stale Data
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestStaleData:
+    """Stale Data: WARNING → STALE → FRESH lifecycle, KillSwitch bridge, StaleFeedError."""
+
+    _KEY = "005930:1m"
+
+    def test_stale_lifecycle(self, db_factory):
+        svc = StaleDataDetectionService(db_factory=db_factory)
+        gate = TradingGate(block_on_unknown=True)
+
+        t0 = _FIXED_NOW
+        # Update feed at t0
+        svc.record_update(self._KEY, ts=t0, now=t0)
+
+        # ── WARNING (>300s, <600s) ──
+        warn_time = t0 + timedelta(seconds=350)
+        warn_result = svc.check(self._KEY, now=warn_time)
+        assert warn_result.state is StaleState.WARNING
+        assert not gate.is_blocking(warn_result)  # WARNING does not block
+
+        # Kill Switch (WARNING → TradingState.WARNING, NEW still allowed)
+        ks, _, _, _ = _kill_switch(db_factory=db_factory, _now=warn_time)
+        ks.report_watchdog_failure(
+            Severity.WARNING,
+            f"OHLCV stale: {self._KEY}",
+            detail={"key": self._KEY},
+            _now=warn_time,
+        )
+        assert ks.state is TradingState.WARNING
+        assert ks.check_order(OrderIntent.NEW).allowed is True
+
+        # ── STALE (>600s) ──
+        stale_time = t0 + timedelta(seconds=700)
+        stale_result = svc.check(self._KEY, now=stale_time)
+        assert stale_result.state is StaleState.STALE
+
+        # 신규 주문 차단: TradingGate blocks and raises StaleFeedError
+        assert gate.is_blocking(stale_result) is True
+        with pytest.raises(StaleFeedError):
+            gate.assert_fresh(stale_result)
+
+        # Also available via service's assert_fresh
+        with pytest.raises(StaleFeedError):
+            svc.assert_fresh(self._KEY, now=stale_time)
+
+        # Kill Switch: CRITICAL → HALTED
+        ks.report_watchdog_failure(
+            Severity.CRITICAL,
+            f"OHLCV stale: {self._KEY}",
+            detail={"key": self._KEY},
+            _now=stale_time,
+        )
+        assert ks.state is TradingState.HALTED
+        assert ks.check_order(OrderIntent.NEW).allowed is False
+
+        # 상태 일관성: repeated STALE checks do NOT produce duplicate audit rows
+        svc.check(self._KEY, now=stale_time)
+        svc.check(self._KEY, now=stale_time)
+        assert _count_audit(db_factory, "stale_data_stale") == 1  # not 3
+
+        # Recovery: fresh update transitions back to FRESH
+        recovered_time = stale_time + timedelta(seconds=1)
+        svc.record_update(self._KEY, ts=recovered_time, now=recovered_time)
+        fresh_result = svc.check(self._KEY, now=recovered_time)
+        assert fresh_result.state is StaleState.FRESH
+
+        # Audit Log: full WARNING→STALE→FRESH lifecycle
+        assert _count_audit(db_factory, "stale_data_warning") == 1
+        assert _count_audit(db_factory, "stale_data_stale") == 1
+        assert _count_audit(db_factory, "stale_data_recovered") == 1
+
+        # KillSwitch resume after HALTED
+        resume_outcome = ks.resume(
+            requested_by="operator",
+            _now=stale_time + timedelta(seconds=310),
+        )
+        assert resume_outcome.approved is True
+        assert ks.state is TradingState.RUNNING
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Scenario 9 — Duplicate Event
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestDuplicateEvent:
+    """Duplicate Event: poller dedup + DB persist dedup prevent double-counting."""
+
+    def test_poller_partial_fill_dedup(self, db_factory):
+        """Layer 1: second identical PARTIAL_FILLED broker response is a no-op."""
+        from unittest.mock import MagicMock
+
+        broker = MagicMock()
+        poller = OrderFillPoller(broker=broker, db_factory=db_factory)
+        order = _broker_order(OrderStatus.SUBMITTED, broker_order_id="ORD001", symbol="005930")
+
+        tracker = _tracker()
+        tracker.mark_pending("005930", "ORD001")
+
+        fill_list = []
+
+        def on_filled_real(filled_order: BOrder):
+            f = Fill(
+                order_id=filled_order.id,
+                symbol=filled_order.symbol,
+                side=filled_order.side,
+                qty=filled_order.filled_qty,
+                price=filled_order.avg_fill_price,
+                market="KR",
+            )
+            fill_list.append(f)
+            tracker.on_fill(f)
+
+        poller.register(order, on_filled=on_filled_real)
+        entry = poller._entries["ORD001"]
+
+        # Broker always returns same PARTIAL_FILLED (filled_qty=5, qty=10)
+        partial = _broker_order(
+            OrderStatus.PARTIAL_FILLED, filled_qty=5, avg_fill_price=70000.0,
+            broker_order_id="ORD001", symbol="005930", qty=10,
+        )
+        broker.get_order_status.return_value = partial
+
+        # First poll: incremental=5>0 → callback fires
+        poller._poll_one(entry)
+        assert len(fill_list) == 1
+        assert entry.last_reported_qty == 5
+
+        # Second poll (duplicate): incremental=5-5=0 → callback NOT fired
+        poller._poll_one(entry)
+        assert len(fill_list) == 1  # still 1, not 2
+        assert entry.last_reported_qty == 5  # unchanged
+
+        # 상태 일관성: position qty == 5 (not double-counted to 10)
+        pos = tracker.get_position("005930")
+        assert pos is not None
+        assert pos.qty == 5
+
+        # 신규 주문 차단: after fill, pending lock is released (on_fill pops it)
+        assert tracker.can_place_order("005930") is True
+
+        # Kill Switch: no spurious trigger from duplicate
+        ks, _, _, _ = _kill_switch(db_factory=db_factory, _now=_FIXED_NOW)
+        assert ks.state is TradingState.RUNNING
+
+        # Audit Log: poller_partial_filled written exactly once
+        assert _count_audit(db_factory, "poller_partial_filled") == 1
+
+    def test_persist_fill_dedup(self, patched_runner_factory):
+        """Layer 2: second identical _persist_fill call is a no-op at DB level."""
+        db_factory = patched_runner_factory
+        # Seed the DBOrder so _persist_fill can find it
+        _insert_order(db_factory, broker_order_id="ORD001", symbol="005930",
+                      broker="kis", status="submitted")
+
+        w = _bare_worker()
+        fill = Fill(order_id="ORD001", symbol="005930", side="buy",
+                    qty=5, price=70000.0, market="KR")
+        order = _broker_order(
+            OrderStatus.PARTIAL_FILLED, filled_qty=5, avg_fill_price=70000.0,
+            broker_order_id="ORD001", symbol="005930",
+        )
+
+        # Call twice — second call must be a no-op
+        w._persist_fill(fill, order)
+        w._persist_fill(fill, order)
+
+        # 상태 일관성: only 1 DBFill row and filled_qty not double-counted
+        sess = db_factory()
+        try:
+            fill_count = sess.query(DBFill).count()
+            db_order = sess.query(DBOrder).filter(DBOrder.broker_order_id == "ORD001").one()
+            assert db_order.filled_qty == 5
+        finally:
+            sess.close()
+        assert fill_count == 1
+
+        # Audit Log: "fill" written exactly once
+        assert _count_audit(db_factory, "fill") == 1
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Scenario 10 — Server Restart
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestServerRestart:
+    """Server Restart: pre-existing kill-switch blocks resume until manually cleared."""
+
+    def _seed_kill_switch(self, factory):
+        from datetime import date
+        sess = factory()
+        sess.add(DailyRiskState(
+            trade_date=date.today(),
+            kill_switch=True,
+            kill_reason="일일 손실 한도 초과",
+            daily_pnl=0.0,
+            weekly_pnl=0.0,
+            peak_equity=0.0,
+        ))
+        sess.commit()
+        sess.close()
+
+    def test_restart_with_active_kill_switch(self, db_factory, monkeypatch):
+        import backend.quant.risk.engine as _eng
+        from datetime import date
+        monkeypatch.setattr(_eng, "_seoul_today", date.today)
+        self._seed_kill_switch(db_factory)
+        broker = _healthy_broker()
+
+        rec = StartupRecovery(
+            db_session_factory=db_factory,
+            redis_client=FakeRedis(),
+            broker=broker,
+        )
+
+        # 신규 주문 차단: run() returns False, SAFE_MODE stays disabled
+        result = rec.run()
+        assert result is False
+        assert SAFE_MODE.can_trade is False
+
+        # Kill Switch: _step_risk restored kill_switch_active
+        assert getattr(rec, "_kill_switch_active", False) is True
+        assert getattr(rec, "_kill_reason", "") == "일일 손실 한도 초과"
+
+        # 상태 일관성: DailyRiskState.kill_switch unchanged (not cleared by failed run)
+        sess = db_factory()
+        row = sess.query(DailyRiskState).first()
+        sess.close()
+        assert row.kill_switch is True
+
+    def test_manual_resume_enables_subsequent_restart(self, db_factory, monkeypatch):
+        import backend.quant.risk.engine as _eng
+        from datetime import date
+        monkeypatch.setattr(_eng, "_seoul_today", date.today)
+        self._seed_kill_switch(db_factory)
+        broker = _healthy_broker()
+
+        # First run: fails due to active kill switch
+        rec = StartupRecovery(
+            db_session_factory=db_factory,
+            redis_client=FakeRedis(),
+            broker=broker,
+        )
+        assert rec.run() is False
+
+        # Recovery: KillSwitch constructed from DB reads HALTED state
+        ks, _, _, _ = _kill_switch(
+            db_factory=db_factory,
+            cooldown_seconds=0.0,
+            _now=_FIXED_NOW,
+        )
+        assert ks.state is TradingState.HALTED
+
+        # Manual resume clears DailyRiskState.kill_switch
+        outcome = ks.resume(requested_by="operator", _now=_FIXED_NOW)
+        assert outcome.approved is True
+        assert ks.state is TradingState.RUNNING
+
+        sess = db_factory()
+        row = sess.query(DailyRiskState).first()
+        sess.close()
+        assert row.kill_switch is False
+
+        # Second run: now succeeds (kill_switch cleared in DB)
+        SAFE_MODE._can_trade = False
+        rec2 = StartupRecovery(
+            db_session_factory=db_factory,
+            redis_client=FakeRedis(),
+            broker=broker,
+        )
+        result2 = rec2.run()
+        assert result2 is True
+        assert SAFE_MODE.can_trade is True
+
+        # Audit Log: kill_switch_event from resume
+        assert _count_audit(db_factory, "kill_switch_event") >= 1
