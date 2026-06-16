@@ -126,12 +126,12 @@ class KISBroker(BrokerAdapter):
         try:
             from backend.data.calendar import get_calendar_service, Market as _Market
             from datetime import datetime as _dt, timezone as _tz
-            _mkt = _Market.KRX if (symbol in KR_ETF or (len(symbol) == 6 and symbol.isdigit())) else _Market.NYSE
+            _mkt = _Market.KRX if self._is_kr(symbol) else _Market.NYSE
             get_calendar_service().assert_tradeable(_mkt, _dt.now(_tz.utc))
         except ImportError:
             pass
 
-        is_kr = symbol in KR_ETF or (len(symbol) == 6 and symbol.isdigit())
+        is_kr = self._is_kr(symbol)
         try:
             if is_kr:
                 raw = (self._orders.buy_kr if side == "buy" else self._orders.sell_kr)(symbol, qty, int(price))
@@ -146,7 +146,7 @@ class KISBroker(BrokerAdapter):
                 status=OrderStatus.SUBMITTED, raw=raw,
             )
         except Exception as e:
-            # MarketClosedError must not increment the circuit breaker failure counter
+            # MarketClosedError from KISClient must not penalize the circuit breaker
             try:
                 from backend.data.calendar import MarketClosedError as _MCE
                 if isinstance(e, _MCE):
@@ -154,10 +154,18 @@ class KISBroker(BrokerAdapter):
             except ImportError:
                 pass
             self._breaker.record_failure()
-            logger.error("주문 실패 %s %s: %s", side, symbol, e)
+            if isinstance(e, RuntimeError):
+                # KIS API returned rt_cd != "0" — broker explicitly rejected
+                logger.error("주문 거부됨 %s %s: %s", side, symbol, e)
+                return Order(
+                    id="", symbol=symbol, side=side, qty=qty, price=price,
+                    status=OrderStatus.REJECTED, raw={"error": str(e)},
+                )
+            # Network timeout / connection error — order may have reached the broker
+            logger.error("주문 결과 불확실 (UNKNOWN) %s %s: %s", side, symbol, e)
             return Order(
                 id="", symbol=symbol, side=side, qty=qty, price=price,
-                status=OrderStatus.REJECTED, raw={"error": str(e)},
+                status=OrderStatus.UNKNOWN, raw={"error": str(e)},
             )
 
     def cancel_order(self, order_id: str, symbol: str = "", qty: int = 0, price: float = 0.0) -> bool:
@@ -297,7 +305,7 @@ class KISBroker(BrokerAdapter):
         if self._breaker.is_open():
             raise RuntimeError(f"KIS circuit breaker open — get_price 차단: {symbol}")
         try:
-            if symbol in KR_ETF or (len(symbol) == 6 and symbol.isdigit()):
+            if self._is_kr(symbol):
                 result = float(self._market.get_price_kr(symbol))
             else:
                 excd = EXCD_MAP.get(symbol, "NASD")
