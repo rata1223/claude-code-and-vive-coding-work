@@ -54,6 +54,8 @@ class KISClient:
                 time.sleep(1)
 
     def post(self, path: str, tr_id: str, body: dict) -> dict:
+        # Retries only on network-level errors (no response received).
+        # rt_cd rejections break out immediately — never retry a confirmed API decision.
         hashkey = self.auth.get_hashkey(body)
         headers = self.auth.get_headers(tr_id)
         headers["hashkey"] = hashkey
