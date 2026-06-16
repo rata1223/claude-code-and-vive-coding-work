@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
 
 import backend.worker.runner as runner
 from backend.brokers.models import Balance, Order as BOrder, OrderStatus, Position as BPosition
@@ -47,7 +48,11 @@ _FIXED_NOW = datetime(2026, 6, 6, 9, 37, 0, tzinfo=timezone.utc)
 
 @pytest.fixture()
 def db_factory():
-    engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    engine = create_engine(
+        "sqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
     Base.metadata.create_all(engine)
     return sessionmaker(bind=engine, expire_on_commit=False)
 
@@ -207,6 +212,15 @@ class TestRedisDown:
         assert result is True
         assert SAFE_MODE.can_trade is True
 
+        # 상태 일관성: StartupRecovery made no order/position/risk DB mutations
+        sess = db_factory()
+        try:
+            assert sess.query(DBOrder).count() == 0
+            assert sess.query(DBPosition).count() == 0
+            assert sess.query(DailyRiskState).count() == 0
+        finally:
+            sess.close()
+
         # Kill Switch: Redis outage is not a KillTriggerEngine condition
         ks, _, _, _ = _kill_switch(db_factory=db_factory, _now=_FIXED_NOW)
         assert ks.state is TradingState.RUNNING
@@ -220,9 +234,6 @@ class TestRedisDown:
         rec_rec = store.get(key.fingerprint)
         assert rec_rec is not None
         assert rec_rec.order_id == "ORD001"
-
-        # 상태 일관성: StartupRecovery ran all 9 steps, no DB mutations from recovery itself
-        assert result is True
 
         # Audit Log: IdempotencyStore DB-fallback write produces an audit row
         assert _count_audit(db_factory, "idempotency_record") == 1
@@ -481,6 +492,9 @@ class TestPollingFailure:
         broker = MagicMock()
         broker.get_order_status.side_effect = RuntimeError("connection timeout")
 
+        _insert_order(db_factory, broker_order_id="ORD001", symbol="005930",
+                      broker="kis", status="submitted", filled_qty=0)
+
         poller = OrderFillPoller(broker=broker, db_factory=db_factory)
         order = _broker_order(OrderStatus.SUBMITTED, broker_order_id="ORD001", symbol="005930")
         on_filled_mock = MagicMock()
@@ -509,8 +523,13 @@ class TestPollingFailure:
 
         # 상태 일관성: failed polls do NOT update DBOrder
         sess = db_factory()
-        assert sess.query(DBOrder).count() == 0  # no orders seeded in DB, just in poller
-        sess.close()
+        try:
+            db_order = sess.query(DBOrder).filter(DBOrder.broker_order_id == "ORD001").one()
+            assert db_order.status == "submitted"
+            assert db_order.filled_qty == 0
+            assert sess.query(DBFill).count() == 0
+        finally:
+            sess.close()
         # poll_index increased with each failure
         assert entry.poll_index == 10
 
@@ -791,10 +810,14 @@ class TestDuplicateEvent:
         w._persist_fill(fill, order)
         w._persist_fill(fill, order)
 
-        # 상태 일관성: only 1 DBFill row despite 2 calls
+        # 상태 일관성: only 1 DBFill row and filled_qty not double-counted
         sess = db_factory()
-        fill_count = sess.query(DBFill).count()
-        sess.close()
+        try:
+            fill_count = sess.query(DBFill).count()
+            db_order = sess.query(DBOrder).filter(DBOrder.broker_order_id == "ORD001").one()
+            assert db_order.filled_qty == 5
+        finally:
+            sess.close()
         assert fill_count == 1
 
         # Audit Log: "fill" written exactly once
