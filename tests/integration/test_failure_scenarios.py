@@ -397,7 +397,9 @@ class TestNetworkTimeout:
         assert sess.query(DBOrder).count() == 0
         sess.close()
 
-        # Recovery: clear timeout → new StartupRecovery succeeds
+        # Recovery: resume kill switch, clear broker error → new StartupRecovery succeeds
+        outcome = ks.resume(requested_by="operator", _now=_FIXED_NOW + timedelta(seconds=301))
+        assert outcome.approved is True
         SAFE_MODE._can_trade = False
         broker.get_balance.side_effect = None
         broker.get_balance.return_value = Balance(cash_krw=0, cash_usd=0, total_eval_krw=1_000_000.0)
