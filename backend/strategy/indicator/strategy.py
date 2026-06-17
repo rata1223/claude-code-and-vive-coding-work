@@ -100,22 +100,10 @@ class IndicatorStrategy(StrategyBase):
             if df is None or len(df) < 50:
                 logger.warning("[%s] OHLCV 데이터 부족 스킵: %s", self.name, symbol)
                 continue
-            # Staleness gate: skip symbol if last candle is more than 3 calendar days old
-            try:
-                from datetime import datetime, timezone as _tz
-                last_idx = df.index[-1]
-                if hasattr(last_idx, "to_pydatetime"):
-                    last_dt = last_idx.to_pydatetime()
-                    if last_dt.tzinfo is None:
-                        last_dt = last_dt.replace(tzinfo=_tz.utc)
-                else:
-                    last_dt = datetime.combine(last_idx, datetime.min.time()).replace(tzinfo=_tz.utc)
-                age_days = (datetime.now(_tz.utc) - last_dt).days
-                if age_days > 3:
-                    logger.warning("[%s] OHLCV 오래됨 스킵: %s (최종봉 %d일 전)", self.name, symbol, age_days)
-                    continue
-            except Exception:
-                pass  # staleness check failure is non-fatal
+            # Unified freshness gate (R-11): fail-closed staleness check before
+            # any signal computation. Replaces the old inline 3-day gate.
+            if self._is_data_stale(symbol, df):
+                continue
             try:
                 result = fusion.evaluate(df, symbol=symbol)
             except Exception as e:
@@ -151,6 +139,11 @@ class IndicatorStrategy(StrategyBase):
         # Atomically claim pending lock before broker call — prevents duplicate orders
         if not self._tracker.try_mark_pending(symbol):
             logger.debug("[%s] 중복 주문 방지: %s", self.name, symbol)
+            return
+        # Unified freshness gate (R-11): block order sizing on stale data.
+        if not self._is_feed_tradeable(symbol):
+            logger.warning("[%s] 데이터 스테일 — 매수 차단: %s", self.name, symbol)
+            self._tracker.unmark_pending(symbol)
             return
         try:
             if capital is None:
@@ -192,6 +185,11 @@ class IndicatorStrategy(StrategyBase):
         # Atomically claim pending lock before broker call
         if not self._tracker.try_mark_pending(symbol):
             logger.debug("[%s] 매도 중복 주문 방지: %s", self.name, symbol)
+            return
+        # Unified freshness gate (R-11): block order sizing on stale data.
+        if not self._is_feed_tradeable(symbol):
+            logger.warning("[%s] 데이터 스테일 — 매도 차단: %s", self.name, symbol)
+            self._tracker.unmark_pending(symbol)
             return
         try:
             price = self._broker.get_price(symbol)
@@ -244,3 +242,37 @@ class IndicatorStrategy(StrategyBase):
             logger.error("[%s] 타임아웃 취소 예외 %s: %s", self.name, order.id, e)
         finally:
             self._tracker.unmark_pending(order.symbol)
+
+    # ── 데이터 신선도 게이트 (R-11) ──────────────────────────────────────────
+    @staticmethod
+    def _data_source(symbol: str) -> str:
+        from backend.quant.data.loader import _is_kr
+        return "pykrx" if _is_kr(symbol) else "yfinance"
+
+    def _is_data_stale(self, symbol: str, df) -> bool:
+        """True if the symbol's daily OHLCV is too old to compute a signal on.
+        Fail-closed; skipped for non-live (backtest/sim) brokers."""
+        if not getattr(self._broker, "is_live", True):
+            return False
+        from backend.data.freshness_gate import get_freshness_gate
+        from backend.data.freshness_config import FreshnessTier
+        gate = get_freshness_gate()
+        result = gate.validate_dataframe(
+            symbol, df, source=self._data_source(symbol),
+            tier=FreshnessTier.DAILY_BAR, raise_on_block=False,
+        )
+        return gate.is_blocking(result)
+
+    def _is_feed_tradeable(self, symbol: str) -> bool:
+        """True if the symbol's data feed is fresh enough to size an order.
+        Fail-closed; skipped for non-live (backtest/sim) brokers."""
+        if not getattr(self._broker, "is_live", True):
+            return True
+        from backend.data.freshness_gate import get_freshness_gate
+        from backend.data.freshness_config import FreshnessTier
+        gate = get_freshness_gate()
+        result = gate.assert_tradeable(
+            symbol, source="get_price",
+            tier=FreshnessTier.DAILY_BAR, raise_on_block=False,
+        )
+        return not gate.is_blocking(result)

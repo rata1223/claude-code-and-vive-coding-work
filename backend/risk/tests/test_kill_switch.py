@@ -660,11 +660,10 @@ class TestDuplicateOrderDetection:
 
 class TestStaleData:
     def test_stale_market_data_reported_via_watchdog_channel_drives_halt_and_blocks_orders(self):
-        """StaleDataWatchdog (backend/worker/emergency.py) is an existing
-        watchdog-style health monitor; this proves its signal can flow through
-        the SAME generic report_watchdog_failure channel as any other
-        watchdog-style detection — no bespoke 'stale data' trigger type needed,
-        keeping the trigger engine's surface bounded."""
+        """The unified FreshnessGate (backend/data/freshness_gate.py) escalates
+        CRITICAL staleness through the SAME generic report_watchdog_failure
+        channel as any other watchdog-style detection — no bespoke 'stale data'
+        trigger type needed, keeping the trigger engine's surface bounded."""
         ks, _, _, _ = _kill_switch(_now=_FIXED_NOW)
 
         warn = ks.report_watchdog_failure(Severity.WARNING,

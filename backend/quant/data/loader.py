@@ -5,7 +5,7 @@ All returned DataFrames have columns: Open, High, Low, Close, Volume
 with DatetimeIndex (UTC-naive, exchange local time).
 """
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Optional
 
 import pandas as pd
@@ -66,8 +66,7 @@ class DataLoader:
                 logger.warning("DataLoader.fetch_multi failed %s: %s", sym, e)
         return result
 
-    def _fetch_us(self, symbol, start, end, period, interval,
-                  stale_hours: int = 26) -> pd.DataFrame:
+    def _fetch_us(self, symbol, start, end, period, interval) -> pd.DataFrame:
         import yfinance as yf
         ticker = yf.Ticker(symbol)
         if start and end:
@@ -79,21 +78,11 @@ class DataLoader:
         df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
         df.index = pd.to_datetime(df.index)
         df.sort_index(inplace=True)
-
-        # 일봉 데이터 신선도 점검 (주말·휴장 제외: 26h 허용)
-        if interval == "1d" and stale_hours > 0:
-            last_ts = df.index[-1]
-            if last_ts.tzinfo is None:
-                last_ts = last_ts.tz_localize("UTC")
-            now_utc = datetime.now(timezone.utc)
-            age_hours = (now_utc - last_ts).total_seconds() / 3600
-            if age_hours > stale_hours:
-                logger.warning(
-                    "yfinance 데이터 stale: %s 마지막봉 %s (%.0fh 전)",
-                    symbol, last_ts.date(), age_hours
-                )
-                # WARN만 — 주말·휴장에는 정상이므로 예외 미발생
-
+        # NOTE (R-11): freshness is NOT judged here anymore. The loader serves
+        # both live scans and intentionally-historical backtests, so a blanket
+        # staleness check here was either wrong (backtests) or toothless (the
+        # old WARN-only 26h check). The single authoritative gate now lives at
+        # the execution boundary — backend/data/freshness_gate.FreshnessGate.
         return df
 
     def _fetch_kr(self, symbol, start, end, period, interval) -> pd.DataFrame:

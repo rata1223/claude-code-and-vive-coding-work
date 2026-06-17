@@ -1,13 +1,14 @@
 """
-비상 청산(Emergency Flatten) + 스테일 데이터 감시자.
+비상 청산(Emergency Flatten).
 
 EmergencyFlattenManager : 모든 포지션 즉시 시장가 청산
-StaleDataWatchdog       : OHLCV / 가격 데이터 과거됨 감지 → 신호 생성 차단
+
+NOTE (R-11): the former ``StaleDataWatchdog`` lived here but was dead code
+(zero call sites). Stale-data detection is now handled by the unified
+``backend/data/freshness_gate.FreshnessGate`` wired into the execution path.
 """
 import logging
-import time
 from contextlib import contextmanager
-from datetime import datetime, timezone, timedelta
 from typing import Callable, Optional
 
 from backend.brokers.base import BrokerAdapter
@@ -130,41 +131,3 @@ class EmergencyFlattenManager:
         except Exception as e:
             logger.warning("감사 로그 저장 실패: %s", e)
 
-
-class StaleDataWatchdog:
-    """
-    OHLCV 데이터 신선도 감시.
-    장 중에 데이터가 N시간 이상 오래됐으면 신호 생성을 차단한다.
-
-    사용 예:
-        watchdog = StaleDataWatchdog(max_age_hours=2)
-        if watchdog.is_stale(df):
-            logger.warning("데이터 스테일 — 신호 스킵")
-            return
-    """
-
-    def __init__(self, max_age_hours: float = 2.0):
-        self._max_age = timedelta(hours=max_age_hours)
-
-    def is_stale(self, df) -> bool:
-        """DataFrame의 마지막 캔들이 max_age 보다 오래됐으면 True."""
-        try:
-            import pandas as pd
-            last_ts = df.index[-1]
-            if isinstance(last_ts, pd.Timestamp):
-                last_ts = last_ts.to_pydatetime()
-            if last_ts.tzinfo is None:
-                last_ts = last_ts.replace(tzinfo=timezone.utc)
-            now = datetime.now(timezone.utc)
-            age = now - last_ts
-            if age > self._max_age:
-                logger.warning("스테일 OHLCV: 마지막 캔들 %s (%.1fh 경과)",
-                               last_ts.isoformat(), age.total_seconds() / 3600)
-                return True
-        except Exception as e:
-            logger.debug("스테일 감지 오류: %s", e)
-        return False
-
-    def check_all(self, dfs: dict) -> list[str]:
-        """Returns list of stale symbols."""
-        return [sym for sym, df in dfs.items() if self.is_stale(df)]

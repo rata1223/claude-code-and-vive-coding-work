@@ -26,7 +26,8 @@ from typing import Callable, Iterable, Optional
 
 logger = logging.getLogger(__name__)
 
-# Mirrors backend/strategy/base.py's _BAR_STALE_SECONDS env var.
+# Legacy default for the standalone service (no tier). The unified gate passes
+# tier-specific checkers from backend/data/freshness_config.py instead.
 _DEFAULT_STALE_AFTER_SECONDS = float(os.environ.get("BAR_STALE_SECONDS", "600"))
 
 
@@ -253,6 +254,7 @@ class StaleDataDetectionService:
                  classifier: Optional[StalenessClassifier] = None,
                  gate: Optional[TradingGate] = None,
                  recovery_hook: Optional[RecoveryHook] = None,
+                 tier_checkers: Optional[dict] = None,
                  db_factory=None,
                  actor: str = "stale_detector") -> None:
         self._freshness = freshness_checker or FreshnessChecker()
@@ -260,55 +262,97 @@ class StaleDataDetectionService:
         self._classifier = classifier or StalenessClassifier(self._freshness)
         self._gate = gate or TradingGate()
         self._recovery = recovery_hook or RecoveryHook()
+        # Per-tier checkers keyed by tier name (str). When a call passes a
+        # `tier`, the matching checker is used and the feed is tracked under a
+        # tier-scoped key so the same symbol can be daily-fresh yet
+        # intraday-stale at the same time. Calls without a tier keep the exact
+        # legacy single-checker behaviour.
+        self._tier_checkers: dict[str, FreshnessChecker] = {
+            str(getattr(k, "value", k)): v for k, v in (tier_checkers or {}).items()
+        }
         self._db = db_factory
         self._actor = actor
         self._lock = threading.Lock()
         self._last_state: dict[str, StaleState] = {}
 
+    @staticmethod
+    def _tier_name(tier) -> Optional[str]:
+        if tier is None:
+            return None
+        return str(getattr(tier, "value", tier))
+
+    def _resolve(self, key: str, tier) -> tuple[str, Optional[FreshnessChecker]]:
+        """Map (key, tier) → (storage_key, checker). checker is None for the
+        legacy no-tier path (uses self._classifier/self._freshness)."""
+        name = self._tier_name(tier)
+        if name is None:
+            return key, None
+        return f"{key}::{name}", self._tier_checkers.get(name, self._freshness)
+
     def record_update(self, key: str, ts: Optional[datetime] = None,
-                       *, now: Optional[datetime] = None) -> StalenessResult:
+                       *, now: Optional[datetime] = None, tier=None) -> StalenessResult:
         """Call when new data arrives for `key` (e.g., each on_bar)."""
-        self._health.record_update(key, ts)
-        return self._evaluate(key, now)
+        storage_key, checker = self._resolve(key, tier)
+        self._health.record_update(storage_key, ts)
+        return self._evaluate(storage_key, now, checker)
 
-    def record_failure(self, key: str, *, now: Optional[datetime] = None) -> StalenessResult:
+    def record_failure(self, key: str, *, now: Optional[datetime] = None, tier=None) -> StalenessResult:
         """Call on a poll/connection error for `key`."""
-        self._health.record_failure(key)
-        return self._evaluate(key, now)
+        storage_key, checker = self._resolve(key, tier)
+        self._health.record_failure(storage_key)
+        return self._evaluate(storage_key, now, checker)
 
-    def record_disconnect(self, key: str, *, now: Optional[datetime] = None) -> StalenessResult:
+    def record_disconnect(self, key: str, *, now: Optional[datetime] = None, tier=None) -> StalenessResult:
         """Call on an explicit disconnect (websocket closed, polling stopped)."""
-        self._health.record_disconnect(key)
-        return self._evaluate(key, now)
+        storage_key, checker = self._resolve(key, tier)
+        self._health.record_disconnect(storage_key)
+        return self._evaluate(storage_key, now, checker)
 
-    def record_bar(self, bar: dict, *, now: Optional[datetime] = None) -> StalenessResult:
+    def record_bar(self, bar: dict, *, now: Optional[datetime] = None, tier=None) -> StalenessResult:
         """Convenience: record_update from a StrategyBase.on_bar bar dict
         (`{"symbol":..., "ts":..., ...}`); `symbol` is the tracking key."""
-        return self.record_update(bar.get("symbol"), ts=bar.get("ts"), now=now)
+        return self.record_update(bar.get("symbol"), ts=bar.get("ts"), now=now, tier=tier)
 
-    def check(self, key: str, now: Optional[datetime] = None) -> StalenessResult:
+    def check(self, key: str, now: Optional[datetime] = None, *, tier=None) -> StalenessResult:
         """Evaluate current staleness for `key` without raising."""
-        return self._evaluate(key, now)
+        storage_key, checker = self._resolve(key, tier)
+        return self._evaluate(storage_key, now, checker)
 
-    def assert_fresh(self, key: str, now: Optional[datetime] = None) -> StalenessResult:
+    def assert_fresh(self, key: str, now: Optional[datetime] = None, *, tier=None) -> StalenessResult:
         """check() and raise StaleFeedError if the result is blocking."""
-        result = self.check(key, now)
+        result = self.check(key, now, tier=tier)
         return self._gate.assert_fresh(result)
 
     def reset(self, key: Optional[str] = None) -> None:
-        """Clear tracked state (all keys if `key` is None)."""
-        self._health.reset(key)
-        with self._lock:
-            if key is None:
-                self._last_state.clear()
-            else:
-                self._last_state.pop(key, None)
+        """Clear tracked state (all keys if `key` is None).
 
-    def _evaluate(self, key: str, now: Optional[datetime] = None) -> StalenessResult:
+        With a `key`, every tier-scoped variant of that key is cleared too."""
+        if key is None:
+            self._health.reset(None)
+            with self._lock:
+                self._last_state.clear()
+            return
+        prefix = f"{key}::"
+        with self._lock:
+            scoped = [k for k in self._last_state if k == key or k.startswith(prefix)]
+        for k in (key, *scoped):
+            self._health.reset(k)
+            with self._lock:
+                self._last_state.pop(k, None)
+
+    def _evaluate(self, key: str, now: Optional[datetime] = None,
+                  checker: Optional[FreshnessChecker] = None) -> StalenessResult:
         try:
             health = self._health.get(key)
-            state = self._classifier.classify(health, now)
-            age = self._freshness.age_seconds(health.last_update, now)
+            if checker is None:
+                state = self._classifier.classify(health, now)
+                age = self._freshness.age_seconds(health.last_update, now)
+            elif health.status == FeedStatus.DISCONNECTED:
+                state = StaleState.STALE
+                age = checker.age_seconds(health.last_update, now)
+            else:
+                state = checker.classify(health.last_update, now)
+                age = checker.age_seconds(health.last_update, now)
         except Exception as exc:
             logger.warning("Stale-data check error for %s: %s", key, exc)
             health = SourceHealth()
