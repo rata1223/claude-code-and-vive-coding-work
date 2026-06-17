@@ -1,7 +1,6 @@
 import logging
 import os
 from abc import ABC
-from datetime import datetime, timezone
 from typing import Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -41,9 +40,6 @@ def _live_trade_allowed(broker, name: str, symbol: str, side: str):
     return True, None
 
 
-_BAR_STALE_SECONDS = int(os.environ.get("BAR_STALE_SECONDS", "600"))
-
-
 class StrategyBase(ABC):
     """
     모든 전략의 기반 클래스.
@@ -78,27 +74,25 @@ class StrategyBase(ABC):
         """
 
     def _is_bar_stale(self, bar: dict) -> bool:
-        """Returns True if bar['ts'] exceeds BAR_STALE_SECONDS age on a live broker.
-        Always returns False for simulated brokers (backtests use historical timestamps)."""
+        """Returns True if bar['ts'] exceeds the intraday-bar freshness threshold
+        on a live broker. Always returns False for simulated brokers (backtests
+        use historical timestamps).
+
+        Delegates to the unified FreshnessGate (R-11) so the threshold lives in
+        one place (backend/data/freshness_config.py), not a local constant."""
         if not getattr(self._broker, "is_live", True):
             return False
-        ts = bar.get("ts")
-        if ts is None:
-            return False
-        try:
-            now = datetime.now(timezone.utc)
-            if hasattr(ts, "tzinfo") and ts.tzinfo is None:
-                ts = ts.replace(tzinfo=timezone.utc)
-            age_secs = (now - ts).total_seconds()
-            if age_secs > _BAR_STALE_SECONDS:
-                logger.warning(
-                    "[%s] 스테일 캔들 무시: %s age=%.0fs (한도 %ds)",
-                    self.name, bar.get("symbol"), age_secs, _BAR_STALE_SECONDS,
-                )
-                return True
-        except Exception as e:
-            logger.debug("캔들 타임스탬프 파싱 오류: %s", e)
-        return False
+        # A missing ts is NOT treated as fresh — the gate resolves it to UNKNOWN
+        # (fail-closed) so a timestamp-less live bar is skipped.
+        from backend.data.freshness_gate import get_freshness_gate
+        from backend.data.freshness_config import FreshnessTier
+        gate = get_freshness_gate()
+        result = gate.validate_timestamp(
+            bar.get("symbol", "unknown"), bar.get("ts"),
+            tier=FreshnessTier.INTRADAY_BAR,
+            source="live_bar", raise_on_block=False,
+        )
+        return gate.is_blocking(result)
 
     def on_fill(self, fill: "Fill"):
         """체결 이벤트 수신 시 호출."""
