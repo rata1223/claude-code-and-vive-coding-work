@@ -137,6 +137,20 @@ class TestMissingTimestamp:
         assert res.state == StaleState.UNKNOWN
         assert gate.is_blocking(res) is True
 
+    def test_missing_timestamp_blocks_even_after_warning(self):
+        """Fail-closed regardless of prior state: a missing ts after a WARNING
+        reading must still resolve to UNKNOWN (not stay non-blocking WARNING)."""
+        # daily warn=10h, stale=72h → a 20h-old bar is WARNING (non-blocking)
+        gate = _gate(_config(daily_warn=36000.0, daily_stale=259200.0))
+        warn = gate.validate_dataframe("SPY", _daily_df(_NOW - timedelta(hours=20)),
+                                       source="yfinance", raise_on_block=False, now=_NOW)
+        assert warn.state == StaleState.WARNING
+        assert gate.is_blocking(warn) is False
+        res = gate.validate_timestamp("SPY", None, tier=FreshnessTier.DAILY_BAR,
+                                      source="yfinance", raise_on_block=False, now=_NOW)
+        assert res.state == StaleState.UNKNOWN
+        assert gate.is_blocking(res) is True
+
 
 # ── 6. unknown source blocks (never recorded) ─────────────────────────────
 
@@ -166,9 +180,30 @@ class TestThresholdOverride:
         ).state == StaleState.STALE
 
     def test_env_override_loads(self, monkeypatch):
+        monkeypatch.setenv("FRESHNESS_DAILY_WARN_SECONDS", "1800")
         monkeypatch.setenv("FRESHNESS_DAILY_STALE_SECONDS", "3600")
         cfg = load_freshness_config()
         assert cfg.daily_bar.stale_after_seconds == 3600.0
+        assert cfg.daily_bar.warn_after_seconds == 1800.0
+
+
+class TestConfigValidation:
+    def test_invalid_bool_env_falls_back_to_default(self, monkeypatch):
+        # A typo must not silently disable fail-closed blocking.
+        monkeypatch.setenv("FRESHNESS_BLOCK_ON_UNKNOWN", "ture")
+        assert load_freshness_config().block_on_unknown is True
+
+    def test_valid_falsy_bool_env(self, monkeypatch):
+        monkeypatch.setenv("FRESHNESS_BLOCK_ON_UNKNOWN", "false")
+        assert load_freshness_config().block_on_unknown is False
+
+    def test_tier_threshold_rejects_negative(self):
+        with pytest.raises(ValueError):
+            TierThreshold(warn_after_seconds=-1.0, stale_after_seconds=600.0)
+
+    def test_tier_threshold_rejects_warn_gt_stale(self):
+        with pytest.raises(ValueError):
+            TierThreshold(warn_after_seconds=900.0, stale_after_seconds=600.0)
 
 
 # ── 8. fail-closed behavior ───────────────────────────────────────────────

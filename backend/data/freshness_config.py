@@ -19,9 +19,12 @@ into a WARNING tier.
 """
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
 from enum import Enum
+
+logger = logging.getLogger(__name__)
 
 
 class FreshnessTier(str, Enum):
@@ -45,7 +48,16 @@ def _env_bool(name: str, default: bool) -> bool:
     raw = os.environ.get(name)
     if raw is None or raw.strip() == "":
         return default
-    return raw.strip().lower() in ("1", "true", "yes", "on")
+    v = raw.strip().lower()
+    if v in ("1", "true", "yes", "on"):
+        return True
+    if v in ("0", "false", "no", "off"):
+        return False
+    # Unrecognized value: fall back to the (fail-closed) default rather than
+    # silently mapping a typo like "ture" to False and disabling blocking.
+    logger.warning("%s=%r is not a recognized boolean — using default %s",
+                   name, raw, default)
+    return default
 
 
 # Default intraday "stale" age preserves the legacy BAR_STALE_SECONDS=600 (10min)
@@ -59,6 +71,18 @@ _HOUR = 3600.0
 class TierThreshold:
     warn_after_seconds: float
     stale_after_seconds: float
+
+    def __post_init__(self) -> None:
+        if self.warn_after_seconds < 0 or self.stale_after_seconds < 0:
+            raise ValueError(
+                f"Freshness thresholds must be non-negative "
+                f"(warn={self.warn_after_seconds}, stale={self.stale_after_seconds})"
+            )
+        if self.warn_after_seconds > self.stale_after_seconds:
+            raise ValueError(
+                f"warn_after_seconds ({self.warn_after_seconds}) cannot exceed "
+                f"stale_after_seconds ({self.stale_after_seconds})"
+            )
 
 
 @dataclass(frozen=True)

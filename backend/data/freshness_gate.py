@@ -118,15 +118,14 @@ class FreshnessGate:
         ts = _coerce_utc(last_ts)
         if ts is None:
             # Do NOT record_update(ts=None) — that would mark the feed fresh.
-            result = self._service.check(symbol, now=now, tier=tier)
-            if result.state == StaleState.FRESH:
-                # Stale-by-omission: a prior fresh reading must not let a
-                # timestamp-less payload through. Force UNKNOWN.
-                result = StalenessResult(
-                    state=StaleState.UNKNOWN, key=result.key, age_seconds=None,
-                    status=result.status, consecutive_failures=result.consecutive_failures,
-                    detail="missing timestamp",
-                )
+            # A timestamp-less payload is always UNKNOWN-by-omission, regardless
+            # of any prior state (FRESH or WARNING), to stay fail-closed.
+            prior = self._service.check(symbol, now=now, tier=tier)
+            result = StalenessResult(
+                state=StaleState.UNKNOWN, key=prior.key, age_seconds=None,
+                status=prior.status, consecutive_failures=prior.consecutive_failures,
+                detail="missing timestamp",
+            )
             return self._finalize(result, symbol=symbol, source=source,
                                   last_ts=None, raise_on_block=raise_on_block)
         result = self._service.record_update(symbol, ts=ts, now=now, tier=tier)

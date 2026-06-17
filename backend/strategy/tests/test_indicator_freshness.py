@@ -83,6 +83,16 @@ def test_stale_data_blocks_buy(monkeypatch):
     assert executed == []  # freshness gate suppressed the signal entirely
 
 
+def test_bar_without_timestamp_is_stale_on_live_broker():
+    """Fail-closed: a live bar with no 'ts' must be treated as stale (skipped),
+    not silently processed."""
+    strat = IndicatorStrategy(
+        broker=_LiveBroker(), tracker=_FakeTracker(), machine=None,
+        name="t", config={"universe": ["SPY"]},
+    )
+    assert strat._is_bar_stale({"symbol": "SPY"}) is True
+
+
 def test_stale_data_blocks_order_sizing(monkeypatch):
     """Even if a buy candidate slips through, _is_feed_tradeable blocks sizing."""
     now = datetime.now(timezone.utc)

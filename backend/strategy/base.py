@@ -82,14 +82,14 @@ class StrategyBase(ABC):
         one place (backend/data/freshness_config.py), not a local constant."""
         if not getattr(self._broker, "is_live", True):
             return False
-        ts = bar.get("ts")
-        if ts is None:
-            return False
+        # A missing ts is NOT treated as fresh — the gate resolves it to UNKNOWN
+        # (fail-closed) so a timestamp-less live bar is skipped.
         from backend.data.freshness_gate import get_freshness_gate
         from backend.data.freshness_config import FreshnessTier
         gate = get_freshness_gate()
         result = gate.validate_timestamp(
-            bar.get("symbol"), ts, tier=FreshnessTier.INTRADAY_BAR,
+            bar.get("symbol", "unknown"), bar.get("ts"),
+            tier=FreshnessTier.INTRADAY_BAR,
             source="live_bar", raise_on_block=False,
         )
         return gate.is_blocking(result)

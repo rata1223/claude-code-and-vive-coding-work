@@ -23,7 +23,7 @@ stale quotes reached order sizing — silently, with no exception and no alert.
 
 ## 2. Previous fragmented flow
 
-```
+```text
 loader.fetch() ── 26h check → logger.warning(), returns stale df ──┐
                                                                     ▼
 _scan_and_trade() ── 3-day gate (except: pass) ─────────► fusion.evaluate(df)  ── may emit signal on stale data
@@ -40,7 +40,7 @@ and the one dedicated component dead.
 
 One authoritative gate, one threshold config, fail-closed, kill-switch wired.
 
-```
+```text
                  backend/data/freshness_config.py   ← THE single threshold location (env-driven, per tier)
                             │
                  backend/data/freshness_gate.FreshnessGate   ← process singleton, authoritative gate
