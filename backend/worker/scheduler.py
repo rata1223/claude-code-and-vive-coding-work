@@ -170,7 +170,8 @@ def _trigger_kr_session():
             logger.info("오늘 KRX 휴장 — 한국 세션 신호 생략")
             return
     except Exception as _e:
-        logger.warning("Calendar gate 오류 (계속 진행): %s", _e)
+        logger.error("Calendar gate 오류 — 세션 신호 스킵 (fail-closed): %s", _e)
+        return
 
     _publish_session_signal("session:kr_open")
 
@@ -186,7 +187,8 @@ def _trigger_us_session():
             logger.info("오늘 NYSE 휴장 — 미국 세션 신호 생략")
             return
     except Exception as _e:
-        logger.warning("Calendar gate 오류 (계속 진행): %s", _e)
+        logger.error("Calendar gate 오류 — 세션 신호 스킵 (fail-closed): %s", _e)
+        return
 
     _publish_session_signal("session:us_open")
 
