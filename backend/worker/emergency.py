@@ -8,12 +8,19 @@ NOTE (R-11): the former ``StaleDataWatchdog`` lived here but was dead code
 ``backend/data/freshness_gate.FreshnessGate`` wired into the execution path.
 """
 import logging
+import threading
 from contextlib import contextmanager
 from typing import Callable, Optional
 
 from backend.brokers.base import BrokerAdapter
 
 logger = logging.getLogger(__name__)
+
+# In-process guard against duplicate concurrent flatten runs (e.g. two
+# /api/admin/flatten calls inside the rate-limit window, or auto+manual).
+# Cross-process duplication is a documented remaining risk (see
+# docs/EMERGENCY_FLATTEN_VALIDATION.md).
+_FLATTEN_LOCK = threading.Lock()
 
 
 @contextmanager
@@ -49,22 +56,52 @@ class EmergencyFlattenManager:
     def flatten_all(self, reason: str = "비상청산") -> dict:
         """
         모든 포지션 시장가 매도.
-        Returns: {"attempted": N, "success": N, "failed": [...]}
+
+        Returns a dict with:
+          - ``attempted``  : positions seen
+          - ``success``    : positions *processed* (orders submitted, OR dry-run
+                             logged) — NOT a confirmation that the position is
+                             closed/filled (see EMERGENCY_FLATTEN_VALIDATION.md).
+          - ``submitted``  : real broker orders actually sent (0 in dry-run)
+          - ``dry_run``    : whether this was a dry run
+          - ``failed``     : list of "symbol: error" strings
+          - ``status``     : "already_in_progress" if a flatten is already running
         """
+        # Duplicate-flatten guard: never run two flattens concurrently in this
+        # process — that would double-submit sells and risk an oversell/short.
+        if not _FLATTEN_LOCK.acquire(blocking=False):
+            logger.error("비상청산 이미 진행 중 — 중복 요청 거부: %s", reason)
+            self._audit("emergency_flatten_rejected", detail={"reason": reason,
+                        "cause": "already_in_progress"})
+            return {"attempted": 0, "success": 0, "submitted": 0,
+                    "dry_run": self._dry_run, "failed": [], "status": "already_in_progress"}
+        try:
+            return self._flatten_all_locked(reason)
+        finally:
+            _FLATTEN_LOCK.release()
+
+    def _flatten_all_locked(self, reason: str) -> dict:
         logger.critical("비상청산 시작: %s", reason)
-        self._audit("emergency_flatten_start", detail={"reason": reason})
+        self._audit("emergency_flatten_start", detail={"reason": reason, "dry_run": self._dry_run})
 
         try:
             positions = self._broker.get_positions()
         except Exception as e:
             logger.error("비상청산 포지션 조회 실패: %s", e)
-            return {"attempted": 0, "success": 0, "failed": [str(e)]}
+            self._audit("emergency_flatten_positions_error", detail={"reason": reason, "error": str(e)})
+            return {"attempted": 0, "success": 0, "submitted": 0,
+                    "dry_run": self._dry_run, "failed": [str(e)]}
 
         if not positions:
             logger.info("비상청산: 보유 포지션 없음")
-            return {"attempted": 0, "success": 0, "failed": []}
+            self._audit("emergency_flatten_complete",
+                        detail={"reason": reason, "attempted": 0, "success": 0,
+                                "submitted": 0, "dry_run": self._dry_run, "failed": []})
+            return {"attempted": 0, "success": 0, "submitted": 0,
+                    "dry_run": self._dry_run, "failed": []}
 
-        results = {"attempted": len(positions), "success": 0, "failed": []}
+        results = {"attempted": len(positions), "success": 0, "submitted": 0,
+                   "dry_run": self._dry_run, "failed": []}
 
         for pos in positions:
             try:
@@ -89,13 +126,20 @@ class EmergencyFlattenManager:
                 logger.critical("비상청산 주문: %s qty=%d @%.2f id=%s",
                                 pos.symbol, pos.qty, price, order.id)
                 results["success"] += 1
+                results["submitted"] += 1
                 self._audit("emergency_flatten_order", symbol=pos.symbol,
                             detail={"qty": pos.qty, "price": price, "order_id": order.id})
             except Exception as e:
                 logger.error("비상청산 실패 %s: %s", pos.symbol, e)
                 results["failed"].append(f"{pos.symbol}: {e}")
+                self._audit("emergency_flatten_failed", symbol=pos.symbol,
+                            detail={"qty": pos.qty, "price": price, "error": str(e)})
 
         self._alert(reason, results)
+        self._audit("emergency_flatten_complete",
+                    detail={"reason": reason, "attempted": results["attempted"],
+                            "success": results["success"], "submitted": results["submitted"],
+                            "dry_run": self._dry_run, "failed": results["failed"]})
         logger.critical("비상청산 완료: %s", results)
         return results
 
