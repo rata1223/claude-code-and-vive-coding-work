@@ -242,7 +242,15 @@ class KISBroker(BrokerAdapter):
             output = resp.get("output1") or resp.get("output", [])
             if not output:
                 return None
-            row = output[0] if isinstance(output, list) else output
+            if isinstance(output, list):
+                # Match the specific order_id; never fall back to a different
+                # order's row (the inquiry can return multiple orders).
+                row = next((r for r in output if r.get("odno") == order_id), None)
+                if row is None:
+                    logger.warning("KR 주문 %s 응답에서 미매칭 — None 반환", order_id)
+                    return None
+            else:
+                row = output
             filled_qty = KIS_DOMESTIC_MAPPER.extract_filled_qty(row)
             ord_qty = KIS_DOMESTIC_MAPPER.extract_order_qty(row)
             avg_price = KIS_DOMESTIC_MAPPER.extract_avg_price(row)

@@ -148,8 +148,12 @@ class StartupRecovery:
                 self._kill_reason = tracker.kill_reason
             return True
         except Exception as e:
-            logger.warning("리스크 상태 복원 실패: %s — 기본값 사용", e)
-            return True  # non-fatal
+            # Fail-closed: if risk state cannot be verified, assume the
+            # kill-switch is active rather than enabling trading on unknown state.
+            logger.error("리스크 상태 복원 실패 — 안전을 위해 매매 차단: %s", e)
+            self._kill_switch_active = True
+            self._kill_reason = f"리스크 상태 복원 실패: {e}"
+            return True
 
     def _step_balance(self) -> bool:
         if self._broker is None:
@@ -210,11 +214,16 @@ class StartupRecovery:
                 ))
             for repair in result.repairs:
                 logger.debug("스타트업 조정 수정: %s", repair)
-            logger.info("스타트업 조정 완료: 갭=%d 수정=%d", len(result.gaps), len(result.repairs))
-            return True
+            logger.info("스타트업 조정 완료: 갭=%d 수정=%d 오류=%d",
+                        len(result.gaps), len(result.repairs), len(result.errors))
+            # Fail-closed: reconcile *errors* (broker/DB failures) mean positions
+            # are unverified — keep SafeMode disabled. Gaps are normal (repaired).
+            if not result.ok:
+                logger.error("스타트업 조정 오류 — 매매 차단 유지: %s", result.errors)
+            return result.ok
         except Exception as e:
-            logger.warning("Reconcile 실패: %s — 스킵", e)
-            return True  # non-fatal
+            logger.error("Reconcile 실패 — 안전을 위해 매매 차단: %s", e)
+            return False  # fail-closed
 
     def _step_pending_orders(self) -> bool:
         if self._broker is None:

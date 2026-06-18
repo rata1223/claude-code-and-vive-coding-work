@@ -162,6 +162,10 @@ class StrategyWorker:
 
         # Process-level PersistentLossTracker — uses db_factory for per-op sessions (P1-3 fix)
         self._loss_tracker = None
+        # Last successfully fetched live equity — used as the kill-switch fallback
+        # when the broker balance API is temporarily unavailable (prevents MDD = 0%
+        # masking). Seeded below from a real startup balance fetch.
+        self._last_known_equity: float | None = None
         try:
             from backend.quant.risk.engine import PersistentLossTracker, RiskConfig
             self._loss_tracker = PersistentLossTracker(
@@ -171,23 +175,23 @@ class StrategyWorker:
             )
             logger.info("PersistentLossTracker 초기화 완료 (kill_switch=%s)", self._loss_tracker.kill_switch)
 
-            # Bootstrap peak_equity from live balance on cold start
-            if self._loss_tracker.peak_equity == 0:
-                try:
-                    bal = get_kis_broker().get_balance()
-                    if bal.total_eval_krw > 0:
-                        self._loss_tracker.peak_equity = bal.total_eval_krw
+            # Seed equity from a live balance fetch at startup. This always sets
+            # _last_known_equity (so the first fill's MDD check has a baseline even
+            # if the balance API is briefly down later) and bootstraps peak_equity
+            # on a cold start (peak_equity == 0).
+            try:
+                _eq = get_kis_broker().get_balance().total_eval_krw
+                if _eq > 0:
+                    self._last_known_equity = _eq
+                    if self._loss_tracker.peak_equity == 0:
+                        self._loss_tracker.peak_equity = _eq
                         self._loss_tracker._persist()
-                        logger.info("peak_equity 초기화: %.0f원", bal.total_eval_krw)
-                except Exception as _e:
-                    logger.warning("peak_equity 초기화 실패: %s", _e)
+                        logger.info("peak_equity 초기화: %.0f원", _eq)
+            except Exception as _e:
+                logger.warning("기준 잔고 시드 실패 — 첫 체결 MDD 평가가 스킵될 수 있음: %s", _e)
 
         except Exception as e:
             logger.warning("PersistentLossTracker 초기화 실패: %s", e)
-
-        # Last successfully fetched live equity — used as kill-switch fallback when
-        # broker balance API is temporarily unavailable (prevents MDD = 0% masking).
-        self._last_known_equity: float | None = None
 
         # Heartbeat — lets watchdog / monitoring know the worker is alive
         self._heartbeat = WorkerHeartbeat(self._redis)
@@ -474,8 +478,18 @@ class StrategyWorker:
                 logger.warning("tracker.on_fill 오류: %s", e)
 
             # 3. Record realized P&L for sell fills → feeds kill-switch evaluation
-            if fill.side == "sell" and entry_price is not None and self._loss_tracker is not None:
-                realized_pnl = (fill.price - entry_price) * fill.qty
+            if fill.side == "sell" and self._loss_tracker is not None:
+                if entry_price is not None:
+                    realized_pnl = (fill.price - entry_price) * fill.qty
+                else:
+                    # Sell with no tracked position: we cannot compute realized
+                    # P&L, but we MUST still refresh equity so MDD/kill-switch
+                    # evaluation runs (a desync must not silently disable risk).
+                    realized_pnl = 0.0
+                    logger.error("매도 체결이지만 진입가 미상 — 손익 0 처리, MDD만 평가: %s",
+                                 fill.symbol)
+                    _audit("sell_without_entry_price", symbol=fill.symbol,
+                           detail={"fill_price": fill.price, "qty": fill.qty})
                 try:
                     ks_before = self._loss_tracker.kill_switch
                     # Never fall back to peak_equity: MDD = (peak - peak)/peak = 0% masks drawdown.
@@ -494,8 +508,10 @@ class StrategyWorker:
                                            current_equity, _be)
                     if current_equity is not None:
                         self._loss_tracker.record_pnl(realized_pnl, current_equity)
-                        logger.info("손익 기록: %s %.0f원 (entry=%.4f fill=%.4f qty=%d)",
-                                    fill.symbol, realized_pnl, entry_price, fill.price, fill.qty)
+                        logger.info("손익 기록: %s %.0f원 (entry=%s fill=%.4f qty=%d)",
+                                    fill.symbol, realized_pnl,
+                                    f"{entry_price:.4f}" if entry_price is not None else "n/a",
+                                    fill.price, fill.qty)
                         if not ks_before and self._loss_tracker.kill_switch:
                             _audit("kill_switch_triggered", symbol=fill.symbol,
                                    detail={"reason": self._loss_tracker.kill_reason,
