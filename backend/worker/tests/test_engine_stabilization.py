@@ -19,7 +19,7 @@ from sqlalchemy.orm import sessionmaker
 import backend.worker.runner as runner
 import backend.worker.scheduler as scheduler
 from backend.brokers.models import Order as BOrder, OrderStatus
-from backend.database.models import AuditLog, Base, Position as DBPosition
+from backend.database.models import AuditLog, Base
 from backend.execution.order_machine import OrderStateMachine
 from backend.execution.position_tracker import Fill, PositionTracker
 from backend.worker.recovery import StartupRecovery
@@ -126,8 +126,10 @@ def _sell_order():
 class TestFillCallbackRiskEval:
     def test_sell_without_position_still_runs_mdd_and_audits(self, db_factory, monkeypatch):
         monkeypatch.setattr(runner, "_SessionFactory", db_factory)
-        bal = MagicMock(); bal.total_eval_krw = 2_000_000.0
-        broker = MagicMock(); broker.get_balance.return_value = bal
+        bal = MagicMock()
+        bal.total_eval_krw = 2_000_000.0
+        broker = MagicMock()
+        broker.get_balance.return_value = bal
         monkeypatch.setattr(runner, "get_kis_broker", lambda: broker)
 
         lt = _FakeLossTracker()
@@ -143,7 +145,8 @@ class TestFillCallbackRiskEval:
 
     def test_sell_uses_seeded_equity_when_balance_fetch_fails(self, db_factory, monkeypatch):
         monkeypatch.setattr(runner, "_SessionFactory", db_factory)
-        broker = MagicMock(); broker.get_balance.side_effect = RuntimeError("api down")
+        broker = MagicMock()
+        broker.get_balance.side_effect = RuntimeError("api down")
         monkeypatch.setattr(runner, "get_kis_broker", lambda: broker)
 
         lt = _FakeLossTracker()
@@ -161,7 +164,8 @@ class TestFillCallbackRiskEval:
 
     def test_sell_skips_mdd_only_when_no_equity_available(self, db_factory, monkeypatch):
         monkeypatch.setattr(runner, "_SessionFactory", db_factory)
-        broker = MagicMock(); broker.get_balance.side_effect = RuntimeError("api down")
+        broker = MagicMock()
+        broker.get_balance.side_effect = RuntimeError("api down")
         monkeypatch.setattr(runner, "get_kis_broker", lambda: broker)
 
         lt = _FakeLossTracker()

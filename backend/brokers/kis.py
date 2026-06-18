@@ -250,7 +250,11 @@ class KISBroker(BrokerAdapter):
                     logger.warning("KR 주문 %s 응답에서 미매칭 — None 반환", order_id)
                     return None
             else:
+                # Single-object response: still fail-closed on a mismatched odno.
                 row = output
+                if row.get("odno") != order_id:
+                    logger.warning("KR 주문 %s 응답에서 미매칭(단일) — None 반환", order_id)
+                    return None
             filled_qty = KIS_DOMESTIC_MAPPER.extract_filled_qty(row)
             ord_qty = KIS_DOMESTIC_MAPPER.extract_order_qty(row)
             avg_price = KIS_DOMESTIC_MAPPER.extract_avg_price(row)

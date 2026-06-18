@@ -48,3 +48,9 @@ def test_returns_none_when_no_row_matches():
 
 def test_returns_none_on_empty_output():
     assert _broker({"output1": []})._get_kr_order_status("ORD-123") is None
+
+
+def test_returns_none_when_single_output_row_mismatches():
+    # Non-list response: a single object with an unrelated odno must NOT be adopted.
+    resp = {"output1": _row("ORD-999", "000660", 50, 50)}
+    assert _broker(resp)._get_kr_order_status("ORD-123") is None
