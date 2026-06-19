@@ -52,6 +52,8 @@ class EmergencyFlattenManager:
         self._broker = broker
         self._factory = db_factory
         self._dry_run = dry_run
+        self._lock = threading.Lock()
+        self._flattening = False
 
     def flatten_all(self, reason: str = "비상청산") -> dict:
         """
@@ -91,6 +93,9 @@ class EmergencyFlattenManager:
             self._audit("emergency_flatten_positions_error", detail={"reason": reason, "error": str(e)})
             return {"attempted": 0, "success": 0, "submitted": 0,
                     "dry_run": self._dry_run, "failed": [str(e)]}
+
+        # qty <= 0 은 이미 청산된 포지션 — 주문 없이 스킵
+        positions = [p for p in positions if p.qty > 0]
 
         if not positions:
             logger.info("비상청산: 보유 포지션 없음")
@@ -174,4 +179,3 @@ class EmergencyFlattenManager:
                 db.commit()
         except Exception as e:
             logger.warning("감사 로그 저장 실패: %s", e)
-
