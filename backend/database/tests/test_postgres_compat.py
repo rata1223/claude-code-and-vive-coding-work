@@ -33,10 +33,11 @@ def factory():
 
 
 def _is_pg(factory) -> bool:
-    return factory.kw["bind"].dialect.name == "postgresql"
-
-
-pg_only = pytest.mark.skipif  # alias for readability below
+    sess = factory()
+    try:
+        return sess.bind.dialect.name == "postgresql"
+    finally:
+        sess.close()
 
 
 def test_unique_constraint_enforced_and_session_recovers(factory):

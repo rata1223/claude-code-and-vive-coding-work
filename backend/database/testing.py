@@ -43,6 +43,11 @@ def make_test_engine(*, connect_args=None, poolclass=None):
     # Postgres: one fresh schema per engine for isolation. NullPool so each
     # short-lived test engine doesn't pin a connection (hundreds of fixtures
     # would otherwise exhaust max_connections).
+    #
+    # The schema name is UUID-derived ("t_" + uuid4 hex → [a-z0-9_] only), so it
+    # is injection-safe; SQLAlchemy text()/DBAPI can't bind SQL *identifiers*
+    # anyway, hence the f-strings. Schemas are not dropped: CI databases are
+    # ephemeral, and locally the per-run schemas are tiny.
     schema = "t_" + uuid.uuid4().hex[:16]
     engine = create_engine(url, poolclass=NullPool)
     with engine.connect() as conn:
