@@ -10,7 +10,7 @@ and the orchestrator, including all 7 required scenarios:
 from datetime import date, datetime, timedelta, timezone
 
 import pytest
-from sqlalchemy import create_engine
+from backend.database.testing import make_test_engine
 from sqlalchemy.orm import sessionmaker
 
 from backend.data.validator import (
@@ -53,7 +53,7 @@ def _candle(**kwargs) -> Candle:
 
 
 def _sqlite_factory():
-    engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    engine = make_test_engine()
     Base.metadata.create_all(engine)
     return sessionmaker(bind=engine, expire_on_commit=False)
 

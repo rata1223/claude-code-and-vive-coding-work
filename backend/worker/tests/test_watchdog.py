@@ -13,7 +13,7 @@ from datetime import datetime, timezone, timedelta
 from unittest.mock import MagicMock
 
 import pytest
-from sqlalchemy import create_engine
+from backend.database.testing import make_test_engine
 from sqlalchemy.orm import sessionmaker
 
 from backend.database.models import AuditLog, Base
@@ -44,7 +44,7 @@ _WORKER_ID = "kis-worker"
 
 
 def _db():
-    engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    engine = make_test_engine()
     Base.metadata.create_all(engine)
     return sessionmaker(bind=engine, expire_on_commit=False)
 
