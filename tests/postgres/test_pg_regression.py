@@ -6,28 +6,26 @@ All tests skip automatically unless TEST_DATABASE_URL points to a real
 PostgreSQL instance (enforced by conftest.pytest_collection_modifyitems).
 
 Coverage:
-  A. Alembic migration round-trip
   B. Unique constraint enforcement
   C. Rollback / savepoint behavior
   D. Foreign key enforcement (api/models.py)
   E. Multi-session / concurrent execution
   F. SQLite-masked behavior (datetime type, text JSON)
+
+Alembic migration round-trip is validated via shell steps in
+.github/workflows/ci-postgres.yml, not here, to avoid global-schema
+state interference with the fixture-based tests.
 """
 import datetime
 import json
 import os
-import subprocess
-import sys
 import threading
-from typing import Generator
 
 import pytest
-from sqlalchemy import inspect, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
-from sqlalchemy.pool import NullPool
 
-from api.models import Credential, Strategy, User
+from api.models import Credential, User
 from backend.database.models import (
     AuditLog,
     Command,
@@ -37,45 +35,6 @@ from backend.database.models import (
 )
 
 PG_URL = os.environ.get("TEST_DATABASE_URL", "")
-
-
-# ── A. Alembic migration round-trip ──────────────────────────────────────────
-
-class TestAlembicMigrations:
-    def _alembic(self, *args) -> subprocess.CompletedProcess:
-        env = os.environ.copy()
-        env["DB_URL"] = PG_URL
-        return subprocess.run(
-            [sys.executable, "-m", "alembic", *args],
-            capture_output=True, text=True, env=env, timeout=60,
-        )
-
-    def test_upgrade_head_exits_zero(self):
-        result = self._alembic("upgrade", "head")
-        assert result.returncode == 0, result.stderr
-
-    def test_downgrade_base_exits_zero(self):
-        result = self._alembic("downgrade", "base")
-        assert result.returncode == 0, result.stderr
-
-    def test_round_trip_upgrade_downgrade_upgrade(self):
-        r1 = self._alembic("upgrade", "head")
-        assert r1.returncode == 0, r1.stderr
-        r2 = self._alembic("downgrade", "base")
-        assert r2.returncode == 0, r2.stderr
-        r3 = self._alembic("upgrade", "head")
-        assert r3.returncode == 0, r3.stderr
-
-    def test_tables_exist_after_upgrade(self, pg_trading_engine):
-        self._alembic("upgrade", "head")
-        inspector = inspect(pg_trading_engine)
-        expected = {
-            "orders", "positions", "fills", "trades", "audit_logs",
-            "commands", "daily_risk_states", "equity_snapshots",
-            "reconciliation_logs", "strategy_runs",
-        }
-        actual = set(inspector.get_table_names())
-        assert expected.issubset(actual), f"Missing tables: {expected - actual}"
 
 
 # ── B. Unique constraints ─────────────────────────────────────────────────────
