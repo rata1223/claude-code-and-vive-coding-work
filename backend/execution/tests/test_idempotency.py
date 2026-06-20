@@ -16,7 +16,7 @@ from datetime import datetime, timezone, timedelta
 from unittest.mock import MagicMock
 
 import pytest
-from sqlalchemy import create_engine
+from backend.database.testing import make_test_engine
 from sqlalchemy.orm import sessionmaker
 
 from backend.brokers.models import Order as BrokerOrder, OrderStatus
@@ -39,7 +39,7 @@ _FIXED_NOW = datetime(2026, 6, 6, 9, 37, 0, tzinfo=timezone.utc)  # bucket = "09
 
 
 def _db():
-    engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    engine = make_test_engine()
     Base.metadata.create_all(engine)
     return sessionmaker(bind=engine, expire_on_commit=False)
 

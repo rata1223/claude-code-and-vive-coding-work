@@ -23,7 +23,7 @@ import time
 from unittest.mock import MagicMock
 
 import pytest
-from sqlalchemy import create_engine
+from backend.database.testing import make_test_engine
 from sqlalchemy.orm import sessionmaker
 
 from backend.brokers.base import BrokerAdapter
@@ -58,7 +58,7 @@ def _query_audit(factory, event_type=None):
 
 @pytest.fixture()
 def db_factory():
-    engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    engine = make_test_engine()
     Base.metadata.create_all(engine)
     return sessionmaker(bind=engine, expire_on_commit=False)
 

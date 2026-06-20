@@ -9,7 +9,7 @@ NOT exercised here).
 import json
 
 import pytest
-from sqlalchemy import create_engine
+from backend.database.testing import make_test_engine
 from sqlalchemy.orm import sessionmaker
 
 from backend.brokers.models import Order, OrderStatus, Position
@@ -20,7 +20,7 @@ from backend.worker.emergency import EmergencyFlattenManager
 
 @pytest.fixture
 def db_factory():
-    eng = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    eng = make_test_engine()
     Base.metadata.create_all(eng)
     return sessionmaker(bind=eng, expire_on_commit=False)
 

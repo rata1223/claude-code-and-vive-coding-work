@@ -13,7 +13,7 @@ import json
 from datetime import date
 
 import pytest
-from sqlalchemy import create_engine
+from backend.database.testing import make_test_engine
 from sqlalchemy.orm import sessionmaker
 
 from backend.data.corporate_actions import (
@@ -46,7 +46,7 @@ def _bar(symbol="AAPL", ts=_EFF, open=100.0, high=105.0, low=99.0, close=100.0, 
 
 
 def _sqlite_factory():
-    engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    engine = make_test_engine()
     Base.metadata.create_all(engine)
     return sessionmaker(bind=engine, expire_on_commit=False)
 

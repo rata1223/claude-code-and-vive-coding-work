@@ -14,7 +14,7 @@ from datetime import datetime, timezone, timedelta
 from enum import Enum
 
 import pytest
-from sqlalchemy import create_engine
+from backend.database.testing import make_test_engine
 from sqlalchemy.orm import sessionmaker
 
 from backend.database.models import AuditLog, Base, DailyRiskState
@@ -45,7 +45,7 @@ _FIXED_NOW = datetime(2026, 6, 6, 9, 37, 0, tzinfo=timezone.utc)
 
 
 def _db():
-    engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    engine = make_test_engine()
     Base.metadata.create_all(engine)
     return sessionmaker(bind=engine, expire_on_commit=False)
 

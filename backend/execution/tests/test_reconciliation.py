@@ -15,7 +15,7 @@ from datetime import datetime, timedelta
 from unittest.mock import MagicMock
 
 import pytest
-from sqlalchemy import create_engine
+from backend.database.testing import make_test_engine
 from sqlalchemy.orm import sessionmaker
 
 from backend.brokers.models import Order as BrokerOrder, OrderStatus
@@ -32,7 +32,7 @@ from backend.execution.reconciliation import FillReconciler, PortfolioSnapshot, 
 @pytest.fixture()
 def db_factory():
     """In-memory SQLite factory, fresh per test."""
-    engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    engine = make_test_engine()
     Base.metadata.create_all(engine)
     return sessionmaker(bind=engine, expire_on_commit=False)
 

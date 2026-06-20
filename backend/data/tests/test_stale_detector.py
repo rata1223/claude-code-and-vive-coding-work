@@ -10,7 +10,7 @@ including all 7 required scenarios:
 from datetime import datetime, timedelta, timezone
 
 import pytest
-from sqlalchemy import create_engine
+from backend.database.testing import make_test_engine
 from sqlalchemy.orm import sessionmaker
 
 from backend.data.stale_detector import (
@@ -37,7 +37,7 @@ _T0 = datetime(2026, 6, 1, 9, 30, tzinfo=timezone.utc)
 
 
 def _sqlite_factory():
-    engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    engine = make_test_engine()
     Base.metadata.create_all(engine)
     return sessionmaker(bind=engine, expire_on_commit=False)
 
