@@ -93,6 +93,13 @@ real-money orders with no second confirmation once the promotion guard passes. T
 2-person / approval control around this flip; it is guarded only by operator discipline and the
 startup consistency check.
 
+One real hard-stop does sit adjacent to this flip: `backend/api/server.py:29-39` refuses to
+start the `kis-api` process (`sys.exit(1)`) when `KIS_API_KEY` is unset while
+`ENABLE_LIVE_TRADING=true` (or `FLASK_ENV=production`). This forces credentialed auth on the
+admin API surface (e.g. `/api/admin/flatten`, `/api/admin/reconcile`) in live mode — but it
+gates the *API process*, not the worker's order path, so it is not a substitute for an approval
+control on the env flip.
+
 ### R-F — MEDIUM: Kill-switch does not auto-liquidate (intentional)
 On a loss/MDD breach, new orders are blocked but existing positions remain open until an operator
 acts (`PHILOSOPHY.md`, `AUDIT.md` R-03). This is a deliberate design choice to avoid forced
