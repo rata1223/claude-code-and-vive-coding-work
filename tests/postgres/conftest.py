@@ -10,7 +10,7 @@ import os
 
 import pytest
 from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import Session
 from sqlalchemy.pool import NullPool
 
 from api.database import Base as ApiBase
@@ -39,11 +39,13 @@ def pg_trading_engine():
 
 @pytest.fixture()
 def pg_trading_session(pg_trading_engine):
-    Session = sessionmaker(bind=pg_trading_engine)
-    session = Session()
+    connection = pg_trading_engine.connect()
+    transaction = connection.begin()
+    session = Session(bind=connection, join_transaction_mode="create_savepoint")
     yield session
-    session.rollback()
     session.close()
+    transaction.rollback()
+    connection.close()
 
 
 # ── API DB (api/models.py) ────────────────────────────────────────────────────
@@ -59,8 +61,10 @@ def pg_api_engine():
 
 @pytest.fixture()
 def pg_api_session(pg_api_engine):
-    Session = sessionmaker(bind=pg_api_engine)
-    session = Session()
+    connection = pg_api_engine.connect()
+    transaction = connection.begin()
+    session = Session(bind=connection, join_transaction_mode="create_savepoint")
     yield session
-    session.rollback()
     session.close()
+    transaction.rollback()
+    connection.close()

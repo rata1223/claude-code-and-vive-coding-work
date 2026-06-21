@@ -197,10 +197,13 @@ class TestMultiSession:
             finally:
                 s.close()
 
-        t1 = threading.Thread(target=_insert_batch, args=(50,))
-        t2 = threading.Thread(target=_insert_batch, args=(50,))
-        t1.start(); t2.start()
-        t1.join(timeout=30); t2.join(timeout=30)
+        t1 = threading.Thread(target=_insert_batch, args=(50,), daemon=True)
+        t2 = threading.Thread(target=_insert_batch, args=(50,), daemon=True)
+        t1.start()
+        t2.start()
+        t1.join(timeout=30)
+        t2.join(timeout=30)
+        assert not t1.is_alive() and not t2.is_alive(), "Worker thread timed out (possible deadlock)"
 
         assert not errors, f"Concurrent insert errors: {errors}"
         s = S()
