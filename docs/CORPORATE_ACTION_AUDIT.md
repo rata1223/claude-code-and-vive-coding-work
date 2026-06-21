@@ -249,6 +249,13 @@ is formalized as CA-13.
 
 ### 2.5 Existing Corporate-Action Awareness: None
 
+> **UPDATED (P2-01A, 2026-06-21):** This is no longer literally true at the
+> *source-tree* level — `backend/data/corporate_actions.py` now exists and
+> defines `split_ratio`/`adjustment_factor`/`ex_date`-equivalent fields. It
+> remains true at the **runtime** level: that module has **zero call sites**
+> outside its own tests, so nothing in the live order/position/risk path is
+> corporate-action-aware. See §13 for the re-audit.
+
 Grep across `backend/`, `kis_adapter/`, `kiwoom_adapter/` for
 `split|dividend|corporate|adjust|merger|spinoff|ticker_change|symbol_change`
 (case-insensitive) returns **zero hits related to corporate-action handling**.
@@ -1060,6 +1067,11 @@ would specify **how**. Candidate scope for TASK 3-4B:
 
 1. Design a `backend/data/corporate_actions.py`-style module (detector +
    adjuster), per §6's six insertion points.
+   > **UPDATED (P2-01A, 2026-06-21):** Item 1 is **done** — the module was
+   > built and unit-tested (58 tests) per `docs/CORPORATE_ACTION_PROCESSOR.md`
+   > (TASK 3-4B). Items 2–10 (the *wiring* into PositionTracker, TrailingStop,
+   > reconciler, schema, kill-switch) remain **not started**: the module is
+   > standalone and unwired. See §13.
 2. `PositionTracker` adjustment hook (§6.2) — detection + `qty`/`avg_price`
    rescaling for Copy 1 + Copy 2 atomically.
 3. `TrailingStopManager`/`PositionStop` adjustment hook (§6.3) — rescale
@@ -1148,3 +1160,190 @@ grep -rni "openbb" backend/ api/ strategy/
 **Future (TASK 3-4B, not this task):** design
 `backend/data/corporate_actions.py` (or similarly named module) per this
 audit's §6 insertion points and §7 ownership boundaries.
+
+---
+
+## 13. P2-01A Re-Audit (2026-06-21) — the module now exists but is unwired
+
+**Scope of this re-audit:** read-only verification of whether a *real*
+corporate-action runtime exists, ~6 months after TASK 3-4A (§1–§12 above) and
+after TASK 3-4B built the module §11 anticipated. **No runtime code is changed
+and no fix is applied by P2-01A** — this is analysis only, appended in place.
+
+**One-line delta:** TASK 3-4B's `backend/data/corporate_actions.py` is now
+fully implemented and unit-tested (58 tests,
+`backend/data/tests/test_corporate_actions.py`), but it has **zero call sites
+anywhere outside its own tests/docstring**. It is **dead/unwired code** — the
+same "build standalone first, defer the wiring as a follow-up" pattern as
+`backend/risk/kill_switch.py` and `backend/execution/idempotency.py`.
+Consequently **every runtime conclusion of this audit (CA-01 … CA-13) still
+holds unchanged**: the live order/position/risk path remains corporate-action-
+blind.
+
+### 13.1 Existing mechanisms (P2-01A's report item 1)
+
+**(a) New, but runtime-inactive — the module.**
+`backend/data/corporate_actions.py` provides:
+
+| Component | Location | Role |
+|---|---|---|
+| `ActionType` (Enum) | `corporate_actions.py:38-42` | `SPLIT` / `REVERSE_SPLIT` / `CASH_DIVIDEND` / `TICKER_CHANGE` — **4 types only** |
+| `CorporateAction` (dataclass) | `corporate_actions.py:52-79` | event model: `ratio`/`cash_amount`/`new_symbol`/`ex_date`; `classified()` fail-closed |
+| `PriceAdjuster` | `corporate_actions.py:112-162` | raw→adjusted price/bar factors; never mutates in place |
+| `PositionAdjuster` | `corporate_actions.py:191-211` | rescales `qty`/`avg_price`, asserts value preservation |
+| `CorporateActionDetector` | `corporate_actions.py:214-244` | price-jump heuristic → always **PENDING** (price alone cannot confirm) |
+| `CorporateActionGate` | `corporate_actions.py:318-339` | `assert_tradeable()` blocks while an action is unconfirmed/unapplied |
+| `AdjustmentAuditLog` | `corporate_actions.py:247-315` | persists detect/register/apply/block to the existing `AuditLog` table |
+| `CorporateActionService` | `corporate_actions.py:349-449` | single entry point: `detect_from_bars` / `register_action` / `apply` / `apply_chain` / `assert_tradeable` |
+
+This is a genuine, well-tested implementation of §6.1–§6.4/§6.6's *logic*. But
+its only importers are line 13 (its own docstring example) and the test file
+(`test_corporate_actions.py:19`) — confirmed by
+`grep -rn "corporate_actions" backend/ kis_adapter/ api/ strategy/ bot/`.
+
+**(b) Pre-existing and runtime-ACTIVE — provider/broker-side adjustment.**
+These pre-date the module and are still the *only* adjustment that actually
+runs in production (unchanged from §2.1/§3/§5.1):
+
+- **yfinance `auto_adjust=True`** at the 6 US-price call sites (§2.1) —
+  retroactively re-bases the whole price series. Covers US *price* only; no
+  event flag, and it drives the cross-time-drift risk (CA-07), not a fix.
+- **KIS broker-side auto-adjust** — `get_positions()` returns already-split-
+  adjusted `qty`/`avg_price` (`kis.py:71-104`, §3 row 1). Implicit, no event
+  flag — which is exactly what makes the reconciler silently absorb it (CA-03).
+
+### 13.2 Missing mechanisms (P2-01A's report item 2)
+
+Everything §4 listed as missing is **still missing at runtime**, because the
+module is not called:
+
+- **Wiring (the whole gap).** No import of `CorporateActionService` /
+  `CorporateActionGate` in `position_tracker.py`, `reconciler.py`,
+  `quant/risk/engine.py`, `execution/trailing_stop.py`, `worker/runner.py`,
+  or `brokers/kis.py`. CA-01, CA-02, CA-05 trailing-stop/kill-switch false-
+  fires remain live.
+- **Persistence/restore.** `CorporateActionService._pending` is an in-memory
+  `dict` guarded by a lock (`corporate_actions.py:367`); pending actions are
+  **not** restored on restart — there is no `restore_*` path the way
+  `position_tracker`/recovery have. A confirmed-but-unapplied action would be
+  lost on a worker bounce.
+- **Schema fields (CA-04).** The module reuses the existing `AuditLog` table;
+  it adds **no** `adjustment_factor`/`corporate_action_type`/`ex_date` columns
+  to `Position`/`Trade`/`Order`/`Fill`. CA-04 is untouched.
+- **Coverage gaps in the model itself.** Only 4 `ActionType` members —
+  **merger and spinoff are not modeled** (CA-08/CA-09 unaddressed even in the
+  module). Detector is heuristic-only with **no event feed** (CA-12); yfinance
+  `actions`/`.splits`/`.dividends` still unused (§5.4).
+- **KR adjustment (CA-06) still UNVERIFIED** — the module does nothing for
+  pykrx; the open question from §5.4/CA-06 is unchanged.
+
+### 13.3 Capability verification table (P2-01A's required checklist)
+
+For each requested capability: is the logic **modeled** in the new module, is
+it **wired** into the runtime path, and is there a **provider/broker-side**
+mechanism already acting in production?
+
+| Capability | Modeled in module? | Wired into runtime? | Provider/broker-side already? | Evidence |
+|---|---|---|---|---|
+| Stock split | ✅ `ActionType.SPLIT` | ❌ no call site | ✅ yfinance `auto_adjust` (US) + KIS broker `get_positions()` | `corporate_actions.py:39,118-126`; `kis.py:71-104`; §2.1 |
+| Reverse split | ✅ `ActionType.REVERSE_SPLIT` | ❌ | ✅ same path (ratio < 1) | `corporate_actions.py:40`; §3 yfinance row |
+| Cash dividend | ✅ `ActionType.CASH_DIVIDEND` (`cash_per_share`) | ❌ | ⚠️ implicit only — cash credited to broker balance, unattributed (CA-10) | `corporate_actions.py:41,121-122`; §2.5/CA-10 |
+| Ticker rename | ✅ `ActionType.TICKER_CHANGE` (`new_symbol`) | ❌ | ⚠️ broker reports new symbol; our DB row orphans (CA-08) | `corporate_actions.py:42,123-124`; CA-08 |
+| Adjusted price | ✅ `PriceAdjuster.adjust_price/adjust_bar` | ❌ | ✅ yfinance `auto_adjust=True` (US only) | `corporate_actions.py:128-146`; §2.1 |
+| Quantity adjustment | ✅ `PositionAdjuster.adjust` (`qty_factor`) | ❌ | ✅ KIS broker auto-adjusts `qty` | `corporate_actions.py:191-211`; `kis.py:71-104` |
+| Average cost | ✅ `PositionAdjuster` rescales `avg_price`, asserts value preserved | ❌ | ✅ KIS broker auto-adjusts `avg_price` | `corporate_actions.py:187-211`; `kis.py:71-104` |
+| Merger / spinoff | ❌ not in the 4-member enum | ❌ | ⚠️ broker reflects new state; DB does not (CA-08/CA-09) | `corporate_actions.py:38-42`; CA-08/CA-09 |
+
+**Reading:** the module column is "wired" = ❌ for *every* row. The only
+capabilities that actually execute in production are the provider/broker-side
+ones — which are the *cause* of the open failure modes, not their fix.
+
+### 13.4 Detection — duplication, dead code, existing paths
+
+- **Overlapping/duplicated adjustment responsibilities (4 owners, no
+  coordinator).** Split/quantity adjustment is now expressed in *four* places
+  with no single owner: (1) the module's `PriceAdjuster`/`PositionAdjuster`
+  (unwired), (2) yfinance `auto_adjust=True` (US price), (3) KIS broker-side
+  auto-adjust (live `qty`/`avg_price`), (4) the reconciler's **implicit
+  absorb** of split-shaped `qty_mismatch` (CA-03, `reconciler.py:206-231`).
+  Wiring the module in *without* deciding ownership vs. (2)/(3)/(4) would
+  double-adjust. §7's ownership table is the prerequisite.
+- **Dead code.** The entire module is unreferenced by runtime (only tests +
+  docstring import it). `CorporateActionGate`/`Service` are never constructed
+  outside tests.
+- **Design-doc/implementation naming drift (stale doc).**
+  `docs/CORPORATE_ACTION_PROCESSOR.md` (the 3-4B *design* spec) names the
+  classes `CorporateActionType` / `CorporateActionStatus` /
+  `CorporateActionEvent` / `CorporateActionError` / `AdjustmentRatio`, but the
+  shipped code renamed them to `ActionType` / `ActionStatus` /
+  `CorporateAction` / `CorporateActionPendingError` / `AdjustmentFactor`. The
+  module **was** built (contra a naïve "design never implemented" reading) —
+  but the design doc's naming table is now **stale** relative to the code.
+- **Existing adjustment paths already in production** (re-confirm §2.1/§3):
+  yfinance `auto_adjust` (US), KIS broker auto-adjust (live positions),
+  reconciler implicit absorb. **Provider-side adjusted data is already in use**
+  — this is the latent double-adjust hazard above, not coverage.
+
+### 13.5 Runtime impact (P2-01A's report item 3)
+
+Unchanged from §4/§9: **CA-01 … CA-13 are all still live.** The reconciler
+still silently auto-repairs split-shaped `qty_mismatch` (CA-03); trailing
+stops and the daily-loss kill-switch still false-fire on the post-split price
+discontinuity (CA-02/CA-05/CA-01) because Copy 1/2/3 are never rescaled in the
+live path.
+
+**New, second-order risk introduced by 3-4B:** the *presence* of a
+thoroughly-tested `corporate_actions.py` creates **false confidence** that
+corporate actions are "handled." They are handled only in unit tests. A
+reviewer who greps and finds the module — or reads §11 item 1 as "done" —
+could wrongly conclude the live path is safe. (Mirrors the kill-switch
+finding in `docs/SYSTEMS_AUDIT_RISK_ANALYSIS.md` R-A.) This re-audit and the
+§2.5/§11 annotations exist to neutralize that false signal.
+
+### 13.6 Recommended implementation location (P2-01A's report item 4)
+
+Because the module already exists, the recommendation is **wire it in — do
+not rebuild** — at this audit's existing §6 insertion points. Recommendation
+only; **P2-01A applies no fix**:
+
+1. **Decide ownership first (§7).** Resolve who owns split adjustment between
+   the module and the existing provider/broker auto-adjust + reconciler absorb
+   (CA-03), to avoid double-adjustment. This is the gating decision.
+2. **`PositionTracker` (§6.2)** — call `CorporateActionService.apply(...,
+   position=...)` to rescale Copy 1 + Copy 2 atomically (`corporate_actions.py:397`).
+3. **`TrailingStopManager`/`PositionStop` (§6.3)** — rescale Copy 3
+   (`entry_price`/`peak_price`/stops) in the same atomic step (CA-05).
+4. **Reconciler (§6.4)** — use `detect_from_bars`/the detector's split
+   signature to *annotate* (not silently absorb) split-shaped `qty_mismatch`
+   (CA-03), and add the `adjustment_factor`/`corporate_action_type`/`ex_date`
+   schema fields (CA-04).
+5. **Kill-switch / EmergencyStop (§6.6)** — consult
+   `CorporateActionService.assert_tradeable(symbol)` before placing orders
+   (`corporate_actions.py:426`).
+6. **Persist `_pending`** so confirmed-but-unapplied actions survive a worker
+   restart (parallels `recovery.py`).
+
+These are **separate, individually-reviewed changes to safety-critical code**,
+each validated under paper trading before live — not part of P2-01A.
+
+### 13.7 Re-verification commands (P2-01A)
+
+```bash
+# Module exists and is fully tested, but...
+ls backend/data/corporate_actions.py backend/data/tests/test_corporate_actions.py
+
+# ...has ZERO runtime call sites (only its own docstring + test import):
+grep -rn "corporate_actions\|CorporateActionService\|CorporateActionGate" \
+  backend/ kis_adapter/ api/ strategy/ bot/
+# expect: only corporate_actions.py:13 (docstring) and tests/test_corporate_actions.py:19
+
+# Only 4 ActionTypes — no merger/spinoff:
+grep -nE "SPLIT|REVERSE_SPLIT|CASH_DIVIDEND|TICKER_CHANGE|MERGER|SPINOFF" \
+  backend/data/corporate_actions.py
+
+# Design-doc naming drift (spec vs. shipped):
+grep -n "CorporateActionType\|CorporateActionEvent\|AdjustmentRatio" \
+  docs/CORPORATE_ACTION_PROCESSOR.md   # design names
+grep -nE "^class (ActionType|CorporateAction|AdjustmentFactor)" \
+  backend/data/corporate_actions.py    # shipped names
+```
