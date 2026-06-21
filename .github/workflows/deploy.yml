@@ -1,7 +1,13 @@
 name: Deploy to Oracle Cloud
 
+# Deploy is GATED on the test suite: it no longer triggers directly on push.
+# Instead it runs after the "Tests (PostgreSQL)" workflow completes on main, and
+# the job only proceeds when that run concluded successfully. A red suite blocks
+# auto-deploy (fail-safe). `workflow_dispatch` remains as a manual escape hatch.
 on:
-  push:
+  workflow_run:
+    workflows: ["Tests (PostgreSQL)"]
+    types: [completed]
     branches: [main]
   workflow_dispatch:
     inputs:
@@ -16,6 +22,11 @@ permissions:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    # Gate: manual dispatch always allowed; automatic deploy only when the
+    # triggering test workflow passed.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
 
     steps:
       - name: Checkout code
@@ -49,6 +60,39 @@ jobs:
             docker compose pull quantdinger || true
             docker compose up -d --build
 
-            # 헬스체크
-            sleep 10
+            # ── 배포 후 헬스 프로브 ─────────────────────────────────────────────
+            # 컨테이너 기동 대기 후, 실패하면 배포를 실패 처리(exit 1)한다.
+            sleep 15
+
+            # 1) exited / unhealthy 컨테이너가 있으면 즉시 실패
+            if docker compose ps | grep -iE 'exit|unhealthy'; then
+              echo "❌ 배포 실패: 종료됐거나 unhealthy 상태인 컨테이너 감지"
+              docker compose ps
+              docker compose logs --tail=80
+              exit 1
+            fi
+
+            # 2) 워커가 실제로 부팅됐는지 검증.
+            #    kis-api의 인증 불필요 엔드포인트 /api/metrics(포트 5001)에서
+            #    worker_alive / db_ok / redis_ok 가 모두 true 가 될 때까지 폴링.
+            HEALTHY=0
+            for i in $(seq 1 24); do
+              METRICS=$(curl -fsS http://localhost:5001/api/metrics 2>/dev/null || true)
+              if echo "$METRICS" | grep -q '"worker_alive": *true' \
+                 && echo "$METRICS" | grep -q '"db_ok": *true' \
+                 && echo "$METRICS" | grep -q '"redis_ok": *true'; then
+                HEALTHY=1
+                break
+              fi
+              sleep 5
+            done
+
+            if [ "$HEALTHY" != "1" ]; then
+              echo "❌ 배포 실패: 헬스 프로브 미통과 (worker_alive/db_ok/redis_ok 중 하나 이상 false)"
+              docker compose ps
+              docker compose logs --tail=80 kis-api kis-worker
+              exit 1
+            fi
+
+            echo "✅ 헬스 프로브 통과: 전체 서비스 정상, 워커 하트비트 감지됨"
             docker compose ps
