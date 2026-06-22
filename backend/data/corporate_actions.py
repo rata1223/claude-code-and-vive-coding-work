@@ -39,7 +39,20 @@ class ActionType(str, Enum):
     SPLIT = "split"
     REVERSE_SPLIT = "reverse_split"
     CASH_DIVIDEND = "cash_dividend"
+    DIVIDEND = "cash_dividend"      # P2-01B canonical alias of CASH_DIVIDEND (same value/member)
     TICKER_CHANGE = "ticker_change"
+    UNKNOWN = "unknown"            # unsupported/unrecognized type — never valid, always fails closed
+
+
+# Action types the processor knows how to adjust. Anything outside this set
+# (e.g. ActionType.UNKNOWN, mergers, spinoffs) is fail-closed by the service:
+# apply() refuses it and the symbol stays blocked. See CorporateActionService.apply().
+SUPPORTED_ACTION_TYPES = frozenset({
+    ActionType.SPLIT,
+    ActionType.REVERSE_SPLIT,
+    ActionType.CASH_DIVIDEND,   # == ActionType.DIVIDEND (alias)
+    ActionType.TICKER_CHANGE,
+})
 
 
 class ActionStatus(str, Enum):
@@ -94,6 +107,25 @@ class CorporateActionPendingError(Exception):
         self.action = action
         super().__init__(detail or
                           f"corporate action pending for {action.symbol}: "
+                          f"{action.action_type.value} ({action.status.value})")
+
+
+class UnsupportedCorporateActionError(Exception):
+    """Raised by CorporateActionService.apply() when asked to apply an action
+    whose type is not in SUPPORTED_ACTION_TYPES (e.g. UNKNOWN / merger / spinoff)
+    or whose required fields are invalid (is_valid() is False).
+
+    Fail-closed contract: the action is NOT applied, it stays in the pending
+    registry, and the symbol therefore remains blocked by assert_tradeable().
+    Not a subclass of RuntimeError — same rationale as
+    CorporateActionPendingError (ConsecutiveFailureBreaker must not count a
+    fail-closed corporate-action hold as a broker failure).
+    """
+
+    def __init__(self, action: CorporateAction, detail: str = "") -> None:
+        self.action = action
+        super().__init__(detail or
+                          f"unsupported/invalid corporate action for {action.symbol}: "
                           f"{action.action_type.value} ({action.status.value})")
 
 
@@ -346,6 +378,33 @@ class CorporateActionApplyResult:
     position_result: Optional[PositionAdjustmentResult]
 
 
+@dataclass(frozen=True)
+class AdjustmentRecord:
+    """One immutable entry in the adjustment history — what was applied, the
+    factor used, and the before/after position snapshots so the qty/avg-price
+    change and value preservation can be audited in-process (the DB AuditLog is
+    fire-and-forget; this history is queryable synchronously via
+    CorporateActionService.history_for())."""
+    symbol: str                                   # the action's original symbol (pre-ticker-change)
+    action: CorporateAction
+    factor: AdjustmentFactor
+    position_before: Optional[PositionSnapshot]
+    position_after: Optional[PositionSnapshot]
+    cash_delta: float
+    applied_at: datetime
+
+    @property
+    def value_preserved(self) -> bool:
+        """True if the position's qty*avg_price value is unchanged by the
+        adjustment (always true for split/reverse/ticker-change; dividends move
+        value into cash_delta, not the position basis)."""
+        if self.position_before is None or self.position_after is None:
+            return True
+        before = self.position_before.qty * self.position_before.avg_price
+        after = self.position_after.qty * self.position_after.avg_price
+        return abs(after - before) <= max(1e-6, abs(before) * 1e-9)
+
+
 class CorporateActionService:
     """Single entry point: detect/register corporate actions, apply price and
     position adjustments, gate trading while an action is unconfirmed or
@@ -366,6 +425,7 @@ class CorporateActionService:
         self._audit = audit_log or AdjustmentAuditLog(db_factory=db_factory, actor=actor)
         self._lock = threading.Lock()
         self._pending: dict[str, list[CorporateAction]] = {}
+        self._history: list[AdjustmentRecord] = []
 
     def detect_from_bars(self, symbol: str, prev_bar: dict, curr_bar: dict) -> Optional[CorporateAction]:
         """Heuristic split/reverse-split detection from two consecutive raw
@@ -398,11 +458,23 @@ class CorporateActionService:
               position: Optional[PositionSnapshot] = None) -> CorporateActionApplyResult:
         """Compute the AdjustmentFactor for `action` and apply it to `bars`
         (new list, raw bars untouched) and/or `position` (new snapshot).
-        Removes `action` from the pending registry and persists EVENT_APPLIED."""
+        Removes `action` from the pending registry, appends an AdjustmentRecord
+        to the history, and persists EVENT_APPLIED.
+
+        Fail-closed: if `action`'s type is not in SUPPORTED_ACTION_TYPES (UNKNOWN,
+        merger, spinoff, …) or its required fields are invalid, the action is
+        NOT applied — it stays pending (so the symbol remains blocked), an
+        EVENT_BLOCKED audit row is written, and UnsupportedCorporateActionError
+        is raised."""
+        if action.action_type not in SUPPORTED_ACTION_TYPES or not action.is_valid():
+            blocked = action.classified()
+            self._audit.record_blocked(blocked)
+            raise UnsupportedCorporateActionError(blocked)
         factor = self._price.factor_for(action)
         adjusted_bars = self._price.adjust_bars(bars, factor) if bars is not None else None
         position_result = self._position.adjust(position, factor) if position is not None else None
         self._remove_pending(action)
+        self._record_history(action, factor, position, position_result)
         self._audit.record_applied(action, position_result)
         return CorporateActionApplyResult(action=action, factor=factor,
                                            adjusted_bars=adjusted_bars, position_result=position_result)
@@ -434,12 +506,26 @@ class CorporateActionService:
             raise
 
     def reset(self, symbol: Optional[str] = None) -> None:
-        """Clear pending actions (all symbols if `symbol` is None)."""
+        """Clear pending actions (all symbols if `symbol` is None). Does NOT
+        clear the applied-adjustment history — use clear_history() for that."""
         with self._lock:
             if symbol is None:
                 self._pending.clear()
             else:
                 self._pending.pop(symbol, None)
+
+    def history_for(self, symbol: Optional[str] = None) -> list[AdjustmentRecord]:
+        """Return the applied-adjustment history (chronological). With `symbol`,
+        only records whose action originally targeted that symbol (matched on the
+        pre-ticker-change symbol). Returns a copy; safe to iterate."""
+        with self._lock:
+            if symbol is None:
+                return list(self._history)
+            return [r for r in self._history if r.symbol == symbol]
+
+    def clear_history(self) -> None:
+        with self._lock:
+            self._history.clear()
 
     def _add_pending(self, action: CorporateAction) -> None:
         with self._lock:
@@ -450,3 +536,18 @@ class CorporateActionService:
             lst = self._pending.get(action.symbol)
             if lst and action in lst:
                 lst.remove(action)
+
+    def _record_history(self, action: CorporateAction, factor: AdjustmentFactor,
+                        position_before: Optional[PositionSnapshot],
+                        position_result: Optional[PositionAdjustmentResult]) -> None:
+        record = AdjustmentRecord(
+            symbol=action.symbol,
+            action=action,
+            factor=factor,
+            position_before=position_before,
+            position_after=position_result.position if position_result is not None else None,
+            cash_delta=position_result.cash_delta if position_result is not None else 0.0,
+            applied_at=datetime.utcnow(),
+        )
+        with self._lock:
+            self._history.append(record)

@@ -621,3 +621,180 @@ class TestCorporateActionService:
         action = svc.detect_from_bars("AAPL", _bar(close=100.0), _bar(close=50.0))
         svc.apply(action)
         assert svc.pending_for("AAPL") == []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TASK P2-01B additions: DIVIDEND alias, UNKNOWN type, fail-closed apply,
+# adjustment history
+# ─────────────────────────────────────────────────────────────────────────────
+
+from backend.data.corporate_actions import (  # noqa: E402
+    AdjustmentRecord,
+    SUPPORTED_ACTION_TYPES,
+    UnsupportedCorporateActionError,
+)
+
+
+class TestActionTypeP2_01B:
+    def test_dividend_is_alias_of_cash_dividend(self):
+        # Task P2-01B uses the name DIVIDEND; the shipped enum member is
+        # CASH_DIVIDEND. They must be the same member (same wire value).
+        assert ActionType.DIVIDEND is ActionType.CASH_DIVIDEND
+        assert ActionType.DIVIDEND.value == "cash_dividend"
+        assert ActionType("cash_dividend") is ActionType.CASH_DIVIDEND
+
+    def test_unknown_action_type_exists_and_is_unsupported(self):
+        assert ActionType.UNKNOWN.value == "unknown"
+        assert ActionType.UNKNOWN not in SUPPORTED_ACTION_TYPES
+
+    def test_unknown_action_is_never_valid(self):
+        action = CorporateAction(action_type=ActionType.UNKNOWN, symbol="AAPL",
+                                   effective_date=_EFF, ratio=2.0, cash_amount=1.0,
+                                   new_symbol="NEW")
+        # Even with every field populated, an UNKNOWN type is not valid.
+        assert action.is_valid() is False
+
+    def test_supported_action_types_are_the_four_real_ones(self):
+        assert SUPPORTED_ACTION_TYPES == frozenset({
+            ActionType.SPLIT, ActionType.REVERSE_SPLIT,
+            ActionType.CASH_DIVIDEND, ActionType.TICKER_CHANGE,
+        })
+
+    def test_dividend_alias_constructs_valid_action(self):
+        action = CorporateAction(action_type=ActionType.DIVIDEND, symbol="AAPL",
+                                   effective_date=_EFF, cash_amount=2.0)
+        assert action.is_valid() is True
+        assert action.action_type == ActionType.CASH_DIVIDEND
+
+
+class TestFailClosedApply:
+    def test_apply_unknown_type_raises_and_stays_pending(self):
+        factory = _sqlite_factory()
+        svc = CorporateActionService(db_factory=factory)
+        action = CorporateAction(action_type=ActionType.UNKNOWN, symbol="AAPL",
+                                   effective_date=_EFF)
+        svc.register_action(action)  # lands in pending (registered)
+
+        position = PositionSnapshot(symbol="AAPL", qty=100, avg_price=100.0)
+        with pytest.raises(UnsupportedCorporateActionError) as exc_info:
+            svc.apply(action, position=position)
+
+        # fail-closed: still pending (symbol stays blocked), nothing applied.
+        # (register_action stored the classified() copy, so compare by type/symbol,
+        # not object identity.)
+        still_pending = svc.pending_for("AAPL")
+        assert len(still_pending) == 1
+        assert still_pending[0].action_type == ActionType.UNKNOWN
+        assert svc.history_for("AAPL") == []
+        assert _count_audit(factory, AdjustmentAuditLog.EVENT_BLOCKED) == 1
+        assert _count_audit(factory, AdjustmentAuditLog.EVENT_APPLIED) == 0
+        assert exc_info.value.action.action_type == ActionType.UNKNOWN
+
+    def test_apply_invalid_split_without_ratio_fails_closed(self):
+        svc = CorporateActionService()
+        action = CorporateAction(action_type=ActionType.SPLIT, symbol="AAPL",
+                                   effective_date=_EFF)  # missing ratio -> invalid
+        with pytest.raises(UnsupportedCorporateActionError):
+            svc.apply(action, position=PositionSnapshot("AAPL", 10, 100.0))
+        assert svc.history_for("AAPL") == []
+
+    def test_unsupported_error_is_not_runtime_error(self):
+        action = CorporateAction(action_type=ActionType.UNKNOWN, symbol="AAPL",
+                                   effective_date=_EFF)
+        exc = UnsupportedCorporateActionError(action)
+        assert not isinstance(exc, RuntimeError)
+        assert exc.action is action
+
+    def test_apply_chain_fails_closed_midway(self):
+        svc = CorporateActionService()
+        good = CorporateAction(action_type=ActionType.SPLIT, symbol="AAPL",
+                                 effective_date=_EFF, ratio=2.0)
+        bad = CorporateAction(action_type=ActionType.UNKNOWN, symbol="AAPL",
+                                effective_date=_EFF)
+        position = PositionSnapshot(symbol="AAPL", qty=100, avg_price=100.0)
+        with pytest.raises(UnsupportedCorporateActionError):
+            svc.apply_chain([good, bad], position=position)
+        # the good split was applied and recorded before the bad one halted the chain
+        assert len(svc.history_for("AAPL")) == 1
+
+
+class TestAdjustmentHistory:
+    def test_split_apply_records_history_with_before_after(self):
+        svc = CorporateActionService()
+        action = CorporateAction(action_type=ActionType.SPLIT, symbol="AAPL",
+                                   effective_date=_EFF, ratio=2.0)
+        position = PositionSnapshot(symbol="AAPL", qty=100, avg_price=100.0)
+        svc.apply(action, position=position)
+
+        history = svc.history_for("AAPL")
+        assert len(history) == 1
+        rec = history[0]
+        assert isinstance(rec, AdjustmentRecord)
+        assert rec.position_before == position
+        assert rec.position_after.qty == 200
+        assert rec.position_after.avg_price == 50.0
+        assert rec.cash_delta == 0.0
+        assert rec.value_preserved is True
+
+    def test_dividend_history_carries_cash_delta_and_preserves_value(self):
+        svc = CorporateActionService()
+        action = CorporateAction(action_type=ActionType.DIVIDEND, symbol="AAPL",
+                                   effective_date=_EFF, cash_amount=1.0)
+        position = PositionSnapshot(symbol="AAPL", qty=100, avg_price=150.0)
+        svc.apply(action, position=position)
+
+        rec = svc.history_for("AAPL")[0]
+        assert rec.cash_delta == 100.0
+        assert rec.position_after.qty == 100
+        assert rec.position_after.avg_price == 150.0
+        assert rec.value_preserved is True
+
+    def test_history_without_position_is_recorded(self):
+        svc = CorporateActionService()
+        action = CorporateAction(action_type=ActionType.SPLIT, symbol="AAPL",
+                                   effective_date=_EFF, ratio=2.0)
+        svc.apply(action, bars=[_bar(close=100.0)])
+        rec = svc.history_for("AAPL")[0]
+        assert rec.position_before is None
+        assert rec.position_after is None
+        assert rec.value_preserved is True  # vacuously preserved when no position
+
+    def test_history_for_filters_by_symbol_and_global_returns_all(self):
+        svc = CorporateActionService()
+        svc.apply(CorporateAction(action_type=ActionType.SPLIT, symbol="AAPL",
+                                    effective_date=_EFF, ratio=2.0))
+        svc.apply(CorporateAction(action_type=ActionType.SPLIT, symbol="MSFT",
+                                    effective_date=_EFF, ratio=3.0))
+        assert len(svc.history_for("AAPL")) == 1
+        assert len(svc.history_for("MSFT")) == 1
+        assert len(svc.history_for()) == 2
+
+    def test_ticker_change_history_keyed_on_original_symbol(self):
+        svc = CorporateActionService()
+        action = CorporateAction(action_type=ActionType.TICKER_CHANGE, symbol="OLD",
+                                   effective_date=_EFF, new_symbol="NEW")
+        position = PositionSnapshot(symbol="OLD", qty=10, avg_price=50.0)
+        svc.apply(action, position=position)
+        # history is keyed on the pre-change symbol
+        assert len(svc.history_for("OLD")) == 1
+        assert svc.history_for("NEW") == []
+        assert svc.history_for("OLD")[0].position_after.symbol == "NEW"
+
+    def test_chain_records_one_history_entry_per_applied_action(self):
+        svc = CorporateActionService()
+        split = CorporateAction(action_type=ActionType.SPLIT, symbol="AAPL",
+                                  effective_date=_EFF, ratio=2.0)
+        dividend = CorporateAction(action_type=ActionType.DIVIDEND, symbol="AAPL",
+                                     effective_date=_EFF, cash_amount=1.0)
+        position = PositionSnapshot(symbol="AAPL", qty=100, avg_price=100.0)
+        svc.apply_chain([split, dividend], position=position)
+        assert len(svc.history_for("AAPL")) == 2
+
+    def test_reset_keeps_history_clear_history_empties_it(self):
+        svc = CorporateActionService()
+        svc.apply(CorporateAction(action_type=ActionType.SPLIT, symbol="AAPL",
+                                    effective_date=_EFF, ratio=2.0))
+        svc.reset()
+        assert len(svc.history_for("AAPL")) == 1  # reset does not touch history
+        svc.clear_history()
+        assert svc.history_for("AAPL") == []
