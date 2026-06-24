@@ -57,7 +57,7 @@ broker, labeled `reconcile_fix_qty`. A split is absorbed silently and indistingu
 
 **Designed behavior:** before the absorb, the reconciler asks the service to **classify** the jump:
 
-```
+```text
 classification = service.classify_broker_jump(
     symbol, db_qty, db_avg, broker_qty, broker_avg, broker_name)
 ```
@@ -111,11 +111,11 @@ fail-open, P2-02A finding 6 / F-7).
 
 ## 3. Pending-action lifecycle (state machine)
 
-```
+```text
             detect (heuristic / reconcile signature / external feed)
                                    │
                                    ▼
-   ┌────────── DETECTED (pending, BLOCKS) ──────────┐
+   ┌────────── PENDING (BLOCKS) ────────────────────┐
    │                                                │ value-not-preserved
    │ confirm (value-preserving known ratio,         │ or unknown ratio
    │ or external announcement)                      ▼
@@ -126,6 +126,11 @@ CONFIRMED (BLOCKS) ── apply (broker already adjusted) ──► APPLIED
    │
    └── operator dismiss ──► DISMISSED (audited)
 ```
+
+The node names are the persisted `corporate_actions.status` values defined in §7
+(`pending` / `confirmed` / `applied` / `unknown` / `dismissed`). **Detection is the transition that
+creates the `pending` row** — it emits the `EVENT_DETECTED` audit event (§7), it is not a separate
+status. (`PENDING` was labeled `DETECTED` in an earlier draft; renamed here to match the schema.)
 
 - **BLOCKS** = `assert_tradeable()` raises for that symbol.
 - **APPLIED** does not move qty/avg (the broker/reconciler already did); it records the
