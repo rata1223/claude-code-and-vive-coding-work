@@ -73,11 +73,13 @@ class StartupRecovery:
     완료 후 SAFE_MODE.enable() 호출.
     """
 
-    def __init__(self, db_session_factory, redis_client=None, broker=None, poller=None):
+    def __init__(self, db_session_factory, redis_client=None, broker=None, poller=None,
+                 ca_runtime=None):
         self._factory = db_session_factory
         self._redis = redis_client
         self._broker = broker
         self._shared_poller = poller  # Worker's poller — avoid creating a second one
+        self._ca_runtime = ca_runtime  # P2-02C: CorporateActionRuntime (optional)
         self._actions: list[ReconcileAction] = []
 
     def run(self) -> bool:
@@ -204,7 +206,17 @@ class StartupRecovery:
                 db_factory=self._factory,
                 redis_client=r,
                 broker_name="kis",
+                ca_runtime=self._ca_runtime,  # P2-02C: classify splits during startup reconcile
             ).reconcile("startup")
+            # P2-02C: rebuild the corporate-action gate from the DB so a pending/UNKNOWN
+            # action persisted before the restart still blocks trading (fail-closed).
+            if self._ca_runtime is not None:
+                try:
+                    n = self._ca_runtime.restore_pending()
+                    if n:
+                        logger.info("기업행위 게이트 복원: %d개", n)
+                except Exception as exc:
+                    logger.warning("기업행위 게이트 복원 실패: %s", exc)
             # Populate _actions from reconcile result for observability
             for gap in result.gaps:
                 self._actions.append(ReconcileAction(

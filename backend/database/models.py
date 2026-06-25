@@ -136,6 +136,57 @@ class AuditLog(Base):
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
 
 
+class CorporateAction(Base):
+    """Persisted corporate-action record (P2-02C runtime integration).
+
+    Survives restart so the trading gate is fail-closed across reboots. The
+    (broker, symbol, effective_date, action_type) unique key makes recording
+    idempotent — the periodic reconciler cannot insert the same split twice.
+
+    NOTE: this is the *runtime persistence* row. The pure in-memory model lives
+    in ``backend.data.corporate_actions.CorporateAction`` (a frozen dataclass);
+    the names intentionally match the domain concept across the two layers.
+    """
+    __tablename__ = "corporate_actions"
+    __table_args__ = (
+        UniqueConstraint("broker", "symbol", "effective_date", "action_type",
+                         name="uq_corporate_action"),
+    )
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    broker = Column(String(10), nullable=False, default="kis", index=True)
+    symbol = Column(String(20), nullable=False, index=True)
+    action_type = Column(String(20), nullable=False)  # split/reverse_split/cash_dividend/ticker_change/unknown
+    effective_date = Column(Date, nullable=False)
+    status = Column(String(20), nullable=False, default="pending", index=True)  # pending/confirmed/applied/unknown/dismissed
+    ratio = Column(Float, nullable=True)
+    cash_amount = Column(Float, nullable=True)
+    new_symbol = Column(String(20), nullable=True)
+    source = Column(String(40), nullable=True)  # reconcile_signature/price_jump_heuristic/external/manual
+    detail = Column(Text, nullable=True)
+    detected_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    applied_at = Column(DateTime, nullable=True)
+
+
+class CorporateActionHistory(Base):
+    """Append-only adjustment history — one immutable row per applied corporate
+    action, recording the broker-resolved before/after position basis so the
+    qty/avg change and value preservation can be audited (P2-02C)."""
+    __tablename__ = "corporate_action_history"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    corporate_action_id = Column(Integer, nullable=True, index=True)
+    broker = Column(String(10), nullable=False, default="kis")
+    symbol = Column(String(20), nullable=False, index=True)  # original (pre-ticker-change) symbol
+    action_type = Column(String(20), nullable=False)
+    qty_before = Column(Float, nullable=True)
+    avg_before = Column(Float, nullable=True)
+    qty_after = Column(Float, nullable=True)
+    avg_after = Column(Float, nullable=True)
+    cash_delta = Column(Float, nullable=False, default=0.0)
+    value_preserved = Column(Boolean, nullable=False, default=True)
+    applied_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+    actor = Column(String(50), nullable=True)
+
+
 def init_db(db_url: str) -> Session:
     engine = create_engine(db_url, echo=False)
     Base.metadata.create_all(engine)
