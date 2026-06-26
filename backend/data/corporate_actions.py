@@ -271,6 +271,54 @@ class CorporateActionDetector:
                                         detail=f"price ratio {ratio:.4f} ~ {r}")
         return None
 
+    def classify_quantity_jump(self, symbol: str, db_qty: float, db_avg: float,
+                                broker_qty: float, broker_avg: float,
+                                effective_date: date,
+                                value_tolerance: float = 0.01) -> CorporateAction:
+        """Classify a broker↔DB *quantity* jump (used by the reconciler, P2-02C).
+
+        Returns a CONFIRMED SPLIT/REVERSE_SPLIT only when the quantity ratio
+        matches a known split signature **and** position book value is preserved
+        (``db_qty*db_avg ≈ broker_qty*broker_avg`` within ``value_tolerance``).
+        Anything else — unknown ratio, or a ratio match whose value is NOT
+        preserved (e.g. a partial fill masquerading as a split) — is classified
+        UNKNOWN so the caller fails closed. Never returns None; the broker is the
+        value authority, this only *labels* the jump."""
+        detail = f"db_qty={db_qty} broker_qty={broker_qty} db_avg={db_avg} broker_avg={broker_avg}"
+        if db_qty and broker_qty and db_qty > 0 and broker_qty > 0:
+            ratio = broker_qty / db_qty
+            matched_type = None
+            matched_ratio = None
+            for r in _KNOWN_RATIOS:
+                if abs(ratio - r) <= self._tolerance * r:
+                    matched_type, matched_ratio = ActionType.SPLIT, float(r)
+                    break
+                inv = 1.0 / r
+                if abs(ratio - inv) <= self._tolerance * inv:
+                    matched_type, matched_ratio = ActionType.REVERSE_SPLIT, float(inv)
+                    break
+            if matched_type is not None:
+                value_before = db_qty * db_avg
+                value_after = broker_qty * broker_avg
+                preserved = abs(value_after - value_before) <= max(1e-6, abs(value_before) * value_tolerance)
+                if preserved:
+                    return CorporateAction(
+                        action_type=matched_type, symbol=symbol,
+                        effective_date=effective_date, status=ActionStatus.CONFIRMED,
+                        ratio=matched_ratio, source="reconcile_signature",
+                        detail=f"qty ratio {ratio:.4f}; {detail}")
+                # ratio matches but value not preserved → suspicious, fail closed
+                return CorporateAction(
+                    action_type=ActionType.UNKNOWN, symbol=symbol,
+                    effective_date=effective_date, status=ActionStatus.UNKNOWN,
+                    source="reconcile_signature",
+                    detail=f"qty ratio {ratio:.4f} matched but value NOT preserved; {detail}")
+        return CorporateAction(
+            action_type=ActionType.UNKNOWN, symbol=symbol,
+            effective_date=effective_date, status=ActionStatus.UNKNOWN,
+            source="reconcile_signature",
+            detail=f"no known split signature; {detail}")
+
 
 # ─────────────────────────────────────────────────────────────────
 # 5. AdjustmentAuditLog
@@ -453,6 +501,17 @@ class CorporateActionService:
     def pending_for(self, symbol: str) -> list[CorporateAction]:
         with self._lock:
             return list(self._pending.get(symbol, []))
+
+    def restore_pending(self, actions: Iterable[CorporateAction]) -> int:
+        """Restore pending/blocking actions into the in-memory registry without
+        re-auditing or re-persisting — used by the runtime to rebuild gate state
+        from the DB after a restart (P2-02C). Returns the count restored."""
+        n = 0
+        with self._lock:
+            for action in actions:
+                self._pending.setdefault(action.symbol, []).append(action)
+                n += 1
+        return n
 
     def apply(self, action: CorporateAction, bars: Optional[list[dict]] = None,
               position: Optional[PositionSnapshot] = None) -> CorporateActionApplyResult:

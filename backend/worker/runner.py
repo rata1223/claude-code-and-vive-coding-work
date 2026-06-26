@@ -197,12 +197,20 @@ class StrategyWorker:
         self._heartbeat = WorkerHeartbeat(self._redis)
         self._heartbeat.start()
 
+        # Corporate-action runtime — one detector/recorder/gate shared across the
+        # reconciler, the per-strategy position trackers, and startup recovery, so
+        # there is exactly one corporate-action gate per worker (P2-02C).
+        from backend.data.corporate_action_runtime import CorporateActionRuntime
+        self._ca_runtime = CorporateActionRuntime(
+            db_factory=_get_session_factory(), broker="kis")
+
         # Reconciler — startup + periodic position/order reconciliation
         self._reconciler = PositionReconciler(
             broker=get_kis_broker(),
             db_factory=_get_session_factory(),
             redis_client=self._redis,
             poller=self._poller,
+            ca_runtime=self._ca_runtime,
         )
 
     def run(self):
@@ -385,7 +393,7 @@ class StrategyWorker:
             return None
 
         machine = OrderStateMachine(on_state_change=lambda o: self._persist_order(o))
-        tracker = PositionTracker(machine)
+        tracker = PositionTracker(machine, corporate_action_runtime=self._ca_runtime)
         run_id = data.get("run_id", 0)
 
         on_filled_cb = self._make_fill_callback(tracker, machine, run_id)
@@ -806,6 +814,7 @@ def main():
         redis_client=r_client,
         broker=broker,
         poller=worker._poller,
+        ca_runtime=worker._ca_runtime,  # P2-02C: same gate the worker uses
     )
     if not recovery.run():
         logger.critical("복구 실패 — Worker SafeMode로 계속 실행")

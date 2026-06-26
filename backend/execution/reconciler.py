@@ -99,13 +99,17 @@ class PositionReconciler:
     _STALE_MIN_AGE_HOURS = 1.0
 
     def __init__(self, broker: BrokerAdapter, db_factory: Callable,
-                 redis_client=None, poller=None, broker_name: str = "kis"):
+                 redis_client=None, poller=None, broker_name: str = "kis",
+                 ca_runtime=None):
         self._broker = broker
         self._factory = db_factory
         self._redis = redis_client
         self._poller = poller  # OrderFillPoller: register re-discovered pending orders
         self._broker_name = broker_name
         self._reconcile_lock = threading.Lock()
+        # P2-02C: optional CorporateActionRuntime (detector/recorder/gate). When None,
+        # reconciliation behaves exactly as before — this hook is purely additive.
+        self._ca_runtime = ca_runtime
 
     # ── Public API ────────────────────────────────────────────────────────
 
@@ -169,6 +173,12 @@ class PositionReconciler:
         from backend.database.models import Position as DBPosition
 
         with _session(self._factory) as db:
+            # P2-02C: CONFIRMED corporate actions detected during this run. We
+            # record() (gate) them inline but DEFER mark_applied() — which clears
+            # the gate + writes applied history — until AFTER the position commit
+            # succeeds, so a failed commit can never leave a CA marked applied
+            # while DB qty/avg is still stale.
+            confirmed_cas: list[dict] = []
             db_rows = db.query(DBPosition).filter(
                 DBPosition.broker == self._broker_name
             ).all()
@@ -209,15 +219,36 @@ class PositionReconciler:
 
                     if qty_diff > self._QTY_TOLERANCE:
                         if self._has_pending_order(sym, db):
+                            # P2-02C: an in-flight fill must not be misread as a CA — defer.
                             result.gap("qty_mismatch_pending", sym,
                                        f"DB qty={dp['qty']} vs 브로커 qty={bp.qty} "
                                        f"— 미체결 주문 있음, 수정 보류")
                         else:
-                            result.gap("qty_mismatch", sym,
-                                       f"DB qty={dp['qty']} vs 브로커 qty={bp.qty}")
+                            # P2-02C: classify the broker jump (corporate action vs anomaly)
+                            # BEFORE the existing absorb. The reconciler remains the SOLE writer
+                            # of position qty/avg — the CA runtime only labels/records/gates.
+                            ca_action = None
+                            ca_confirmed = False
+                            if self._ca_runtime is not None:
+                                ca_action = self._ca_runtime.classify_broker_jump(
+                                    sym, dp["qty"], dp["avg_price"], bp.qty, bp.avg_price)
+                                ca_confirmed = ca_action.status.value == "confirmed"
+                            gap_kind = "qty_mismatch"
+                            if ca_action is not None:
+                                gap_kind = ("qty_corporate_action" if ca_confirmed
+                                            else "qty_corporate_action_unknown")
+                            result.gap(gap_kind, sym,
+                                       f"DB qty={dp['qty']} vs 브로커 qty={bp.qty}"
+                                       + (f" [{ca_action.action_type.value}/{ca_action.status.value}]"
+                                          if ca_action is not None else ""))
                             if not dry_run:
+                                # Record the corporate action: persists + gates (UNKNOWN → blocks,
+                                # fail-closed; CONFIRMED split → cleared below once broker value applied).
+                                if self._ca_runtime is not None and ca_action is not None:
+                                    self._ca_runtime.record(ca_action)
                                 self._audit_position_change(
-                                    "reconcile_fix_qty", sym,
+                                    "reconcile_corporate_action" if ca_confirmed else "reconcile_fix_qty",
+                                    sym,
                                     {"db_qty": dp["qty"], "broker_qty": bp.qty,
                                      "db_avg": dp["avg_price"], "broker_avg": bp.avg_price,
                                      "broker_name": self._broker_name, "trigger": result.trigger},
@@ -229,6 +260,16 @@ class PositionReconciler:
                                     row.updated_at = datetime.utcnow()
                                 result.repaired("fix_qty", sym,
                                                 f"DB qty {dp['qty']}→{bp.qty}")
+                                # CONFIRMED corporate action: broker has already adjusted the
+                                # position value. Defer mark_applied() until after db.commit()
+                                # (collected here) so the gate is cleared / history written only
+                                # once the position write is durable.
+                                if self._ca_runtime is not None and ca_confirmed:
+                                    confirmed_cas.append({
+                                        "action": ca_action, "qty_before": dp["qty"],
+                                        "avg_before": dp["avg_price"], "qty_after": bp.qty,
+                                        "avg_after": bp.avg_price,
+                                    })
                     elif price_changed and qty_diff <= self._QTY_TOLERANCE:
                         # avg_price drift only — always safe to fix
                         if not dry_run:
@@ -275,6 +316,14 @@ class PositionReconciler:
 
             if not dry_run:
                 db.commit()
+                # Position writes are now durable — only NOW clear the CA gate and
+                # write applied history for each confirmed corporate action. If the
+                # commit above raised, execution never reaches here, so the symbol
+                # stays gated by the earlier record() (fail closed).
+                for ca in confirmed_cas:
+                    self._ca_runtime.mark_applied(
+                        ca["action"], qty_before=ca["qty_before"], avg_before=ca["avg_before"],
+                        qty_after=ca["qty_after"], avg_after=ca["avg_after"], value_preserved=True)
 
     def _has_pending_order(self, symbol: str, db) -> bool:
         """Return True if there is any open order for this symbol and broker."""

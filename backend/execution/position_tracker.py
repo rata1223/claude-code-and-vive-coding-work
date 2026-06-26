@@ -31,11 +31,15 @@ class PositionTracker:
     Thread-safe: RLock guards all mutations of _positions and _pending_symbols.
     """
 
-    def __init__(self, machine: OrderStateMachine):
+    def __init__(self, machine: OrderStateMachine, corporate_action_runtime=None):
         self._machine = machine
         self._positions: dict[str, Position] = {}  # symbol → Position
         self._pending_symbols: dict[str, float] = {}  # symbol → lock_timestamp
         self._lock = threading.RLock()
+        # P2-02C: optional CorporateActionRuntime. When a symbol has a blocking
+        # corporate action (pending/UNKNOWN), order entry is refused (fail-closed).
+        # None → behavior unchanged. The tracker NEVER adjusts positions itself.
+        self._ca = corporate_action_runtime
 
     # ── 포지션 조회 ────────────────────────────────────────────────────────
     def get_position(self, symbol: str) -> Optional[Position]:
@@ -48,6 +52,8 @@ class PositionTracker:
 
     # ── 중복 주문 방지 ────────────────────────────────────────────────────
     def can_place_order(self, symbol: str) -> bool:
+        if self._ca_blocked(symbol):
+            return False
         with self._lock:
             ts = self._pending_symbols.get(symbol)
             if ts is None:
@@ -59,12 +65,32 @@ class PositionTracker:
             return False
 
     def try_mark_pending(self, symbol: str) -> bool:
-        """Atomically check and set pending lock. Returns False if already locked (race-safe)."""
+        """Atomically check and set pending lock. Returns False if already locked (race-safe)
+        or if a corporate action is blocking the symbol (fail-closed, P2-02C)."""
+        if self._ca_blocked(symbol):
+            return False
         with self._lock:
             ts = self._pending_symbols.get(symbol)
             if ts is not None and time.monotonic() - ts <= _PENDING_LOCK_TTL:
                 return False
             self._pending_symbols[symbol] = time.monotonic()
+            return True
+
+    def _ca_blocked(self, symbol: str) -> bool:
+        """True if a corporate action gates this symbol. When no CA runtime is
+        attached, never blocks. When the gate check itself errors we **fail
+        closed** — block the order — because an unverifiable gate must not
+        silently enable trading on a symbol that may have an open corporate
+        action."""
+        if self._ca is None:
+            return False
+        try:
+            if self._ca.is_blocked(symbol):
+                logger.warning("주문 차단 — 기업행위 대기 중: %s", symbol)
+                return True
+            return False
+        except Exception as exc:  # noqa: BLE001 - fail closed on any gate-check error
+            logger.warning("기업행위 게이트 확인 오류 — 안전을 위해 주문 차단 (%s): %s", symbol, exc)
             return True
 
     def mark_pending(self, symbol: str, order_id: str):
