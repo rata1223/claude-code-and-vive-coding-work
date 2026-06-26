@@ -77,9 +77,11 @@ class PositionTracker:
             return True
 
     def _ca_blocked(self, symbol: str) -> bool:
-        """True if a corporate action gates this symbol. Never raises — a runtime
-        failure must not silently *enable* trading, but it also must not crash the
-        order path; we log and treat it as not-blocked only when the gate is absent."""
+        """True if a corporate action gates this symbol. When no CA runtime is
+        attached, never blocks. When the gate check itself errors we **fail
+        closed** — block the order — because an unverifiable gate must not
+        silently enable trading on a symbol that may have an open corporate
+        action."""
         if self._ca is None:
             return False
         try:
@@ -87,9 +89,9 @@ class PositionTracker:
                 logger.warning("주문 차단 — 기업행위 대기 중: %s", symbol)
                 return True
             return False
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.warning("기업행위 게이트 확인 오류 (%s): %s", symbol, exc)
-            return False
+        except Exception as exc:  # noqa: BLE001 - fail closed on any gate-check error
+            logger.warning("기업행위 게이트 확인 오류 — 안전을 위해 주문 차단 (%s): %s", symbol, exc)
+            return True
 
     def mark_pending(self, symbol: str, order_id: str):
         with self._lock:

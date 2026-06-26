@@ -68,9 +68,13 @@ class CorporateActionRuntime:
 
     def record(self, action: CorporateAction) -> Optional[int]:
         """Register the action in the in-memory gate (blocks the symbol) and
-        upsert its DB row (idempotent on the unique key). Returns the row id."""
-        self._service.register_action(action)
-        return self._persist_action(action)
+        upsert its DB row (idempotent on the unique key). Returns the row id.
+
+        Persists the *classified* action returned by ``register_action()`` (which
+        may normalize via ``action.classified()``) so the DB row and the in-memory
+        gate — and therefore ``restore_pending()`` after a restart — stay canonical."""
+        classified = self._service.register_action(action)
+        return self._persist_action(classified)
 
     def mark_applied(self, action: CorporateAction, *, qty_before: Optional[float],
                      avg_before: Optional[float], qty_after: Optional[float],
@@ -78,11 +82,19 @@ class CorporateActionRuntime:
                      value_preserved: bool = True, actor: Optional[str] = None) -> None:
         """Clear the gate for a CONFIRMED action whose value the broker has
         already adjusted, and persist the applied status + an append-only history
-        row. Does NOT touch positions."""
+        row. Does NOT touch positions.
+
+        Atomicity: if the in-memory ``apply()`` fails, we do **not** persist the
+        applied lifecycle/history — leaving the symbol gated (fail closed) rather
+        than half-applied. If persistence later fails (it is fire-and-forget), the
+        DB row stays non-terminal, so a restart re-restores the gate — also a
+        fail-closed direction."""
         try:
             self._service.apply(action)  # clears pending + in-memory history + EVENT_APPLIED audit
-        except Exception as exc:  # invalid/unsupported never reaches here for confirmed splits
-            logger.warning("CA mark_applied service.apply 실패 (%s): %s", action.symbol, exc)
+        except Exception as exc:  # noqa: BLE001 - keep memory/DB consistent: do not persist on failure
+            logger.warning("CA mark_applied service.apply 실패 — 적용 보류 (게이트 유지) (%s): %s",
+                           action.symbol, exc)
+            return
         self._persist_applied(action, qty_before, avg_before, qty_after, avg_after,
                               cash_delta, value_preserved, actor or f"reconciler:{self._broker}")
 
@@ -107,25 +119,28 @@ class CorporateActionRuntime:
 
     def restore_pending(self) -> int:
         """Reload blocking corporate actions from the DB into the in-memory gate
-        so the symbol stays blocked across a restart. Returns count restored."""
+        so the symbol stays blocked across a restart. Returns the count restored
+        (``0`` only when the query succeeds and there is genuinely nothing to
+        restore).
+
+        Does **not** swallow DB/parse errors — it lets them propagate so the
+        caller (StartupRecovery) can fail closed. Collapsing a failed restore into
+        ``0`` would be indistinguishable from "no blocking actions" and could
+        re-enable trading after a restart with an empty gate."""
         if self._db is None:
             return 0
         actions: list[CorporateAction] = []
+        from backend.database.models import CorporateAction as CARow
+        sess = self._db()
         try:
-            from backend.database.models import CorporateAction as CARow
-            sess = self._db()
-            try:
-                rows = (sess.query(CARow)
-                        .filter(CARow.broker == self._broker,
-                                CARow.status.in_(_BLOCKING_STATUSES))
-                        .all())
-                for r in rows:
-                    actions.append(self._row_to_action(r))
-            finally:
-                sess.close()
-        except Exception as exc:
-            logger.warning("CA restore_pending 실패: %s", exc)
-            return 0
+            rows = (sess.query(CARow)
+                    .filter(CARow.broker == self._broker,
+                            CARow.status.in_(_BLOCKING_STATUSES))
+                    .all())
+            for r in rows:
+                actions.append(self._row_to_action(r))
+        finally:
+            sess.close()
         n = self._service.restore_pending(actions)
         if n:
             logger.info("CA pending 복원: %d개 (broker=%s)", n, self._broker)

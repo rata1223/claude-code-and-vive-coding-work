@@ -91,7 +91,7 @@ def test_reconciliation_after_split_records_and_converges(db_factory):
 
 def test_reconciler_is_sole_position_writer(db_factory):
     _insert_db_pos(db_factory, "AAPL", 100, 150.0)
-    rec, ca = _reconciler([_bpos("AAPL", 200, 75.0)], db_factory)
+    rec, _ca = _reconciler([_bpos("AAPL", 200, 75.0)], db_factory)
     rec.reconcile("periodic")
     # The CA runtime never wrote qty/avg — only the reconciler did. Final value is
     # exactly the broker's, proving exactly one adjustment owner.
@@ -103,7 +103,7 @@ def test_reconciler_is_sole_position_writer(db_factory):
 
 def test_no_double_adjust_across_repeated_reconciles(db_factory):
     _insert_db_pos(db_factory, "AAPL", 100, 150.0)
-    rec, ca = _reconciler([_bpos("AAPL", 200, 75.0)], db_factory)
+    rec, _ca = _reconciler([_bpos("AAPL", 200, 75.0)], db_factory)
 
     rec.reconcile("periodic")
     rec.reconcile("periodic")  # second run: DB already == broker → no jump

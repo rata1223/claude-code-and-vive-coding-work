@@ -210,13 +210,16 @@ class StartupRecovery:
             ).reconcile("startup")
             # P2-02C: rebuild the corporate-action gate from the DB so a pending/UNKNOWN
             # action persisted before the restart still blocks trading (fail-closed).
+            # If the restore cannot be confirmed, keep SafeMode disabled (return False)
+            # rather than booting with an empty gate that could re-enable trading.
             if self._ca_runtime is not None:
                 try:
                     n = self._ca_runtime.restore_pending()
                     if n:
                         logger.info("기업행위 게이트 복원: %d개", n)
                 except Exception as exc:
-                    logger.warning("기업행위 게이트 복원 실패: %s", exc)
+                    logger.error("기업행위 게이트 복원 실패 — 안전을 위해 매매 차단: %s", exc)
+                    return False
             # Populate _actions from reconcile result for observability
             for gap in result.gaps:
                 self._actions.append(ReconcileAction(
@@ -330,6 +333,7 @@ class StartupRecovery:
                             db_factory=self._factory,
                             redis_client=r,
                             broker_name="kis",
+                            ca_runtime=self._ca_runtime,  # P2-02C: same CA gate as startup reconcile
                         ).reconcile("post_recovery")
                     except Exception as ex:
                         logger.warning("post-recovery 포지션 조정 실패: %s", ex)

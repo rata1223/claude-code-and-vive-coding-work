@@ -173,6 +173,12 @@ class PositionReconciler:
         from backend.database.models import Position as DBPosition
 
         with _session(self._factory) as db:
+            # P2-02C: CONFIRMED corporate actions detected during this run. We
+            # record() (gate) them inline but DEFER mark_applied() — which clears
+            # the gate + writes applied history — until AFTER the position commit
+            # succeeds, so a failed commit can never leave a CA marked applied
+            # while DB qty/avg is still stale.
+            confirmed_cas: list[dict] = []
             db_rows = db.query(DBPosition).filter(
                 DBPosition.broker == self._broker_name
             ).all()
@@ -255,11 +261,15 @@ class PositionReconciler:
                                 result.repaired("fix_qty", sym,
                                                 f"DB qty {dp['qty']}→{bp.qty}")
                                 # CONFIRMED corporate action: broker has already adjusted the
-                                # position value, so clear the gate and write the history row.
+                                # position value. Defer mark_applied() until after db.commit()
+                                # (collected here) so the gate is cleared / history written only
+                                # once the position write is durable.
                                 if self._ca_runtime is not None and ca_confirmed:
-                                    self._ca_runtime.mark_applied(
-                                        ca_action, qty_before=dp["qty"], avg_before=dp["avg_price"],
-                                        qty_after=bp.qty, avg_after=bp.avg_price, value_preserved=True)
+                                    confirmed_cas.append({
+                                        "action": ca_action, "qty_before": dp["qty"],
+                                        "avg_before": dp["avg_price"], "qty_after": bp.qty,
+                                        "avg_after": bp.avg_price,
+                                    })
                     elif price_changed and qty_diff <= self._QTY_TOLERANCE:
                         # avg_price drift only — always safe to fix
                         if not dry_run:
@@ -306,6 +316,14 @@ class PositionReconciler:
 
             if not dry_run:
                 db.commit()
+                # Position writes are now durable — only NOW clear the CA gate and
+                # write applied history for each confirmed corporate action. If the
+                # commit above raised, execution never reaches here, so the symbol
+                # stays gated by the earlier record() (fail closed).
+                for ca in confirmed_cas:
+                    self._ca_runtime.mark_applied(
+                        ca["action"], qty_before=ca["qty_before"], avg_before=ca["avg_before"],
+                        qty_after=ca["qty_after"], avg_after=ca["avg_after"], value_preserved=True)
 
     def _has_pending_order(self, symbol: str, db) -> bool:
         """Return True if there is any open order for this symbol and broker."""

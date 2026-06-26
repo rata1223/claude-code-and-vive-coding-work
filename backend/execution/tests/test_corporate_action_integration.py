@@ -124,6 +124,37 @@ def test_tracker_without_ca_runtime_is_unchanged():
     assert tracker.try_mark_pending("AAPL") is True
 
 
+class _RaisingGateRuntime:
+    def is_blocked(self, symbol):
+        raise RuntimeError("gate runtime down")
+
+
+def test_tracker_fails_closed_when_gate_runtime_errors():
+    """If the CA gate cannot be verified, order entry must be refused (fail closed),
+    never silently allowed."""
+    tracker = PositionTracker(OrderStateMachine(),
+                              corporate_action_runtime=_RaisingGateRuntime())
+    assert tracker.can_place_order("AAPL") is False
+    assert tracker.try_mark_pending("AAPL") is False
+
+
+class _RaisingRestoreRuntime:
+    def classify_broker_jump(self, *a, **k):  # pragma: no cover - must not be called here
+        raise AssertionError("classify should not run when broker has no positions")
+    def restore_pending(self):
+        raise RuntimeError("db unavailable during restore")
+
+
+def test_recovery_fails_closed_when_gate_restore_errors(factory):
+    """A failed gate restore must keep SafeMode disabled (return False), not boot
+    with an empty gate."""
+    broker = MagicMock()
+    broker.get_positions.return_value = []
+    recovery = StartupRecovery(db_session_factory=factory, redis_client=None,
+                               broker=broker, ca_runtime=_RaisingRestoreRuntime())
+    assert recovery._step_reconcile() is False
+
+
 def test_tracker_unblocks_after_split_applied(factory):
     ca = CorporateActionRuntime(db_factory=factory, broker="kis")
     action = ca.classify_broker_jump("AAPL", 100, 150.0, 200, 75.0, _EFF)  # CONFIRMED split
