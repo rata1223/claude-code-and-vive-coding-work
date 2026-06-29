@@ -1,3 +1,25 @@
 engines:
   bandit:
     enabled: false
+
+# Exclude binary assets from analysis. The Codacy CLI's SARIF formatter reads
+# every flagged file as UTF-8 text (Files.readAllLines), which throws
+# MalformedInputException on binary bytes and aborts the whole scan with exit 1
+# (the crash is in report generation, so max-allowed-issues never applies).
+# Excluding binaries keeps them out of the results the formatter reads.
+exclude_paths:
+  - "**/*.png"
+  - "**/*.jpg"
+  - "**/*.jpeg"
+  - "**/*.gif"
+  - "**/*.ico"
+  - "**/*.webp"
+  - "**/*.jks"
+  - "**/*.keystore"
+  - "**/*.woff"
+  - "**/*.woff2"
+  - "**/*.ttf"
+  - "**/*.eot"
+  - "**/*.pdf"
+  - "**/*.zip"
+  - "**/*.jar"
