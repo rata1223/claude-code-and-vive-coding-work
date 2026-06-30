@@ -166,7 +166,7 @@ def test_corporate_action_blocks_order_entry(broker):
     h = PaperHarness(broker, corporate_action_runtime=_StubCA({"SPY"}))
     res = h.submit_order("SPY", "buy", 10, 100.0)
     assert res.order is None
-    assert res.blocked_by == "pending_or_ca"
+    assert res.blocked_by == "corporate_action"
     # 차단되지 않은 심볼은 정상 통과
     ok = h.submit_order("069500", "buy", 1, 30_000.0)
     assert ok.order is not None
