@@ -1,13 +1,23 @@
 engines:
   bandit:
     enabled: false
+  # Disabled: noisy/low-value here and (eslint/pmd) emit "No rules found" warnings.
+  eslint:
+    enabled: false
+  pmd:
+    enabled: false
+  pmd-legacy:
+    enabled: false
 
-# Exclude binary assets from analysis. The Codacy CLI's SARIF formatter reads
-# every flagged file as UTF-8 text (Files.readAllLines), which throws
-# MalformedInputException on binary bytes and aborts the whole scan with exit 1
-# (the crash is in report generation, so max-allowed-issues never applies).
-# Excluding binaries keeps them out of the results the formatter reads.
+# Exclude binaries + vendored/build dirs from analysis (hygiene; fewer files for
+# the formatter to read). NOTE: the SARIF MalformedInputException crash is a JVM
+# default-charset issue on non-ASCII (Korean) SOURCE files — the decisive fix is
+# the UTF-8 env in .github/workflows/codacy.yml, not these excludes.
 exclude_paths:
+  - "node_modules/**"
+  - "**/node_modules/**"
+  - "dist/**"
+  - "**/dist/**"
   - "**/*.png"
   - "**/*.jpg"
   - "**/*.jpeg"
