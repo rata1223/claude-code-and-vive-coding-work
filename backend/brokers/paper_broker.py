@@ -260,6 +260,28 @@ class ScriptedPaperBroker(BrokerAdapter):
 
             return replace(so.order)
 
+    def settle_all_open(self) -> int:
+        """테스트 헬퍼: 미체결(SUBMITTED/PARTIAL) 주문을 전량 즉시 체결한다.
+
+        EmergencyFlattenManager 가 제출한 매도처럼 OrderFillPoller 에 등록되지
+        않은 주문을 결제시켜 포지션 청산을 검증할 때 사용한다. 반환값은 결제된
+        주문 수."""
+        settled = 0
+        with self._lock:
+            for so in self._orders.values():
+                if so.order.status in (OrderStatus.FILLED, OrderStatus.CANCELED,
+                                       OrderStatus.REJECTED, OrderStatus.EXPIRED):
+                    continue
+                remaining = so.order.qty - so.revealed_filled
+                if remaining > 0:
+                    self._apply_to_book(so, remaining, so.order.price)
+                    so.revealed_filled = so.order.qty
+                so.order.filled_qty = so.order.qty
+                so.order.avg_fill_price = so.order.price
+                so.order.status = OrderStatus.FILLED
+                settled += 1
+        return settled
+
     # ── 내부 ────────────────────────────────────────────────────────────────
     def _pop_script(self, symbol: str, side: str) -> Optional[_Scripted]:
         q = self._scripts.get((symbol, side))

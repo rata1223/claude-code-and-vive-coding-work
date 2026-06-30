@@ -26,8 +26,11 @@ from backend.execution.order_machine import FillEvent, OrderStateMachine
 from backend.execution.order_poller import OrderFillPoller
 from backend.execution.position_tracker import Fill, PositionTracker
 from backend.risk.kill_switch import KillSwitch, OrderIntent
+from backend.testing.metrics import ValidationMetrics
 
 logger = logging.getLogger(__name__)
+
+_UNSET = object()  # submit_order(bar_ts=...) sentinel: "do not run freshness gate"
 
 
 def market_of(symbol: str) -> str:
@@ -71,10 +74,13 @@ class PaperHarness:
         db_factory: Optional[Callable] = None,
         corporate_action_runtime=None,
         kill_switch: Optional[KillSwitch] = None,
+        freshness_gate=None,
         on_state_change: Optional[Callable[[Order], None]] = None,
     ):
         self.broker = broker or ScriptedPaperBroker()
         self.db_factory = db_factory
+        self._ca = corporate_action_runtime
+        self._freshness_gate = freshness_gate
         self._external_state_cb = on_state_change
 
         self.machine = OrderStateMachine(on_state_change=self._on_state_change)
@@ -84,28 +90,45 @@ class PaperHarness:
         self.kill_switch = kill_switch or KillSwitch(db_factory=db_factory)
 
         # 관측 가능한 기록
+        self.metrics = ValidationMetrics()
         self.fills: list[FillRecord] = []
         self.realized_pnl: float = 0.0
         self.state_changes: list[tuple[str, str]] = []  # (order_id, status)
         self.timeouts: list[str] = []
         self.rejects: list[str] = []
         self.cancels: list[str] = []
+        self._counted_fills: set[str] = set()   # FILLED 1회만 successful_orders 집계
+        self._seen_signals: set[tuple] = set()   # 중복 신호 dedup 키
 
     # ── 주문 제출 (전략 buy/sell 게이트를 그대로 재현) ──────────────────────
     def submit_order(self, symbol: str, side: str, qty: int, price: float,
                      order_type: str = "limit",
-                     fill_steps=None, reject: bool = False, no_fill: bool = False) -> SubmitResult:
+                     fill_steps=None, reject: bool = False, no_fill: bool = False,
+                     bar_ts=_UNSET, tier=None, _dup_metric: str = "duplicate_orders") -> SubmitResult:
         """게이트 → 브로커 제출 → machine 등록 → poller 등록.
 
+        게이트 순서(모두 fail-closed): freshness → 중복/기업행위 → kill-switch.
         fill_steps/reject/no_fill 로 이 주문의 체결 시나리오를 스크립트한다.
+        bar_ts 를 명시하면(예: None 또는 과거 시각) freshness 게이트가 평가된다.
         """
+        # 0. 시세 신선도 게이트 (gate 가 구성되고 bar_ts 가 명시된 경우에만; fail-closed)
+        if self._freshness_gate is not None and bar_ts is not _UNSET:
+            if not self._is_fresh(symbol, bar_ts, tier):
+                self.metrics.stale_data_blocks += 1
+                return SubmitResult(order=None, blocked_by="stale_data")
+
         # 1. 중복주문 / 기업행위 게이트 (PositionTracker)
         if not self.tracker.try_mark_pending(symbol):
+            if self._ca_blocking(symbol):
+                self.metrics.corporate_action_events += 1
+                return SubmitResult(order=None, blocked_by="corporate_action")
+            setattr(self.metrics, _dup_metric, getattr(self.metrics, _dup_metric) + 1)
             return SubmitResult(order=None, blocked_by="pending_or_ca")
 
         # 2. kill-switch 게이트 (HALTED 시 NEW 차단)
         if not self.kill_switch.check_order(OrderIntent.NEW).allowed:
             self.tracker.unmark_pending(symbol)
+            self.metrics.kill_switch_blocks += 1
             return SubmitResult(order=None, blocked_by="kill_switch")
 
         # 3. 체결 스크립트 등록
@@ -121,6 +144,7 @@ class PaperHarness:
         if order.status == OrderStatus.REJECTED:
             self.tracker.unmark_pending(symbol)
             self.rejects.append(order.id)
+            self.metrics.rejected_orders += 1
             return SubmitResult(order=order)
 
         # 4. 상태머신 등록 + 폴러 등록
@@ -160,6 +184,59 @@ class PaperHarness:
             if entry is not None:
                 entry.registered_at = datetime.now(timezone.utc) - timedelta(minutes=31)
 
+    # ── 신호 레벨 진입 (중복 신호 dedup) ───────────────────────────────────
+    def submit_signal(self, symbol: str, side: str, qty: int, price: float,
+                      *, signal_key=None, **kwargs) -> SubmitResult:
+        """전략 신호 1건을 주문으로 변환. 동일 (symbol, side, signal_key) 가
+        이미 처리됐으면 중복 신호로 차단한다(idempotency 의 신호 레벨 모사).
+
+        in-flight 중복(이미 pending)은 submit_order 의 pending 게이트가 잡고
+        duplicate_signals 로 집계한다."""
+        key = (symbol, side, signal_key)
+        if key in self._seen_signals:
+            self.metrics.duplicate_signals += 1
+            return SubmitResult(order=None, blocked_by="duplicate_signal")
+        self._seen_signals.add(key)
+        return self.submit_order(symbol, side, qty, price,
+                                 _dup_metric="duplicate_signals", **kwargs)
+
+    # ── 비상 청산 (실제 EmergencyFlattenManager 사용) ──────────────────────
+    def emergency_flatten(self, *, dry_run: bool = False, reason: str = "검증",
+                          settle: bool = True) -> dict:
+        """실제 EmergencyFlattenManager 로 전 포지션 시장가 청산.
+
+        dry_run=False 면 브로커에 매도 주문이 실제 제출된다. settle=True 면
+        브로커의 미체결 주문을 모두 체결시켜 포지션이 청산됐는지 검증할 수 있다."""
+        from backend.worker.emergency import EmergencyFlattenManager
+        mgr = EmergencyFlattenManager(self.broker, db_factory=self.db_factory, dry_run=dry_run)
+        result = mgr.flatten_all(reason)
+        if not dry_run and settle:
+            self.broker.settle_all_open()
+        return result
+
+    def record_reconciliation(self, result) -> None:
+        """reconciler 결과의 갭 수를 지표에 반영."""
+        try:
+            self.metrics.reconciliation_mismatches += len(result.gaps)
+        except Exception:
+            pass
+
+    # ── 내부 게이트 헬퍼 ────────────────────────────────────────────────────
+    def _is_fresh(self, symbol: str, bar_ts, tier) -> bool:
+        from backend.data.freshness_config import FreshnessTier
+        t = tier or FreshnessTier.INTRADAY_BAR
+        result = self._freshness_gate.validate_timestamp(
+            symbol, bar_ts, tier=t, source="paper_harness", raise_on_block=False)
+        return not self._freshness_gate.is_blocking(result)
+
+    def _ca_blocking(self, symbol: str) -> bool:
+        if self._ca is None:
+            return False
+        try:
+            return bool(self._ca.is_blocked(symbol))
+        except Exception:  # fail-closed: an unverifiable gate blocks
+            return True
+
     # ── 체결 콜백 체인 (runner._make_fill_callback 미러) ────────────────────
     def _on_fill(self, order: Order) -> None:
         # poller 규약: order.filled_qty 는 '증분' 수량
@@ -167,6 +244,11 @@ class PaperHarness:
         if inc <= 0:
             return
         self.machine.process_fill(FillEvent(order.id, inc, order.avg_fill_price))
+        # 완전 체결 1회만 successful_orders 로 집계
+        m = self.machine.get(order.id)
+        if m is not None and m.status == OrderStatus.FILLED and order.id not in self._counted_fills:
+            self._counted_fills.add(order.id)
+            self.metrics.successful_orders += 1
 
         # 매도 실현손익: 포지션 평단 기준(체결 반영 전)
         realized = 0.0
@@ -183,16 +265,28 @@ class PaperHarness:
                                      order.avg_fill_price, realized))
 
     def _on_timeout(self, order: Order) -> None:
+        # 타임아웃 시 poller 가 브로커에 취소를 요청한다 → 상태머신도 CANCELED 로.
         self.timeouts.append(order.id)
+        self._terminate(order.id, OrderStatus.CANCELED)
         self.tracker.unmark_pending(order.symbol)
 
     def _on_rejected(self, order: Order) -> None:
         self.rejects.append(order.id)
+        self.metrics.rejected_orders += 1
+        self._terminate(order.id, OrderStatus.REJECTED)
         self.tracker.unmark_pending(order.symbol)
 
     def _on_canceled(self, order: Order) -> None:
         self.cancels.append(order.id)
+        self._terminate(order.id, OrderStatus.CANCELED)
         self.tracker.unmark_pending(order.symbol)
+
+    def _terminate(self, order_id: str, status: OrderStatus) -> None:
+        """상태머신을 터미널 상태로 전환(이미 터미널이면 무시)."""
+        try:
+            self.machine.transition(order_id, status)
+        except Exception:
+            pass  # 이미 터미널/등록 안 됨 — 주문 수명주기엔 영향 없음
 
     def _on_state_change(self, order: Order) -> None:
         self.state_changes.append((order.id, order.status.value))
