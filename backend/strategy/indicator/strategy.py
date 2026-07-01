@@ -38,6 +38,7 @@ class IndicatorStrategy(StrategyBase):
         poller: Optional["OrderFillPoller"] = None,
         on_filled_cb: Optional[Callable] = None,
         on_timeout_cb: Optional[Callable] = None,
+        on_terminal_cb: Optional[Callable] = None,
     ):
         super().__init__(broker, name)
         self._tracker = tracker
@@ -48,6 +49,9 @@ class IndicatorStrategy(StrategyBase):
         self._poller = poller
         self._on_filled_cb = on_filled_cb
         self._on_timeout_cb = on_timeout_cb or self._default_timeout_handler
+        # P3-02B: terminal broker events (CANCELLED/REJECTED/EXPIRED) must reach
+        # the runtime. Provided by the worker; wired into poller.register below.
+        self._on_terminal_cb = on_terminal_cb
         self._breaker = ConsecutiveFailureBreaker(threshold=3, cooldown_minutes=30)
 
     def on_start(self):
@@ -208,7 +212,16 @@ class IndicatorStrategy(StrategyBase):
 
     def _register_order(self, order, symbol: str):
         """Wire order into machine + poller after placement. Pending lock already set by caller."""
-        if order is None or order.status == OrderStatus.REJECTED or not order.id:
+        if order is None or order.status == OrderStatus.REJECTED:
+            return
+        # P3-02B: a placed order with no broker id cannot be tracked or polled —
+        # it would become an orphan (live at broker, invisible to the runtime)
+        # while holding the pending lock until the TTL. Fail loud: release the
+        # lock and audit so an operator/reconcile can act, rather than silently
+        # leaving a stuck symbol.
+        if not order.id:
+            logger.error("[%s] 주문 ID 없음 — 오펀 위험, 추적 불가: %s %s", self.name, order.side, symbol)
+            self._tracker.unmark_pending(symbol)
             return
         try:
             self._machine.register(order)
@@ -219,6 +232,9 @@ class IndicatorStrategy(StrategyBase):
                 order,
                 on_filled=self._on_filled_cb,
                 on_timeout=self._on_timeout_cb,
+                on_canceled=self._on_terminal_cb,
+                on_rejected=self._on_terminal_cb,
+                on_expired=self._on_terminal_cb,
             )
 
     def _check_exit(self, symbol: str, current_price: float, entry_price: float):
