@@ -405,6 +405,14 @@ class StrategyWorker:
         def on_terminal_cb(o):
             apply_terminal_event(machine, tracker, o, actor="poller")
 
+        # P3-02B (review Finding 1): durable audit for an untrackable order (no
+        # broker id). The strategy fails closed (keeps the pending lock); this
+        # records the orphan so reconcile/an operator can act.
+        def on_orphan_cb(symbol, o):
+            _audit("orphan_order_no_id", symbol=symbol, order_id=getattr(o, "id", "") or "",
+                   detail={"side": getattr(o, "side", None), "qty": getattr(o, "qty", None),
+                           "price": float(getattr(o, "price", 0) or 0)})
+
         def on_timeout_cb(o):
             logger.warning("주문 타임아웃 — 브로커 취소 시도: %s %s %s", o.id, o.side, o.symbol)
             try:
@@ -442,6 +450,7 @@ class StrategyWorker:
                     on_filled_cb=on_filled_cb,
                     on_timeout_cb=on_timeout_cb,
                     on_terminal_cb=on_terminal_cb,
+                    on_orphan_cb=on_orphan_cb,
                 )
             elif stype == "script":
                 from backend.strategy.script.strategy import ScriptStrategy
