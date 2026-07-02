@@ -281,8 +281,15 @@ class PaperHarness:
         transitioned = apply_terminal_event(
             self.machine, self.tracker, order, db_factory=self.db_factory)
         if transitioned:
-            self.rejects.append(order.id)
-            self.metrics.rejected_orders += 1
+            # A PARTIAL_FILLED order reported REJECTED converges to CANCELED
+            # (order_events voids only the unfilled remainder). Book it by the
+            # order's true final status, not the incoming event label.
+            final = self.machine.get(order.id)
+            if final is not None and final.status == OrderStatus.CANCELED:
+                self.cancels.append(order.id)
+            else:
+                self.rejects.append(order.id)
+                self.metrics.rejected_orders += 1
 
     def _on_canceled(self, order: Order) -> None:
         transitioned = apply_terminal_event(

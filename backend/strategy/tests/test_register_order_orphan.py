@@ -60,7 +60,7 @@ def test_valid_order_registers_normally():
 
 
 def test_rejected_order_not_registered():
-    strat, tracker, machine, poller = _make()
+    strat, _tracker, machine, poller = _make()
     order = Order(id="SIM-2", symbol="SPY", side="buy", qty=10, price=100.0,
                   status=OrderStatus.REJECTED)
     strat._register_order(order, "SPY")

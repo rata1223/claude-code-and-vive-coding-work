@@ -403,7 +403,8 @@ class StrategyWorker:
         # the poller must converge the runtime — transition the state machine and
         # release the pending lock — via the shared, idempotent handler.
         def on_terminal_cb(o):
-            apply_terminal_event(machine, tracker, o, actor="poller")
+            apply_terminal_event(machine, tracker, o, actor="poller",
+                                 db_factory=_get_session_factory())
 
         # P3-02B (review Finding 1): durable audit for an untrackable order (no
         # broker id). The strategy fails closed (keeps the pending lock); this
@@ -428,7 +429,8 @@ class StrategyWorker:
                 # Converge the machine to CANCELLED and release the lock (was:
                 # unmark only, which left the order stuck SUBMITTED — P3-02B H1).
                 apply_terminal_event(machine, tracker, o,
-                                     target_status=OrderStatus.CANCELED)
+                                     target_status=OrderStatus.CANCELED,
+                                     db_factory=_get_session_factory())
 
         self._restore_positions(tracker, broker=data.get("broker", "kis"))
         self._restore_pending_to_tracker(
@@ -695,7 +697,8 @@ class StrategyWorker:
                 # Extract scalars before the session closes (avoid DetachedInstanceError)
                 pending = [
                     {"symbol": r.symbol, "order_id": r.broker_order_id, "side": r.side,
-                     "qty": r.qty, "price": r.price or 0.0, "status": r.status}
+                     "qty": r.qty, "price": r.price or 0.0, "status": r.status,
+                     "filled_qty": r.filled_qty or 0}
                     for r in rows
                 ]
             for p in pending:
@@ -728,6 +731,7 @@ class StrategyWorker:
         border = Order(
             id=p["order_id"], symbol=p["symbol"], side=p["side"],
             qty=p["qty"], price=p["price"], status=status,
+            filled_qty=p.get("filled_qty", 0),
         )
 
         def _guarded_on_filled(order: Order):
