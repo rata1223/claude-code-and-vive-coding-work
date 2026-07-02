@@ -11,7 +11,7 @@
 |---|---|---|---|
 | **C1** | CRITICAL | CANCELLED/REJECTED/EXPIRED 브로커 이벤트가 런타임에 도달하지 않음 (poller 에 `on_canceled/on_rejected/on_expired` 미배선) | ✅ 수정 |
 | **H1** | HIGH | 타임아웃 콜백이 pending 락만 해제하고 상태머신을 전환하지 않음 | ✅ 수정 |
-| **H3** | HIGH | broker_order_id 없는 주문이 오펀(추적 불가 + pending 락 점유) | ✅ 수정(fail-loud) |
+| **H3** | HIGH | broker_order_id 없는 주문이 오펀(추적 불가 + pending 락 점유) | ✅ 수정(fail-closed + 감사) |
 | **M1** | MEDIUM | async 취소/거부 후 pending 락이 30분 TTL 까지 유지 | ✅ 즉시 해제 |
 | **H2** | HIGH | reconciler 가 DB 는 고치지만 인메모리 상태머신은 못 고침 | 🟡 잔존(아래 5) |
 | **M2/M3** | MEDIUM | reconcile 전용 체결의 손익 누락 / flatten 후 tracker 동기화 | 🟡 범위 밖(아래 5) |
@@ -33,7 +33,7 @@
 | 파일 | 변경 |
 |---|---|
 | `backend/execution/order_events.py` (신규) | `apply_terminal_event(machine, tracker, order, …)` — 멱등 공유 핸들러: 상태머신 전환 + pending 락 해제 + 감사. PARTIAL_FILLED→REJECTED 는 CANCELLED 로 수렴(체결분 보존). |
-| `backend/strategy/indicator/strategy.py` | `on_terminal_cb` 파라미터 추가, `poller.register` 에 `on_canceled/on_rejected/on_expired` 전달, broker_order_id 없는 주문 fail-loud(락 해제 + 로그). |
+| `backend/strategy/indicator/strategy.py` | `on_terminal_cb` 파라미터 추가, `poller.register` 에 `on_canceled/on_rejected/on_expired` 전달. broker_order_id 없는 주문은 **fail-closed**(pending 락 유지 → 중복 방지) + `on_orphan_cb` 감사(리뷰 Finding 1 반영). |
 | `backend/worker/runner.py` | 터미널 콜백 생성·주입(`on_terminal_cb`), 타임아웃 시 `apply_terminal_event(target=CANCELLED)` 로 상태머신 전환, 복구 경로(`_restore_pending_to_tracker`/`_register_recovered_order`)까지 배선. |
 | `backend/testing/paper_harness.py` | 터미널 콜백을 프로덕션과 동일한 `apply_terminal_event` 로 위임(하니스=런타임 경로 일치). |
 
