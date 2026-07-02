@@ -64,6 +64,7 @@ def apply_terminal_event(machine, tracker, order: Order, *,
 
     transitioned = False
     o = machine.get(order.id) if machine is not None else None
+    already_terminal = o is not None and o.status in _TERMINAL
     if o is not None and o.status not in _TERMINAL:
         # PARTIAL_FILLED can't be rejected wholesale — void the remainder.
         if status is OrderStatus.REJECTED and o.status is OrderStatus.PARTIAL_FILLED:
@@ -75,9 +76,14 @@ def apply_terminal_event(machine, tracker, order: Order, *,
             logger.warning("terminal transition 실패 %s → %s: %s",
                            order.id, status.value, e)
 
-    # Always release the pending lock (idempotent), even when the order was
-    # unknown to the machine — an orphaned pending lock is the worse failure.
-    if tracker is not None:
+    # Release the pending lock — but NOT when this order was ALREADY terminal
+    # before this call. A stale/duplicate terminal callback for a done order
+    # must not clear a lock that now belongs to a *newer* in-flight order on
+    # the same symbol (that would expose the newer order to a duplicate). We
+    # still release when we actually transitioned this order (our own lock) or
+    # when the order is unknown to the machine (orphan safety — an orphaned
+    # pending lock is the worse failure).
+    if tracker is not None and not already_terminal:
         try:
             tracker.unmark_pending(order.symbol)
         except Exception as e:
