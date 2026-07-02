@@ -269,18 +269,26 @@ class PaperHarness:
     # → 하니스가 실제 런타임 경로를 그대로 검증한다(P3-02B).
     def _on_timeout(self, order: Order) -> None:
         # 타임아웃 시 poller 가 브로커 취소를 시도 → 상태머신도 CANCELED 로 강제.
-        self.timeouts.append(order.id)
-        apply_terminal_event(self.machine, self.tracker, order,
-                             target_status=OrderStatus.CANCELED, db_factory=self.db_factory)
+        # CodeRabbit Finding A: bookkeeping은 실제 전이가 일어난 경우에만 기록한다
+        # (중복 브로커 이벤트는 apply_terminal_event 가 False 를 반환 → 중복 집계 방지).
+        transitioned = apply_terminal_event(
+            self.machine, self.tracker, order,
+            target_status=OrderStatus.CANCELED, db_factory=self.db_factory)
+        if transitioned:
+            self.timeouts.append(order.id)
 
     def _on_rejected(self, order: Order) -> None:
-        self.rejects.append(order.id)
-        self.metrics.rejected_orders += 1
-        apply_terminal_event(self.machine, self.tracker, order, db_factory=self.db_factory)
+        transitioned = apply_terminal_event(
+            self.machine, self.tracker, order, db_factory=self.db_factory)
+        if transitioned:
+            self.rejects.append(order.id)
+            self.metrics.rejected_orders += 1
 
     def _on_canceled(self, order: Order) -> None:
-        self.cancels.append(order.id)
-        apply_terminal_event(self.machine, self.tracker, order, db_factory=self.db_factory)
+        transitioned = apply_terminal_event(
+            self.machine, self.tracker, order, db_factory=self.db_factory)
+        if transitioned:
+            self.cancels.append(order.id)
 
     def _on_state_change(self, order: Order) -> None:
         self.state_changes.append((order.id, order.status.value))
