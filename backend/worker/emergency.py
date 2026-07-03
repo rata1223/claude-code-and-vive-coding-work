@@ -61,12 +61,20 @@ class EmergencyFlattenManager:
         # own int/bool/str literal, so API callers (backend/api/server.py)
         # can report a summary without any exception text flowing into an
         # HTTP response (CodeQL py/stack-trace-exposure).
-        self.last_attempted = 0
+        self._reset_last_run(attempted=0, dry_run=dry_run)
+
+    def _reset_last_run(self, attempted: int, dry_run: bool,
+                         failed_count: int = 0, status: Optional[str] = None) -> None:
+        """(Re)initialize the last-run counters at the start of each flatten_all()
+        branch, so every early-return path stays in sync without repeating the
+        six assignments verbatim. success/submitted always start at 0 here —
+        the per-position loop increments them directly as it runs."""
+        self.last_attempted = attempted
         self.last_success = 0
         self.last_submitted = 0
         self.last_dry_run = dry_run
-        self.last_failed_count = 0
-        self.last_status: Optional[str] = None
+        self.last_failed_count = failed_count
+        self.last_status = status
 
     def flatten_all(self, reason: str = "비상청산") -> dict:
         """
@@ -88,12 +96,7 @@ class EmergencyFlattenManager:
             logger.error("비상청산 이미 진행 중 — 중복 요청 거부: %s", reason)
             self._audit("emergency_flatten_rejected", detail={"reason": reason,
                         "cause": "already_in_progress"})
-            self.last_attempted = 0
-            self.last_success = 0
-            self.last_submitted = 0
-            self.last_dry_run = self._dry_run
-            self.last_failed_count = 0
-            self.last_status = "already_in_progress"
+            self._reset_last_run(attempted=0, dry_run=self._dry_run, status="already_in_progress")
             return {"attempted": 0, "success": 0, "submitted": 0,
                     "dry_run": self._dry_run, "failed": [], "status": "already_in_progress"}
         try:
@@ -110,12 +113,7 @@ class EmergencyFlattenManager:
         except Exception as e:
             logger.error("비상청산 포지션 조회 실패: %s", e)
             self._audit("emergency_flatten_positions_error", detail={"reason": reason, "error": str(e)})
-            self.last_attempted = 0
-            self.last_success = 0
-            self.last_submitted = 0
-            self.last_dry_run = self._dry_run
-            self.last_failed_count = 1
-            self.last_status = None
+            self._reset_last_run(attempted=0, dry_run=self._dry_run, failed_count=1)
             return {"attempted": 0, "success": 0, "submitted": 0,
                     "dry_run": self._dry_run, "failed": [str(e)]}
 
@@ -127,23 +125,13 @@ class EmergencyFlattenManager:
             self._audit("emergency_flatten_complete",
                         detail={"reason": reason, "attempted": 0, "success": 0,
                                 "submitted": 0, "dry_run": self._dry_run, "failed": []})
-            self.last_attempted = 0
-            self.last_success = 0
-            self.last_submitted = 0
-            self.last_dry_run = self._dry_run
-            self.last_failed_count = 0
-            self.last_status = None
+            self._reset_last_run(attempted=0, dry_run=self._dry_run)
             return {"attempted": 0, "success": 0, "submitted": 0,
                     "dry_run": self._dry_run, "failed": []}
 
         results = {"attempted": len(positions), "success": 0, "submitted": 0,
                    "dry_run": self._dry_run, "failed": []}
-        self.last_attempted = len(positions)
-        self.last_success = 0
-        self.last_submitted = 0
-        self.last_dry_run = self._dry_run
-        self.last_failed_count = 0
-        self.last_status = None
+        self._reset_last_run(attempted=len(positions), dry_run=self._dry_run)
 
         for pos in positions:
             try:
