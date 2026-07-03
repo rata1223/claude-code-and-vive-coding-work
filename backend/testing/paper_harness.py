@@ -22,6 +22,7 @@ from typing import Callable, Optional
 
 from backend.brokers.models import Order, OrderStatus
 from backend.brokers.paper_broker import ScriptedPaperBroker
+from backend.execution.order_events import apply_terminal_event
 from backend.execution.order_machine import FillEvent, OrderStateMachine
 from backend.execution.order_poller import OrderFillPoller
 from backend.execution.position_tracker import Fill, PositionTracker
@@ -264,29 +265,37 @@ class PaperHarness:
         self.fills.append(FillRecord(order.id, order.symbol, order.side, inc,
                                      order.avg_fill_price, realized))
 
+    # 터미널 콜백은 프로덕션과 동일한 공유 핸들러(apply_terminal_event)로 위임한다
+    # → 하니스가 실제 런타임 경로를 그대로 검증한다(P3-02B).
     def _on_timeout(self, order: Order) -> None:
-        # 타임아웃 시 poller 가 브로커에 취소를 요청한다 → 상태머신도 CANCELED 로.
-        self.timeouts.append(order.id)
-        self._terminate(order.id, OrderStatus.CANCELED)
-        self.tracker.unmark_pending(order.symbol)
+        # 타임아웃 시 poller 가 브로커 취소를 시도 → 상태머신도 CANCELED 로 강제.
+        # CodeRabbit Finding A: bookkeeping은 실제 전이가 일어난 경우에만 기록한다
+        # (중복 브로커 이벤트는 apply_terminal_event 가 False 를 반환 → 중복 집계 방지).
+        transitioned = apply_terminal_event(
+            self.machine, self.tracker, order,
+            target_status=OrderStatus.CANCELED, db_factory=self.db_factory)
+        if transitioned:
+            self.timeouts.append(order.id)
 
     def _on_rejected(self, order: Order) -> None:
-        self.rejects.append(order.id)
-        self.metrics.rejected_orders += 1
-        self._terminate(order.id, OrderStatus.REJECTED)
-        self.tracker.unmark_pending(order.symbol)
+        transitioned = apply_terminal_event(
+            self.machine, self.tracker, order, db_factory=self.db_factory)
+        if transitioned:
+            # A PARTIAL_FILLED order reported REJECTED converges to CANCELED
+            # (order_events voids only the unfilled remainder). Book it by the
+            # order's true final status, not the incoming event label.
+            final = self.machine.get(order.id)
+            if final is not None and final.status == OrderStatus.CANCELED:
+                self.cancels.append(order.id)
+            else:
+                self.rejects.append(order.id)
+                self.metrics.rejected_orders += 1
 
     def _on_canceled(self, order: Order) -> None:
-        self.cancels.append(order.id)
-        self._terminate(order.id, OrderStatus.CANCELED)
-        self.tracker.unmark_pending(order.symbol)
-
-    def _terminate(self, order_id: str, status: OrderStatus) -> None:
-        """상태머신을 터미널 상태로 전환(이미 터미널이면 무시)."""
-        try:
-            self.machine.transition(order_id, status)
-        except Exception:
-            pass  # 이미 터미널/등록 안 됨 — 주문 수명주기엔 영향 없음
+        transitioned = apply_terminal_event(
+            self.machine, self.tracker, order, db_factory=self.db_factory)
+        if transitioned:
+            self.cancels.append(order.id)
 
     def _on_state_change(self, order: Order) -> None:
         self.state_changes.append((order.id, order.status.value))

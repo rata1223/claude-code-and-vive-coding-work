@@ -38,6 +38,8 @@ class IndicatorStrategy(StrategyBase):
         poller: Optional["OrderFillPoller"] = None,
         on_filled_cb: Optional[Callable] = None,
         on_timeout_cb: Optional[Callable] = None,
+        on_terminal_cb: Optional[Callable] = None,
+        on_orphan_cb: Optional[Callable] = None,
     ):
         super().__init__(broker, name)
         self._tracker = tracker
@@ -48,6 +50,12 @@ class IndicatorStrategy(StrategyBase):
         self._poller = poller
         self._on_filled_cb = on_filled_cb
         self._on_timeout_cb = on_timeout_cb or self._default_timeout_handler
+        # P3-02B: terminal broker events (CANCELLED/REJECTED/EXPIRED) must reach
+        # the runtime. Provided by the worker; wired into poller.register below.
+        self._on_terminal_cb = on_terminal_cb
+        # P3-02B (review Finding 1): durable audit hook for an order that comes
+        # back with no broker id (untrackable orphan). Provided by the worker.
+        self._on_orphan_cb = on_orphan_cb
         self._breaker = ConsecutiveFailureBreaker(threshold=3, cooldown_minutes=30)
 
     def on_start(self):
@@ -208,7 +216,23 @@ class IndicatorStrategy(StrategyBase):
 
     def _register_order(self, order, symbol: str):
         """Wire order into machine + poller after placement. Pending lock already set by caller."""
-        if order is None or order.status == OrderStatus.REJECTED or not order.id:
+        if order is None or order.status == OrderStatus.REJECTED:
+            return
+        # P3-02B (review Finding 1): a placed order with no broker id cannot be
+        # tracked or polled. It may be LIVE at the broker, so we fail CLOSED —
+        # KEEP the pending lock so no duplicate order can be placed for this
+        # symbol (releasing it would trade a stuck symbol for a duplicate live
+        # position). The lock self-heals via its TTL, and position reconciliation
+        # (broker = ground truth) will surface any resulting fill. Audit durably
+        # so an operator/reconcile can act.
+        if not order.id:
+            logger.error("[%s] 주문 ID 없음 — 오펀 위험(추적 불가), pending 유지(중복 방지): %s %s",
+                         self.name, order.side, symbol)
+            if self._on_orphan_cb is not None:
+                try:
+                    self._on_orphan_cb(symbol, order)
+                except Exception as e:  # audit must never break the trading path
+                    logger.warning("[%s] 오펀 감사 콜백 오류: %s", self.name, e)
             return
         try:
             self._machine.register(order)
@@ -219,6 +243,9 @@ class IndicatorStrategy(StrategyBase):
                 order,
                 on_filled=self._on_filled_cb,
                 on_timeout=self._on_timeout_cb,
+                on_canceled=self._on_terminal_cb,
+                on_rejected=self._on_terminal_cb,
+                on_expired=self._on_terminal_cb,
             )
 
     def _check_exit(self, symbol: str, current_price: float, entry_price: float):

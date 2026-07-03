@@ -119,7 +119,7 @@ class TestRestorePendingPollerRegistration:
 
         captured = {}
 
-        def _capture_register(order, on_filled=None, on_timeout=None):
+        def _capture_register(order, on_filled=None, on_timeout=None, **_):
             captured["order"] = order
             captured["on_filled"] = on_filled
 
@@ -141,6 +141,34 @@ class TestRestorePendingPollerRegistration:
         captured["on_filled"](filled)
         on_filled_cb.assert_called_once_with(filled)
 
+    def test_recovered_order_wires_terminal_cb_and_registers_in_machine(self, patched_runner_factory):
+        """P3-02B Finding B: a recovered pending order must (a) route the poller's
+        terminal broker events (cancel/reject/expire) to on_terminal_cb, and
+        (b) be registered in the state machine so apply_terminal_event has an
+        entry to converge after a restart."""
+        f = patched_runner_factory
+        _insert_order(f, "KIS001", "005930", broker="kis")
+        poller = MagicMock()
+        worker = _bare_worker(poller=poller)
+        tracker = _tracker()
+        machine = OrderStateMachine()
+
+        captured = {}
+        poller.register.side_effect = lambda order, **kwargs: captured.update(kwargs, order=order)
+
+        on_terminal_cb = MagicMock()
+        worker._restore_pending_to_tracker(
+            tracker, broker="kis", on_filled_cb=lambda o: None, on_timeout_cb=lambda o: None,
+            on_terminal_cb=on_terminal_cb, machine=machine,
+        )
+
+        # (a) terminal broker events routed to the shared terminal callback
+        assert captured["on_canceled"] is on_terminal_cb
+        assert captured["on_rejected"] is on_terminal_cb
+        assert captured["on_expired"] is on_terminal_cb
+        # (b) recovered order registered in the state machine
+        assert machine.get("KIS001") is not None
+
     def test_guard_skips_already_filled_and_releases_lock(self, patched_runner_factory):
         f = patched_runner_factory
         # Order already FILLED in DB (recovery DB-only callback won the race)
@@ -150,7 +178,7 @@ class TestRestorePendingPollerRegistration:
         tracker = _tracker()
 
         captured = {}
-        poller.register.side_effect = lambda order, on_filled=None, on_timeout=None: captured.update(
+        poller.register.side_effect = lambda order, on_filled=None, on_timeout=None, **_: captured.update(
             on_filled=on_filled
         )
         on_filled_cb = MagicMock()
@@ -181,7 +209,7 @@ class TestRestorePendingPollerRegistration:
         tracker = _tracker()
 
         captured = {}
-        poller.register.side_effect = lambda order, on_filled=None, on_timeout=None: captured.update(
+        poller.register.side_effect = lambda order, on_filled=None, on_timeout=None, **_: captured.update(
             on_filled=on_filled
         )
         on_filled_cb = MagicMock()
