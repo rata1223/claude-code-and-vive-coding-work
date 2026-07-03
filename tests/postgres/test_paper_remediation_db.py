@@ -83,7 +83,10 @@ def test_worker_restart_after_cancel_no_stuck_pending(db_factory):
     # 취소 동기화가 끝난 상태(위 시나리오 이후)를 모사: DB 에 canceled 주문 + 포지션 없음
     _seed_order(db_factory, broker_order_id="SIM-CANCELLED", status="canceled")
 
-    # "재시작"의 pending 복원 쿼리(runner._restore_pending_to_tracker 와 동일 필터)
+    # DB 필터 계약(contract) 검증: runner._restore_pending_to_tracker 의 복원 필터
+    # (status.in_(_OPEN) + broker_order_id NOT NULL)를 그대로 미러링해, 취소 주문이
+    # 복원 대상에서 제외됨을 Postgres 상에서 고정한다. 실제 메서드 배선(콜백/머신
+    # 등록)은 backend/worker/tests/test_recovery_safety.py 의 인메모리 테스트가 커버.
     s = db_factory()
     try:
         restorable = s.query(DBOrder).filter(

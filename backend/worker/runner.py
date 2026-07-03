@@ -759,12 +759,14 @@ class StrategyWorker:
         # Register the recovered order in the state machine so terminal broker
         # events (cancel/reject/expire) observed by the poller after restart can
         # transition it — otherwise apply_terminal_event has no machine entry to
-        # converge (CodeRabbit Finding B). Idempotent: skip if already present.
-        if machine is not None:
+        # converge (CodeRabbit Finding B). register() unconditionally (re)writes
+        # the entry, so guard on get() to genuinely skip a duplicate; the except
+        # only covers an unrelated persistence-callback failure.
+        if machine is not None and machine.get(border.id) is None:
             try:
                 machine.register(border)
             except Exception as e:
-                logger.debug("복구 주문 machine.register 스킵 (이미 등록): %s", e)
+                logger.debug("복구 주문 machine.register 실패: %s", e)
         self._poller.register(border, on_filled=_guarded_on_filled, on_timeout=on_timeout_cb,
                               on_canceled=on_terminal_cb, on_rejected=on_terminal_cb,
                               on_expired=on_terminal_cb)
