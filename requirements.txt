@@ -59,7 +59,14 @@ cryptography==48.0.1
 python-json-logger==2.0.7
 
 # Stage 6+: Advanced Features
-RestrictedPython==7.1
+# 8.0 (was 7.1): two GHSAs.
+# - AttributeError.obj + the string module could leak protected info out of
+#   the restricted exec environment (patched 7.3).
+# - try/except* could bypass the sandbox via a CPython type-confusion bug;
+#   fixed by dropping try/except* support entirely (patched 8.0,
+#   CVE-2025-22153). backend/strategy/script/sandbox.py's own AST checker
+#   also no longer allows ast.TryStar, as defense in depth.
+RestrictedPython==8.0
 
 # Development & Testing (optional)
 # pytest==7.4.3

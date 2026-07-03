@@ -55,6 +55,19 @@ class EmergencyFlattenManager:
         self._lock = threading.Lock()
         self._flattening = False
 
+        # Plain counters tracking the last flatten_all() run, incremented
+        # in lockstep with the `results` dict below but NEVER derived from
+        # (or read out of) the tainted "failed" string list — each is its
+        # own int/bool/str literal, so API callers (backend/api/server.py)
+        # can report a summary without any exception text flowing into an
+        # HTTP response (CodeQL py/stack-trace-exposure).
+        self.last_attempted = 0
+        self.last_success = 0
+        self.last_submitted = 0
+        self.last_dry_run = dry_run
+        self.last_failed_count = 0
+        self.last_status: Optional[str] = None
+
     def flatten_all(self, reason: str = "비상청산") -> dict:
         """
         모든 포지션 시장가 매도.
@@ -75,6 +88,12 @@ class EmergencyFlattenManager:
             logger.error("비상청산 이미 진행 중 — 중복 요청 거부: %s", reason)
             self._audit("emergency_flatten_rejected", detail={"reason": reason,
                         "cause": "already_in_progress"})
+            self.last_attempted = 0
+            self.last_success = 0
+            self.last_submitted = 0
+            self.last_dry_run = self._dry_run
+            self.last_failed_count = 0
+            self.last_status = "already_in_progress"
             return {"attempted": 0, "success": 0, "submitted": 0,
                     "dry_run": self._dry_run, "failed": [], "status": "already_in_progress"}
         try:
@@ -91,6 +110,12 @@ class EmergencyFlattenManager:
         except Exception as e:
             logger.error("비상청산 포지션 조회 실패: %s", e)
             self._audit("emergency_flatten_positions_error", detail={"reason": reason, "error": str(e)})
+            self.last_attempted = 0
+            self.last_success = 0
+            self.last_submitted = 0
+            self.last_dry_run = self._dry_run
+            self.last_failed_count = 1
+            self.last_status = None
             return {"attempted": 0, "success": 0, "submitted": 0,
                     "dry_run": self._dry_run, "failed": [str(e)]}
 
@@ -102,11 +127,23 @@ class EmergencyFlattenManager:
             self._audit("emergency_flatten_complete",
                         detail={"reason": reason, "attempted": 0, "success": 0,
                                 "submitted": 0, "dry_run": self._dry_run, "failed": []})
+            self.last_attempted = 0
+            self.last_success = 0
+            self.last_submitted = 0
+            self.last_dry_run = self._dry_run
+            self.last_failed_count = 0
+            self.last_status = None
             return {"attempted": 0, "success": 0, "submitted": 0,
                     "dry_run": self._dry_run, "failed": []}
 
         results = {"attempted": len(positions), "success": 0, "submitted": 0,
                    "dry_run": self._dry_run, "failed": []}
+        self.last_attempted = len(positions)
+        self.last_success = 0
+        self.last_submitted = 0
+        self.last_dry_run = self._dry_run
+        self.last_failed_count = 0
+        self.last_status = None
 
         for pos in positions:
             try:
@@ -124,6 +161,7 @@ class EmergencyFlattenManager:
             if self._dry_run:
                 logger.critical("[DRY RUN] 비상청산: %s qty=%d @%.2f", pos.symbol, pos.qty, price)
                 results["success"] += 1
+                self.last_success += 1
                 continue
 
             try:
@@ -132,11 +170,14 @@ class EmergencyFlattenManager:
                                 pos.symbol, pos.qty, price, order.id)
                 results["success"] += 1
                 results["submitted"] += 1
+                self.last_success += 1
+                self.last_submitted += 1
                 self._audit("emergency_flatten_order", symbol=pos.symbol,
                             detail={"qty": pos.qty, "price": price, "order_id": order.id})
             except Exception as e:
                 logger.error("비상청산 실패 %s: %s", pos.symbol, e)
                 results["failed"].append(f"{pos.symbol}: {e}")
+                self.last_failed_count += 1
                 self._audit("emergency_flatten_failed", symbol=pos.symbol,
                             detail={"qty": pos.qty, "price": price, "error": str(e)})
 
