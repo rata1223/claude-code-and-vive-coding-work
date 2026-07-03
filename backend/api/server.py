@@ -309,11 +309,18 @@ def trigger_reconcile():
             redis_client=r,
         )
         result = reconciler.reconcile("manual")
-        # 상세 오류 텍스트(result.to_dict()["errors"])는 이미 reconciler 내부에서
-        # logger.error/warning으로 서버 로그에 남는다 — HTTP 응답에는 개수만 노출한다.
-        response = result.to_dict()
-        response["error_count"] = len(response.pop("errors", []))
-        return jsonify(response)
+        # 상세 오류 텍스트(result.errors, 원본 예외 문자열 포함)는 이미 reconciler
+        # 내부에서 logger.error/warning으로 서버 로그에 남는다 — HTTP 응답은
+        # result.to_dict()를 그대로/부분적으로 재사용하지 않고 안전한 필드만으로
+        # 새로 구성해 예외 텍스트가 흘러들어올 여지를 원천 차단한다.
+        return jsonify({
+            "trigger": result.trigger,
+            "started_at": result.started_at.isoformat(),
+            "completed_at": result.completed_at.isoformat() if result.completed_at else None,
+            "gaps_found": len(result.gaps),
+            "repairs_made": len(result.repairs),
+            "error_count": len(result.errors),
+        })
     except Exception:
         logger.exception("수동 조정 실패")
         return jsonify({"error": "수동 조정 중 내부 오류가 발생했습니다"}), 500
@@ -337,11 +344,17 @@ def trigger_flatten():
             dry_run=dry_run,
         )
         result = mgr.flatten_all(reason=body.get("reason", "수동 비상청산"))
-        # 상세 실패 사유(result["failed"])는 emergency.py의 _audit()이 이미 DB 감사
-        # 로그에 남긴다 — HTTP 응답에는 개수만 노출한다.
-        response = dict(result)
-        response["failed_count"] = len(response.pop("failed", []))
-        return jsonify(response)
+        # 상세 실패 사유(result["failed"], 원본 예외 텍스트 포함)는 emergency.py의
+        # _audit()이 이미 DB 감사 로그에 남긴다 — HTTP 응답은 result dict를 그대로/
+        # 부분적으로 재사용하지 않고 안전한 필드만으로 새로 구성한다.
+        return jsonify({
+            "attempted": result.get("attempted", 0),
+            "success": result.get("success", 0),
+            "submitted": result.get("submitted", 0),
+            "dry_run": result.get("dry_run"),
+            "failed_count": len(result.get("failed", [])),
+            "status": result.get("status"),
+        })
     except Exception:
         logger.exception("비상청산 실패")
         return jsonify({"error": "비상청산 중 내부 오류가 발생했습니다"}), 500
