@@ -343,17 +343,18 @@ def trigger_flatten():
             db_factory=_get_factory(),
             dry_run=dry_run,
         )
-        result = mgr.flatten_all(reason=body.get("reason", "수동 비상청산"))
-        # 상세 실패 사유(result["failed"], 원본 예외 텍스트 포함)는 emergency.py의
-        # _audit()이 이미 DB 감사 로그에 남긴다 — HTTP 응답은 result dict를 그대로/
-        # 부분적으로 재사용하지 않고 안전한 필드만으로 새로 구성한다.
+        mgr.flatten_all(reason=body.get("reason", "수동 비상청산"))
+        # 상세 실패 사유(원본 예외 텍스트 포함)는 emergency.py의 _audit()이 이미
+        # DB 감사 로그에 남긴다 — HTTP 응답은 flatten_all()이 반환한 dict를
+        # 전혀 참조하지 않고, mgr에 병행 기록된 순수 정수/불리언 카운터만
+        # 사용해 예외 텍스트가 흘러들어올 경로 자체를 차단한다.
         return jsonify({
-            "attempted": result.get("attempted", 0),
-            "success": result.get("success", 0),
-            "submitted": result.get("submitted", 0),
-            "dry_run": result.get("dry_run"),
-            "failed_count": len(result.get("failed", [])),
-            "status": result.get("status"),
+            "attempted": mgr.last_attempted,
+            "success": mgr.last_success,
+            "submitted": mgr.last_submitted,
+            "dry_run": mgr.last_dry_run,
+            "failed_count": mgr.last_failed_count,
+            "status": mgr.last_status,
         })
     except Exception:
         logger.exception("비상청산 실패")
