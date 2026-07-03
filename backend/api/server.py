@@ -260,9 +260,9 @@ def get_balance():
             "cash_usd": bal.cash_usd,
             "total_eval_krw": bal.total_eval_krw,
         })
-    except Exception as e:
-        logger.warning("잔고 조회 실패: %s", e)
-        return jsonify({"error": str(e)}), 503
+    except Exception:
+        logger.exception("잔고 조회 실패")
+        return jsonify({"error": "잔고 조회 중 내부 오류가 발생했습니다"}), 503
 
 
 # ── 백테스트 ──────────────────────────────────────────────────────────────
@@ -286,9 +286,9 @@ def run_backtest():
             initial_cash=float(body.get("initial_cash", 2_000_000)),
         )
         return jsonify(result)
-    except Exception as e:
-        logger.error("백테스트 오류: %s", e)
-        return jsonify({"error": str(e)}), 500
+    except Exception:
+        logger.exception("백테스트 오류")
+        return jsonify({"error": "백테스트 실행 중 내부 오류가 발생했습니다"}), 500
 
 
 # ── 관리 (운영자 전용) ────────────────────────────────────────────────────
@@ -309,10 +309,14 @@ def trigger_reconcile():
             redis_client=r,
         )
         result = reconciler.reconcile("manual")
-        return jsonify(result.to_dict())
-    except Exception as e:
-        logger.error("수동 조정 실패: %s", e)
-        return jsonify({"error": str(e)}), 500
+        # 상세 오류 텍스트(result.to_dict()["errors"])는 이미 reconciler 내부에서
+        # logger.error/warning으로 서버 로그에 남는다 — HTTP 응답에는 개수만 노출한다.
+        response = result.to_dict()
+        response["error_count"] = len(response.pop("errors", []))
+        return jsonify(response)
+    except Exception:
+        logger.exception("수동 조정 실패")
+        return jsonify({"error": "수동 조정 중 내부 오류가 발생했습니다"}), 500
 
 
 @app.post("/api/admin/flatten")
@@ -333,10 +337,14 @@ def trigger_flatten():
             dry_run=dry_run,
         )
         result = mgr.flatten_all(reason=body.get("reason", "수동 비상청산"))
-        return jsonify(result)
-    except Exception as e:
-        logger.error("비상청산 실패: %s", e)
-        return jsonify({"error": str(e)}), 500
+        # 상세 실패 사유(result["failed"])는 emergency.py의 _audit()이 이미 DB 감사
+        # 로그에 남긴다 — HTTP 응답에는 개수만 노출한다.
+        response = dict(result)
+        response["failed_count"] = len(response.pop("failed", []))
+        return jsonify(response)
+    except Exception:
+        logger.exception("비상청산 실패")
+        return jsonify({"error": "비상청산 중 내부 오류가 발생했습니다"}), 500
 
 
 @app.get("/api/admin/heartbeat")
@@ -348,8 +356,9 @@ def worker_heartbeat_status():
         last = HeartbeatMonitor.last_beat(_redis)
         ttl = HeartbeatMonitor.ttl_seconds(_redis)
         return jsonify({"alive": alive, "last_beat": last, "ttl_seconds": ttl})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 503
+    except Exception:
+        logger.exception("하트비트 상태 조회 실패")
+        return jsonify({"error": "하트비트 상태 조회 중 내부 오류가 발생했습니다"}), 503
 
 
 # ── 메트릭 ────────────────────────────────────────────────────────────────────
