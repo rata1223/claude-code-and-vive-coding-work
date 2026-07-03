@@ -216,3 +216,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Android release signing (must never be committed — inject via CI secrets instead)
+mobile/signing/*.jks
+mobile/signing/*.keystore
+mobile/signing/keystore.properties

@@ -1,13 +1,24 @@
-QuantDinger Android release signing (tracked for your GitHub backup)
+QuantDinger Android release signing (NOT tracked in git — see .gitignore)
 
-Files:
+Files (create locally, never commit):
   quantdinger-release.jks  — PKCS12 keystore (alias: quantdinger)
   keystore.properties       — storePassword / keyPassword / keyAlias / storeFile
 
 Security:
-  - Anyone with this repo can sign APKs with your package name. Use a PRIVATE
-    GitHub repo, or remove this folder from git and use CI secrets instead.
-  - If this folder is ever leaked, rotate keys and Play App Signing as applicable.
+  - This folder previously had a real keystore + plaintext passwords committed
+    to git. Those credentials must be treated as compromised: regenerate the
+    keystore and re-enroll with Play App Signing before the app is ever
+    published, then rotate any values that were reused elsewhere.
+  - quantdinger-release.jks and keystore.properties are now gitignored. Keep
+    them local only, or inject them in CI from secrets, e.g.:
+      echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > mobile/signing/quantdinger-release.jks
+      cat > mobile/signing/keystore.properties <<EOF
+      storePassword=$ANDROID_STORE_PASSWORD
+      keyPassword=$ANDROID_KEY_PASSWORD
+      keyAlias=quantdinger
+      storeFile=quantdinger-release.jks
+      EOF
 
 Build:
+  Once the Capacitor android/ platform is added (`npx cap add android`),
   Gradle reads ../signing from android/ (see android/app/build.gradle).
