@@ -49,9 +49,8 @@ _ALLOWED_NODES = {
 # Python 3.8 이하 호환 (ast.Index는 3.9+에서 제거)
 if hasattr(ast, "Index"):
     _ALLOWED_NODES.add(ast.Index)
-# Python 3.11+ TryStar 지원
-if hasattr(ast, "TryStar"):
-    _ALLOWED_NODES.add(ast.TryStar)
+# try/except*(ast.TryStar)는 의도적으로 허용하지 않는다 — CVE-2025-22153
+# (RestrictedPython < 8.0, CPython 타입 컨퓨전으로 샌드박스 우회 가능)
 
 # 완전 금지 AST 노드 (import, exec, 파일 I/O 등)
 _FORBIDDEN_NODES = {
