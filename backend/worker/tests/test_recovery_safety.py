@@ -119,7 +119,7 @@ class TestRestorePendingPollerRegistration:
 
         captured = {}
 
-        def _capture_register(order, on_filled=None, on_timeout=None):
+        def _capture_register(order, on_filled=None, on_timeout=None, **kwargs):
             captured["order"] = order
             captured["on_filled"] = on_filled
 
@@ -150,7 +150,7 @@ class TestRestorePendingPollerRegistration:
         tracker = _tracker()
 
         captured = {}
-        poller.register.side_effect = lambda order, on_filled=None, on_timeout=None: captured.update(
+        poller.register.side_effect = lambda order, on_filled=None, on_timeout=None, **kwargs: captured.update(
             on_filled=on_filled
         )
         on_filled_cb = MagicMock()
@@ -181,7 +181,7 @@ class TestRestorePendingPollerRegistration:
         tracker = _tracker()
 
         captured = {}
-        poller.register.side_effect = lambda order, on_filled=None, on_timeout=None: captured.update(
+        poller.register.side_effect = lambda order, on_filled=None, on_timeout=None, **kwargs: captured.update(
             on_filled=on_filled
         )
         on_filled_cb = MagicMock()

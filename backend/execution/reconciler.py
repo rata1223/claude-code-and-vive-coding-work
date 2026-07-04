@@ -374,6 +374,26 @@ class PositionReconciler:
 
     def _sync_order_status(self, db_order_id: int, broker_order, result: ReconciliationResult):
         from backend.database.models import Order as DBOrder, Fill as DBFill
+
+        # Route the broker-confirmed state through the SINGLE fill-processing pipeline
+        # (OrderFillPoller) when this order is owned by a live poller entry. resync()
+        # re-drives the exact same machine → tracker → PnL → DB → audit path as normal
+        # polling, so the runtime (in-memory tracker + state machine + pending lock) is
+        # repaired without a restart — and there is never a second fill processor here.
+        routed = False
+        if self._poller is not None:
+            try:
+                routed = self._poller.resync(broker_order)
+            except Exception as e:
+                logger.warning("poller resync 실패 — DB 폴백: %s", e)
+
+        # A FILLED order routed through the pipeline had its Fill row + DBOrder advanced
+        # by that single authority. Writing here too would duplicate the fill/audit.
+        if routed and broker_order.status == OrderStatus.FILLED:
+            result.repaired("sync_order_runtime", broker_order.symbol,
+                            f"주문 {broker_order.id}: 런타임 파이프라인 경유 체결 반영")
+            return
+
         with _session(self._factory) as db:
             row = db.get(DBOrder, db_order_id)
             if row is None:
@@ -384,11 +404,12 @@ class PositionReconciler:
             row.avg_fill_price = broker_order.avg_fill_price
             row.updated_at = datetime.utcnow()
 
-            # If newly filled: insert fill record if not already there.
+            # Insert a Fill only on the DB-only fallback (poller did not own the order).
             # Use enum value for comparison (not raw string) so an enum rename isn't silently missed.
             # The _reconcile_lock prevents concurrent reconciler runs; this application-level
             # check is the dedup guard against a simultaneous poller callback.
-            if broker_order.status == OrderStatus.FILLED and old_status != OrderStatus.FILLED.value:
+            if (not routed and broker_order.status == OrderStatus.FILLED
+                    and old_status != OrderStatus.FILLED.value):
                 existing_fill = db.query(DBFill).filter(DBFill.order_id == row.id).first()
                 if not existing_fill:
                     db.add(DBFill(

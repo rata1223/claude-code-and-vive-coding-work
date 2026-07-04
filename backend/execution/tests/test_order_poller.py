@@ -587,21 +587,37 @@ class TestSemanticMapperTimeout:
 # ── D4-a: Fill loss — on_filled exception handling ───────────────────────────
 
 class TestFillLoss:
-    def test_on_filled_exception_entry_removed_for_filled(self):
-        """FILLED: if on_filled raises, the entry is still removed (no infinite re-poll)."""
+    def test_on_filled_exception_entry_kept_for_filled_then_retried(self):
+        """FILLED: a lost callback must NOT drop the fill (P3-02C-B). The entry
+        stays registered so the next poll re-drives the same increment, and the
+        persistent watermark keeps it from being double-counted on success."""
         broker = MagicMock()
         broker.get_order_status.return_value = _order(status=OrderStatus.FILLED, filled_qty=100)
 
-        def bad_callback(o):
-            raise RuntimeError("downstream failure")
+        applied = []
+        state = {"fail_next": True}
+
+        def flaky_callback(o):
+            if state["fail_next"]:
+                state["fail_next"] = False
+                raise RuntimeError("downstream failure")
+            applied.append(o.filled_qty)
 
         poller = _poller(broker=broker)
         order = _order()
-        entry = _entry(order, on_filled=bad_callback)
+        entry = _entry(order, on_filled=flaky_callback)
         poller._entries[order.id] = entry
-        poller._poll_one(entry)
 
-        assert order.id not in poller._entries  # cleaned up despite callback failure
+        # First poll: callback raises → entry retained, watermark not advanced.
+        poller._poll_one(entry)
+        assert order.id in poller._entries
+        assert entry.last_reported_qty == 0
+        assert applied == []
+
+        # Second poll: callback succeeds → applied exactly once, entry removed.
+        poller._poll_one(entry)
+        assert order.id not in poller._entries
+        assert applied == [100]
 
     def test_on_filled_exception_entry_kept_for_partial(self):
         """PARTIAL_FILLED: if on_filled raises, the entry stays (polling continues)."""

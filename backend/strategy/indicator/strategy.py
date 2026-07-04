@@ -38,6 +38,7 @@ class IndicatorStrategy(StrategyBase):
         poller: Optional["OrderFillPoller"] = None,
         on_filled_cb: Optional[Callable] = None,
         on_timeout_cb: Optional[Callable] = None,
+        on_terminal_cb: Optional[Callable] = None,
     ):
         super().__init__(broker, name)
         self._tracker = tracker
@@ -48,6 +49,9 @@ class IndicatorStrategy(StrategyBase):
         self._poller = poller
         self._on_filled_cb = on_filled_cb
         self._on_timeout_cb = on_timeout_cb or self._default_timeout_handler
+        # Runtime sync for broker-confirmed CANCELED / REJECTED / EXPIRED: releases
+        # the pending lock + transitions the machine (no fill). Optional.
+        self._on_terminal_cb = on_terminal_cb
         self._breaker = ConsecutiveFailureBreaker(threshold=3, cooldown_minutes=30)
 
     def on_start(self):
@@ -221,6 +225,9 @@ class IndicatorStrategy(StrategyBase):
                 order,
                 on_filled=self._on_filled_cb,
                 on_timeout=self._on_timeout_cb,
+                on_canceled=self._on_terminal_cb,
+                on_rejected=self._on_terminal_cb,
+                on_expired=self._on_terminal_cb,
             )
 
     def _check_exit(self, symbol: str, current_price: float, entry_price: float):

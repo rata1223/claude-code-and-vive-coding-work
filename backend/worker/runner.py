@@ -385,6 +385,7 @@ class StrategyWorker:
         run_id = data.get("run_id", 0)
 
         on_filled_cb = self._make_fill_callback(tracker, machine, run_id)
+        on_terminal_cb = self._make_terminal_callback(tracker, machine)
 
         def on_timeout_cb(o):
             logger.warning("주문 타임아웃 — 브로커 취소 시도: %s %s %s", o.id, o.side, o.symbol)
@@ -404,6 +405,7 @@ class StrategyWorker:
         self._restore_pending_to_tracker(
             tracker, broker=data.get("broker", "kis"),
             on_filled_cb=on_filled_cb, on_timeout_cb=on_timeout_cb,
+            on_terminal_cb=on_terminal_cb,
         )
 
         stype = data.get("strategy_type", "indicator")
@@ -418,6 +420,7 @@ class StrategyWorker:
                     poller=self._poller,
                     on_filled_cb=on_filled_cb,
                     on_timeout_cb=on_timeout_cb,
+                    on_terminal_cb=on_terminal_cb,
                 )
             elif stype == "script":
                 from backend.strategy.script.strategy import ScriptStrategy
@@ -515,6 +518,32 @@ class StrategyWorker:
                         order.id, order.symbol, fill.qty, fill.price)
 
         return on_filled
+
+    def _make_terminal_callback(self, tracker: PositionTracker, machine: OrderStateMachine):
+        """Returns a callback for broker-confirmed non-fill terminal states
+        (CANCELED / REJECTED / EXPIRED).
+
+        Runtime synchronization only: transition the state machine (the single
+        state-transition authority) and release the pending lock. Idempotent — a
+        machine already in a terminal state is skipped, and unmark_pending is a
+        no-op if the lock is already gone, so duplicate deliveries (poll +
+        reconcile) never double-transition or double-release.
+        """
+        _terminal = (OrderStatus.FILLED, OrderStatus.CANCELED,
+                     OrderStatus.REJECTED, OrderStatus.EXPIRED)
+
+        def on_terminal(order: Order):
+            try:
+                m_order = machine.get(order.id)
+                if m_order is not None and m_order.status not in _terminal:
+                    machine.transition(order.id, order.status)
+            except Exception as e:
+                logger.warning("terminal 상태 전환 오류 %s → %s: %s",
+                               order.id, order.status.value, e)
+            finally:
+                tracker.unmark_pending(order.symbol)
+
+        return on_terminal
 
     # ── DB 연동 ───────────────────────────────────────────────────────────
     def _persist_order(self, order: Order):
@@ -628,7 +657,7 @@ class StrategyWorker:
             logger.warning("포지션 복원 실패: %s", e)
 
     def _restore_pending_to_tracker(self, tracker: PositionTracker, broker: str = "kis",
-                                    on_filled_cb=None, on_timeout_cb=None):
+                                    on_filled_cb=None, on_timeout_cb=None, on_terminal_cb=None):
         """Re-mark pending orders in tracker so duplicate orders are blocked after restart.
 
         Also re-registers each still-open order with the shared poller using the strategy's
@@ -649,13 +678,15 @@ class StrategyWorker:
                 # Extract scalars before the session closes (avoid DetachedInstanceError)
                 pending = [
                     {"symbol": r.symbol, "order_id": r.broker_order_id, "side": r.side,
-                     "qty": r.qty, "price": r.price or 0.0, "status": r.status}
+                     "qty": r.qty, "price": r.price or 0.0, "status": r.status,
+                     "filled_qty": r.filled_qty or 0}
                     for r in rows
                 ]
             for p in pending:
                 tracker.mark_pending(p["symbol"], p["order_id"])
                 if self._poller is not None and on_filled_cb is not None:
-                    self._register_recovered_order(p, tracker, on_filled_cb, on_timeout_cb)
+                    self._register_recovered_order(p, tracker, on_filled_cb, on_timeout_cb,
+                                                   on_terminal_cb=on_terminal_cb)
                 _audit("recovery_restore_pending", symbol=p["symbol"], order_id=p["order_id"],
                        detail={"broker": broker, "status": p["status"]})
             if pending:
@@ -665,13 +696,17 @@ class StrategyWorker:
             logger.warning("pending tracker 복원 실패: %s", e)
 
     def _register_recovered_order(self, p: dict, tracker: PositionTracker,
-                                  on_filled_cb, on_timeout_cb):
+                                  on_filled_cb, on_timeout_cb, on_terminal_cb=None):
         """Register a recovered pending order with the shared poller under the full pipeline.
 
         Wrapped in a guard that skips processing if the order already reached a terminal
         FILLED state in the DB (the startup DB-only recovery callback may have fired in the
         narrow window between the pending query and this re-registration). In that case the
         pending lock is simply released to avoid a stuck symbol.
+
+        The recovered Order carries the DB-persisted ``filled_qty`` so the poller seeds its
+        replay watermark from it — a post-restart poll (or reconcile resync) never re-reports
+        shares already processed before the crash (P3-02C-B, fixes CL-1).
         """
         try:
             status = OrderStatus(p["status"])
@@ -680,6 +715,7 @@ class StrategyWorker:
         border = Order(
             id=p["order_id"], symbol=p["symbol"], side=p["side"],
             qty=p["qty"], price=p["price"], status=status,
+            filled_qty=p.get("filled_qty", 0) or 0,
         )
 
         def _guarded_on_filled(order: Order):
@@ -704,7 +740,10 @@ class StrategyWorker:
                 return
             on_filled_cb(order)
 
-        self._poller.register(border, on_filled=_guarded_on_filled, on_timeout=on_timeout_cb)
+        self._poller.register(
+            border, on_filled=_guarded_on_filled, on_timeout=on_timeout_cb,
+            on_canceled=on_terminal_cb, on_rejected=on_terminal_cb, on_expired=on_terminal_cb,
+        )
 
     def _upsert_position_db(self, symbol: str, market: str, pos):
         """Upsert or delete position row in DB after a fill."""
