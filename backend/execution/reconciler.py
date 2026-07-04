@@ -135,7 +135,7 @@ class PositionReconciler:
                     return result
 
                 self._reconcile_positions(broker_positions, result, dry_run)
-                self._reconcile_pending_orders(result)
+                self._reconcile_pending_orders(result, dry_run)
                 result.finish()
             except Exception as e:
                 result.error(f"조정 예외: {e}")
@@ -337,7 +337,7 @@ class PositionReconciler:
 
     # ── Order reconciliation ────────────────────────────────────────────────
 
-    def _reconcile_pending_orders(self, result: ReconciliationResult):
+    def _reconcile_pending_orders(self, result: ReconciliationResult, dry_run: bool = False):
         """DB에서 open 상태인 주문을 브로커에 확인해 stale 처리."""
         from backend.database.models import Order as DBOrder
 
@@ -394,7 +394,7 @@ class PositionReconciler:
             if new_status != db_order["status"]:
                 result.gap("order_status_mismatch", db_order["symbol"],
                            f"DB={db_order['status']} 브로커={new_status}")
-                self._sync_order_status(db_order["id"], broker_order, result)
+                self._sync_order_status(db_order["id"], broker_order, result, dry_run)
 
     def _mark_order_lost(self, db_order_id: int, result: ReconciliationResult):
         from backend.database.models import Order as DBOrder
@@ -421,8 +421,37 @@ class PositionReconciler:
                 result.repaired("cancel_lost_order", row.symbol,
                                 f"주문 {row.broker_order_id} 취소 처리")
 
-    def _sync_order_status(self, db_order_id: int, broker_order, result: ReconciliationResult):
+    def _sync_order_status(self, db_order_id: int, broker_order, result: ReconciliationResult,
+                           dry_run: bool = False):
         from backend.database.models import Order as DBOrder, Fill as DBFill
+
+        # dry_run detects gaps only (the caller already recorded the gap); it must not
+        # route through the mutating pipeline or touch the DB.
+        if dry_run:
+            return
+
+        # Route the broker-confirmed state through the SINGLE fill-processing pipeline
+        # (OrderFillPoller) when this order is owned by a live poller entry. resync()
+        # re-drives the exact same machine → tracker → PnL → DB → audit path as normal
+        # polling, so the runtime (in-memory tracker + state machine + pending lock) is
+        # repaired without a restart — and there is never a second fill processor here.
+        routed = False
+        if self._poller is not None:
+            try:
+                routed = self._poller.resync(broker_order)
+            except Exception as e:
+                logger.warning("poller resync 실패 — DB 폴백: %s", e)
+
+        # A FILLED order routed through the pipeline had its Fill row + DBOrder advanced
+        # by that single authority. Writing here too would duplicate the fill/audit.
+        if routed and broker_order.status in (OrderStatus.FILLED, OrderStatus.PARTIAL_FILLED):
+            # The pipeline (_make_fill_callback → _persist_fill) is the single authority
+            # that wrote the Fill row + advanced DBOrder for BOTH full and partial fills;
+            # writing here too would duplicate the fill/audit or overstate DB filled_qty.
+            result.repaired("sync_order_runtime", broker_order.symbol,
+                            f"주문 {broker_order.id}: 런타임 파이프라인 경유 체결 반영")
+            return
+
         with _session(self._factory) as db:
             row = db.get(DBOrder, db_order_id)
             if row is None:
@@ -433,11 +462,12 @@ class PositionReconciler:
             row.avg_fill_price = broker_order.avg_fill_price
             row.updated_at = datetime.utcnow()
 
-            # If newly filled: insert fill record if not already there.
+            # Insert a Fill only on the DB-only fallback (poller did not own the order).
             # Use enum value for comparison (not raw string) so an enum rename isn't silently missed.
             # The _reconcile_lock prevents concurrent reconciler runs; this application-level
             # check is the dedup guard against a simultaneous poller callback.
-            if broker_order.status == OrderStatus.FILLED and old_status != OrderStatus.FILLED.value:
+            if (not routed and broker_order.status == OrderStatus.FILLED
+                    and old_status != OrderStatus.FILLED.value):
                 existing_fill = db.query(DBFill).filter(DBFill.order_id == row.id).first()
                 if not existing_fill:
                     db.add(DBFill(
