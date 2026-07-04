@@ -12,6 +12,38 @@
 
 ---
 
+## 프로젝트 진행 현황 (2026-07-04 기준, PR #79 이후)
+
+> **이 섹션이 최신 상태의 단일 진실 공급원(SoT).** 아래 "다음 작업 목록(Stage 1~9)"은 초기 설계 로드맵으로,
+> 대부분 이미 구현 완료됐다. 실제 진행은 `AUDIT.md` → `ROADMAP.md` 기반 하드닝 트랙으로 이어지고 있다.
+
+**PR #79 (TASK 4-1C 실패 시나리오 통합테스트, 2026-06-16 머지) 이후 머지된 작업:**
+
+| 영역 | PR | 내용 |
+|---|---|---|
+| DB/인프라 | #85, #86 | Postgres를 정규 CI DB로 확정 + Alembic 마이그레이션·회귀 스위트 (P1-05B) |
+| 배포 안전 | #88 | 배포를 그린 테스트에 게이팅 + 배포 후 실제 헬스 프로브 (R-D) |
+| 코퍼레이트 액션 | #89~#97 | 배당·분할·병합 처리: 감사→설계→구현→검증. `CorporateActionService` 라이브 런타임 통합 완료 (P2-01x, P2-02x) |
+| 페이퍼 트레이딩 | #99, #102 | 페이퍼 트레이딩 하네스 + E2E 검증 스위트 (P3-01A/B) |
+| 주문 실행 런타임 | #109 | 브로커 터미널 이벤트(취소/거부/만료)가 런타임에 반영 (P3-02B) |
+| 보안 하드닝 | #110, #114 | CodeQL 알림 다수 수정, 커밋된 안드로이드 서명키 제거, RestrictedPython 업그레이드 |
+| CI 품질 | #100, #101, #115 | Codacy SARIF/이진자산 예외 처리, `_reset_last_run()` 리팩터 |
+
+**진행 중 (이번 세션):**
+- **PR #116 — P3-02C-B 런타임 재조정 동기화**: `PositionReconciler`가 발견한 체결을 단일 `OrderFillPoller` 파이프라인(`resync()`)으로 라우팅해, 워커 재시작 없이 런타임(포지션 트래커·상태머신·펜딩락)을 복구한다. 브랜치 `claude/p3-02c-runtime-recon`.
+  - ⚠️ 이미 머지된 P3-02B(#109)가 워커/전략의 터미널 콜백·복구 `filled_qty` 부분을 더 완전하게 선구현 → 3개 파일 충돌. 신규 가치는 **poller self-heal + reconciler→resync 라우팅 + 통합테스트/문서**로 재범위 조정 필요.
+  - CodeRabbit 유효 지적 4건 대기: `_apply_update` 동시성 락(resync↔폴링 경쟁), 워터마크 명시화(라이브 주문 0 시드), `dry_run` 존중, 라우팅된 `PARTIAL_FILLED` 중복 방지.
+
+**아키텍처 실제 현황 (초기 로드맵 대비 완료분):**
+- `backend/brokers/`: `base`·`models`·`kis`·`kiwoom`·`capabilities`·`router`·`paper_broker`·`semantic_mapper`·`validator` 모두 존재 (Stage 1 완료)
+- `backend/execution/`: `order_poller`(폴링·서킷브레이커)·`reconciler`(브로커-우선 재조정)·주문 상태머신
+- `backend/quant/`: `indicators`·`signals`·`risk/engine`·`live`·`analysis`·`data` 퀀트 엔진 (`QUANT_ENGINE.md` 참고)
+- 프로세스 분리: `docker-compose`에서 레거시 `kis-bot` 비활성화 → `kis-api`·`kis-worker`·`kis-ws`로 분리 (P1-08/P5-04)
+- `kiwoom_adapter/`: `client`·`market_data`·`orders`·`portfolio` 모듈 존재 (더 이상 빈 스텁 아님)
+- 핵심 문서: `AUDIT.md`·`ROADMAP.md`(P0~P6, 1105줄)·`PHILOSOPHY.md`·`BROKER_SEMANTICS.md`·`QUANT_ENGINE.md` + `docs/` 30여 개 설계·감사 문서
+
+---
+
 ## 운영 환경
 
 - **서버**: AWS (Ubuntu 22.04), Docker Compose로 전체 스택 실행
@@ -51,14 +83,15 @@
 ## 현재 알려진 버그 / 주의사항 ⚠️
 
 1. **QuantDinger 백엔드 빌드**: `docker-compose.yml`에서 `./quantdinger/backend_api_python`을 빌드하므로 서버에 먼저 `git clone https://github.com/brokermr810/QuantDinger.git ./quantdinger` 필요
-2. **키움증권**: 아직 스텁 없음. 코드에 없으니 구현 필요
+2. **키움증권**: `kiwoom_adapter/`(client·market_data·orders·portfolio) + `backend/brokers/kiwoom.py` 존재하나 완성도·실거래 검증 미완. 세부 이슈는 `docs/KIWOOM_AUDIT_REPORT.md`·`ROADMAP.md`(P1-01 등) 참고
 3. **모의→실전**: `.env`에서 `KIS_ENV=paper` → `KIS_ENV=real`만 변경. **4주 모의 전 절대 금지**
 
 ---
 
-## 다음 작업 목록 (우선순위 순) 🔜
+## 다음 작업 목록 (초기 설계 로드맵 — 참고용) 🔜
 
-아래 Stage 순서대로 구현하면 된다. **Stage 1부터 시작.**
+> ⚠️ **이 Stage 1~9는 초기 설계안이며 대부분 이미 구현 완료됐다.** 최신 진행 상태는 위 "프로젝트 진행 현황"
+> 섹션과 `ROADMAP.md`(P0~P6 하드닝 계획)를 단일 진실 공급원으로 삼을 것. 아래는 원래 아키텍처 의도를 남겨둔 기록이다.
 
 ### Stage 1 — 기반 안정화 (지금 당장 해야 함)
 
@@ -371,13 +404,17 @@ KR_ETF   = ["069500", "360750", "091160"]  # KODEX200, TIGER S&P500, KODEX반도
 
 ## GitHub 저장소 / 브랜치
 
-- **메인**: `rata1223/claude-code-and-vive-coding-work`
-- **PR #1**: 초기 시스템 구축 (`claude/vibrant-davinci-skmpx`)
-- **PR #2**: 버그 수정 + 전략 고도화 (`claude/vibrant-davinci-skmpx-fixes`)
-- 새 작업: PR #2 브랜치에 계속 push
+- **메인**: `rata1223/claude-code-and-vive-coding-work` (기본 브랜치 `main`)
+- 초기 구축: PR #1 (`claude/vibrant-davinci-skmpx`), PR #2 (`claude/vibrant-davinci-skmpx-fixes`)
+- **PR #79** (`claude/update-MW7LQ`): 실패 시나리오 통합테스트 (TASK 4-1C) — **머지됨** (2026-06-16)
+- 하드닝 트랙 PR #85~#115: 위 "프로젝트 진행 현황" 표 참조 — **모두 머지됨**
+- **PR #116** (`claude/p3-02c-runtime-recon`): P3-02C-B 런타임 재조정 동기화 — **진행 중** (P3-02B와 충돌, 재범위 조정 필요)
+
+> 작업 방식: 기능별 새 브랜치에서 작업 → `main`으로 드래프트 PR → CodeRabbit/CodeQL 리뷰 → 머지.
+> 브랜치 보호 룰셋(PR 필수 + 코드 스캐닝)이 적용돼 `main` 직접 푸시 불가.
 
 ```bash
-# 새 세션에서 작업 시작
-git checkout claude/vibrant-davinci-skmpx-fixes
-git pull origin claude/vibrant-davinci-skmpx-fixes
+# 새 세션에서 최신 상태 받기
+git fetch origin main
+git checkout -B <새-작업-브랜치> origin/main
 ```
