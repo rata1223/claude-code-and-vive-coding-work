@@ -386,7 +386,10 @@ class PositionReconciler:
                 if age_hours > 1:
                     result.gap("lost_order", db_order["symbol"],
                                f"주문 {db_order['broker_order_id']} 브로커 미조회 (나이 {age_hours:.1f}h)")
-                    self._mark_order_lost(db_order["id"], result)
+                    # dry_run: gap detection only — _mark_order_lost cancels at the
+                    # broker and commits the DB, so it must not run on a dry pass.
+                    if not dry_run:
+                        self._mark_order_lost(db_order["id"], result)
                 continue
 
             # Sync broker state → DB
@@ -435,19 +438,27 @@ class PositionReconciler:
         # re-drives the exact same machine → tracker → PnL → DB → audit path as normal
         # polling, so the runtime (in-memory tracker + state machine + pending lock) is
         # repaired without a restart — and there is never a second fill processor here.
-        routed = False
+        owned, applied = False, False
         if self._poller is not None:
             try:
-                routed = self._poller.resync(broker_order)
+                owned, applied = self._poller.resync(broker_order)
             except Exception as e:
                 logger.warning("poller resync 실패 — DB 폴백: %s", e)
+                owned, applied = False, False
 
-        # A FILLED order routed through the pipeline had its Fill row + DBOrder advanced
-        # by that single authority. Writing here too would duplicate the fill/audit.
-        if routed and broker_order.status in (OrderStatus.FILLED, OrderStatus.PARTIAL_FILLED):
-            # The pipeline (_make_fill_callback → _persist_fill) is the single authority
-            # that wrote the Fill row + advanced DBOrder for BOTH full and partial fills;
-            # writing here too would duplicate the fill/audit or overstate DB filled_qty.
+        # Owned but the fill callback raised: the poller RETAINED the entry and will
+        # retry it. Writing to the DB now (then the retry firing) would double-count,
+        # so leave an unresolved gap for the poll retry / next reconcile to settle —
+        # do NOT mark it repaired.
+        if owned and not applied:
+            result.gap("sync_order_deferred", broker_order.symbol,
+                       f"주문 {broker_order.id}: 런타임 콜백 실패 — 폴러 재시도 대기")
+            return
+
+        # A FILLED/PARTIAL order routed through the pipeline had its Fill row + DBOrder
+        # advanced by that single authority (_make_fill_callback → _persist_fill);
+        # writing here too would duplicate the fill/audit or overstate DB filled_qty.
+        if owned and broker_order.status in (OrderStatus.FILLED, OrderStatus.PARTIAL_FILLED):
             result.repaired("sync_order_runtime", broker_order.symbol,
                             f"주문 {broker_order.id}: 런타임 파이프라인 경유 체결 반영")
             return
@@ -466,7 +477,7 @@ class PositionReconciler:
             # Use enum value for comparison (not raw string) so an enum rename isn't silently missed.
             # The _reconcile_lock prevents concurrent reconciler runs; this application-level
             # check is the dedup guard against a simultaneous poller callback.
-            if (not routed and broker_order.status == OrderStatus.FILLED
+            if (not owned and broker_order.status == OrderStatus.FILLED
                     and old_status != OrderStatus.FILLED.value):
                 existing_fill = db.query(DBFill).filter(DBFill.order_id == row.id).first()
                 if not existing_fill:

@@ -281,7 +281,7 @@ class OrderFillPoller:
 
         self._apply_update(entry, updated)
 
-    def resync(self, broker_order: Order) -> bool:
+    def resync(self, broker_order: Order) -> tuple[bool, bool]:
         """Reconciler entry point — repair a missed callback WITHOUT a restart.
 
         Re-drives a broker-confirmed order through the SAME processing pipeline as
@@ -290,26 +290,32 @@ class OrderFillPoller:
         increment is computed against the entry's persistent watermark, so a state
         already applied is a no-op.
 
-        Returns True if this poller owns the order (a live entry exists and was
-        driven); False if it does not — the caller should then fall back to a
-        DB-only sync, since no runtime pipeline is bound to this order here.
+        Returns ``(owned, applied)``:
+        - ``owned`` — True if a live entry exists for this order and was driven.
+          When False the caller should fall back to a DB-only sync (no runtime
+          pipeline is bound here).
+        - ``applied`` — True if the update settled. False means the fill callback
+          raised and the entry was RETAINED for the poller to retry; the caller
+          must NOT DB-write (a write now + the retry would double-count) and must
+          NOT record the order as repaired.
         """
         with self._lock:
             entry = self._entries.get(broker_order.id)
         if entry is None:
-            return False
-        self._apply_update(entry, broker_order)
-        return True
+            return (False, False)
+        applied = self._apply_update(entry, broker_order)
+        return (True, applied)
 
-    def _apply_update(self, entry: _PollEntry, updated: Order) -> None:
+    def _apply_update(self, entry: _PollEntry, updated: Order) -> bool:
         """Serialize per-entry, then apply. resync() (reconciler) and the background
         poll loop can both target the same entry; the per-entry lock guarantees exactly
         one in-flight update so an increment is never computed twice against a stale
-        watermark (double-apply)."""
+        watermark (double-apply). Returns True if the update settled; False if a fill
+        callback raised and the entry was RETAINED for a later retry."""
         with entry.processing_lock:
-            self._apply_update_locked(entry, updated)
+            return self._apply_update_locked(entry, updated)
 
-    def _apply_update_locked(self, entry: _PollEntry, updated: Order) -> None:
+    def _apply_update_locked(self, entry: _PollEntry, updated: Order) -> bool:
         """Shared processing core for a broker status update (poll + resync).
 
         This is the single place where a broker-confirmed state is turned into a
@@ -346,7 +352,7 @@ class OrderFillPoller:
                     # advance the watermark or pop, so the same increment recomputes.
                     logger.error("on_filled 콜백 오류 — 재시도 위해 유지: %s", e)
                     entry.advance()
-                    return
+                    return False
                 entry.last_reported_qty = updated.filled_qty
                 self._health.record_fill()
                 self._audit("poller_filled", updated,
@@ -403,7 +409,7 @@ class OrderFillPoller:
                     # recomputes the same increment (self-heal, no double count).
                     logger.error("on_filled 콜백 오류 (부분체결) — 재시도 위해 유지: %s", e)
                     entry.advance()
-                    return
+                    return False
                 entry.last_reported_qty = updated.filled_qty
                 self._health.record_partial_fill()
                 self._audit("poller_partial_filled", updated,
@@ -412,6 +418,8 @@ class OrderFillPoller:
 
         else:
             entry.advance()
+
+        return True
 
     def _handle_timeout(self, entry: _PollEntry) -> None:
         logger.warning("주문 타임아웃 (%dm): %s %s %s",

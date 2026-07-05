@@ -43,8 +43,10 @@ and after this change they share **one** processing core:
                        6 websocket push
 ```
 
-`resync()` re-drives an order through **exactly the same** `_apply_update` →
-`on_filled` path as live polling. The reconciler never applies a fill itself.
+`resync()` re-drives an order through the same `_apply_update` → `on_filled` path
+as live polling. On the routed `resync()` path the reconciler never applies a fill
+itself; for an **unowned** order (no live entry) it falls back to a DB-only sync
+that does write the fill row (see §2).
 
 ### Single-authority guarantees
 

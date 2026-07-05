@@ -367,6 +367,57 @@ class TestRestartAfterReconciliation:
             sess.close()
 
 
+# ── 7b. reconcile deferred when the routed callback fails ────────────────────
+
+class TestReconcileDeferredOnCallbackFailure:
+    """During reconcile, resync() owns the order but on_filled raises. The poller
+    RETAINS the entry for retry, so resync reports (owned=True, applied=False): the
+    reconciler records a gap (NOT a repair) and writes no Fill — a DB write now plus
+    the poller\'s later retry would double-count. The next poll then applies once."""
+
+    def test_deferred_then_retry_applies_once(self, db_factory):
+        _insert_order(db_factory)
+        tracker = _tracker()
+        good, calls = _pipeline(tracker, db_factory)
+        flaky = {"fail_next": True}
+
+        def on_filled(order):
+            if flaky["fail_next"]:
+                flaky["fail_next"] = False
+                raise RuntimeError("pipeline down")
+            good(order)
+
+        broker = _mock_broker(_broker_order(OrderStatus.FILLED, filled_qty=10))
+        poller = OrderFillPoller(broker=broker, db_factory=db_factory)
+        _register(poller, _broker_order(OrderStatus.SUBMITTED, filled_qty=0), on_filled)
+        rec = PositionReconciler(
+            broker=broker, db_factory=db_factory, poller=poller, broker_name="kis")
+
+        # Reconcile: callback fails → deferred. No fill applied/persisted, entry kept,
+        # and it is NOT recorded as a runtime repair.
+        result = rec.reconcile("periodic")
+        assert tracker.get_position("005930") is None
+        assert calls == []
+        assert "ORD001" in poller._entries
+        assert not any("sync_order_runtime" in str(r) for r in result.repairs)
+        sess = db_factory()
+        try:
+            assert sess.query(DBFill).count() == 0
+        finally:
+            sess.close()
+
+        # Poller retry applies the fill exactly once (no double from a stray DB write).
+        poller._poll_one(poller._entries["ORD001"])
+        assert tracker.get_position("005930").qty == 10
+        assert calls == [10]
+        assert "ORD001" not in poller._entries
+        sess = db_factory()
+        try:
+            assert sess.query(DBFill).count() == 1
+        finally:
+            sess.close()
+
+
 # ── 8. terminal non-fill states (CANCELED / REJECTED / EXPIRED) ──────────────
 
 class TestTerminalStateSync:
