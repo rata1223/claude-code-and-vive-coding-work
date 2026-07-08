@@ -14,7 +14,7 @@
 The broker is ground truth. Two paths turn a broker state into a runtime effect,
 and after this change they share **one** processing core:
 
-```
+```text
                        ┌──────────────── Broker (ground truth) ───────────────┐
                        │ get_order_status(order_id, symbol)                    │
                        └───────┬───────────────────────────────────┬──────────┘

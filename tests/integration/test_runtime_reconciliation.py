@@ -418,6 +418,33 @@ class TestReconcileDeferredOnCallbackFailure:
             sess.close()
 
 
+# ── 7c. re-registration keeps one entry (one lock, one watermark) per id ─────
+
+class TestReRegistrationKeepsOneEntry:
+    """Re-registering a still-tracked order.id mutates the EXISTING entry in place
+    rather than forking a new _PollEntry with a fresh lock + reset watermark — which
+    could let an in-flight poll race the replacement into a double-apply."""
+
+    def test_reregister_preserves_lock_and_watermark(self, db_factory):
+        broker = _mock_broker(_broker_order(OrderStatus.SUBMITTED, filled_qty=0))
+        poller = OrderFillPoller(broker=broker, db_factory=db_factory)
+        _register(poller, _broker_order(OrderStatus.SUBMITTED, filled_qty=0),
+                  lambda o: None, initial_reported_qty=7)
+        entry1 = poller._entries["ORD001"]
+        lock1 = entry1.processing_lock
+        assert entry1.last_reported_qty == 7
+
+        # Re-register the same id with a LOWER seed: same object, same mutex, and the
+        # watermark is not rewound (max), so a fill already counted can\'t reappear.
+        _register(poller, _broker_order(OrderStatus.SUBMITTED, filled_qty=0),
+                  lambda o: None, initial_reported_qty=3)
+        entry2 = poller._entries["ORD001"]
+        assert entry2 is entry1
+        assert entry2.processing_lock is lock1
+        assert entry2.last_reported_qty == 7
+        assert poller.pending_count() == 1
+
+
 # ── 8. terminal non-fill states (CANCELED / REJECTED / EXPIRED) ──────────────
 
 class TestTerminalStateSync:

@@ -227,7 +227,25 @@ class OrderFillPoller:
             last_reported_qty=initial_reported_qty,
         )
         with self._lock:
-            self._entries[order.id] = entry
+            existing = self._entries.get(order.id)
+            if existing is not None:
+                # Re-registration of a still-tracked order.id (e.g. startup recovery
+                # while the poll loop already runs): mutate the EXISTING entry in place
+                # instead of replacing it. A replacement would give the id a fresh
+                # processing_lock and reset watermark, letting an in-flight poll on the
+                # old object race the new one and double-apply a fill. Keeping one entry
+                # per id preserves a single mutex and a monotonic watermark. (register
+                # holds only self._lock — never processing_lock — so no lock inversion.)
+                existing.order = order
+                existing.on_filled = on_filled
+                existing.on_timeout = on_timeout or self._default_timeout_handler
+                existing.on_canceled = on_canceled
+                existing.on_rejected = on_rejected
+                existing.on_expired = on_expired
+                existing.last_reported_qty = max(existing.last_reported_qty,
+                                                 initial_reported_qty)
+            else:
+                self._entries[order.id] = entry
             self._health.set_pending_count(len(self._entries))
         self._health.record_register()
         self._audit("poller_register", order,
