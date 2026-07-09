@@ -438,13 +438,20 @@ class PositionReconciler:
         # re-drives the exact same machine → tracker → PnL → DB → audit path as normal
         # polling, so the runtime (in-memory tracker + state machine + pending lock) is
         # repaired without a restart — and there is never a second fill processor here.
-        owned, applied = False, False
+        owned, applied, resync_error = False, False, False
         if self._poller is not None:
             try:
                 owned, applied = self._poller.resync(broker_order)
             except Exception as e:
-                logger.warning("poller resync 실패 — DB 폴백: %s", e)
-                owned, applied = False, False
+                # The poller may still own the entry and retry it; a DB write here plus
+                # that retry would double-count. Treat as deferred, NOT as unowned (F6).
+                logger.warning("poller resync 예외 — 재시도 대기(DB 폴백 안 함): %s", e)
+                resync_error = True
+
+        if resync_error:
+            result.gap("sync_order_resync_error", broker_order.symbol,
+                       f"주문 {broker_order.id}: resync 예외 — 폴러 재시도/다음 조정 대기")
+            return
 
         # Owned but the fill callback raised: the poller RETAINED the entry and will
         # retry it. Writing to the DB now (then the retry firing) would double-count,

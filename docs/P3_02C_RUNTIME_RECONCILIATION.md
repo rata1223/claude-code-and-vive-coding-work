@@ -176,3 +176,38 @@ reconciliation) plus terminal-state sync.
   change reuses it — see §2.)
 - `tests/integration/test_runtime_reconciliation.py` — scenario suite (callback
   lost, restart timing, duplicate reconcile/fill, terminal-state sync).
+
+---
+
+## P3-02C-D — validation hardening (follow-up)
+
+The P3-02C-C validation found defects that `resync()` (a 2nd thread + a 2nd fill
+route) made newly reachable. P3-02C-D fixes them:
+
+- **Recovery accounting (F1/F2).** `recovery.py` `StartupRecovery` registers
+  recovered orders on the **shared** poller; it now seeds `initial_reported_qty`
+  from the DB `filled_qty` (like the `runner.py` seam), and its fill stub
+  **accumulates** (`+=`) instead of overwriting `filled_qty`. The redundant
+  `(order_id, qty, price)` fill dedup (non-unique — audit **I-1**) is removed; the
+  poller watermark is the single fill dedup. A recovered PARTIAL reaching broker
+  truth now ends at exactly broker qty (no over- or under-count).
+- **register() re-registration (F4).** The in-place entry mutation now runs under
+  the entry's `processing_lock` (acquired outside `self._lock`, no inversion), so a
+  concurrent poll/resync can't read a half-updated entry or lose a watermark advance.
+- **Timeout vs resync (F5).** `_handle_timeout` runs under `processing_lock` and
+  no-ops if the order already reached a terminal state — a timeout can no longer
+  cancel an order a resync is concurrently filling.
+- **resync() exception (F6).** `_sync_order_status` treats a `resync()` exception as
+  **deferred** (records a gap, no DB write) rather than "unowned" — the poller may
+  still own + retry, and a DB-fallback write would double-count.
+- **Terminal idempotency (F7).** The terminal branch guards on a per-entry
+  `terminal_fired` flag, so a poll+resync race on the same cancel/reject/expire fires
+  the callback and writes its audit once.
+
+Tests: `TestPartialFillIncrements`, `TestRecoveredPartialWatermarkSeed`,
+`TestTerminalDedup`, `TestResyncErrorDefers` (+ existing suite). Full run: 1060
+passed, 20 skipped.
+
+**Still deferred (each needs its own task; none a regression from this change):**
+audit **I-1** (unique fill fingerprint on `DBFill`), **D-2** (two kill switches),
+**D-5** (non-atomic fill pipeline), **D-6** (cross-process reconcile lock).

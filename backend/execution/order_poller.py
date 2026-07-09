@@ -146,6 +146,10 @@ class _PollEntry:
     # background poll loop can never process the same broker update concurrently
     # and double-apply an increment.
     processing_lock: threading.Lock = field(default_factory=threading.Lock)
+    # F7: set once the terminal (cancel/reject/expire) branch has fired for this
+    # entry, so a resync() racing the poll loop on the same terminal event can't
+    # re-run the terminal callback or re-write its audit rows.
+    terminal_fired: bool = False
 
     @property
     def is_timed_out(self) -> bool:
@@ -228,14 +232,18 @@ class OrderFillPoller:
         )
         with self._lock:
             existing = self._entries.get(order.id)
-            if existing is not None:
-                # Re-registration of a still-tracked order.id (e.g. startup recovery
-                # while the poll loop already runs): mutate the EXISTING entry in place
-                # instead of replacing it. A replacement would give the id a fresh
-                # processing_lock and reset watermark, letting an in-flight poll on the
-                # old object race the new one and double-apply a fill. Keeping one entry
-                # per id preserves a single mutex and a monotonic watermark. (register
-                # holds only self._lock — never processing_lock — so no lock inversion.)
+            if existing is None:
+                self._entries[order.id] = entry
+            self._health.set_pending_count(len(self._entries))
+        if existing is not None:
+            # Re-registration of a still-tracked order.id (e.g. startup recovery while
+            # the poll loop already runs): mutate the EXISTING entry in place instead of
+            # replacing it — one entry per id keeps a single mutex + monotonic watermark.
+            # Do it under the entry's OWN processing_lock (the mutex _apply_update uses)
+            # so a concurrent poll/resync can't read a half-updated entry or lose the
+            # watermark advance (F4). Acquired OUTSIDE self._lock — register never nests
+            # self._lock inside processing_lock — so there is no ordering inversion.
+            with existing.processing_lock:
                 existing.order = order
                 existing.on_filled = on_filled
                 existing.on_timeout = on_timeout or self._default_timeout_handler
@@ -244,9 +252,6 @@ class OrderFillPoller:
                 existing.on_expired = on_expired
                 existing.last_reported_qty = max(existing.last_reported_qty,
                                                  initial_reported_qty)
-            else:
-                self._entries[order.id] = entry
-            self._health.set_pending_count(len(self._entries))
         self._health.record_register()
         self._audit("poller_register", order,
                     {"symbol": order.symbol, "side": order.side, "qty": order.qty})
@@ -384,6 +389,11 @@ class OrderFillPoller:
                 self._health.set_pending_count(len(self._entries))
 
         elif updated.status in (OrderStatus.CANCELED, OrderStatus.REJECTED, OrderStatus.EXPIRED):
+            if entry.terminal_fired:
+                # A poll and a resync() can both deliver the same terminal event; the
+                # first fired the callback + audit, so the second is a no-op (F7).
+                return True
+            entry.terminal_fired = True
             logger.warning("주문 취소/거부/만료: %s status=%s", updated.id, updated.status.value)
             with self._lock:
                 self._entries.pop(updated.id, None)
@@ -440,6 +450,18 @@ class OrderFillPoller:
         return True
 
     def _handle_timeout(self, entry: _PollEntry) -> None:
+        # Serialize with _apply_update: since P3-02C a reconciler resync() is a second
+        # thread that can be applying a fill on this same entry. Take the entry mutex so
+        # a timeout can't cancel an order a resync is concurrently filling (F5).
+        with entry.processing_lock:
+            self._handle_timeout_locked(entry)
+
+    def _handle_timeout_locked(self, entry: _PollEntry) -> None:
+        # A concurrent/preceding resync() may have already driven this entry terminal;
+        # never cancel an order that already filled or terminated.
+        if entry.order.status in (OrderStatus.FILLED, OrderStatus.CANCELED,
+                                  OrderStatus.REJECTED, OrderStatus.EXPIRED):
+            return
         logger.warning("주문 타임아웃 (%dm): %s %s %s",
                        _TIMEOUT_MINUTES, entry.order.id, entry.order.side, entry.order.symbol)
         with self._lock:
