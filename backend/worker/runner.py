@@ -769,7 +769,11 @@ class StrategyWorker:
                 logger.debug("복구 주문 machine.register 실패: %s", e)
         self._poller.register(border, on_filled=_guarded_on_filled, on_timeout=on_timeout_cb,
                               on_canceled=on_terminal_cb, on_rejected=on_terminal_cb,
-                              on_expired=on_terminal_cb)
+                              on_expired=on_terminal_cb,
+                              # Seed the poller watermark from the DB-persisted filled_qty so a
+                              # recovered PARTIAL order never re-reports its pre-crash fill (the
+                              # fill pipeline has no other dedup for partials).
+                              initial_reported_qty=p.get("filled_qty", 0) or 0)
 
     def _upsert_position_db(self, symbol: str, market: str, pos):
         """Upsert or delete position row in DB after a fill."""

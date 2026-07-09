@@ -142,6 +142,10 @@ class _PollEntry:
     poll_index: int = 0
     next_poll_at: float = field(default_factory=time.monotonic)
     last_reported_qty: int = 0  # prevents double-counting on replay
+    # Serializes _apply_update for THIS entry so a reconciler resync() and the
+    # background poll loop can never process the same broker update concurrently
+    # and double-apply an increment.
+    processing_lock: threading.Lock = field(default_factory=threading.Lock)
 
     @property
     def is_timed_out(self) -> bool:
@@ -203,6 +207,7 @@ class OrderFillPoller:
         on_canceled: Optional[Callable[[Order], None]] = None,
         on_rejected: Optional[Callable[[Order], None]] = None,
         on_expired: Optional[Callable[[Order], None]] = None,
+        initial_reported_qty: int = 0,
     ) -> None:
         if not order.id:
             logger.warning("주문 ID 없음 — 폴링 등록 스킵: %s %s", order.side, order.symbol)
@@ -214,9 +219,33 @@ class OrderFillPoller:
             on_canceled=on_canceled,
             on_rejected=on_rejected,
             on_expired=on_expired,
+            # Seed the replay high-water mark. Live registrations pass 0 (an immediate
+            # broker fill must still be reported — see IndicatorStrategy._register_order).
+            # Recovery/replay passes the DB-persisted filled_qty so a re-poll after a
+            # restart never re-reports shares already processed pre-crash (persistent
+            # watermark; the only fill-dedup for a recovered PARTIAL order).
+            last_reported_qty=initial_reported_qty,
         )
         with self._lock:
-            self._entries[order.id] = entry
+            existing = self._entries.get(order.id)
+            if existing is not None:
+                # Re-registration of a still-tracked order.id (e.g. startup recovery
+                # while the poll loop already runs): mutate the EXISTING entry in place
+                # instead of replacing it. A replacement would give the id a fresh
+                # processing_lock and reset watermark, letting an in-flight poll on the
+                # old object race the new one and double-apply a fill. Keeping one entry
+                # per id preserves a single mutex and a monotonic watermark. (register
+                # holds only self._lock — never processing_lock — so no lock inversion.)
+                existing.order = order
+                existing.on_filled = on_filled
+                existing.on_timeout = on_timeout or self._default_timeout_handler
+                existing.on_canceled = on_canceled
+                existing.on_rejected = on_rejected
+                existing.on_expired = on_expired
+                existing.last_reported_qty = max(existing.last_reported_qty,
+                                                 initial_reported_qty)
+            else:
+                self._entries[order.id] = entry
             self._health.set_pending_count(len(self._entries))
         self._health.record_register()
         self._audit("poller_register", order,
@@ -268,6 +297,51 @@ class OrderFillPoller:
             entry.advance()
             return
 
+        self._apply_update(entry, updated)
+
+    def resync(self, broker_order: Order) -> tuple[bool, bool]:
+        """Reconciler entry point — repair a missed callback WITHOUT a restart.
+
+        Re-drives a broker-confirmed order through the SAME processing pipeline as
+        live polling (`_apply_update` → the registered `on_filled` / terminal
+        callbacks), so there is exactly one fill processor. Idempotent: the
+        increment is computed against the entry's persistent watermark, so a state
+        already applied is a no-op.
+
+        Returns ``(owned, applied)``:
+        - ``owned`` — True if a live entry exists for this order and was driven.
+          When False the caller should fall back to a DB-only sync (no runtime
+          pipeline is bound here).
+        - ``applied`` — True if the update settled. False means the fill callback
+          raised and the entry was RETAINED for the poller to retry; the caller
+          must NOT DB-write (a write now + the retry would double-count) and must
+          NOT record the order as repaired.
+        """
+        with self._lock:
+            entry = self._entries.get(broker_order.id)
+        if entry is None:
+            return (False, False)
+        applied = self._apply_update(entry, broker_order)
+        return (True, applied)
+
+    def _apply_update(self, entry: _PollEntry, updated: Order) -> bool:
+        """Serialize per-entry, then apply. resync() (reconciler) and the background
+        poll loop can both target the same entry; the per-entry lock guarantees exactly
+        one in-flight update so an increment is never computed twice against a stale
+        watermark (double-apply). Returns True if the update settled; False if a fill
+        callback raised and the entry was RETAINED for a later retry."""
+        with entry.processing_lock:
+            return self._apply_update_locked(entry, updated)
+
+    def _apply_update_locked(self, entry: _PollEntry, updated: Order) -> bool:
+        """Shared processing core for a broker status update (poll + resync).
+
+        This is the single place where a broker-confirmed state is turned into a
+        runtime effect. On a FILLED/PARTIAL increment the watermark is advanced and
+        the entry popped ONLY after the callback succeeds — a callback that raises
+        leaves the entry registered so the next poll re-drives the same increment
+        (lost-callback self-heal), and never double-counts thanks to the watermark.
+        """
         # Transition validation — warn on unexpected broker status regression.
         prev_status = entry.order.status
         if updated.status != prev_status:
@@ -282,27 +356,32 @@ class OrderFillPoller:
 
         if updated.status == OrderStatus.FILLED:
             incremental = (updated.filled_qty or 0) - entry.last_reported_qty
-            entry.last_reported_qty = updated.filled_qty
             logger.info("체결 확인 %s: %s qty=%d (증분=%d) avg=%.4f",
                         updated.id, updated.symbol, updated.filled_qty,
                         incremental, updated.avg_fill_price or 0)
-            with self._lock:
-                self._entries.pop(updated.id, None)
-                self._health.set_pending_count(len(self._entries))
             if incremental > 0:
-                self._health.record_fill()
-                self._audit("poller_filled", updated,
-                            {"incremental": incremental, "total": updated.filled_qty,
-                             "avg": updated.avg_fill_price or 0})
                 # Pass a copy with filled_qty=incremental so the callback records
                 # only the new quantity — same convention as PARTIAL_FILLED.
                 final_fill = dataclasses.replace(updated, filled_qty=incremental)
                 try:
                     entry.on_filled(final_fill)
                 except Exception as e:
-                    logger.error("on_filled 콜백 오류: %s", e)
+                    # Callback lost — keep the entry so the next poll retries. Do NOT
+                    # advance the watermark or pop, so the same increment recomputes.
+                    logger.error("on_filled 콜백 오류 — 재시도 위해 유지: %s", e)
+                    entry.advance()
+                    return False
+                entry.last_reported_qty = updated.filled_qty
+                self._health.record_fill()
+                self._audit("poller_filled", updated,
+                            {"incremental": incremental, "total": updated.filled_qty,
+                             "avg": updated.avg_fill_price or 0})
             else:
                 logger.warning("체결 중복 감지 — 콜백 스킵: %s", updated.id)
+            # FILLED is terminal: unregister once the increment is settled.
+            with self._lock:
+                self._entries.pop(updated.id, None)
+                self._health.set_pending_count(len(self._entries))
 
         elif updated.status in (OrderStatus.CANCELED, OrderStatus.REJECTED, OrderStatus.EXPIRED):
             logger.warning("주문 취소/거부/만료: %s status=%s", updated.id, updated.status.value)
@@ -336,23 +415,29 @@ class OrderFillPoller:
         elif updated.status == OrderStatus.PARTIAL_FILLED:
             incremental = (updated.filled_qty or 0) - entry.last_reported_qty
             if incremental > 0:
-                entry.last_reported_qty = updated.filled_qty
-                self._health.record_partial_fill()
                 logger.info("부분체결 %s: 증분=%d (누적=%d/%d)",
                             updated.id, incremental, updated.filled_qty, updated.qty)
-                self._audit("poller_partial_filled", updated,
-                            {"incremental": incremental, "cumulative": updated.filled_qty})
                 # Pass a copy with filled_qty=incremental so the callback records
                 # only the new quantity without double-counting prior partials.
                 partial = dataclasses.replace(updated, filled_qty=incremental)
                 try:
                     entry.on_filled(partial)
                 except Exception as e:
-                    logger.error("on_filled 콜백 오류 (부분체결): %s", e)
+                    # Callback lost — keep watermark unchanged so the next poll
+                    # recomputes the same increment (self-heal, no double count).
+                    logger.error("on_filled 콜백 오류 (부분체결) — 재시도 위해 유지: %s", e)
+                    entry.advance()
+                    return False
+                entry.last_reported_qty = updated.filled_qty
+                self._health.record_partial_fill()
+                self._audit("poller_partial_filled", updated,
+                            {"incremental": incremental, "cumulative": updated.filled_qty})
             entry.advance()
 
         else:
             entry.advance()
+
+        return True
 
     def _handle_timeout(self, entry: _PollEntry) -> None:
         logger.warning("주문 타임아웃 (%dm): %s %s %s",
