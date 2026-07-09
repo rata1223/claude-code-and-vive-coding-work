@@ -271,17 +271,14 @@ class StartupRecovery:
                             if row:
                                 fill_qty = order.filled_qty or order.qty
                                 fill_price = order.avg_fill_price or order.price
-                                # F7: idempotency guard — skip if a matching fill row exists
-                                existing_fill = sess.query(DBFill).filter(
-                                    DBFill.order_id == db_order_pk,
-                                    DBFill.qty == fill_qty,
-                                    DBFill.price == fill_price,
-                                ).first()
-                                if existing_fill is not None:
-                                    logger.info("복구 중복 체결 감지 — 스킵: order_id=%d", db_order_pk)
-                                    return
+                                # P3-02C-D F2: the poller delivers INCREMENTAL fill
+                                # quantities and its watermark (seeded from filled_qty at
+                                # register — F1) is now the single dedup, so ACCUMULATE
+                                # rather than overwrite, and do not re-dedup on
+                                # (qty, price) here — that key is not unique and would drop
+                                # a legitimate equal-sized second leg (audit I-1).
                                 row.status = order.status.value
-                                row.filled_qty = fill_qty
+                                row.filled_qty = (row.filled_qty or 0) + fill_qty
                                 row.avg_fill_price = fill_price
                                 sess.add(DBFill(order_id=db_order_pk,
                                                qty=fill_qty,
@@ -314,6 +311,12 @@ class StartupRecovery:
                     poller.register(
                         border,
                         on_filled=_make_recovery_fill_cb(row.id, row.broker_order_id),
+                        # P3-02C-D F1: seed the replay watermark from the DB-persisted
+                        # filled_qty so a recovered PARTIAL is not re-reported from 0 by
+                        # the poll loop or a reconciler resync() (matches the runner.py
+                        # recovery seam). The poller watermark is now the single fill
+                        # dedup for this order.
+                        initial_reported_qty=(row.filled_qty or 0),
                     )
 
                 # After all pending orders are processed, schedule a post-recovery

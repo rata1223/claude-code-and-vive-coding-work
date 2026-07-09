@@ -445,6 +445,111 @@ class TestReRegistrationKeepsOneEntry:
         assert poller.pending_count() == 1
 
 
+# ── 7d. P3-02C-D: partial increments, watermark seed, terminal dedup, resync error ──
+
+class TestPartialFillIncrements:
+    """PARTIAL_FILLED branch: each poll reports only the NEW shares (increment),
+    never the cumulative total. (Closes the P3-02C-C F9 coverage gap.)"""
+
+    def test_partial_increments_reported_once_each(self, db_factory):
+        _insert_order(db_factory)
+        tracker = _tracker()
+        on_filled, calls = _pipeline(tracker, db_factory)
+        broker = MagicMock()
+        broker.get_positions.return_value = []
+        broker.get_order_status.side_effect = [
+            _broker_order(OrderStatus.PARTIAL_FILLED, filled_qty=5, qty=10),
+            _broker_order(OrderStatus.PARTIAL_FILLED, filled_qty=8, qty=10),
+        ]
+        poller = OrderFillPoller(broker=broker, db_factory=db_factory)
+        _register(poller, _broker_order(OrderStatus.SUBMITTED, filled_qty=0), on_filled)
+        entry = poller._entries["ORD001"]
+        poller._poll_one(entry)   # broker cumulative 5 -> increment 5
+        poller._poll_one(entry)   # broker cumulative 8 -> increment 3
+        assert calls == [5, 3]
+        assert tracker.get_position("005930").qty == 8
+
+
+class TestRecoveredPartialWatermarkSeed:
+    """F1: a recovered PARTIAL registered with initial_reported_qty=DB filled_qty
+    only reports the shares filled AFTER the crash, never the pre-crash ones."""
+
+    def test_seeded_partial_reports_only_new_shares(self, db_factory):
+        _insert_order(db_factory, filled_qty=5, status="partial_filled")
+        tracker = _tracker()
+        on_filled, calls = _pipeline(tracker, db_factory)
+        broker = _mock_broker(_broker_order(OrderStatus.FILLED, filled_qty=10))
+        poller = OrderFillPoller(broker=broker, db_factory=db_factory)
+        # Recovered with 5 already filled pre-crash -> seed watermark to 5.
+        _register(poller, _broker_order(OrderStatus.PARTIAL_FILLED, filled_qty=5),
+                  on_filled, initial_reported_qty=5)
+        poller._poll_one(poller._entries["ORD001"])   # broker FILLED total 10
+        assert calls == [5]   # only the 5 shares filled after the crash, not 10
+
+
+class TestTerminalDedup:
+    """F7: a terminal event delivered twice to the same entry (poll + resync race)
+    fires the terminal callback exactly once."""
+
+    @pytest.mark.parametrize("status", [
+        OrderStatus.CANCELED, OrderStatus.REJECTED, OrderStatus.EXPIRED,
+    ])
+    def test_terminal_fires_once(self, db_factory, status):
+        machine = OrderStateMachine()
+        tracker = PositionTracker(machine)
+        machine.register(BOrder(id="ORD001", symbol="005930", side="buy",
+                                qty=10, price=70000.0, status=OrderStatus.SUBMITTED))
+        tracker.mark_pending("005930", "ORD001")
+        from backend.execution.order_events import apply_terminal_event
+        calls = []
+
+        def on_terminal(o):
+            calls.append(o.status)
+            apply_terminal_event(machine, tracker, o, actor="poller")
+
+        broker = _mock_broker(_broker_order(status, filled_qty=0))
+        poller = OrderFillPoller(broker=broker, db_factory=db_factory)
+        poller.register(
+            _broker_order(OrderStatus.SUBMITTED, filled_qty=0),
+            on_filled=lambda o: None, on_timeout=lambda o: None,
+            on_canceled=on_terminal, on_rejected=on_terminal, on_expired=on_terminal,
+        )
+        entry = poller._entries["ORD001"]
+        # Deliver the SAME terminal update twice on the same entry (poll + resync).
+        poller._apply_update(entry, _broker_order(status, filled_qty=0))
+        poller._apply_update(entry, _broker_order(status, filled_qty=0))
+        assert calls == [status]                       # fired exactly once
+        assert machine.get("ORD001").status == status  # transitioned once
+        assert tracker.can_place_order("005930") is True
+
+
+class TestResyncErrorDefers:
+    """F6: when resync() raises, the reconciler must NOT do the DB-only fallback (the
+    poller may still own + retry the order), so no Fill is written and the order is
+    left as an unresolved gap rather than force-filled."""
+
+    def test_resync_exception_no_db_write(self, db_factory):
+        _insert_order(db_factory)
+
+        class _RaisingPoller:
+            def resync(self, broker_order):
+                raise RuntimeError("resync boom")
+
+        broker = _mock_broker(_broker_order(OrderStatus.FILLED, filled_qty=10))
+        rec = PositionReconciler(
+            broker=broker, db_factory=db_factory, poller=_RaisingPoller(),
+            broker_name="kis")
+        rec.reconcile("periodic")
+        sess = db_factory()
+        try:
+            assert sess.query(DBFill).count() == 0   # no fallback fill written
+            dbo = sess.query(DBOrder).filter(
+                DBOrder.broker_order_id == "ORD001").first()
+            assert dbo.status != OrderStatus.FILLED.value   # not force-filled
+        finally:
+            sess.close()
+
+
 # ── 8. terminal non-fill states (CANCELED / REJECTED / EXPIRED) ──────────────
 
 class TestTerminalStateSync:
