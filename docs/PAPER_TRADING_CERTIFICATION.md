@@ -56,7 +56,7 @@ least isolation-level coverage; the ⚠️/❌ items are the remaining gates in 
 ## 2. Runtime traces
 
 **Fill path (scenarios 1–4,9)** — identical to `runner._make_fill_callback`:
-```
+```text
 ScriptedPaperBroker.get_order_status (1 obs/poll)
   → OrderFillPoller._poll_one → _apply_update  (increment = filled − watermark)
     → on_filled(increment) → OrderStateMachine.process_fill
@@ -64,19 +64,19 @@ ScriptedPaperBroker.get_order_status (1 obs/poll)
                            → realized PnL (sell)      → AuditLog
 ```
 **Terminal path (5,6,7,17)** — shared production handler:
-```
+```text
 poller detects CANCELED/REJECTED/EXPIRED / _handle_timeout
   → apply_terminal_event(machine, tracker, order)
       transitioned=True  → state converge + unmark_pending  (+timeout_recovery on 7)
       transitioned=False → duplicate suppressed             (+duplicate_event_suppression)
 ```
 **Reconcile path (9,10,18)**:
-```
+```text
 PositionReconciler.reconcile → _sync_order_status → poller.resync (owned) | DB fallback (unowned)
   → result.repairs[]  → record_reconciliation → reconciliation_repairs
 ```
 **Risk paths (14,15,16)**:
-```
+```text
 FreshnessGate.validate_* (fail-closed)          → stale_data_blocks
 KillSwitch.report_loss_breach → RUNNING→HALTED   → kill_switch_activations ; NEW blocked
 EmergencyFlattenManager.flatten_all → broker sells → settle → broker book flat
@@ -84,7 +84,7 @@ EmergencyFlattenManager.flatten_all → broker sells → settle → broker book 
 ```
 
 **Live metric-collection trace (representative mix, this run):**
-```
+```text
 buy(fill) ·  multi-partial[30,70,100] ·  reject ·  timeout+recover ·
 reconcile(1 repair) ·  duplicate cancel(suppressed) ·  loss breach→HALT ·  flatten(1,closed)
 → 비상청산 완료: {'attempted':1,'success':1,'submitted':1,'dry_run':False}
