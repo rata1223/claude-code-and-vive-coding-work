@@ -26,7 +26,7 @@ from backend.execution.order_events import apply_terminal_event
 from backend.execution.order_machine import FillEvent, OrderStateMachine
 from backend.execution.order_poller import OrderFillPoller
 from backend.execution.position_tracker import Fill, PositionTracker
-from backend.risk.kill_switch import KillSwitch, OrderIntent
+from backend.risk.kill_switch import KillSwitch, OrderIntent, TradingState
 from backend.testing.metrics import ValidationMetrics
 
 logger = logging.getLogger(__name__)
@@ -211,6 +211,8 @@ class PaperHarness:
         from backend.worker.emergency import EmergencyFlattenManager
         mgr = EmergencyFlattenManager(self.broker, db_factory=self.db_factory, dry_run=dry_run)
         result = mgr.flatten_all(reason)
+        if not dry_run and result.get("attempted", 0) > 0:
+            self.metrics.emergency_flatten_executions += 1
         if not dry_run and settle:
             self.broker.settle_all_open()
         return result
@@ -219,6 +221,7 @@ class PaperHarness:
         """reconciler 결과의 갭 수를 지표에 반영."""
         try:
             self.metrics.reconciliation_mismatches += len(result.gaps)
+            self.metrics.reconciliation_repairs += len(result.repairs)
         except Exception:
             pass
 
@@ -243,6 +246,7 @@ class PaperHarness:
         # poller 규약: order.filled_qty 는 '증분' 수량
         inc = order.filled_qty
         if inc <= 0:
+            self.metrics.duplicate_event_suppression += 1   # 중복 체결 이벤트 억제
             return
         self.machine.process_fill(FillEvent(order.id, inc, order.avg_fill_price))
         # 완전 체결 1회만 successful_orders 로 집계
@@ -276,6 +280,9 @@ class PaperHarness:
             target_status=OrderStatus.CANCELED, db_factory=self.db_factory)
         if transitioned:
             self.timeouts.append(order.id)
+            self.metrics.timeout_recovery += 1
+        else:
+            self.metrics.duplicate_event_suppression += 1
 
     def _on_rejected(self, order: Order) -> None:
         transitioned = apply_terminal_event(
@@ -290,12 +297,16 @@ class PaperHarness:
             else:
                 self.rejects.append(order.id)
                 self.metrics.rejected_orders += 1
+        else:
+            self.metrics.duplicate_event_suppression += 1
 
     def _on_canceled(self, order: Order) -> None:
         transitioned = apply_terminal_event(
             self.machine, self.tracker, order, db_factory=self.db_factory)
         if transitioned:
             self.cancels.append(order.id)
+        else:
+            self.metrics.duplicate_event_suppression += 1
 
     def _on_state_change(self, order: Order) -> None:
         self.state_changes.append((order.id, order.status.value))
@@ -304,7 +315,12 @@ class PaperHarness:
 
     # ── 위험 이벤트 보고 (전략/loss-tracker 가 하던 호출을 직접 트리거) ─────
     def report_loss(self, daily_pnl_pct: float, mdd_pct: float = 0.0):
-        return self.kill_switch.report_loss_breach(daily_pnl_pct, mdd_pct)
+        before = self.kill_switch.state
+        event = self.kill_switch.report_loss_breach(daily_pnl_pct, mdd_pct)
+        if (before is not TradingState.HALTED
+                and self.kill_switch.state is TradingState.HALTED):
+            self.metrics.kill_switch_activations += 1
+        return event
 
     # ── 검증 헬퍼 ────────────────────────────────────────────────────────────
     def position_qty(self, symbol: str) -> int:
