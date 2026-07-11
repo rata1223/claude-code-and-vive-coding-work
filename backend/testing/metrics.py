@@ -20,6 +20,12 @@ class ValidationMetrics:
     stale_data_blocks: int = 0          # freshness 게이트가 차단한 주문
     corporate_action_events: int = 0    # 기업행위로 차단/처리된 건
     kill_switch_blocks: int = 0         # kill-switch HALTED 로 차단된 주문
+    # P3-03B: certification metrics (task-named)
+    timeout_recovery: int = 0              # 타임아웃 → 취소로 복구된 주문 수
+    reconciliation_repairs: int = 0        # reconciler 가 실제 수리(repair)한 건
+    kill_switch_activations: int = 0       # RUNNING/WARNING → HALTED 전이 횟수
+    emergency_flatten_executions: int = 0  # 실제 비상청산 실행 횟수(dry-run 제외)
+    duplicate_event_suppression: int = 0   # 억제된 중복 브로커 이벤트(체결/터미널)
     recovery_attempts: int = 0
     recovery_successes: int = 0
     restart_recovery_seconds: list[float] = field(default_factory=list)
@@ -52,6 +58,11 @@ class ValidationMetrics:
             "stale_data_blocks": self.stale_data_blocks,
             "corporate_action_events": self.corporate_action_events,
             "kill_switch_blocks": self.kill_switch_blocks,
+            "timeout_recovery": self.timeout_recovery,
+            "reconciliation_repairs": self.reconciliation_repairs,
+            "kill_switch_activations": self.kill_switch_activations,
+            "emergency_flatten_executions": self.emergency_flatten_executions,
+            "duplicate_event_suppression": self.duplicate_event_suppression,
             "recovery_attempts": self.recovery_attempts,
             "recovery_successes": self.recovery_successes,
             "recovery_success_rate": round(self.recovery_success_rate(), 4),
