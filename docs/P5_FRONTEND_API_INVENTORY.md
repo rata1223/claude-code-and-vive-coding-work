@@ -11,10 +11,10 @@
 
 | Metric | Value |
 |---|---|
-| **Total REST endpoints** | **84** distinct exported functions across 14 API groups, each a unique method+path combination. Defined identically (byte-for-byte) in both `mobile/src/api/index.js` and `frontend/src/api/index.js`. |
+| **Total REST endpoints** | **84** distinct exported functions across 13 API groups, each a unique method+path combination. Defined identically (byte-for-byte) in both `mobile/src/api/index.js` and `frontend/src/api/index.js`. |
 | **Total WebSocket events** | **0** consumed by any frontend code. The backend (`backend/websocket/server.py`) defines 4 broadcast channels + 4 handshake events (8 total), none of which has a frontend subscriber anywhere in `mobile/` or `frontend/`. |
 | **Duplicated endpoints** | 2 functional-duplicate pairs (`authApi.changePassword` / `userApi.changePassword`; `aiAnalysisApi.getHistory` / `getAllHistory`), plus the entire 84-function surface is duplicated wholesale across `mobile/` and `frontend/` (same file, byte-identical). |
-| **Unused APIs** | **14 of 84** functions are defined but never called from any view, component, or store. Separately, **2 call sites invoke functions that don't exist** (phantom calls — a distinct defect category, not counted in the 84 or the 14). |
+| **Unused APIs** | **15 of 84** functions are defined but never called from any view, component, or store (including `authApi.loginWithCode`, marked ⛔ in §2 but omitted from this count in an earlier draft). Separately, **2 call sites invoke functions that don't exist** (phantom calls — a distinct defect category, not counted in the 84 or the 15). |
 
 ---
 
@@ -96,6 +96,7 @@ Uses the raw `axios` import directly — no `baseURL` resolution, no auth header
 All 84 functions, from `mobile/src/api/index.js` (identical in `frontend/`). "Response" reflects the shape returned *after* interceptor transform, as coded — not inferred. ✅ = called from at least one view/component; ⛔ = never called anywhere (see §7).
 
 ### `authApi` (lines 371-381)
+
 | Fn | Method | Path | Body | Query | Response | Used |
 |---|---|---|---|---|---|---|
 | `login` | POST | `/api/auth/login` | `data` | — | envelope | ✅ |
@@ -111,12 +112,14 @@ All 84 functions, from `mobile/src/api/index.js` (identical in `frontend/`). "Re
 Note: `loginWithCode` (`/api/auth/login-code`) is defined but no view in the call-site inventory (§4) invokes it — the login screen's code-based flow uses `sendCode` + `login`/`register` instead. Marking ⛔.
 
 ### `dashboardApi` (lines 383-398)
+
 | Fn | Method | Path | Body | Query | Response | Used |
 |---|---|---|---|---|---|---|
 | `getSummary` | GET | `/api/dashboard/summary` | — | — | `{...res, data: res.data \|\| {}}` | ✅ |
 | `getPendingOrders` | GET | `/api/dashboard/pendingOrders` | — | `params` (default `{}`) | `{...res, data: res.data \|\| {items:[], total:0}}` | ⛔ |
 
 ### `credentialsApi` (lines 400-428)
+
 | Fn | Method | Path | Body | Query | Response | Used |
 |---|---|---|---|---|---|---|
 | `list` | GET | `/api/credentials/list` | — | — | `{...res, data: unwrapItems(res.data)}` | ✅ |
@@ -126,6 +129,7 @@ Note: `loginWithCode` (`/api/auth/login-code`) is defined but no view in the cal
 | `getEgressIp` | GET | `/api/credentials/egress-ip` | — | — | `{...res, data: res.data \|\| {}}` | ✅ |
 
 ### `strategyApi` (lines 430-535)
+
 | Fn | Method | Path | Body | Query | Response | Used |
 |---|---|---|---|---|---|---|
 | `getTemplates` | GET | `/api/templates` | — | `params` (default `{}`) | `{...res, data: ensureArray(res.data)}` | ⛔ |
@@ -152,6 +156,7 @@ Note: `loginWithCode` (`/api/auth/login-code`) is defined but no view in the cal
 | `clearNotifications` | DELETE | `/api/strategies/notifications/clear` | — | — | envelope | ⛔ |
 
 ### `quickTradeApi` (lines 537-572)
+
 | Fn | Method | Path | Body | Query | Response | Used |
 |---|---|---|---|---|---|---|
 | `getBalance` | GET | `/api/quick-trade/balance` | — | `{credential_id, market_type='spot'}` | `res.data \|\| {available:0,total:0,currency:'USDT'}` | ✅ |
@@ -161,6 +166,7 @@ Note: `loginWithCode` (`/api/auth/login-code`) is defined but no view in the cal
 | `getHistory` | GET | `/api/quick-trade/history` | — | `params` (default `{}`) | `unwrapItems(res.data,'trades')` | ✅ |
 
 ### `aiAnalysisApi` (lines 574-611)
+
 | Fn | Method | Path | Body | Query | Response | Used |
 |---|---|---|---|---|---|---|
 | `analyze` | POST | `/api/fast-analysis/analyze` | `payload` | — (`timeout:300000` config) | envelope | ✅ |
@@ -172,6 +178,7 @@ Note: `loginWithCode` (`/api/auth/login-code`) is defined but no view in the cal
 | `getSimilarPatterns` | GET | `/api/fast-analysis/similar-patterns` | — | `params` (default `{}`) | `res.data \|\| {}` | ⛔ |
 
 ### `marketApi` (lines 613-662)
+
 | Fn | Method | Path | Body | Query | Response | Used |
 |---|---|---|---|---|---|---|
 | `getIndicators` | GET | `/api/community/indicators` | — | `params` (default `{}`) | `{items, total, page, page_size}` | ✅ |
@@ -183,6 +190,7 @@ Note: `loginWithCode` (`/api/auth/login-code`) is defined but no view in the cal
 | `getIndicatorPerformance` | GET | `/api/community/indicators/${id}/performance` | — | — | `res.data \|\| {}` | ✅ |
 
 ### `watchlistApi` (lines 664-702)
+
 | Fn | Method | Path | Body | Query | Response | Used |
 |---|---|---|---|---|---|---|
 | `getList` | GET | `/api/market/watchlist/get` | — | — | mapped array | ✅ |
@@ -193,6 +201,7 @@ Note: `loginWithCode` (`/api/auth/login-code`) is defined but no view in the cal
 | `getPrices` | GET | `/api/market/watchlist/prices` | — | `{watchlist: JSON.stringify(list\|\|[])}` | `ensureArray(res.data)` | ✅ |
 
 ### `klineApi` (lines 704-721)
+
 | Fn | Method | Path | Body | Query | Response | Used |
 |---|---|---|---|---|---|---|
 | `getKline` | GET | `/api/indicator/kline` | — | `{market='Crypto', symbol, timeframe='1h', limit=200[, before_time]}` | `ensureArray(res.data)` | ✅ |
@@ -201,6 +210,7 @@ Note: `loginWithCode` (`/api/auth/login-code`) is defined but no view in the cal
 **Note:** no `getTicker` function exists in this group (see §7 phantom call).
 
 ### `indicatorApi` (lines 723-745)
+
 | Fn | Method | Path | Body | Query | Response | Used |
 |---|---|---|---|---|---|---|
 | `getList` | GET | `/api/indicator/getIndicators` | — | — | `ensureArray(res.data?.indicators \|\| res.data)` | ✅ |
@@ -210,6 +220,7 @@ Note: `loginWithCode` (`/api/auth/login-code`) is defined but no view in the cal
 **Note:** no `getIndicators` function exists on `indicatorApi` (see §7 phantom call — `getList` is the actual name; the literal path `/api/indicator/getIndicators` is what `getList` calls, which is presumably the source of the naming confusion).
 
 ### `userApi` (lines 747-782)
+
 | Fn | Method | Path | Body | Query | Response | Used |
 |---|---|---|---|---|---|---|
 | `getProfile` | GET | `/api/users/profile` | — | — | envelope | ✅ |
@@ -222,6 +233,7 @@ Note: `loginWithCode` (`/api/auth/login-code`) is defined but no view in the cal
 | `getMyReferrals` | GET | `/api/users/my-referrals` | — | `params` (default `{}`) | `{list, total, referral_code, referral_bonus, register_bonus}` | ✅ |
 
 ### `globalMarketApi` (lines 784-810)
+
 | Fn | Method | Path | Body | Query | Response | Used |
 |---|---|---|---|---|---|---|
 | `getOverview` | GET | `/api/global-market/overview` | — | — | `res.data \|\| {indices:[]}` | ✅ |
@@ -229,6 +241,7 @@ Note: `loginWithCode` (`/api/auth/login-code`) is defined but no view in the cal
 | `getSentiment` | GET | `/api/global-market/sentiment` | — | — | normalized sentiment | ✅ |
 
 ### `billingApi` (lines 812-842)
+
 | Fn | Method | Path | Body | Query | Response | Used |
 |---|---|---|---|---|---|---|
 | `listUsdtChains` | GET | `/api/billing/usdt/chains` | — | — | `res.data \|\| {chains:[]}` | ✅ |
@@ -451,7 +464,7 @@ Pinia only (confirmed — `mobile/src/stores/index.js:1` and `frontend/src/store
 
 ## 8. Answers to the four required report items
 
-- **Total REST endpoints: 84**, across 14 groups, identical in `mobile/` and `frontend/` (§2).
+- **Total REST endpoints: 84**, across 13 groups, identical in `mobile/` and `frontend/` (§2).
 - **Total WebSocket events: 0** consumed client-side; 8 defined server-side with no consumer (§6).
 - **Duplicated endpoints**: `authApi.changePassword` vs `userApi.changePassword` (same purpose, different path, only the former used); `aiAnalysisApi.getHistory` vs `getAllHistory` (overlapping purpose, only the latter used); the entire 84-function surface duplicated wholesale between `mobile/` and `frontend/` (§4).
-- **Unused APIs**: 14 defined-but-never-called functions (marked ⛔ in §2), plus 2 phantom calls to functions that were never defined at all (§5) — a distinct, more severe category since they're active runtime bugs waiting to trigger, not just dead code.
+- **Unused APIs**: 15 defined-but-never-called functions (marked ⛔ in §2, including `authApi.loginWithCode`), plus 2 phantom calls to functions that were never defined at all (§5) — a distinct, more severe category since they're active runtime bugs waiting to trigger, not just dead code.

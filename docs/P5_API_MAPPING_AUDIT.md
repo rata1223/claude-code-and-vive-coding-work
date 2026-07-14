@@ -1,6 +1,8 @@
 # P5-API_MAPPING_AUDIT: Frontend↔Backend API Compatibility Audit
 
 > **Analysis only.** No backend or frontend code was changed to produce this document. Every classification below is taken directly from source (`mobile/src/api/index.js`, `api/main.py`, `api/routers/*.py`, `api/schemas.py`, `api/models.py`, `Dockerfile.api`, `docker-compose.yml`) — nothing is inferred.
+>
+> **Status update (post-Phase-1A, see `docs/P5_COMPAT_PHASE1A.md`):** the `authApi.login` and `credentialsApi.create` mismatches described below (§2 rows 1 & 3, §5 credentials row) have since been **resolved** by `api/compat.py`. This document is left as the point-in-time snapshot that justified that work — the affected rows are tagged `✅ RESOLVED (P5-02A)` inline rather than rewritten, so the original audit trail stays intact. Everything else in this document (all other endpoints, the Missing-endpoint list, the remaining Adapter Candidates) is still current as of the same date.
 
 **Date:** 2026-07-14
 **Base document:** `docs/P5_FRONTEND_API_INVENTORY.md` (84 frontend endpoint functions, verified)
@@ -24,6 +26,7 @@ Definitively resolved before any comparison work: **`api/main.py`** (FastAPI, `u
 All 84 frontend endpoints. **BE Method+Path** is "— missing —" where no backend route exists at all. **Class** = Fully compatible (FC) / DTO differs (DTO) / Partially implemented (PI) / Missing (MISS). No case of URL-differs-only was found anywhere in the 84.
 
 ### authApi (FE base `/api/auth`)
+
 | FE function | FE method+path | BE method+path | Class |
 |---|---|---|---|
 | login | POST /api/auth/login | POST /api/auth/login | DTO |
@@ -37,10 +40,12 @@ All 84 frontend endpoints. **BE Method+Path** is "— missing —" where no back
 | changePassword | POST /api/auth/change-password | POST /api/auth/change-password | FC |
 
 ### dashboardApi (`/api/dashboard`)
+
 | getSummary | GET /api/dashboard/summary | GET /api/dashboard/summary | FC |
 | getPendingOrders | GET /api/dashboard/pendingOrders | GET /api/dashboard/pendingOrders | FC |
 
 ### credentialsApi (`/api/credentials`)
+
 | list | GET /api/credentials/list | GET /api/credentials/list | FC |
 | get | GET /api/credentials/get | GET /api/credentials/get | FC |
 | create | POST /api/credentials/create | POST /api/credentials/create | DTO |
@@ -48,6 +53,7 @@ All 84 frontend endpoints. **BE Method+Path** is "— missing —" where no back
 | getEgressIp | GET /api/credentials/egress-ip | GET /api/credentials/egress-ip | FC |
 
 ### strategyApi (`/api/strategies`, `/api/templates`)
+
 | getTemplates | GET /api/templates | GET /api/templates | FC |
 | getTemplate | GET /api/templates/{key} | GET /api/templates/{key} | FC |
 | create | POST /api/strategies/create | POST /api/strategies/create | DTO |
@@ -72,6 +78,7 @@ All 84 frontend endpoints. **BE Method+Path** is "— missing —" where no back
 | clearNotifications | DELETE /api/strategies/notifications/clear | DELETE /api/strategies/notifications/clear | FC |
 
 ### quickTradeApi (`/api/quick-trade`)
+
 | getBalance | GET /api/quick-trade/balance | GET /api/quick-trade/balance | DTO |
 | getPosition | GET /api/quick-trade/position | GET /api/quick-trade/position | DTO |
 | placeOrder | POST /api/quick-trade/place-order | POST /api/quick-trade/place-order | DTO |
@@ -79,6 +86,7 @@ All 84 frontend endpoints. **BE Method+Path** is "— missing —" where no back
 | getHistory | GET /api/quick-trade/history | GET /api/quick-trade/history | PI |
 
 ### aiAnalysisApi (`/api/fast-analysis`) — entirely unimplemented
+
 | analyze | POST /api/fast-analysis/analyze | — missing — | MISS |
 | getHistory | GET /api/fast-analysis/history | — missing — | MISS |
 | getAllHistory | GET /api/fast-analysis/history/all | — missing — | MISS |
@@ -88,6 +96,7 @@ All 84 frontend endpoints. **BE Method+Path** is "— missing —" where no back
 | getSimilarPatterns | GET /api/fast-analysis/similar-patterns | — missing — | MISS |
 
 ### marketApi (`/api/community`) — entirely unimplemented
+
 | getIndicators | GET /api/community/indicators | — missing — | MISS |
 | getIndicator | GET /api/community/indicators/{id} | — missing — | MISS |
 | purchase | POST /api/community/indicators/{id}/purchase | — missing — | MISS |
@@ -97,6 +106,7 @@ All 84 frontend endpoints. **BE Method+Path** is "— missing —" where no back
 | getIndicatorPerformance | GET /api/community/indicators/{id}/performance | — missing — | MISS |
 
 ### watchlistApi (`/api/market`)
+
 | getList | GET /api/market/watchlist/get | GET /api/market/watchlist/get | DTO |
 | add | POST /api/market/watchlist/add | POST /api/market/watchlist/add | FC |
 | remove | POST /api/market/watchlist/remove | POST /api/market/watchlist/remove | FC |
@@ -105,15 +115,18 @@ All 84 frontend endpoints. **BE Method+Path** is "— missing —" where no back
 | getPrices | GET /api/market/watchlist/prices | GET /api/market/watchlist/prices | DTO |
 
 ### klineApi (`/api/indicator`)
+
 | getKline | GET /api/indicator/kline | GET /api/indicator/kline | DTO |
 | getPrice | GET /api/indicator/price | GET /api/indicator/price | PI |
 
 ### indicatorApi (`/api/indicator`)
+
 | getList | GET /api/indicator/getIndicators | GET /api/indicator/getIndicators | DTO |
 | getParams | GET /api/indicator/getIndicatorParams | GET /api/indicator/getIndicatorParams | FC |
 | parseStrategyConfig | POST /api/indicator/parseStrategyConfig | POST /api/indicator/parseStrategyConfig | DTO |
 
 ### userApi (`/api/users`)
+
 | getProfile | GET /api/users/profile | GET /api/users/profile | FC |
 | updateProfile | PUT /api/users/profile/update | PUT /api/users/profile/update | FC |
 | getNotificationSettings | GET /api/users/notification-settings | GET /api/users/notification-settings | PI |
@@ -124,11 +137,13 @@ All 84 frontend endpoints. **BE Method+Path** is "— missing —" where no back
 | getMyReferrals | GET /api/users/my-referrals | GET /api/users/my-referrals | PI |
 
 ### globalMarketApi (`/api/global-market`)
+
 | getOverview | GET /api/global-market/overview | GET /api/global-market/overview | FC |
 | getCalendar | GET /api/global-market/calendar | GET /api/global-market/calendar | FC |
 | getSentiment | GET /api/global-market/sentiment | GET /api/global-market/sentiment | FC |
 
 ### billingApi (`/api/billing`) — entirely unimplemented
+
 | listUsdtChains | GET /api/billing/usdt/chains | — missing — | MISS |
 | getPlans | GET /api/billing/plans | — missing — | MISS |
 | purchase | POST /api/billing/purchase | — missing — | MISS |
@@ -143,9 +158,9 @@ Every entry: exact frontend expectation (quoted from `mobile/src/api/index.js`) 
 
 | # | Endpoint | FE expects | BE actually does | Failure mode |
 |---|---|---|---|---|
-| 1 | `authApi.login` | body `data` incl. `turnstile_token` | `LoginRequest{email: EmailStr, password: str}` — no captcha field exists | `turnstile_token` silently dropped (no `extra="forbid"`); harmless since backend never checks it, but signals a fake security control on the frontend |
+| 1 | `authApi.login` | body `data` incl. `turnstile_token` | `LoginRequest{email: EmailStr, password: str}` — no captcha field exists | `turnstile_token` silently dropped (no `extra="forbid"`); harmless since backend never checks it, but signals a fake security control on the frontend. **✅ RESOLVED (P5-02A):** separately, `docs/P5_ADAPTER_PLAN.md` §0 found the frontend actually sends `username` (not `email`) — a more severe break than this row originally described. `api/compat.py`'s `CompatLoginRequest` now accepts both; see `docs/P5_COMPAT_PHASE1A.md`. |
 | 2 | `authApi.register` | `{email, code, username, password, turnstile_token, referral_code}` | `RegisterRequest{email, password (min_length=6), nickname: Optional}` | `code`, `username`, `turnstile_token`, `referral_code` all silently dropped — email verification code is never checked (backend has no code-verification logic at all), referral is never recorded |
-| 3 | `credentialsApi.create` | `{name, exchange_id, api_key, secret_key, passphrase, account_no, hts_id, enable_demo_trading}` | `CredentialCreate{name, exchange_id, app_key: Optional, app_secret: Optional, account_no, hts_id, api_key: Optional, env: str="paper"}` | `secret_key` has no matching field → dropped, never persisted. `api_key` lands in `CredentialCreate.api_key` → stored as `api_key_enc`, but `dashboard.py`'s `_build_kis_client_from_cred()` reads `app_key_enc`/`app_secret_enc` — both stay empty. `passphrase` dropped (KIS doesn't use one, so this is fine to drop). `enable_demo_trading` dropped — `env` always defaults to `"paper"` regardless of the user's toggle. **Net: no KIS credential created via the app can ever produce a working broker connection.** |
+| 3 | `credentialsApi.create` | `{name, exchange_id, api_key, secret_key, passphrase, account_no, hts_id, enable_demo_trading}` | `CredentialCreate{name, exchange_id, app_key: Optional, app_secret: Optional, account_no, hts_id, api_key: Optional, env: str="paper"}` | `secret_key` has no matching field → dropped, never persisted. `api_key` lands in `CredentialCreate.api_key` → stored as `api_key_enc`, but `dashboard.py`'s `_build_kis_client_from_cred()` reads `app_key_enc`/`app_secret_enc` — both stay empty. `passphrase` dropped (KIS doesn't use one, so this is fine to drop). `enable_demo_trading` dropped — `env` always defaults to `"paper"` regardless of the user's toggle. **Net (as originally audited): no KIS credential created via the app can ever produce a working broker connection.** **✅ RESOLVED (P5-02A):** `api/compat.py`'s `CompatCredentialCreate` now maps `api_key`→`app_key`, `secret_key`→`app_secret`, and derives `env` from `enable_demo_trading` — verified live against a decrypted database in `docs/P5_COMPAT_PHASE1A.md`. |
 | 4 | `strategyApi.getList` | `res.data?.strategies` (array) | `Resp.ok({"total": n, "items": [...]})` | key is `items`, not `strategies` → `getList()` always returns `[]` |
 | 5 | `strategyApi.getTrades` | query `{id, limit}`; response `res.data.trades` | query requires `strategy_id` (not `id`), pagination is `page`/`page_size` (no `limit`); response `{"total", "items"}` | wrong required query param name → HTTP 422 before the `items` vs `trades` key mismatch even matters |
 | 6 | `strategyApi.getPositions` | query `{id}`; response `res.data.positions` | requires `strategy_id`; response `{"items": [...]}` | same 422, then `items` vs `positions` key mismatch |
@@ -172,10 +187,10 @@ Every entry: exact frontend expectation (quoted from `mobile/src/api/index.js`) 
 
 | Group | FC | DTO | PI | MISS | Total |
 |---|---|---|---|---|---|
-| authApi | 6 | 2 | 2 | 1 | 9 |
+| authApi | 4 | 2 | 2 | 1 | 9 |
 | dashboardApi | 2 | 0 | 0 | 0 | 2 |
 | credentialsApi | 4 | 1 | 0 | 0 | 5 |
-| strategyApi (incl. templates) | 11 | 8 | 3 | 0 | 22 |
+| strategyApi (incl. templates) | 12 | 8 | 2 | 0 | 22 |
 | quickTradeApi | 0 | 4 | 1 | 0 | 5 |
 | aiAnalysisApi | 0 | 0 | 0 | 7 | 7 |
 | marketApi | 0 | 0 | 0 | 7 | 7 |
@@ -218,7 +233,7 @@ Mismatches fixable by a thin request/response translation layer (a BFF/gateway a
 | Systemic `{"items":[...]}` vs bare-array/renamed-key (watchlist get/search/hot, strategy list/trades/positions/equityCurve/logs, indicator getIndicators, kline) | Backend has one uniform list-wrapping convention (`items`); frontend was written against per-resource semantic key names | A single response-unwrapping adapter: map `items`→(bare array, or `trades`/`positions`/`strategies`/`indicators`/`logs` as appropriate per route) | **Yes** — one gateway-side transform rule per route covers all ~9 instances; equally fixable by patching `ensureArray`/`unwrapItems` call sites in `mobile/src/api/index.js` directly, which is arguably simpler than standing up a gateway for this alone |
 | `strategy_id` vs `id` query param (trades/positions/equityCurve/performance/logs) | Backend's five strategy sub-resource routes all named their required query param `strategy_id`; frontend consistently sends `id` | Rename `id`→`strategy_id` on the way out (or in on the gateway) | **Yes** — trivial rename, no data loss either direction |
 | `strategyApi.getUnreadNotificationCount`: `count` vs `unread` | Pure key-naming difference | Rename `count`→`unread` in the response | **Yes** |
-| `credentialsApi.create` field mismatch | Backend's `CredentialCreate` model already has `app_key`, `app_secret`, `env` fields — the frontend just uses different names (`api_key`, `secret_key`, `enable_demo_trading`) and the backend has no field for `passphrase` (fine — KIS doesn't use one) | Adapter maps `api_key`→`app_key`, `secret_key`→`app_secret`, `enable_demo_trading` (`true`/`false`)→`env` (`"real"`/`"paper"`), drops `passphrase` | **Yes** — no backend schema change needed at all, since every destination field already exists; this is the cheapest possible fix for the single most consequential bug in this audit |
+| `credentialsApi.create` field mismatch — **✅ RESOLVED (P5-02A)**, kept here as the adapter-candidate rationale that justified the fix | Backend's `CredentialCreate` model already has `app_key`, `app_secret`, `env` fields — the frontend just uses different names (`api_key`, `secret_key`, `enable_demo_trading`) and the backend has no field for `passphrase` (fine — KIS doesn't use one) | Adapter maps `api_key`→`app_key`, `secret_key`→`app_secret`, `enable_demo_trading` (`true`/`false`)→`env` (`"real"`/`"paper"`), drops `passphrase` — **implemented** in `api/compat.py`, see `docs/P5_COMPAT_PHASE1A.md` | **Yes** — no backend schema change needed at all, since every destination field already exists; this was the cheapest possible fix for the single most consequential bug in this audit |
 | `quickTradeApi.getBalance`/`getPosition`: `market_type` vs `market` | Pure param-naming difference | Rename `market_type`→`market` | **Yes** |
 | `quickTradeApi.placeOrder`: `amount` vs `qty` | Frontend computes an `amount` value that the backend calls `qty` | Rename `amount`→`qty` before sending | **Yes** — assuming `amount` and `qty` mean the same quantity (share count), which the field names suggest but should be confirmed against `kis_adapter/orders.py`'s actual usage before treating this as a pure rename |
 | `quickTradeApi.closePosition`: missing `qty`/`price` | Frontend doesn't currently collect/send these at all | Frontend (or a stateful gateway that already knows the open position's qty/price) must supply real values — a *stateless* adapter cannot invent `qty`/`price` out of nothing, so this is only adapter-fixable if the gateway maintains position state itself; otherwise it's a frontend form-field addition | **Partially** — needs either a frontend change to collect/send the values, or a stateful gateway (more complex than a simple rename) |
