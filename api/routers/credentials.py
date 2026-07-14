@@ -2,11 +2,12 @@ import httpx
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
 
+from api.compat import CompatCredentialCreate
 from api.crypto import decrypt, encrypt
 from api.database import get_db
 from api.deps import get_current_user
 from api.models import Credential, User
-from api.schemas import CredentialCreate, CredentialOut, Resp
+from api.schemas import CredentialOut, Resp
 
 router = APIRouter(prefix="/api/credentials", tags=["credentials"])
 
@@ -52,7 +53,7 @@ def get_credential(
 
 @router.post("/create")
 def create_credential(
-    body: CredentialCreate,
+    body: CompatCredentialCreate,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
