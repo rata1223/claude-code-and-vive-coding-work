@@ -4,12 +4,12 @@ from slowapi import Limiter
 from slowapi.util import get_remote_address
 
 from api.auth import create_access_token, hash_password, verify_password
+from api.compat import CompatLoginRequest
 from api.database import get_db
 from api.deps import get_current_user
 from api.models import User
 from api.schemas import (
     ChangePasswordRequest,
-    LoginRequest,
     RegisterRequest,
     Resp,
 )
@@ -38,7 +38,7 @@ def register(request: Request, body: RegisterRequest, db: Session = Depends(get_
 
 @router.post("/login")
 @limiter.limit("5/minute")
-def login(request: Request, body: LoginRequest, db: Session = Depends(get_db)):
+def login(request: Request, body: CompatLoginRequest, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.email == body.email).first()
     if not user or not verify_password(body.password, user.password_hash):
         return Resp.err("Invalid email or password", code=-1)
