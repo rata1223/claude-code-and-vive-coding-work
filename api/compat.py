@@ -1,4 +1,4 @@
-"""Frontend/backend request compatibility adapter (P5-02A, Phase 1).
+"""Frontend/backend request compatibility adapter (P5-02A/B, Phase 1).
 
 These models are attribute-compatible with the existing backend schemas
 (``LoginRequest``, ``CredentialCreate`` in ``api/schemas.py``) — same field
@@ -8,12 +8,24 @@ etc.) — but also accept the frontend's actual wire field names via pydantic
 models therefore requires no change to the route handler itself: only the
 type annotation changes.
 
+``StrategyCompatMiddleware`` (Phase 1B) covers the strategy sub-resource
+endpoints, which take their identifying parameter as a bare ``Query(...)``
+rather than a Pydantic body model — there's no type annotation to swap, so
+translation happens as HTTP middleware instead: it rewrites the query string
+before FastAPI resolves route parameters, and reshapes the JSON response
+body afterwards. ``api/routers/strategies.py`` is not modified at all.
+
 Scope: request/response translation only. No authentication or business
 logic lives here.
 """
-from typing import Optional
+import json
+from typing import Dict, NamedTuple, Optional, Tuple
+from urllib.parse import parse_qsl, urlencode
 
 from pydantic import AliasChoices, BaseModel, EmailStr, Field, model_validator
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import Response
 
 
 class CompatLoginRequest(BaseModel):
@@ -61,3 +73,131 @@ class CompatCredentialCreate(BaseModel):
         if self.enable_demo_trading is not None:
             self.env = "paper" if self.enable_demo_trading else "real"
         return self
+
+
+# ── Phase 1B: strategy sub-resource compatibility (HTTP middleware) ─────────
+
+
+class _StrategyPathConfig(NamedTuple):
+    """Per-path Phase 1B translation config.
+
+    `response_key_add` is `(old_key, new_key)`: copies `data[old_key]` to
+    `data[new_key]`, additive — `old_key` stays, so nothing reading the old
+    shape today breaks. `response_unwrap_key`, when set, replaces `data`
+    with `data[response_unwrap_key]` instead — the one non-additive case,
+    needed because the frontend does `ensureArray(res.data)` for
+    equityCurve: `data` itself must *be* the array, which can't coexist
+    with also being a dict with a keyed array inside it. A path never sets
+    both `response_key_add` and `response_unwrap_key`.
+    """
+
+    query_remap: bool = False
+    response_key_add: Optional[Tuple[str, str]] = None
+    response_unwrap_key: Optional[str] = None
+
+
+# Single source of truth for which strategy GET paths this middleware
+# touches and how — one entry per path, so there's no risk of the
+# request-side and response-side tables drifting out of sync with each
+# other, and no implicit precedence rule to trip over.
+_STRATEGY_PATH_CONFIG: Dict[str, _StrategyPathConfig] = {
+    "/api/strategies": _StrategyPathConfig(response_key_add=("items", "strategies")),
+    "/api/strategies/trades": _StrategyPathConfig(query_remap=True, response_key_add=("items", "trades")),
+    "/api/strategies/positions": _StrategyPathConfig(query_remap=True, response_key_add=("items", "positions")),
+    "/api/strategies/equityCurve": _StrategyPathConfig(query_remap=True, response_unwrap_key="items"),
+    "/api/strategies/performance": _StrategyPathConfig(query_remap=True),
+    "/api/strategies/logs": _StrategyPathConfig(query_remap=True, response_key_add=("items", "logs")),
+    "/api/strategies/notifications/unread-count": _StrategyPathConfig(response_key_add=("count", "unread")),
+}
+
+
+class StrategyCompatMiddleware(BaseHTTPMiddleware):
+    """Translates strategy sub-resource requests/responses between the
+    frontend's expected shape and the backend's actual shape, without any
+    change to `api/routers/strategies.py`."""
+
+    async def dispatch(self, request: Request, call_next):
+        path = request.url.path
+        config = _STRATEGY_PATH_CONFIG.get(path) if request.method == "GET" else None
+
+        if config and config.query_remap:
+            self._remap_query_string(request)
+
+        response = await call_next(request)
+
+        if config and response.status_code == 200:
+            response = await self._transform_response(config, response)
+
+        return response
+
+    @staticmethod
+    def _remap_query_string(request: Request) -> None:
+        # keep_blank_values=True matches Starlette's own QueryParams parsing
+        # (see starlette.datastructures.QueryParams) — without it, any other
+        # blank-valued param sharing the query string (e.g. `?id=1&level=`)
+        # would be silently dropped by the rewrite below, not just left blank.
+        params = dict(
+            parse_qsl(request.scope["query_string"].decode("latin-1"), keep_blank_values=True)
+        )
+        if "strategy_id" not in params and "id" in params:
+            params["strategy_id"] = params["id"]
+            request.scope["query_string"] = urlencode(params).encode("latin-1")
+
+    @staticmethod
+    async def _transform_response(config: "_StrategyPathConfig", response: Response) -> Response:
+        body = b"".join([chunk async for chunk in response.body_iterator])
+        try:
+            payload = json.loads(body)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return StrategyCompatMiddleware._rebuild(response, body)
+
+        data = payload.get("data") if isinstance(payload, dict) else None
+        changed = False
+        if isinstance(data, dict):
+            if config.response_unwrap_key is not None and config.response_unwrap_key in data:
+                payload["data"] = data[config.response_unwrap_key]
+                changed = True
+            elif config.response_key_add is not None:
+                old_key, new_key = config.response_key_add
+                if old_key in data:
+                    data[new_key] = data[old_key]
+                    changed = True
+
+        if not changed:
+            # Nothing to add (e.g. a "Strategy not found" business error,
+            # where `data` is null) — skip the JSON re-serialization entirely
+            # rather than paying for it on every no-op response.
+            return StrategyCompatMiddleware._rebuild(response, body)
+
+        # Match FastAPI's own JSONResponse.render() formatting exactly
+        # (ensure_ascii=False, allow_nan=False, compact separators) —
+        # otherwise Korean/non-ASCII text (strategy names, log messages)
+        # would round-trip through this middleware re-encoded as \uXXXX
+        # escapes instead of raw UTF-8, and every response on these paths
+        # would gain extra whitespace compared to the rest of the API.
+        new_body = json.dumps(
+            payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+        ).encode("utf-8")
+        return StrategyCompatMiddleware._rebuild(response, new_body)
+
+    @staticmethod
+    def _rebuild(response: Response, body: bytes) -> Response:
+        """Construct a fresh Response carrying `body` — unavoidable once
+        `response.body_iterator` has been consumed to inspect it — while
+        preserving every original header via `raw_headers` (a list, so
+        duplicate headers like multiple Set-Cookie survive) rather than
+        collapsing them through a `dict(...)`, which would silently drop
+        anything but the last value for a repeated header name. Only
+        Content-Length/Content-Type are recomputed, since `body` may be a
+        different length than the original.
+        """
+        new_response = Response(
+            content=body, status_code=response.status_code, media_type=response.media_type
+        )
+        preserved = [
+            (k, v)
+            for k, v in response.raw_headers
+            if k.lower() not in (b"content-length", b"content-type")
+        ]
+        new_response.raw_headers = new_response.raw_headers + preserved
+        return new_response
