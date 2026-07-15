@@ -24,6 +24,7 @@ from backend.brokers.paper_broker import ScriptedPaperBroker
 from backend.data.corporate_actions import ActionStatus, ActionType, CorporateAction
 from backend.data.corporate_action_runtime import CorporateActionRuntime
 from backend.execution.order_poller import OrderFillPoller
+from backend.quant.risk.engine import _seoul_today
 from backend.worker.recovery import SAFE_MODE, StartupRecovery
 
 BROKER = "kis"
@@ -105,7 +106,10 @@ def test_restart_restores_ca_gate_and_halts_on_kill_switch(db_factory, pg_tradin
                               status=ActionStatus.UNKNOWN))   # unknown → fail-closed block
     s = db_factory()
     try:
-        s.add(DailyRiskState(trade_date=date.today(), kill_switch=True,
+        # Must match _seoul_today() below — PersistentLossTracker._restore_state()
+        # looks up DailyRiskState keyed on Asia/Seoul's date, not the CI runner's
+        # local/UTC date, which disagree for part of every day.
+        s.add(DailyRiskState(trade_date=_seoul_today(), kill_switch=True,
                              kill_reason="이전 세션 손실 한도"))
         s.commit()
     finally:
