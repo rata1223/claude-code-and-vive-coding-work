@@ -55,7 +55,7 @@ High-effort `/code-review` (8 independent finder angles + 1-vote verify) ran aga
 ## Request mapping
 
 **`search`:**
-```
+```text
 FE sends query:  { keyword, market, limit }
 BE wants query:  { q, market, limit }
 
@@ -65,7 +65,7 @@ Middleware: if "q" not in query and "keyword" in query,
 `q` always wins if both are present (same precedence pattern as Phase 1A's `email`/`username` and Phase 1B's `strategy_id`/`id`) — verified by `test_search_q_takes_precedence_over_keyword_when_both_present`. Direct callers already sending `q` are unaffected, since the remap only fires when `q` is absent. If `keyword` itself is repeated, the last value is used, matching native `q` semantics — verified by `test_search_duplicate_keyword_resolves_to_last_value`.
 
 **`getPrices`:**
-```
+```text
 FE sends query:  { watchlist: '[{"symbol":"AAPL","market":"NASD"}, ...]' }
 BE wants query:  { symbols: "AAPL,MSFT,..." }
 
@@ -82,7 +82,7 @@ Fails open by design: if `watchlist` is missing, not valid JSON, not a list, or 
 ## Response mapping
 
 For all four paths:
-```
+```text
 BE returns:  { "total"?: n, "items": [...] }
 Middleware:  data = data["items"]              -- non-additive, matches equityCurve's precedent
 FE reads:    ensureArray(res.data)
@@ -114,15 +114,15 @@ This mirrors Phase 1B's `equityCurve` case exactly, for the same reason: the fro
 
 **Before implementation** (middleware did not exist): 11 of 19 initial tests failed exactly as expected — every test depending on the `keyword`→`q` alias, the `watchlist`→`symbols` alias, or the response unwrap returned the pre-existing broken shape (unfiltered catalogue, 422, or a dict instead of an array), while tests exercising already-existing behavior (missing-param 422, malformed-JSON 422, `add`/`remove`, unrelated routes) already passed.
 
-**After implementation, plus 2 regression tests added during the `/code-review` pass** (duplicate-query-key last-value-wins, for both `search` and `getPrices` — see the catches above): all 21 watchlist tests pass, and all 46 Phase 1A/1B tests continue to pass unchanged (67/67 total in `api/tests/`).
+**After implementation, plus 2 regression tests added during the `/code-review` pass** (duplicate-query-key last-value-wins, for both `search` and `getPrices` — see the catches above) **and 1 more from CodeRabbit's review of the PR** (`symbols` takes precedence over `watchlist`, matching the existing `q`/`keyword` precedence coverage): all 22 watchlist tests pass, and all 46 Phase 1A/1B tests continue to pass unchanged (68/68 total in `api/tests/`).
 
-```
-api/tests/test_compat_watchlist.py — 21 passed
+```text
+api/tests/test_compat_watchlist.py — 22 passed
 api/tests/test_compat_strategy.py  — 30 passed
 api/tests/test_compat_login.py     — 7 passed
 api/tests/test_compat_credentials.py — 9 passed
 
-======================= 67 passed in 30.21s =======================
+======================= 68 passed in 32.40s =======================
 ```
 
 ## Files changed

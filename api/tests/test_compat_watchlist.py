@@ -81,6 +81,18 @@ class TestWatchlistRequestMapping:
         symbols = [row["symbol"] for row in res.json()["data"]]
         assert symbols == ["AAPL"]
 
+    def test_prices_symbols_takes_precedence_over_watchlist(self, client, auth_headers):
+        # Matches the equivalent q/keyword precedence coverage: the native
+        # param wins, the remap only fires when "symbols" is absent.
+        res = client.get(
+            '/api/market/watchlist/prices?symbols=AAPL&watchlist=[{"symbol":"MSFT"}]',
+            headers=auth_headers,
+        )
+
+        assert res.status_code == 200
+        symbols = [row["symbol"] for row in res.json()["data"]]
+        assert symbols == ["AAPL"]
+
     def test_prices_multiple_symbols_in_watchlist_json_all_resolve(self, client, auth_headers):
         res = client.get(
             '/api/market/watchlist/prices?watchlist=[{"symbol":"AAPL","market":"NASD"},'
