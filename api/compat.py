@@ -136,11 +136,16 @@ class StrategyCompatMiddleware(BaseHTTPMiddleware):
         # (see starlette.datastructures.QueryParams) — without it, any other
         # blank-valued param sharing the query string (e.g. `?id=1&level=`)
         # would be silently dropped by the rewrite below, not just left blank.
-        params = dict(
-            parse_qsl(request.scope["query_string"].decode("latin-1"), keep_blank_values=True)
-        )
-        if "strategy_id" not in params and "id" in params:
-            params["strategy_id"] = params["id"]
+        #
+        # Kept as a list of tuples rather than a dict — parse_qsl already
+        # returns one, and collapsing it into a dict would silently drop any
+        # other repeated sibling parameter sharing the query string (e.g.
+        # `?tag=a&tag=b&id=5`) down to its last value.
+        params = parse_qsl(request.scope["query_string"].decode("latin-1"), keep_blank_values=True)
+        keys = {key for key, _ in params}
+        if "strategy_id" not in keys and "id" in keys:
+            id_value = next(value for key, value in reversed(params) if key == "id")
+            params = params + [("strategy_id", id_value)]
             request.scope["query_string"] = urlencode(params).encode("latin-1")
 
     @staticmethod
@@ -187,17 +192,19 @@ class StrategyCompatMiddleware(BaseHTTPMiddleware):
         preserving every original header via `raw_headers` (a list, so
         duplicate headers like multiple Set-Cookie survive) rather than
         collapsing them through a `dict(...)`, which would silently drop
-        anything but the last value for a repeated header name. Only
-        Content-Length/Content-Type are recomputed, since `body` may be a
-        different length than the original.
+        anything but the last value for a repeated header name.
+
+        `response.media_type` is unusable here: `BaseHTTPMiddleware`'s
+        `call_next()` hands back a streaming wrapper with `media_type=None`
+        regardless of what the underlying route actually returned, so passing
+        it to `Response(...)` would silently drop Content-Type instead of
+        preserving it. The original Content-Type header is carried over
+        verbatim via `raw_headers` instead; only Content-Length is recomputed,
+        since `body` may be a different length than the original.
         """
-        new_response = Response(
-            content=body, status_code=response.status_code, media_type=response.media_type
-        )
+        new_response = Response(content=body, status_code=response.status_code)
         preserved = [
-            (k, v)
-            for k, v in response.raw_headers
-            if k.lower() not in (b"content-length", b"content-type")
+            (k, v) for k, v in response.raw_headers if k.lower() != b"content-length"
         ]
         new_response.raw_headers = new_response.raw_headers + preserved
         return new_response

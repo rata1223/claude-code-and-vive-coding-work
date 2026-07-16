@@ -164,6 +164,22 @@ class TestStrategyRequestMapping:
         assert res.status_code == 200
         assert res.json()["data"]["total"] == 1
 
+    def test_repeated_sibling_query_param_survives_the_id_remap(
+        self, client, auth_headers, db_session, seed_user
+    ):
+        # Regression guard: found during CodeRabbit review — parsing the query
+        # string into a dict collapsed repeated sibling params (any key other
+        # than id/strategy_id sharing the query string) down to their last
+        # value whenever the id -> strategy_id remap fired.
+        user, _ = seed_user
+        s = _create_strategy(db_session, user)
+        _add_log(db_session, s)
+
+        res = client.get(f"/api/strategies/logs?tag=a&tag=b&id={s.id}", headers=auth_headers)
+
+        assert res.status_code == 200
+        assert res.json()["data"]["total"] == 1
+
 
 # ── 2. Response mapping ──────────────────────────────────────────────────────
 class TestStrategyResponseMapping:
@@ -371,3 +387,17 @@ class TestRegressionExistingEndpoints:
 
         assert res.status_code == 200
         assert res.headers.get("access-control-allow-origin") == "http://localhost:5173"
+
+    def test_content_type_survives_response_rebuild(self, client, auth_headers, db_session, seed_user):
+        # Regression guard: found during CodeRabbit review — BaseHTTPMiddleware's
+        # call_next() hands back a streaming wrapper with media_type=None
+        # regardless of the route's actual response, so passing
+        # response.media_type into the rebuilt Response silently dropped
+        # Content-Type entirely instead of preserving "application/json".
+        user, _ = seed_user
+        _create_strategy(db_session, user)
+
+        res = client.get("/api/strategies", headers=auth_headers)
+
+        assert res.status_code == 200
+        assert res.headers["content-type"] == "application/json"
