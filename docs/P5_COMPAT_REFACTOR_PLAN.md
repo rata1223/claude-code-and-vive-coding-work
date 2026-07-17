@@ -16,7 +16,7 @@ Phase 1 of the P5 compatibility-adapter workstream is complete and merged: Phase
 
 ## Current middleware graph
 
-```
+```text
 Registration order (api/main.py):
   1. CORSMiddleware             (line 63)
   2. StrategyCompatMiddleware   (line 74)
@@ -88,7 +88,7 @@ The requested framing is `Route → Request Mapping → Query Mapping → Respon
 
 This document presents **3 real stages**, not 4:
 
-```
+```text
 Route
   ↓
 Request Mapping   (query-string rewrite — what the code and existing
@@ -210,8 +210,8 @@ Net: consolidation is a clear win for the straightforward `GET` rows a future ph
 
 No feature-flag system exists in this repository, and none should be built for this. This is a single small FastAPI service behind branch-protection + CI, and "is the new middleware's output identical to the old one's" is a pre-merge correctness question answerable completely by tests — not a partial-rollout observability question that benefits from watching production traffic.
 
-1. **Additive commit.** Add `CompatMiddleware` / `_PathConfig` / `_alias` / `_PATH_CONFIG` to `api/compat.py` *alongside* the two existing classes — not yet wired into `api/main.py`. Reuses all 5 existing shared helpers (`_rebuild_response`, `_dumps_like_fastapi`, `_read_query_params`, `_write_query_params`, `_alias_query_param`, `_read_json_body`) unchanged.
-2. **Differential equivalence test, scoped to the cutover PR only — not permanent regression coverage.** Build two in-process apps: one with the current two-middleware registration, one with the new single-middleware registration. Replay a table-driven battery derived directly from the 11 `_PATH_CONFIG` keys — happy path, the null-`data` business-error path (e.g. "Strategy not found"), a duplicate-query-key path, and at least one path neither middleware ever touched (e.g. `/health`, `/api/auth/login`) — asserting identical `status_code`, response body bytes, and headers as an **order-insensitive, case-insensitive-name multiset** (not literal byte-order equality — Starlette/uvicorn never guaranteed wire order, and today's disjoint-path design means `_rebuild_response` only ever runs once per response, so there's no actual double-rebuild reordering risk to prove against, but the harness should compare this way regardless). This test's job ends once the cutover lands — it should be deleted in the same commit as the classes it's diffing (step 3), not kept as ongoing coverage.
+1. **Additive commit.** Add `CompatMiddleware` / `_PathConfig` / `_alias` / `_PATH_CONFIG` to `api/compat.py` *alongside* the two existing classes — not yet wired into `api/main.py`. Reuses all 6 existing shared helpers (`_rebuild_response`, `_dumps_like_fastapi`, `_read_query_params`, `_write_query_params`, `_alias_query_param`, `_read_json_body`) unchanged.
+2. **Differential equivalence test, scoped to the cutover PR only — not permanent regression coverage.** Build two in-process apps: one with the current two-middleware registration, one with the new single-middleware registration. Replay a table-driven battery derived directly from the 11 `_PATH_CONFIG` keys — happy path, the null-`data` business-error path (e.g. "Strategy not found"), a duplicate-query-key path, and at least one path neither middleware ever touched (e.g. `/health`, `/api/auth/login`) — asserting identical `status_code`, response body bytes, and headers as an **order-insensitive multiset of `(lowercase(name), value)` pairs** — not just names (two responses with the same header names but different `Content-Type`/`Content-Length`/CORS values would otherwise compare as equal, defeating the point of a differential *equivalence* test), and not literal byte-order equality (Starlette/uvicorn never guaranteed wire order, and today's disjoint-path design means `_rebuild_response` only ever runs once per response, so there's no actual double-rebuild reordering risk to prove against, but the harness should compare this way regardless). Duplicate headers (e.g. multiple `Set-Cookie`) must be preserved as separate pairs in the multiset, not collapsed. This test's job ends once the cutover lands — it should be deleted in the same commit as the classes it's diffing (step 3), not kept as ongoing coverage.
     - **Note:** `api/tests/conftest.py`'s `client` fixture already builds `TestClient(app)` from the real, fully-wired `api.main.app` — so the **existing 68 tests already function as a free equivalence oracle** and need **zero edits** at cutover. The differential test above is *extra, targeted* proof for the cutover PR specifically; it is not a replacement for the existing suite, and the existing suite is not a replacement for it (it only proves the new middleware works, not that it's byte-identical to the old one on the exact same request).
 3. **Atomic cutover commit.** Swap `api/main.py`'s two `add_middleware(...)` calls for one. Delete `StrategyCompatMiddleware`, `WatchlistCompatMiddleware`, `_StrategyPathConfig`, `_WatchlistPathConfig`, `_STRATEGY_PATH_CONFIG`, `_WATCHLIST_PATH_CONFIG`, the now-inlined one-line wrapper functions (`_remap_query_string`, `_watchlist_remap_search_keyword`), and the differential test from step 2 — all in **one commit, one green CI run**. No intermediate half-migrated state ever lands on a branch that could be merged.
 4. **Keep `api/tests/test_compat_strategy.py` and `api/tests/test_compat_watchlist.py` as two separate files** even after the classes merge. They need different DB fixtures (Strategy needs `Trade`/`StrategyLog`/`Notification` rows; Watchlist doesn't) — merging the test files would be an unrelated, riskier restructure bundled into a change whose entire point is "no behavior change."
@@ -232,7 +232,7 @@ No canary or gradual-traffic-split mechanism is proposed, and none is recommende
 
 ## Open questions / future extension points (flagged, not resolved here)
 
-- **Header-comparison semantics for the differential test.** Recommended: order-insensitive, case-insensitive-name multiset — not literal byte-order equality. Should be confirmed before the differential harness's comparison logic is written, not assumed silently.
+- **Header-comparison semantics for the differential test.** Recommended: order-insensitive multiset of `(lowercase(name), value)` pairs, preserving duplicates — comparing names alone would treat responses with different header values as equivalent, and literal byte-order equality is stricter than Starlette/uvicorn ever guaranteed. Should be confirmed before the differential harness's comparison logic is written, not assumed silently.
 - **Whether to add a startup-time assertion** that no `_PATH_CONFIG` entry sets both `response_key_add` and `response_unwrap_key` (today this invariant is enforced only by a docstring comment: "a path never sets both"). Cheap, zero per-request cost, and arguably worth doing once the table doubles in size and gains a second author's entries — but it is a small *new* behavior, not purely mechanical consolidation, so it's named as optional/recommended here rather than assumed in scope, consistent with this task's "do not add features" constraint.
 - **The `getPosition`-style singular→list response primitive**, surfaced above under "Effect on named future phases." Explicitly deferred to whichever phase actually scopes `quickTradeApi` — not designed here, per the same "do not add features" constraint, and per `docs/P5_COMPAT_PHASE1C.md`'s own request that this kind of question be "settled before that phase, not during it."
 
