@@ -10,7 +10,7 @@
 
 **Before (Phase 1B + 1C, two classes):**
 
-```
+```text
 Registration order (api/main.py):
   1. CORSMiddleware
   2. StrategyCompatMiddleware   (7 paths under /api/strategies/*)
@@ -28,7 +28,7 @@ control-flow shape but different config types and mutation logic.
 
 **After (P5-02E, one class):**
 
-```
+```text
 Registration order (api/main.py):
   1. CORSMiddleware
   2. CompatMiddleware   (11 paths, both resource families)

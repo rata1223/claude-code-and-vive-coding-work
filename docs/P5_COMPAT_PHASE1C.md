@@ -1,7 +1,7 @@
 # P5-02C: Compatibility Adapter Phase 1C (Watchlist)
 
 > **Superseded by `docs/P5_COMPAT_REFACTOR_PLAN.md` / `docs/P5_COMPAT_REFACTOR.md` (P5-02E):** `WatchlistCompatMiddleware` described below was consolidated into a single unified `CompatMiddleware` alongside Phase 1B's `StrategyCompatMiddleware` — this document's own "Recommended Phase 2" section (below) is what proposed that consolidation in the first place. This document remains the correct historical record of *why* `query_remap` started out as two different shapes across the two middlewares.
-
+>
 > Implements the watchlist portion of the P1 slice of `docs/P5_ADAPTER_PLAN.md`. TDD: failing tests written first, then the minimum code to pass. `api/routers/watchlist.py` was not modified — all translation logic lives in `api/compat.py`, activated via a middleware-registration line in `api/main.py`, the same mechanism as Phase 1B.
 
 **Date:** 2026-07-16
