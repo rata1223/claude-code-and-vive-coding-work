@@ -131,10 +131,13 @@ class TestTransformGolden:
         assert res.json() == _expected(path, _CANNED[path])
 
     def test_all_11_path_config_entries_are_covered(self):
-        # Guards the golden-value table itself against silently losing an
-        # entry (e.g. a future _PATH_CONFIG addition/removal not mirrored
-        # here would otherwise pass this file trivially).
-        assert len(_CANNED) == 11
+        # Guards the golden-value table against drifting from the real
+        # _PATH_CONFIG -- comparing the key sets (not just counts) catches
+        # a path being swapped for another while the total stays 11, which
+        # a bare length check would silently miss.
+        from api.compat import _PATH_CONFIG
+
+        assert set(_CANNED) == set(_PATH_CONFIG)
 
 
 # ── 2. Edge cases ─────────────────────────────────────────────────────────
