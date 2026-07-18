@@ -2,6 +2,8 @@
 
 > **Analysis and design only. No code was changed to produce this document.** It designs collapsing the two existing compatibility middleware classes into one, with the explicit goal of zero runtime behavior change — verification of that claim is left to the implementation phase this document scopes, not performed here.
 
+> **P5-02E implementation note (2026-07-18):** this document's "Migration order" section below proposes a 2-PR split (an additive PR with a live dual-app differential test, then a separate cutover PR) specifically to keep a CodeRabbit-raised concern satisfied: the correctness check must still be able to run in the exact commit that ships, not just at some intermediate state. P5-02E executed as a **single PR** instead, using an **analytically-derived golden-value test** (`api/tests/test_compat_unified.py::TestTransformGolden`) rather than a live dual-app comparison: expected output is hand-computed by applying the documented `_PathConfig` algorithm to hardcoded canned input, in a DB-free stub app running only the new `CompatMiddleware`. This validates the new unified code against the reviewed, documented output contract — it does not execute the removed classes, so it is not a runtime equivalence proof against their actual behavior; that guarantee instead comes from the manual entry-by-entry translation captured in this document's mapping table (below) plus the unmodified 68-test full-stack suite, which exercises the real app both before and after the cutover. Because the golden-value test never imports the old classes, it keeps compiling and gating CI in the same commit that deletes them, without a transient second app or a two-PR split. See `docs/P5_COMPAT_REFACTOR.md` for the executed design.
+
 **Date:** 2026-07-16
 
 ---
