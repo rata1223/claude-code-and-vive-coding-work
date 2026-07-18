@@ -1,4 +1,4 @@
-"""Frontend/backend request compatibility adapter (P5-02A/B, Phase 1).
+"""Frontend/backend request compatibility adapter (P5-02A/B/C, unified P5-02E).
 
 These models are attribute-compatible with the existing backend schemas
 (``LoginRequest``, ``CredentialCreate`` in ``api/schemas.py``) — same field
@@ -8,14 +8,14 @@ etc.) — but also accept the frontend's actual wire field names via pydantic
 models therefore requires no change to the route handler itself: only the
 type annotation changes.
 
-``StrategyCompatMiddleware`` (Phase 1B) and ``WatchlistCompatMiddleware``
-(Phase 1C) cover sub-resource endpoints that take their identifying/query
-parameters as bare ``Query(...)`` arguments rather than a Pydantic body
-model — there's no type annotation to swap, so translation happens as HTTP
-middleware instead: each rewrites the query string before FastAPI resolves
-route parameters, and reshapes the JSON response body afterwards.
-``api/routers/strategies.py`` and ``api/routers/watchlist.py`` are not
-modified at all.
+``CompatMiddleware`` covers strategy sub-resource and watchlist/symbol-search
+endpoints that take their identifying/query parameters as bare ``Query(...)``
+arguments rather than a Pydantic body model — there's no type annotation to
+swap, so translation happens as HTTP middleware instead: it rewrites the
+query string before FastAPI resolves route parameters, and reshapes the JSON
+response body afterwards, driven by a single ``_PATH_CONFIG`` table covering
+both resource families. ``api/routers/strategies.py`` and
+``api/routers/watchlist.py`` are not modified at all.
 
 Scope: request/response translation only. No authentication or business
 logic lives here.
@@ -46,9 +46,9 @@ def _rebuild_response(response: Response, body: bytes) -> Response:
     verbatim via `raw_headers` instead; only Content-Length is recomputed,
     since `body` may be a different length than the original.
 
-    Shared by every compat middleware in this module (Phase 1B, 1C, ...) —
-    the response-rebuild mechanics are identical regardless of which paths
-    a given middleware covers or how it reshapes the payload.
+    Used by `CompatMiddleware` for every path in `_PATH_CONFIG` — the
+    response-rebuild mechanics are identical regardless of which path is
+    being reshaped.
     """
     new_response = Response(content=body, status_code=response.status_code)
     preserved = [(k, v) for k, v in response.raw_headers if k.lower() != b"content-length"]
@@ -76,9 +76,9 @@ def _read_query_params(request: Request) -> List[Tuple[str, str]]:
     param (e.g. `?id=1&level=`) would be silently dropped by a rewrite,
     not just left blank.
 
-    Shared by every compat middleware in this module for the same reason
-    `_rebuild_response` is: the parse/rewrite mechanics are identical
-    regardless of which params a given middleware aliases.
+    Used by `CompatMiddleware` for the same reason `_rebuild_response` is:
+    the parse/rewrite mechanics are identical regardless of which params
+    a given path aliases.
     """
     return parse_qsl(request.scope["query_string"].decode("latin-1"), keep_blank_values=True)
 
@@ -168,105 +168,7 @@ class CompatCredentialCreate(BaseModel):
         return self
 
 
-# ── Phase 1B: strategy sub-resource compatibility (HTTP middleware) ─────────
-
-
-class _StrategyPathConfig(NamedTuple):
-    """Per-path Phase 1B translation config.
-
-    `response_key_add` is `(old_key, new_key)`: copies `data[old_key]` to
-    `data[new_key]`, additive — `old_key` stays, so nothing reading the old
-    shape today breaks. `response_unwrap_key`, when set, replaces `data`
-    with `data[response_unwrap_key]` instead — the one non-additive case,
-    needed because the frontend does `ensureArray(res.data)` for
-    equityCurve: `data` itself must *be* the array, which can't coexist
-    with also being a dict with a keyed array inside it. A path never sets
-    both `response_key_add` and `response_unwrap_key`.
-    """
-
-    query_remap: bool = False
-    response_key_add: Optional[Tuple[str, str]] = None
-    response_unwrap_key: Optional[str] = None
-
-
-# Single source of truth for which strategy GET paths this middleware
-# touches and how — one entry per path, so there's no risk of the
-# request-side and response-side tables drifting out of sync with each
-# other, and no implicit precedence rule to trip over.
-_STRATEGY_PATH_CONFIG: Dict[str, _StrategyPathConfig] = {
-    "/api/strategies": _StrategyPathConfig(response_key_add=("items", "strategies")),
-    "/api/strategies/trades": _StrategyPathConfig(query_remap=True, response_key_add=("items", "trades")),
-    "/api/strategies/positions": _StrategyPathConfig(query_remap=True, response_key_add=("items", "positions")),
-    "/api/strategies/equityCurve": _StrategyPathConfig(query_remap=True, response_unwrap_key="items"),
-    "/api/strategies/performance": _StrategyPathConfig(query_remap=True),
-    "/api/strategies/logs": _StrategyPathConfig(query_remap=True, response_key_add=("items", "logs")),
-    "/api/strategies/notifications/unread-count": _StrategyPathConfig(response_key_add=("count", "unread")),
-}
-
-
-class StrategyCompatMiddleware(BaseHTTPMiddleware):
-    """Translates strategy sub-resource requests/responses between the
-    frontend's expected shape and the backend's actual shape, without any
-    change to `api/routers/strategies.py`."""
-
-    async def dispatch(self, request: Request, call_next):
-        path = request.url.path
-        config = _STRATEGY_PATH_CONFIG.get(path) if request.method == "GET" else None
-
-        if config and config.query_remap:
-            self._remap_query_string(request)
-
-        response = await call_next(request)
-
-        if config and response.status_code == 200:
-            response = await self._transform_response(config, response)
-
-        return response
-
-    @staticmethod
-    def _remap_query_string(request: Request) -> None:
-        _alias_query_param(request, "id", "strategy_id")
-
-    @staticmethod
-    async def _transform_response(config: "_StrategyPathConfig", response: Response) -> Response:
-        body, payload = await _read_json_body(response)
-        if payload is None:
-            return _rebuild_response(response, body)
-
-        data = payload.get("data")
-        changed = False
-        if isinstance(data, dict):
-            if config.response_unwrap_key is not None and config.response_unwrap_key in data:
-                payload["data"] = data[config.response_unwrap_key]
-                changed = True
-            elif config.response_key_add is not None:
-                old_key, new_key = config.response_key_add
-                if old_key in data:
-                    data[new_key] = data[old_key]
-                    changed = True
-
-        if not changed:
-            # Nothing to add (e.g. a "Strategy not found" business error,
-            # where `data` is null) — skip the JSON re-serialization entirely
-            # rather than paying for it on every no-op response.
-            return _rebuild_response(response, body)
-
-        return _rebuild_response(response, _dumps_like_fastapi(payload))
-
-
-# ── Phase 1C: watchlist / symbol-search compatibility (HTTP middleware) ─────
-
-
-def _watchlist_remap_search_keyword(request: Request) -> None:
-    """`GET /api/market/symbols/search` — the frontend sends `keyword`, the
-    backend reads `q` (`Query("", min_length=0)`). Without this alias
-    `keyword` is silently ignored (FastAPI drops unrecognized query keys),
-    so `q` always falls back to its `""` default and search always returns
-    the full unfiltered catalogue instead of matching anything — this is a
-    genuine break `docs/P5_API_MAPPING_AUDIT.md` didn't flag (it only
-    covered this endpoint's response shape).
-    """
-    _alias_query_param(request, "keyword", "q")
+# ── P5-02E: query-alias helpers referenced from _PATH_CONFIG below ──────────
 
 
 def _watchlist_remap_prices_symbols(request: Request) -> None:
@@ -308,35 +210,78 @@ def _watchlist_remap_prices_symbols(request: Request) -> None:
     _write_query_params(request, params + [("symbols", ",".join(symbols))])
 
 
-class _WatchlistPathConfig(NamedTuple):
-    """Per-path Phase 1C translation config. Unlike Strategy's mixed
-    additive/unwrap response modes, every watchlist path covered here needs
-    the identical response transform (`ensureArray(res.data)` on the
-    frontend, so `data` is replaced with `data["items"]`) — only the
-    request side differs per path, so that's the only per-path knob."""
+# ── P5-02E: unified compat middleware, covering both strategy sub-resource
+# and watchlist/symbol-search paths through one config table and one
+# dispatch/response-transform control flow. See
+# docs/P5_COMPAT_REFACTOR_PLAN.md for the full design rationale.
+
+
+class _PathConfig(NamedTuple):
+    """Per-path translation config, shared by every path this middleware
+    covers regardless of resource family. `query_remap`, when set, is
+    called to rewrite the request's query string before the route resolves
+    params — a plain rename is expressed via `_alias()` below, a genuinely
+    custom transform (e.g. `_watchlist_remap_prices_symbols`) is passed
+    directly, unchanged.
+
+    `response_key_add` is `(old_key, new_key)`: copies `data[old_key]` to
+    `data[new_key]`, additive — `old_key` stays, so nothing reading the old
+    shape today breaks. `response_unwrap_key`, when set, replaces `data`
+    with `data[response_unwrap_key]` instead — the one non-additive case,
+    needed because the frontend does `ensureArray(res.data)` for paths like
+    equityCurve and every watchlist path: `data` itself must *be* the
+    array, which can't coexist with also being a dict with a keyed array
+    inside it. A path never sets both `response_key_add` and
+    `response_unwrap_key`.
+    """
 
     query_remap: Optional[Callable[[Request], None]] = None
+    response_key_add: Optional[Tuple[str, str]] = None
+    response_unwrap_key: Optional[str] = None
 
 
-_WATCHLIST_PATH_CONFIG: Dict[str, _WatchlistPathConfig] = {
-    "/api/market/watchlist/get": _WatchlistPathConfig(),
-    "/api/market/symbols/search": _WatchlistPathConfig(query_remap=_watchlist_remap_search_keyword),
-    "/api/market/symbols/hot": _WatchlistPathConfig(),
-    "/api/market/watchlist/prices": _WatchlistPathConfig(query_remap=_watchlist_remap_prices_symbols),
+def _alias(old_key: str, new_key: str) -> Callable[[Request], None]:
+    """Factory for the common case — a `query_remap` that's a pure rename.
+    A plain rename is expressed inline via this factory; a genuinely custom
+    transform (like the JSON-parsing prices alias) is passed directly."""
+    return lambda request: _alias_query_param(request, old_key, new_key)
+
+
+# Single source of truth across both resource families — one entry per
+# path, so there's no risk of the request-side and response-side tables
+# drifting out of sync with each other, and no implicit precedence rule to
+# trip over.
+_PATH_CONFIG: Dict[str, _PathConfig] = {
+    # Strategy (originally Phase 1B)
+    "/api/strategies": _PathConfig(response_key_add=("items", "strategies")),
+    "/api/strategies/trades": _PathConfig(query_remap=_alias("id", "strategy_id"), response_key_add=("items", "trades")),
+    "/api/strategies/positions": _PathConfig(query_remap=_alias("id", "strategy_id"), response_key_add=("items", "positions")),
+    "/api/strategies/equityCurve": _PathConfig(query_remap=_alias("id", "strategy_id"), response_unwrap_key="items"),
+    "/api/strategies/performance": _PathConfig(query_remap=_alias("id", "strategy_id")),
+    "/api/strategies/logs": _PathConfig(query_remap=_alias("id", "strategy_id"), response_key_add=("items", "logs")),
+    "/api/strategies/notifications/unread-count": _PathConfig(response_key_add=("count", "unread")),
+    # Watchlist (originally Phase 1C) — every entry uses
+    # response_unwrap_key="items", the same primitive Strategy's
+    # equityCurve already exercises, not a new one.
+    "/api/market/watchlist/get": _PathConfig(response_unwrap_key="items"),
+    "/api/market/symbols/search": _PathConfig(query_remap=_alias("keyword", "q"), response_unwrap_key="items"),
+    "/api/market/symbols/hot": _PathConfig(response_unwrap_key="items"),
+    "/api/market/watchlist/prices": _PathConfig(query_remap=_watchlist_remap_prices_symbols, response_unwrap_key="items"),
 }
 
 
-class WatchlistCompatMiddleware(BaseHTTPMiddleware):
-    """Translates watchlist/symbol-search requests/responses between the
-    frontend's expected shape and the backend's actual shape, without any
-    change to `api/routers/watchlist.py`. `add`/`remove` are already
-    fully compatible (verified against `WatchlistAdd`/`WatchlistRemove` in
-    `api/schemas.py`) and are not in `_WATCHLIST_PATH_CONFIG`, so this
-    middleware never touches them."""
+class CompatMiddleware(BaseHTTPMiddleware):
+    """Translates strategy sub-resource and watchlist/symbol-search
+    requests/responses between the frontend's expected shape and the
+    backend's actual shape, without any change to
+    `api/routers/strategies.py` or `api/routers/watchlist.py`. `add`/
+    `remove` are already fully compatible (verified against
+    `WatchlistAdd`/`WatchlistRemove` in `api/schemas.py`) and are not in
+    `_PATH_CONFIG`, so this middleware never touches them."""
 
     async def dispatch(self, request: Request, call_next):
         path = request.url.path
-        config = _WATCHLIST_PATH_CONFIG.get(path) if request.method == "GET" else None
+        config = _PATH_CONFIG.get(path) if request.method == "GET" else None
 
         if config and config.query_remap:
             config.query_remap(request)
@@ -344,22 +289,32 @@ class WatchlistCompatMiddleware(BaseHTTPMiddleware):
         response = await call_next(request)
 
         if config and response.status_code == 200:
-            response = await self._unwrap_items(response)
+            response = await self._transform_response(config, response)
 
         return response
 
     @staticmethod
-    async def _unwrap_items(response: Response) -> Response:
+    async def _transform_response(config: "_PathConfig", response: Response) -> Response:
         body, payload = await _read_json_body(response)
         if payload is None:
             return _rebuild_response(response, body)
 
         data = payload.get("data")
-        if not (isinstance(data, dict) and "items" in data):
-            # Nothing to unwrap (e.g. an auth/business error where `data`
-            # is null, or an already-unexpected shape) — leave as-is rather
-            # than guessing.
+        changed = False
+        if isinstance(data, dict):
+            if config.response_unwrap_key is not None and config.response_unwrap_key in data:
+                payload["data"] = data[config.response_unwrap_key]
+                changed = True
+            elif config.response_key_add is not None:
+                old_key, new_key = config.response_key_add
+                if old_key in data:
+                    data[new_key] = data[old_key]
+                    changed = True
+
+        if not changed:
+            # Nothing to add (e.g. a "Strategy not found" business error,
+            # where `data` is null) — skip the JSON re-serialization entirely
+            # rather than paying for it on every no-op response.
             return _rebuild_response(response, body)
 
-        payload["data"] = data["items"]
         return _rebuild_response(response, _dumps_like_fastapi(payload))

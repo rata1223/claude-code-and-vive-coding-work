@@ -1,5 +1,7 @@
 # P5-02B: Compatibility Adapter Phase 1B (Strategy)
 
+> **Superseded by `docs/P5_COMPAT_REFACTOR_PLAN.md` / `docs/P5_COMPAT_REFACTOR.md` (P5-02E):** `StrategyCompatMiddleware` described below was consolidated into a single unified `CompatMiddleware` alongside Phase 1C's `WatchlistCompatMiddleware`. This document remains the correct historical record of *why* Phase 1B's `_StrategyPathConfig` shape and query-remap approach were designed the way they were.
+
 > Implements the strategy portion of the P1 slice of `docs/P5_ADAPTER_PLAN.md` (migration order items 3-4). TDD: failing tests written first, then the minimum code to pass. `api/routers/strategies.py` was not modified — all translation logic lives in `api/compat.py`, activated via a single middleware-registration line in `api/main.py`.
 
 **Date:** 2026-07-15

@@ -9,7 +9,7 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
-from api.compat import StrategyCompatMiddleware, WatchlistCompatMiddleware
+from api.compat import CompatMiddleware
 from api.database import create_tables
 from api.routers import (
     auth,
@@ -68,15 +68,11 @@ app.add_middleware(
     allow_headers=["Authorization", "Content-Type", "X-API-Key"],
 )
 
-# Strategy sub-resource frontend/backend compatibility (P5-02B) — all
-# translation logic lives in api/compat.py; api/routers/strategies.py is
-# unmodified.
-app.add_middleware(StrategyCompatMiddleware)
-
-# Watchlist/symbol-search frontend/backend compatibility (P5-02C) — all
-# translation logic lives in api/compat.py; api/routers/watchlist.py is
-# unmodified.
-app.add_middleware(WatchlistCompatMiddleware)
+# Strategy sub-resource + watchlist/symbol-search frontend/backend
+# compatibility (P5-02B/C, unified under P5-02E) — all translation logic
+# lives in api/compat.py; api/routers/strategies.py and
+# api/routers/watchlist.py are unmodified.
+app.add_middleware(CompatMiddleware)
 
 
 # ── Global exception handler ──────────────────────────────────────────────
