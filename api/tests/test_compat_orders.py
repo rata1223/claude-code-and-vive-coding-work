@@ -116,7 +116,11 @@ def _orders_echo_stub_app() -> FastAPI:
         raw = await request.body()
         try:
             parsed = json.loads(raw)
-        except (json.JSONDecodeError, UnicodeDecodeError):
+            # FastAPI's own JSONResponse.render() uses allow_nan=False --
+            # reject non-finite floats here too, or this handler's own
+            # response would crash trying to echo them back.
+            json.dumps(parsed, allow_nan=False)
+        except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
             parsed = None
         return JSONResponse({"raw": raw.decode("utf-8", errors="replace"), "parsed": parsed})
 
@@ -178,6 +182,24 @@ class TestBodyRemapIsolated:
 
         assert res.status_code == 200
         assert res.json()["parsed"] == [1, 2, 3]
+
+    def test_alias_body_fails_safe_on_non_finite_float_values(self, orders_echo_client):
+        # `json.loads` accepts NaN/Infinity as a non-standard Python
+        # extension, but `_dumps_like_fastapi`'s `allow_nan=False` would
+        # raise on re-encode if the rename fires and tries to re-serialize.
+        # Must not crash mid-middleware -- same fail-safe contract as an
+        # undecodable body. Asserted against the raw echoed string (not
+        # "parsed", which the echo handler's own JSONResponse can't
+        # round-trip through `inf` either -- a test-handler artifact,
+        # unrelated to what's being proven about the middleware).
+        res = orders_echo_client.post(
+            "/api/quick-trade/place-order",
+            content=b'{"amount": Infinity, "symbol": "AAPL"}',
+            headers={"Content-Type": "application/json"},
+        )
+
+        assert res.status_code == 200
+        assert res.json()["raw"] == '{"amount": Infinity, "symbol": "AAPL"}'  # untouched, not renamed
 
 
 # ── 2. response_transform, isolated (DB-free) ────────────────────────────────
@@ -393,7 +415,14 @@ class TestOrdersTransformGolden:
 # ── 5. Full-stack end-to-end ────────────────────────────────────────────────
 
 class TestGetBalanceEndToEnd:
-    def test_market_type_alias_maps_to_kr_balance_lookup(self, client, auth_headers, db_session, fake_kis):
+    def test_market_type_alias_forwards_value_to_market_param(self, client, auth_headers, db_session, fake_kis):
+        # "kr" is a convenient test value that hits a distinguishable
+        # backend code branch (the KR-vs-US balance lookup) -- it does NOT
+        # reflect real frontend traffic. The live UI's `marketType` is a
+        # crypto-exchange concept ("spot"/"swap"), never "kr"; see the
+        # correction note in docs/P5_ORDERS_COMPAT.md's Request mapping
+        # section. This test proves the alias mechanism forwards whatever
+        # value it's given, not that the live UI can reach the KR branch.
         cred_id = _seed_credential(client, auth_headers)
 
         res = client.get(

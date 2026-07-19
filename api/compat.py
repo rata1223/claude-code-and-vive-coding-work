@@ -299,8 +299,17 @@ async def _alias_body_fields(request: Request, pairs: Tuple[Tuple[str, str], ...
             payload[new_key] = payload[old_key]
             changed = True
 
-    if changed:
+    if not changed:
+        return
+    try:
         request._body = _dumps_like_fastapi(payload)
+    except ValueError:
+        # `json.loads` accepts NaN/Infinity/-Infinity as a non-standard
+        # Python extension, but `_dumps_like_fastapi`'s `allow_nan=False`
+        # rejects them on re-encode. Leave the body untouched rather than
+        # let this raise mid-middleware -- same fail-safe contract as an
+        # undecodable body, just caught one step later.
+        return
 
 
 def _alias_body(*pairs: Tuple[str, str]) -> Callable[[Request], Awaitable[None]]:
