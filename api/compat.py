@@ -1,4 +1,5 @@
-"""Frontend/backend request compatibility adapter (P5-02A/B/C, unified P5-02E).
+"""Frontend/backend request compatibility adapter (P5-02A/B/C, unified P5-02E,
+quick-trade coverage added P5-03B).
 
 These models are attribute-compatible with the existing backend schemas
 (``LoginRequest``, ``CredentialCreate`` in ``api/schemas.py``) — same field
@@ -8,20 +9,25 @@ etc.) — but also accept the frontend's actual wire field names via pydantic
 models therefore requires no change to the route handler itself: only the
 type annotation changes.
 
-``CompatMiddleware`` covers strategy sub-resource and watchlist/symbol-search
-endpoints that take their identifying/query parameters as bare ``Query(...)``
-arguments rather than a Pydantic body model — there's no type annotation to
-swap, so translation happens as HTTP middleware instead: it rewrites the
-query string before FastAPI resolves route parameters, and reshapes the JSON
-response body afterwards, driven by a single ``_PATH_CONFIG`` table covering
-both resource families. ``api/routers/strategies.py`` and
-``api/routers/watchlist.py`` are not modified at all.
+``CompatMiddleware`` covers strategy sub-resource, watchlist/symbol-search,
+and quick-trade (Orders) endpoints that take their identifying/query
+parameters as bare ``Query(...)`` arguments (or, for quick-trade's
+``place-order``, a POST body whose field names differ from the frontend's)
+rather than a Pydantic body model already shaped to match — there's often no
+type annotation to swap, so translation happens as HTTP middleware instead:
+it rewrites the query string and/or JSON request body before FastAPI/Pydantic
+resolves route parameters, and reshapes the JSON response body afterwards,
+driven by two path-keyed tables (``_PATH_CONFIG`` for strategy/watchlist,
+``_ORDERS_PATH_CONFIG`` for quick-trade — kept separate so each family's own
+regression/drift-guard tests stay independent). ``api/routers/strategies.py``,
+``api/routers/watchlist.py``, and ``api/routers/quick_trade.py`` are not
+modified at all.
 
 Scope: request/response translation only. No authentication or business
 logic lives here.
 """
 import json
-from typing import Callable, Dict, List, NamedTuple, Optional, Tuple
+from typing import Awaitable, Callable, Dict, List, NamedTuple, Optional, Tuple
 from urllib.parse import parse_qsl, urlencode
 
 from pydantic import AliasChoices, BaseModel, EmailStr, Field, model_validator
@@ -231,13 +237,29 @@ class _PathConfig(NamedTuple):
     needed because the frontend does `ensureArray(res.data)` for paths like
     equityCurve and every watchlist path: `data` itself must *be* the
     array, which can't coexist with also being a dict with a keyed array
-    inside it. A path never sets both `response_key_add` and
-    `response_unwrap_key`.
+    inside it. `response_transform`, when set, takes exclusive precedence
+    over both — a generic escape hatch for response reshapes that aren't a
+    rename (e.g. wrapping a singular value into a list; see
+    `_quick_trade_position_to_array` in `_ORDERS_PATH_CONFIG` below). A
+    path never sets more than one of `response_key_add`,
+    `response_unwrap_key`, `response_transform`.
+
+    `body_remap`, when set, is an async callable that rewrites the JSON
+    request body before the route's Pydantic model parses it — the
+    request-body counterpart to `query_remap` (see `_alias_body()` below).
+
+    `methods` gates which HTTP method(s) this config applies to; defaults
+    to `("GET",)` so every pre-P5-03B entry keeps its exact original
+    behavior unchanged. POST-only entries (e.g. `place-order`) override
+    this explicitly.
     """
 
     query_remap: Optional[Callable[[Request], None]] = None
     response_key_add: Optional[Tuple[str, str]] = None
     response_unwrap_key: Optional[str] = None
+    body_remap: Optional[Callable[[Request], Awaitable[None]]] = None
+    response_transform: Optional[Callable[[dict], Optional[dict]]] = None
+    methods: Tuple[str, ...] = ("GET",)
 
 
 def _alias(old_key: str, new_key: str) -> Callable[[Request], None]:
@@ -245,6 +267,60 @@ def _alias(old_key: str, new_key: str) -> Callable[[Request], None]:
     A plain rename is expressed inline via this factory; a genuinely custom
     transform (like the JSON-parsing prices alias) is passed directly."""
     return lambda request: _alias_query_param(request, old_key, new_key)
+
+
+async def _alias_body_fields(request: Request, pairs: Tuple[Tuple[str, str], ...]) -> None:
+    """Fail-safe body field rename(s), applied before the route's Pydantic
+    model parses/validates the body. Starlette's `Request.body()` caches
+    the bytes on `request._body`; `BaseHTTPMiddleware`'s cached-request
+    wrapper re-reads that attribute fresh on every `call_next` call rather
+    than a snapshot taken earlier, so overwriting `request._body` here is
+    what actually gets relayed to the route.
+
+    If the body isn't valid JSON or isn't a JSON object, left byte-
+    identical — the route's own validation error (422) surfaces exactly as
+    it does today, same fail-open philosophy as
+    `_watchlist_remap_prices_symbols`. Per `(old_key, new_key)` pair:
+    additive — only injects `new_key` when it's absent and `old_key` is
+    present; `old_key` stays, and a caller already sending `new_key`
+    directly (native shape) is left alone.
+    """
+    body = await request.body()
+    try:
+        payload = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return
+    if not isinstance(payload, dict):
+        return
+
+    changed = False
+    for old_key, new_key in pairs:
+        if new_key not in payload and old_key in payload:
+            payload[new_key] = payload[old_key]
+            changed = True
+
+    if not changed:
+        return
+    try:
+        request._body = _dumps_like_fastapi(payload)
+    except ValueError:
+        # `json.loads` accepts NaN/Infinity/-Infinity as a non-standard
+        # Python extension, but `_dumps_like_fastapi`'s `allow_nan=False`
+        # rejects them on re-encode. Leave the body untouched rather than
+        # let this raise mid-middleware -- same fail-safe contract as an
+        # undecodable body, just caught one step later.
+        return
+
+
+def _alias_body(*pairs: Tuple[str, str]) -> Callable[[Request], Awaitable[None]]:
+    """Factory for the common case — a `body_remap` that's one or more pure
+    field renames on the same JSON body, mirroring `_alias()` for query
+    params."""
+
+    async def remap(request: Request) -> None:
+        await _alias_body_fields(request, pairs)
+
+    return remap
 
 
 # Single source of truth across both resource families — one entry per
@@ -270,21 +346,87 @@ _PATH_CONFIG: Dict[str, _PathConfig] = {
 }
 
 
+def _quick_trade_position_to_array(data: dict) -> Optional[dict]:
+    """`GET /api/quick-trade/position` — backend returns
+    `{"symbol", "position": dict | None}` (singular); the frontend does
+    `unwrapItems(res.data, 'positions')`, expecting a plural array. Wraps
+    `position` into a 0-or-1-element list under a NEW `positions` key —
+    additive, `position` stays untouched. Returns `None` (no-op) if
+    `position` isn't present at all (unexpected/future shape), matching
+    `response_key_add`'s fail-safe contract when `old_key` is absent.
+    """
+    if "position" not in data:
+        return None
+    position = data["position"]
+    data["positions"] = [] if position is None else [position]
+    return data
+
+
+def _quick_trade_balance_reshape(data: dict) -> Optional[dict]:
+    """`GET /api/quick-trade/balance` — the frontend reads
+    `balance.available`/`balance.total`; the backend returns
+    `cash`/`total_eval`. Confirmed mapping (not inferred): `available` =
+    cash on hand, `total` = full portfolio evaluation. Additive —
+    `cash`/`total_eval` stay untouched.
+    """
+    if "cash" not in data or "total_eval" not in data:
+        return None
+    data["available"] = data["cash"]
+    data["total"] = data["total_eval"]
+    return data
+
+
+# ── P5-03B: quick-trade (Orders) path config — kept as a separate table
+# from _PATH_CONFIG (strategy/watchlist) rather than merged into it, so
+# api/tests/test_compat_unified.py's existing drift guard
+# (`set(_CANNED) == set(_PATH_CONFIG)`) stays untouched; this table gets
+# its own drift guard in api/tests/test_compat_orders.py instead. See
+# docs/P5_ORDERS_COMPAT_AUDIT.md for the full per-endpoint mapping
+# rationale and docs/P5_ORDERS_COMPAT.md for what shipped.
+#
+# `close-position` is deliberately NOT covered here: the only "price"
+# derivable from the backend's position data is a stale average purchase
+# price, which the broker submits as an actual limit-order price — a
+# live-trading pricing decision, not a DTO reshape, and out of this
+# adapter's scope. See docs/P5_ORDERS_COMPAT.md's "remaining gaps".
+_ORDERS_PATH_CONFIG: Dict[str, _PathConfig] = {
+    "/api/quick-trade/balance": _PathConfig(
+        query_remap=_alias("market_type", "market"),
+        response_transform=_quick_trade_balance_reshape,
+    ),
+    "/api/quick-trade/position": _PathConfig(
+        query_remap=_alias("market_type", "market"),
+        response_transform=_quick_trade_position_to_array,
+    ),
+    "/api/quick-trade/place-order": _PathConfig(
+        methods=("POST",),
+        body_remap=_alias_body(("amount", "qty"), ("market_type", "market")),
+    ),
+    "/api/quick-trade/history": _PathConfig(response_key_add=("items", "trades")),
+}
+
+
 class CompatMiddleware(BaseHTTPMiddleware):
-    """Translates strategy sub-resource and watchlist/symbol-search
-    requests/responses between the frontend's expected shape and the
-    backend's actual shape, without any change to
-    `api/routers/strategies.py` or `api/routers/watchlist.py`. `add`/
-    `remove` are already fully compatible (verified against
-    `WatchlistAdd`/`WatchlistRemove` in `api/schemas.py`) and are not in
-    `_PATH_CONFIG`, so this middleware never touches them."""
+    """Translates strategy sub-resource, watchlist/symbol-search, and
+    quick-trade (Orders) requests/responses between the frontend's expected
+    shape and the backend's actual shape, without any change to
+    `api/routers/strategies.py`, `api/routers/watchlist.py`, or
+    `api/routers/quick_trade.py`. `add`/`remove` (watchlist) are already
+    fully compatible (verified against `WatchlistAdd`/`WatchlistRemove` in
+    `api/schemas.py`) and are not in `_PATH_CONFIG`, so this middleware
+    never touches them; `close-position` (quick-trade) is deliberately not
+    in `_ORDERS_PATH_CONFIG` either — see that table's docstring."""
 
     async def dispatch(self, request: Request, call_next):
         path = request.url.path
-        config = _PATH_CONFIG.get(path) if request.method == "GET" else None
+        config = _PATH_CONFIG.get(path) or _ORDERS_PATH_CONFIG.get(path)
+        if config is not None and request.method not in config.methods:
+            config = None
 
         if config and config.query_remap:
             config.query_remap(request)
+        if config and config.body_remap:
+            await config.body_remap(request)
 
         response = await call_next(request)
 
@@ -302,7 +444,12 @@ class CompatMiddleware(BaseHTTPMiddleware):
         data = payload.get("data")
         changed = False
         if isinstance(data, dict):
-            if config.response_unwrap_key is not None and config.response_unwrap_key in data:
+            if config.response_transform is not None:
+                new_data = config.response_transform(data)
+                if new_data is not None:
+                    payload["data"] = new_data
+                    changed = True
+            elif config.response_unwrap_key is not None and config.response_unwrap_key in data:
                 payload["data"] = data[config.response_unwrap_key]
                 changed = True
             elif config.response_key_add is not None:
