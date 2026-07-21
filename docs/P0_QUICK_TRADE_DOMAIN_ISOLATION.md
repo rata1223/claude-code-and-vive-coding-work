@@ -53,7 +53,7 @@ Quick Trade is a **manual, per-request, multi-user convenience trading domain**.
 | UI 요청 변환 (request translation) | Yes — via CompatMiddleware DTO reshape (P5-03B) | **KEEP** in Compat (shape only, no logic) |
 | 주문 의사결정 (order decision) | No — client supplies symbol/side/qty/price verbatim | **KEEP absent** — QT never decides qty/price (constraint) |
 | 주문 제출 (submit) | Yes — one synchronous `orders.buy_*/sell_*` call (`quick_trade.py:134-147`) | **KEEP**, but move broker construction into a request-scoped factory (P0-03) |
-| 주문 상태 (order status) | Fake — hardcoded `"status":"submitted"` (`quick_trade.py:159`) | **REMOVE the fake**; real status is DEFER (§4) |
+| 주문 상태 (order status) | Fake — hardcoded `"status":"submitted"` (`quick_trade.py:159`) | **REMOVE the fake literal**. Store only a **submission outcome** (`submitted`/`failed`/`unknown`) — the broker-*submission* result, which **never means filled**. Real fill/lifecycle status is DEFER (§4) |
 | 체결 (fill) | Not detectable — single call, no confirmation (`quick_trade.py:46` behavior) | **DEFER** — no async fill confirmation in P0 |
 | Position 반영 | Live read per `GET /position` (`quick_trade.py:90-118`), nothing tracked | **KEEP** live-read; no tracked position |
 | Fill Persistence | Zero — no row written (`quick_trade.py:149-150`) | **ADD** — QT persists its own to `quick_trade_orders` (§8) |
@@ -70,11 +70,11 @@ Quick Trade is a **manual, per-request, multi-user convenience trading domain**.
 
 ## 4. Shared Infrastructure (allowed coupling)
 
-Only **stateless, credential-agnostic** components may be shared across both domains:
+Only **stateless, credential-agnostic** components may be shared across both domains. **This table describes the post-P0-03 target.** The KIS SDK is only credential-agnostic once clients are built from **request-scoped** credentials; today `_load_kis` still injects them via process-wide `os.environ` (§5), so the request-scoped client factory (P0-03) is a **hard prerequisite** — multi-user Quick Trade must not be enabled until it lands.
 
 | Component | Path | Why shareable |
 |---|---|---|
-| KIS broker SDK | `kis_adapter/*` (`KISClient`, `KISOrders`, `KISPortfolio`) | Pure per-call broker HTTP wrapper; holds no cross-request state of its own |
+| KIS broker SDK | `kis_adapter/*` (`KISClient`, `KISOrders`, `KISPortfolio`) | Pure per-call broker HTTP wrapper, no cross-request state of its own — **but only credential-agnostic after P0-03**; the current `os.environ` injection (§5) must be replaced first |
 | Semantic mapper | `backend/brokers/semantic_mapper.py` (`extract_broker_order_id`) | Pure function over a broker response |
 | Risk manager | `strategy/risk.py` `RiskManager` | **Schema-independent** — Redis halt-flag + env thresholds, no SQL dependency; the one execution-adjacent capability wire-able into QT with zero schema change |
 | Credential decrypt | `api/crypto.decrypt` | Pure crypto helper |
@@ -85,8 +85,8 @@ Only **stateless, credential-agnostic** components may be shared across both dom
 
 | Capability | Verdict | Reason |
 |---|---|---|
-| Fill persistence | **KEEP** | SEPARATE requires QT to own its own fills; done via the new `quick_trade_orders` table (§8), a fresh lightweight impl — **not** the backend `Fill` table |
-| Order lifecycle state | **DEFER** | QT is synchronous today; a full state machine is out of P0 scope. Minimal `submitted`/`failed` only; no async transitions |
+| Fill persistence | **KEEP** | SEPARATE requires QT to own its own fills; **planned** via the new `quick_trade_orders` table (§8), a fresh lightweight impl created in P0-04 — **not** the backend `Fill` table. Not yet implemented |
+| Order lifecycle state | **DEFER** | QT is synchronous today; a full state machine is out of P0 scope. Store only **submission outcomes** (`submitted`/`failed`/`unknown`), explicitly not fill/lifecycle status; no async transitions |
 | Kill switch | **DEFER** | Dormant platform-wide (zero call sites, PR #135 §3); wiring it is a platform decision, not QT's to make |
 | MDD | **DEFER** | Part of the risk/kill-switch platform layer; deferred with it |
 | Position reconciliation | **DEFER** | QT tracks no position state → nothing to reconcile. Likely never needed while QT stays stateless |
@@ -129,6 +129,8 @@ Seven-owner definition (constraint: **no compat/backend auto-calculation of qty 
 | Execution owner | **QT lightweight service** | The future `quick_trade_service`, not `backend/execution/*` |
 | Fill owner | **QT (`quick_trade_orders`)** | Persisted like any QT order (§8) |
 
+**Client-owned ≠ unvalidated.** "Client owns qty/price" means the domain never *derives or calculates* them (the no-auto-calc constraint) — it does **not** mean they are submitted unchecked. The current `PlaceOrderRequest`/`ClosePositionRequest` expose unconstrained `float` fields and the code submits them verbatim with no sanity guard. The final contract must specify a **server-side validation boundary** in the QT service (enforcement, not calculation): quantity > 0; price > 0 with valid precision/tick for the instrument; a maximum-exposure cap (qty × price); and scope enforcement that the target symbol/position and `credential_id` belong to the authenticated user. Validation rejects a bad request; it never invents a missing value.
+
 **Consequence (UI contract, §7):** because qty and price are client-owned and must not be auto-filled, the current frontend — which sends neither — produces a guaranteed 422 (confirmed by P5-03B's `TestClosePositionRemainingGap`). The contract must be **redesigned** to require both explicitly; auto-injecting a stale `pchs_avg_pric` as a live limit price was rejected in P5-03B as a real-money pricing decision outside the adapter's scope, and that rejection stands.
 
 ---
@@ -146,7 +148,7 @@ Current UI expectation vs. KIS-equity backend, eight items classified **유지 /
 | quantity | **변환** | Frontend `amount` → backend `qty` (P5-03B `body_remap`); keep as a conversion |
 | price | **유지** | Passed through, but documented as a **real limit price** (no market path) — callers must send a sane price |
 | position | **변환** | Backend singular `{symbol, position}` → frontend `positions[]` via P5-03B `response_transform`; keep |
-| order status | **재설계** | No status endpoint exists; `"submitted"` is a hardcoded literal (`quick_trade.py:159`). A real status contract is future work (DEFER, §4) — the redesign is to stop asserting a status the backend never verified |
+| order status | **재설계** | No status endpoint exists; `"submitted"` is a hardcoded literal (`quick_trade.py:159`). The redesigned field is a **submission acknowledgement** (`submitted`/`failed`/`unknown`), explicitly **not** a fill/lifecycle status — `submitted` never implies filled, and an ambiguous broker result (timeout) is `unknown`. Real fill status is future work (DEFER, §4) |
 
 ---
 
@@ -154,7 +156,7 @@ Current UI expectation vs. KIS-equity backend, eight items classified **유지 /
 
 **Decision: Quick Trade persists to a new, dedicated table `quick_trade_orders`, owned solely by the `api/` app.** Rationale:
 
-1. `api/models.py:74` `Trade.strategy_id` is **NOT NULL** (FK→strategies). The code's hinted "strategy_id=None" persistence (`quick_trade.py:149-150`) would violate the constraint — persisting a manual, non-strategy order into `trades` is **impossible today** without either a fake strategy or a schema change.
+1. `api/models.py:74` `Trade.strategy_id` is **NOT NULL** (FK→strategies). Today **no trade row is persisted at all** for quick-trade orders — `quick_trade.py:149-150` explicitly skips it ("skip for simplicity"). But the comment's implied approach (`strategy_id=None`) would, if ever implemented, violate the NOT-NULL constraint: persisting a manual, non-strategy order into `trades` is **impossible without either a fake strategy or a schema change**. This is a reason to persist elsewhere, not a description of current behavior.
 2. The `trades` table is **contested** (§5 landmine): reusing it entangles Quick Trade with the execution/Alembic schema-ownership conflict.
 3. A dedicated table is the cleanest expression of SEPARATE: QT owns a table nothing else writes, `user_id`/`credential_id`-scoped from day one.
 
@@ -168,9 +170,11 @@ Proposed shape (design only; created in P0-04):
 | `symbol`, `side`, `market` | strings | order identity |
 | `qty`, `price` | numeric | client-supplied |
 | `broker_order_id` | string, nullable | broker ODNO from `extract_broker_order_id` |
-| `status` | string | `submitted` / `failed` only in P0 (no async lifecycle) |
-| `idempotency_key` | string, nullable, unique-per-user | double-submit protection (P0-05) |
+| `status` | string | **submission outcome** only: `submitted` / `failed` / `unknown` (never a fill/lifecycle status; `unknown` = ambiguous/timeout broker result, recoverable) |
+| `idempotency_key` | string, **NOT NULL, unique per user** | reserved **before** the broker call (§9); a retry reuses the reservation and cannot double-submit |
 | `created_at` | datetime | |
+
+**Tenant-ownership invariant.** `user_id` and `credential_id` are independent FKs, which alone do **not** guarantee the credential belongs to the order's user. This invariant must be enforced explicitly, or cross-tenant attribution can be corrupted. Two layers: (1) at write time, the service resolves the credential via `_get_cred` (`quick_trade.py:38-43`), which already filters `Credential.user_id == current_user.id` — the new service path must preserve this and reject a mismatch; (2) every history/read query must filter on `user_id` (never on `credential_id` alone). Preferred belt-and-suspenders: a composite FK `(user_id, credential_id)` referencing a matching unique key on `credentials`, so the database rejects a mismatched pair outright.
 
 **`get_history` implication:** the current handler INNER-JOINs `Trade.strategy_id == Strategy.id` (`quick_trade.py:216-221`), so it can only ever return strategy-attributed trades. Surfacing `quick_trade_orders` in history is therefore **explicit follow-up work** (part of P0-04) — it does not come for free by reusing `Trade`. This is a deliberate, acknowledged cost of the dedicated-table choice.
 
@@ -188,10 +192,15 @@ Frontend
   → api/services/quick_trade_service.py  ← NEW, minimal (no heavy abstraction):
       1. build request-scoped KIS client from the decrypted Credential
          (NO os.environ mutation)                        [P0-03]
-      2. RiskManager pre-submit gate (halt-flag / thresholds) [P0-05, WRAP]
-      3. idempotency check (per-user double-submit)          [P0-05]
-      4. orders.buy_*/sell_* — single synchronous broker call
-      5. persist to quick_trade_orders (status submitted/failed) [P0-04, KEEP]
+      2. validate DTO (qty>0, price precision/tick, exposure cap,
+         symbol/credential belongs to user)               [P0-04, §6]
+      3. RiskManager pre-submit gate (halt-flag / thresholds) [P0-05, WRAP]
+      4. RESERVE per-user idempotency_key + write a pending row
+         BEFORE the broker call (crash-safety)            [P0-04/05]
+      5. orders.buy_*/sell_* — single synchronous broker call
+      6. finalize status: submitted / failed; an ambiguous or
+         timed-out broker result → unknown (recoverable, never "filled")
+         — a retry reuses the reservation, never double-submits [P0-04, KEEP]
   → KIS Open API
   → response (broker_order_id, status)
 
@@ -210,8 +219,8 @@ The one structural change vs. today is inserting a **thin service** between the 
 Incremental and additive; nothing in `backend/execution/*` is touched.
 
 1. **P0-03 first — credential isolation (the rollout gate).** Replace `_load_kis`'s `os.environ` mutation with a request-scoped credential→client factory. No caller-visible behavior change; closes the active concurrency bug before any further QT hardening builds on it. Highest priority precisely because PR #135 declared it a rollout gate, not a backlog item.
-2. **P0-04 — persistence.** Add `quick_trade_orders` via a **new Alembic migration** (not `create_all`, to avoid the non-altering-provisioner conflict in §5). Add the model, write rows on submit, and extend `get_history` (or add a QT-scoped history path) to surface them — the inner-join limitation (§8) makes this explicit work.
-3. **P0-05 — risk gate + idempotency.** Wrap `RiskManager` as a pre-submit gate and add per-user double-submit protection in the service.
+2. **P0-04 — persistence (crash-safe).** Add `quick_trade_orders` via a **new Alembic migration** (not `create_all`, to avoid the non-altering-provisioner conflict in §5). Add the model with the tenant-ownership invariant (§8), write a **pending row and reserve the unique idempotency key *before* the broker call**, finalize to `submitted`/`failed`/`unknown` after, and extend `get_history` (or add a QT-scoped history path) to surface them — the inner-join limitation (§8) makes this explicit work. **Not production-complete without the reserve-before-submit guarantee**: doing the broker call first risks a duplicate on retry and an order missing from history if the process dies between submit and persist.
+3. **P0-05 — risk gate + idempotency enforcement.** Wrap `RiskManager` as a pre-submit gate and enforce the per-user idempotency reservation from P0-04 (a retry reuses the reservation, never double-submits).
 
 Sequencing rule: the credential fix (P0-03) lands **before** persistence and risk, so the hardened path is never built on top of the unsafe injection mechanism.
 
@@ -221,8 +230,8 @@ Sequencing rule: the credential fix (P0-03) lands **before** persistence and ris
 
 - **`os.environ` credential bleed is live until P0-03.** The rollout gate from PR #135 §1 remains open in current code; multi-credential concurrent use is unsafe until the request-scoped factory ships.
 - **Dual `trades` definition (§5).** `UNVERIFIED` whether `api/` and `backend/` share the physical `trading` DB. If they do, the api `Trade` ORM and the Alembic `trades` schema disagree on columns and one side can fail at query time — independent of Quick Trade, but it must be resolved before anyone assumes `trades` is a reliable QT persistence target (the dedicated-table choice avoids depending on the answer).
-- **No async fill confirmation.** QT reports `submitted` and never learns real fill outcome; `quick_trade_orders.status` stays `submitted`/`failed` only. Accepted scope limit, not a bug to fix in P0.
-- **Stale-price closePosition.** Client must supply a live limit price; there is no server-side guard that the price is reasonable (§6). The adapter fixes shape, not price sanity.
+- **No async fill confirmation.** QT records a **submission outcome** (`submitted`/`failed`/`unknown`) and never learns the real fill outcome; `submitted` must never be read as "filled." Accepted scope limit, not a bug to fix in P0 — but the `unknown` outcome and the reserve-before-submit ordering (§9/§10) are required so an ambiguous broker result is recoverable rather than silently lost or duplicated.
+- **Stale-price closePosition.** Client must supply a live limit price. Today there is **no** server-side guard that the price is reasonable; §6 makes a validation boundary (positive/precision/tick/exposure/scope) a required part of the final contract, but until it is built the risk is live. Note validation can reject an unreasonable price but cannot *choose* a correct one — that remains the client's responsibility.
 - **`RiskManager` currently unwired on both stacks.** Until P0-05, QT places orders with zero risk gating; the wrap is reuse, but the wiring is genuinely new surface.
 
 ---
