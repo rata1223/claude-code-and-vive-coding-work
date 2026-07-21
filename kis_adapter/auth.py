@@ -23,6 +23,21 @@ _MEM_TOKENS: dict[str, tuple[str, float]] = {}
 _MEM_TOKENS_LOCK = Lock()
 _TOKEN_REFRESH_BUFFER = 900  # 15 minutes before expiry
 
+# Per-credential issuance locks — serialize concurrent token issuance for the
+# same credential so cold-cache callers don't each hit KIS's 1-token/minute
+# limit (EGW00133). Distinct credentials still issue in parallel.
+_ISSUE_LOCKS: dict[str, Lock] = {}
+_ISSUE_LOCKS_META = Lock()
+
+
+def _issuance_lock(fp: str) -> Lock:
+    with _ISSUE_LOCKS_META:
+        lock = _ISSUE_LOCKS.get(fp)
+        if lock is None:
+            lock = Lock()
+            _ISSUE_LOCKS[fp] = lock
+        return lock
+
 
 @dataclass(frozen=True)
 class KISCredentials:
@@ -94,17 +109,25 @@ class KISAuth:
             logger.debug("Redis 불가 — in-memory token 사용")
             return entry[0]
 
-        # 3. Issue a new token
-        token, expires_in = self._issue_token()
-        expiry_ts = time.time() + expires_in
-        with _MEM_TOKENS_LOCK:
-            _MEM_TOKENS[self._fp] = (token, expiry_ts)
-        try:
-            self._redis.set(self._token_cache_key, token)
-            self._redis.set(self._token_expiry_key, expiry_ts)
-        except Exception as e:
-            logger.warning("Redis token cache write 실패 (in-memory のみ): %s", e)
-        return token
+        # 3. Issue a new token — serialized per credential so concurrent
+        # cold-cache callers issue exactly one token (KIS caps issuance at
+        # 1/minute and returns EGW00133 on excess).
+        with _issuance_lock(self._fp):
+            # Double-check: another thread may have issued while we waited.
+            with _MEM_TOKENS_LOCK:
+                entry = _MEM_TOKENS.get(self._fp)
+            if entry and entry[1] - time.time() > _TOKEN_REFRESH_BUFFER:
+                return entry[0]
+            token, expires_in = self._issue_token()
+            expiry_ts = time.time() + expires_in
+            with _MEM_TOKENS_LOCK:
+                _MEM_TOKENS[self._fp] = (token, expiry_ts)
+            try:
+                self._redis.set(self._token_cache_key, token)
+                self._redis.set(self._token_expiry_key, expiry_ts)
+            except Exception as e:
+                logger.warning("Redis token cache write 실패 (in-memory のみ): %s", e)
+            return token
 
     def _issue_token(self) -> tuple[str, int]:
         url = f"{self.base_url}/oauth2/tokenP"
@@ -119,7 +142,16 @@ class KISAuth:
         return data["access_token"], int(data.get("expires_in", 86400))
 
     def revoke_token(self):
-        token = self._redis.get(self._token_cache_key)
+        try:
+            token = self._redis.get(self._token_cache_key)
+        except Exception as e:
+            logger.warning("Redis token cache read 실패 during revoke: %s", e)
+            token = None
+        # Always clear the in-memory cache — even on a Redis outage or a
+        # token that was only ever cached in-memory — so a revoked credential
+        # cannot keep authenticating via the fallback.
+        with _MEM_TOKENS_LOCK:
+            _MEM_TOKENS.pop(self._fp, None)
         if not token:
             return
         url = f"{self.base_url}/oauth2/revokeP"
@@ -129,9 +161,10 @@ class KISAuth:
             "token": token.decode(),
         }
         requests.post(url, json=body, timeout=10)
-        self._redis.delete(self._token_cache_key, self._token_expiry_key)
-        with _MEM_TOKENS_LOCK:
-            _MEM_TOKENS.pop(self._fp, None)
+        try:
+            self._redis.delete(self._token_cache_key, self._token_expiry_key)
+        except Exception as e:
+            logger.warning("Redis token cache delete 실패 during revoke: %s", e)
 
     def require_account(self) -> str:
         """Resolve the trading account for this credential scope.

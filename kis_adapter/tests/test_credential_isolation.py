@@ -8,6 +8,7 @@ static account) must keep working unchanged.
 """
 import os
 import threading
+import time
 
 import pytest
 
@@ -202,3 +203,66 @@ def test_injected_credential_never_falls_back_to_env_account(monkeypatch):
         auth.require_account()
     with pytest.raises(ValueError):
         KISOrders(KISClient(cred_no_account))
+
+
+# ── 6. revoke_token robustness (CodeRabbit Major) ─────────────────────────────
+
+def test_revoke_token_tolerates_redis_failure_and_clears_memory():
+    """revoke_token must not raise on a Redis outage and must always clear the
+    in-memory cache — otherwise a revoked, in-memory-only token keeps working.
+    """
+    import kis_adapter.auth as authmod
+
+    class _RaisingRedis:
+        def get(self, *a, **k):
+            raise ConnectionError("redis down")
+
+        def delete(self, *a, **k):
+            raise ConnectionError("redis down")
+
+    auth = KISAuth(CRED_A)
+    auth._redis = _RaisingRedis()
+    with authmod._MEM_TOKENS_LOCK:
+        authmod._MEM_TOKENS[auth._fp] = ("tok-APPKEY_A", 9e18)  # seed in-memory token
+
+    auth.revoke_token()  # must not raise
+
+    with authmod._MEM_TOKENS_LOCK:
+        assert auth._fp not in authmod._MEM_TOKENS
+
+
+# ── 7. token issuance serialized per credential (CodeRabbit Major) ────────────
+
+def test_concurrent_cold_cache_issues_token_once(monkeypatch):
+    """Concurrent cold-cache callers for the SAME credential must issue exactly
+    one token — KIS caps issuance at 1/minute (EGW00133 on excess).
+    """
+    calls = {"n": 0}
+    calls_lock = threading.Lock()
+
+    def _counting_issue(self):
+        # Hold the issuance lock briefly so the other threads pile up on it
+        # (proving they wait and then reuse rather than each issuing).
+        with calls_lock:
+            calls["n"] += 1
+        time.sleep(0.05)
+        return (f"tok-{self.app_key}", 3600)
+
+    monkeypatch.setattr(KISAuth, "_issue_token", _counting_issue)
+
+    tokens: list[str] = []
+    tokens_lock = threading.Lock()
+
+    def worker():
+        tok = KISAuth(CRED_A).get_token()
+        with tokens_lock:
+            tokens.append(tok)
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert calls["n"] == 1, f"expected exactly one issuance, got {calls['n']}"
+    assert tokens == ["tok-APPKEY_A"] * 8
