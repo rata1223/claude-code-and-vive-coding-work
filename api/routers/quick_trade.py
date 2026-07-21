@@ -1,6 +1,5 @@
 """Quick-trade endpoints: balance, positions, order placement, history."""
 import logging
-import os
 from datetime import datetime
 from typing import Optional
 
@@ -20,16 +19,22 @@ router = APIRouter(prefix="/api/quick-trade", tags=["quick-trade"])
 
 
 def _load_kis(cred: Credential):
-    """Set env vars from credential and return (KISClient, KISOrders, KISPortfolio)."""
-    from kis_adapter import KISClient, KISOrders, KISPortfolio
+    """Build request-scoped KIS clients from a credential, without touching env.
 
-    os.environ["KIS_APP_KEY"] = decrypt(cred.app_key_enc) or ""
-    os.environ["KIS_APP_SECRET"] = decrypt(cred.app_secret_enc) or ""
-    os.environ["KIS_ACCOUNT_NO"] = decrypt(cred.account_no_enc) or ""
-    os.environ["KIS_HTS_ID"] = decrypt(cred.hts_id_enc) or ""
-    os.environ["KIS_ENV"] = cred.env
+    Credentials are injected explicitly into the client instance (P0-03); the
+    process-wide ``os.environ`` is never mutated, so concurrent requests from
+    different users cannot leak or overwrite each other's credentials.
+    """
+    from kis_adapter import KISClient, KISCredentials, KISOrders, KISPortfolio
 
-    client = KISClient()
+    creds = KISCredentials(
+        app_key=decrypt(cred.app_key_enc) or "",
+        app_secret=decrypt(cred.app_secret_enc) or "",
+        account_no=decrypt(cred.account_no_enc) or "",
+        hts_id=decrypt(cred.hts_id_enc) or "",
+        env=cred.env,
+    )
+    client = KISClient(creds)
     orders = KISOrders(client)
     portfolio = KISPortfolio(client)
     return client, orders, portfolio
