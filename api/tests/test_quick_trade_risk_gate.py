@@ -505,3 +505,22 @@ def test_risk_manager_redis_client_has_socket_timeout(monkeypatch):
     assert captured["kwargs"].get("socket_connect_timeout") is not None
     assert captured["kwargs"]["socket_timeout"] > 0
     assert captured["kwargs"]["socket_connect_timeout"] > 0
+
+
+@pytest.mark.parametrize("raw", ["0", "-1", "nan", "inf", "-inf", "abc", "", None])
+def test_redis_timeout_rejects_invalid_values(raw):
+    """A malformed/zero/negative/non-finite REDIS_SOCKET_TIMEOUT must fall back to
+    the default (finite, > 0) rather than raising at import or disabling the bound.
+    """
+    from strategy.risk import _positive_finite_float, _DEFAULT_REDIS_TIMEOUT
+
+    result = _positive_finite_float(raw, _DEFAULT_REDIS_TIMEOUT)
+    assert result == _DEFAULT_REDIS_TIMEOUT
+    assert result > 0
+
+
+@pytest.mark.parametrize("raw,expected", [("2", 2.0), ("0.5", 0.5), (5, 5.0), ("10", 10.0)])
+def test_redis_timeout_accepts_valid_values(raw, expected):
+    from strategy.risk import _positive_finite_float, _DEFAULT_REDIS_TIMEOUT
+
+    assert _positive_finite_float(raw, _DEFAULT_REDIS_TIMEOUT) == expected
