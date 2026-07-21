@@ -3,14 +3,20 @@ import logging
 from datetime import datetime
 from typing import Optional
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Header, Query
 from sqlalchemy.orm import Session
 
 from api.crypto import decrypt
 from api.database import get_db
 from api.deps import get_current_user
-from api.models import Credential, Strategy, Trade, User
+from api.models import Credential, QT_SUBMITTED, Strategy, Trade, User
 from api.schemas import ClosePositionRequest, PlaceOrderRequest, Resp
+from api.services.quick_trade_service import (
+    IdempotencyConflict,
+    derive_idempotency_key,
+    request_fingerprint,
+    reserve_and_submit,
+)
 from backend.brokers.semantic_mapper import KIS_DOMESTIC_MAPPER, KIS_OVERSEAS_MAPPER
 
 logger = logging.getLogger(__name__)
@@ -128,6 +134,7 @@ def get_position(
 @router.post("/place-order")
 def place_order(
     body: PlaceOrderRequest,
+    idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -136,34 +143,65 @@ def place_order(
         return Resp.err("Credential not found")
 
     try:
-        _, orders, _ = _load_kis(cred)
         qty = int(body.qty)
+        market = body.market.lower()
+        order_type = "limit"  # KIS quick-trade submits ORD_DVSN "00" — always limit
+        exchange = body.exchange or "NASD"
+        req = {
+            "symbol": body.symbol, "side": body.side, "qty": float(qty),
+            "price": body.price, "market": market, "exchange": exchange,
+            "order_type": order_type,
+        }
 
-        if body.market.lower() == "kr":
-            if body.side.lower() == "buy":
-                result = orders.buy_kr(body.symbol, qty, int(body.price))
-            else:
-                result = orders.sell_kr(body.symbol, qty, int(body.price))
-        else:
-            exchange = body.exchange or "NASD"
-            if body.side.lower() == "buy":
-                result = orders.buy_us(body.symbol, exchange, qty, body.price)
-            else:
-                result = orders.sell_us(body.symbol, exchange, qty, body.price)
-
-        # Record trade in DB (quick-trade doesn't belong to a strategy; use strategy_id=None)
-        # We store it under a special "manual" strategy if needed – skip for simplicity.
-        mapper = KIS_DOMESTIC_MAPPER if body.market.lower() == "kr" else KIS_OVERSEAS_MAPPER
-        return Resp.ok(
-            {
-                "order_id": mapper.extract_broker_order_id(result),
-                "symbol": body.symbol,
-                "side": body.side,
-                "qty": qty,
-                "price": body.price,
-                "status": "submitted",
-            }
+        # Idempotency key: explicit header if the caller supplied one, else a
+        # server-derived double-click fingerprint (no frontend change needed).
+        fp_args = dict(
+            user_id=current_user.id, credential_id=body.credential_id,
+            symbol=body.symbol, side=body.side, qty=float(qty), price=body.price,
+            market=market, exchange=exchange, order_type=order_type,
         )
+        key = idempotency_key or derive_idempotency_key(**fp_args)
+        req_hash = request_fingerprint(**fp_args)
+
+        mapper = KIS_DOMESTIC_MAPPER if market == "kr" else KIS_OVERSEAS_MAPPER
+
+        def broker_submit():
+            # The ONLY broker call site — invoked by the service strictly after
+            # the reservation is committed, at most once per idempotency key.
+            _, orders, _ = _load_kis(cred)
+            if market == "kr":
+                if body.side.lower() == "buy":
+                    return orders.buy_kr(body.symbol, qty, int(body.price))
+                return orders.sell_kr(body.symbol, qty, int(body.price))
+            if body.side.lower() == "buy":
+                return orders.buy_us(body.symbol, exchange, qty, body.price)
+            return orders.sell_us(body.symbol, exchange, qty, body.price)
+
+        order = reserve_and_submit(
+            db,
+            user_id=current_user.id,
+            credential_id=body.credential_id,
+            request=req,
+            idempotency_key=key,
+            request_hash=req_hash,
+            broker_submit=broker_submit,
+            extract_order_id=mapper.extract_broker_order_id,
+        )
+        payload = {
+            "order_id": order.broker_order_id or "",
+            "symbol": order.symbol,
+            "side": order.side,
+            "qty": qty,
+            "price": order.price,
+            "status": order.status,  # submitted / reserved / rejected / failed
+        }
+        if order.status == QT_SUBMITTED:
+            return Resp.ok(payload)
+        # Rejected / reserved(indeterminate) / failed → error envelope so clients
+        # that branch on Resp.err keep detecting failed orders (prior behaviour).
+        return Resp.err(f"Order {order.status}: {order.error or 'no broker order id'}")
+    except IdempotencyConflict:
+        return Resp.err("Duplicate idempotency key with different parameters")
     except Exception as e:
         logger.error("place order failed: %s", e)
         return Resp.err(f"Order failed: {e}")
