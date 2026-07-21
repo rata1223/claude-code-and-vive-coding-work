@@ -190,11 +190,13 @@ def reserve_and_submit(
         db.commit()
         logger.warning("quick-trade blocked by risk gate (order %s): %s", order.id, e)
         return order
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - intentional catch-all: any risk error must fail closed
         # Indeterminate risk state (e.g. Redis unreachable, missing context) →
-        # fail closed, never submit.
+        # fail closed, never submit. Persist only the exception *type* — order.error
+        # is surfaced to the API client via Resp.err, and str(e) on a Redis/connection
+        # error can carry host/credential detail. The full exception goes to the log.
         qt_transition(order, QT_BLOCKED)
-        order.error = f"risk-error(fail-closed): {e}"
+        order.error = f"risk-error(fail-closed): {type(e).__name__}"
         db.commit()
         logger.error("quick-trade risk gate errored, failing closed (order %s): %s", order.id, e)
         return order

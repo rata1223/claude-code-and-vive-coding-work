@@ -13,6 +13,11 @@ PEAK_EQUITY_KEY = "risk:peak_equity"
 DAILY_LOSS_LIMIT = float(os.environ.get("DAILY_LOSS_LIMIT_PCT", 0.03))
 MDD_LIMIT = float(os.environ.get("MDD_LIMIT_PCT", 0.15))
 
+# Bound every Redis call so a slow/unreachable Redis fails fast instead of
+# hanging a caller (e.g. the quick-trade pre-submit risk gate, which relies on
+# a *prompt* exception to fail closed) or the trading bot. Finite by default.
+_REDIS_TIMEOUT = float(os.environ.get("REDIS_SOCKET_TIMEOUT", "2"))
+
 # Redis 재시작에도 peak equity 유지하는 파일 경로
 _DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
 _PEAK_FILE = _DATA_DIR / "peak_equity.json"
@@ -38,7 +43,11 @@ def _save_peak_to_file(peak: float):
 
 class RiskManager:
     def __init__(self):
-        self._redis = redis.from_url(os.environ.get("REDIS_URL", "redis://redis:6379"))
+        self._redis = redis.from_url(
+            os.environ.get("REDIS_URL", "redis://redis:6379"),
+            socket_timeout=_REDIS_TIMEOUT,
+            socket_connect_timeout=_REDIS_TIMEOUT,
+        )
         # 부팅 시 파일 → Redis 복원
         peak = _load_peak_from_file()
         if peak and not self._redis.exists(PEAK_EQUITY_KEY):

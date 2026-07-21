@@ -476,3 +476,32 @@ def test_http_risk_allows_submits(
     assert res.json()["code"] == 1  # Resp.ok
     assert res.json()["data"]["status"] == "submitted"
     assert http_fake.calls == 1
+
+
+# ── RiskManager bounds its Redis client so the fail-closed gate fails FAST ─────
+
+def test_risk_manager_redis_client_has_socket_timeout(monkeypatch):
+    """The pre-submit gate's fail-closed guarantee is only useful if a slow/
+    unreachable Redis raises promptly instead of hanging the request. Assert the
+    RiskManager Redis client is constructed with finite socket timeouts.
+    """
+    import strategy.risk as risk_mod
+
+    captured = {}
+
+    class _FakeRedis:
+        def exists(self, *a, **k):
+            return 0  # no peak-equity key → __init__ won't call .set
+
+    def _fake_from_url(url, **kwargs):
+        captured["url"] = url
+        captured["kwargs"] = kwargs
+        return _FakeRedis()
+
+    monkeypatch.setattr(risk_mod.redis, "from_url", _fake_from_url)
+    risk_mod.RiskManager()
+
+    assert captured["kwargs"].get("socket_timeout") is not None
+    assert captured["kwargs"].get("socket_connect_timeout") is not None
+    assert captured["kwargs"]["socket_timeout"] > 0
+    assert captured["kwargs"]["socket_connect_timeout"] > 0
