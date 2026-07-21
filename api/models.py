@@ -1,10 +1,25 @@
 from datetime import datetime
 from sqlalchemy import (
     Column, Integer, String, Text, Boolean, Float,
-    DateTime, ForeignKey, JSON
+    DateTime, ForeignKey, JSON, UniqueConstraint
 )
 from sqlalchemy.orm import relationship
 from api.database import Base
+
+# Quick Trade order lifecycle states (P0-04). Kept as plain strings — a
+# stored submission outcome, never a fill/lifecycle status (see P0-02 §7).
+QT_RESERVED = "reserved"    # durable idempotency reservation, pre/awaiting broker
+QT_SUBMITTED = "submitted"  # broker acknowledged the submission
+QT_REJECTED = "rejected"    # broker explicitly rejected (terminal)
+QT_FAILED = "failed"        # reconciliation determined the broker never got it
+
+# Legal transitions out of each state (terminal states → empty set).
+QT_VALID_TRANSITIONS = {
+    QT_RESERVED: {QT_SUBMITTED, QT_REJECTED, QT_FAILED},
+    QT_SUBMITTED: set(),
+    QT_REJECTED: set(),
+    QT_FAILED: set(),
+}
 
 
 class User(Base):
@@ -121,3 +136,41 @@ class Notification(Base):
 
     user = relationship("User", back_populates="notifications")
     strategy = relationship("Strategy", back_populates="notifications")
+
+
+class QuickTradeOrder(Base):
+    """Dedicated persistence for manual Quick Trade orders (P0-04).
+
+    Separate from the Execution Layer's ``backend/database/models.py`` tables
+    (which are single-account, no user/credential columns — see P0-02). Owned
+    exclusively by the ``api/`` app and provisioned by ``create_all``; the
+    repo's Alembic config targets the *backend* Base, so this table is not an
+    Alembic migration.
+
+    The ``(user_id, idempotency_key)`` unique constraint is the durable
+    reserve-before-submit guarantee: one committed reservation per key per
+    tenant, enforced by the DB. The application guarantee is "1 durable DB
+    reservation per idempotency key", NOT exactly-once broker submission.
+    """
+
+    __tablename__ = "quick_trade_orders"
+    __table_args__ = (
+        UniqueConstraint("user_id", "idempotency_key", name="uq_qto_user_idempotency"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    credential_id = Column(Integer, ForeignKey("credentials.id"), nullable=False, index=True)
+    idempotency_key = Column(String(128), nullable=False)
+    request_hash = Column(String(64), nullable=False)
+    symbol = Column(String(50), nullable=False)
+    side = Column(String(10), nullable=False)              # buy / sell
+    market = Column(String(10), nullable=False, default="us")
+    order_type = Column(String(20), nullable=False, default="limit")
+    qty = Column(Float, nullable=False)
+    price = Column(Float, nullable=False)
+    status = Column(String(20), nullable=False, default=QT_RESERVED)
+    broker_order_id = Column(String(64), nullable=True)    # broker ODNO after submit
+    error = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
