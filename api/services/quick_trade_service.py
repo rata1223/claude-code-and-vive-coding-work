@@ -32,7 +32,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from api.models import (
-    QuickTradeOrder,
+    QuickTradeOrder, qt_transition,
     QT_RESERVED, QT_SUBMITTED, QT_REJECTED, QT_FAILED,
 )
 
@@ -58,13 +58,16 @@ def _canonical(payload: dict) -> str:
 
 def request_fingerprint(
     *, user_id: int, credential_id: int, symbol: str, side: str,
-    qty: float, price: float, market: str = "us", order_type: str = "limit",
+    qty: float, price: float, market: str = "us", exchange: str = "NASD",
+    order_type: str = "limit",
 ) -> str:
     """Stable SHA256 over the order parameters only (no time component).
 
     Used as ``request_hash`` to detect an idempotency key reused with different
     params. ``qty``/``price`` are quantised to integer 'cents' to avoid float
-    drift, matching ``backend/execution/idempotency.py``'s approach.
+    drift, matching ``backend/execution/idempotency.py``'s approach. ``exchange``
+    is part of the order identity — the same symbol on NASD vs NYSE is a
+    distinct order.
     """
     return hashlib.sha256(_canonical({
         "v": 1,
@@ -75,13 +78,15 @@ def request_fingerprint(
         "qty_c": round(qty * 100),
         "price_c": round(price * 100),
         "mkt": market.lower(),
+        "exch": exchange.upper(),
         "ot": order_type.lower(),
     }).encode()).hexdigest()
 
 
 def derive_idempotency_key(
     *, user_id: int, credential_id: int, symbol: str, side: str,
-    qty: float, price: float, market: str = "us", order_type: str = "limit",
+    qty: float, price: float, market: str = "us", exchange: str = "NASD",
+    order_type: str = "limit",
     bucket_seconds: int = IDEMPOTENCY_BUCKET_SECONDS,
     _now: Optional[datetime] = None,
 ) -> str:
@@ -96,7 +101,7 @@ def derive_idempotency_key(
     bucket = epoch - (epoch % max(bucket_seconds, 1))
     fp = request_fingerprint(
         user_id=user_id, credential_id=credential_id, symbol=symbol, side=side,
-        qty=qty, price=price, market=market, order_type=order_type,
+        qty=qty, price=price, market=market, exchange=exchange, order_type=order_type,
     )
     return hashlib.sha256(f"{fp}:{bucket}".encode()).hexdigest()
 
@@ -127,6 +132,7 @@ def reserve_and_submit(
         symbol=request["symbol"],
         side=request["side"],
         market=request.get("market", "us"),
+        exchange=request.get("exchange", "NASD"),
         order_type=request.get("order_type", "limit"),
         qty=request["qty"],
         price=request["price"],
@@ -149,7 +155,7 @@ def reserve_and_submit(
         if existing is None:
             raise
         if existing.request_hash != request_hash:
-            raise IdempotencyConflict(existing)
+            raise IdempotencyConflict(existing) from None
         return existing
     db.refresh(order)
 
@@ -158,7 +164,7 @@ def reserve_and_submit(
         result = broker_submit()
     except RuntimeError as e:
         # Broker explicitly rejected (rt_cd != "0") — terminal.
-        order.status = QT_REJECTED
+        qt_transition(order, QT_REJECTED)
         order.error = str(e)
         db.commit()
         return order
@@ -172,7 +178,7 @@ def reserve_and_submit(
         return order
 
     order.broker_order_id = extract_order_id(result)
-    order.status = QT_SUBMITTED
+    qt_transition(order, QT_SUBMITTED)
     db.commit()
     return order
 
@@ -195,9 +201,9 @@ def reconcile_reserved(
     found = broker_lookup(order.symbol)
     if found:
         order.broker_order_id, _broker_status = found
-        order.status = QT_SUBMITTED
+        qt_transition(order, QT_SUBMITTED)
     else:
-        order.status = QT_FAILED
+        qt_transition(order, QT_FAILED)
         order.error = order.error or "reconcile: broker has no matching order"
     db.commit()
     return order

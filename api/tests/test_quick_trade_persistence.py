@@ -389,3 +389,61 @@ def test_http_double_submit_same_params_dedupes_at_router(
     # Identical params within the double-click window → one broker call, one row.
     assert http_fake.calls == 1
     assert db_session.query(QuickTradeOrder).filter_by(user_id=1, symbol="AAPL").count() == 1
+
+
+class _HttpRejectingOrders:
+    def buy_us(self, symbol, excd, qty, price):
+        raise RuntimeError("KIS API error: rejected")
+
+
+def test_http_broker_rejection_returns_error_envelope(client, auth_headers, db_session, monkeypatch):
+    monkeypatch.setattr(
+        "api.routers.quick_trade._load_kis",
+        lambda cred: (None, _HttpRejectingOrders(), object()),
+    )
+    cred_id = _seed_credential(client, auth_headers)
+    payload = {"credential_id": cred_id, "symbol": "AAPL", "side": "buy",
+               "qty": 5, "price": 150.0, "market": "us", "exchange": "NASD"}
+    res = client.post("/api/quick-trade/place-order", headers=auth_headers, json=payload)
+    assert res.status_code == 200
+    body = res.json()
+    assert body["code"] == -1  # Resp.err — clients branching on code detect failure
+    # The reservation is still persisted as REJECTED (auditable), just not "ok".
+    assert db_session.query(QuickTradeOrder).filter_by(user_id=1, status=QT_REJECTED).count() == 1
+
+
+# ── exchange is part of order identity ────────────────────────────────────────
+
+def test_exchange_distinguishes_idempotency(db):
+    broker = FakeBroker()
+    nasd = {**_REQ, "exchange": "NASD"}
+    nyse = {**_REQ, "exchange": "NYSE"}
+    k1, h1 = _key_and_hash(nasd)
+    k2, h2 = _key_and_hash(nyse)
+    assert k1 != k2 and h1 != h2  # same symbol/side/qty/price, different exchange
+    _reserve(db, broker, req=nasd, key=k1, request_hash=h1)
+    _reserve(db, broker, req=nyse, key=k2, request_hash=h2)
+    assert db.query(QuickTradeOrder).count() == 2
+    assert broker.calls == 2
+    assert {o.exchange for o in db.query(QuickTradeOrder).all()} == {"NASD", "NYSE"}
+
+
+# ── credential delete cascades quick-trade orders (no FK error) ───────────────
+
+def test_deleting_credential_cascades_quick_trade_orders(db):
+    _reserve(db, FakeBroker())
+    assert db.query(QuickTradeOrder).count() == 1
+    cred = db.get(Credential, 1)
+    db.delete(cred)
+    db.commit()  # must not raise an FK violation
+    assert db.query(QuickTradeOrder).filter_by(credential_id=1).count() == 0
+
+
+# ── illegal state transitions are rejected ────────────────────────────────────
+
+def test_transition_guard_rejects_illegal_transition(db):
+    from api.models import qt_transition
+    order = _reserve(db, FakeBroker())  # ends SUBMITTED (terminal)
+    assert order.status == QT_SUBMITTED
+    with pytest.raises(ValueError):
+        qt_transition(order, QT_RESERVED)  # cannot re-open a terminal order

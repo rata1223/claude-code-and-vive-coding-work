@@ -22,6 +22,19 @@ QT_VALID_TRANSITIONS = {
 }
 
 
+def qt_transition(order, new_status: str) -> None:
+    """Move a QuickTradeOrder to ``new_status``, enforcing QT_VALID_TRANSITIONS.
+
+    Raises ``ValueError`` on an illegal transition (e.g. re-opening a terminal
+    order), so a stray mutation can never silently corrupt an order's lifecycle.
+    """
+    if new_status not in QT_VALID_TRANSITIONS.get(order.status, set()):
+        raise ValueError(
+            f"illegal QuickTradeOrder transition {order.status!r} -> {new_status!r}"
+        )
+    order.status = new_status
+
+
 class User(Base):
     __tablename__ = "users"
 
@@ -56,6 +69,11 @@ class Credential(Base):
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
     user = relationship("User", back_populates="credentials")
+    # Deleting a credential removes its quick-trade order records, mirroring the
+    # Strategy→Trade cascade — otherwise the required FK would fail the delete.
+    quick_trade_orders = relationship(
+        "QuickTradeOrder", back_populates="credential", cascade="all, delete-orphan"
+    )
 
 
 class Strategy(Base):
@@ -166,6 +184,7 @@ class QuickTradeOrder(Base):
     symbol = Column(String(50), nullable=False)
     side = Column(String(10), nullable=False)              # buy / sell
     market = Column(String(10), nullable=False, default="us")
+    exchange = Column(String(10), nullable=False, default="NASD")  # NASD / NYSE / KRX
     order_type = Column(String(20), nullable=False, default="limit")
     qty = Column(Float, nullable=False)
     price = Column(Float, nullable=False)
@@ -174,3 +193,5 @@ class QuickTradeOrder(Base):
     error = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    credential = relationship("Credential", back_populates="quick_trade_orders")

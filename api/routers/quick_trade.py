@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 from api.crypto import decrypt
 from api.database import get_db
 from api.deps import get_current_user
-from api.models import Credential, Strategy, Trade, User
+from api.models import Credential, QT_SUBMITTED, Strategy, Trade, User
 from api.schemas import ClosePositionRequest, PlaceOrderRequest, Resp
 from api.services.quick_trade_service import (
     IdempotencyConflict,
@@ -149,7 +149,8 @@ def place_order(
         exchange = body.exchange or "NASD"
         req = {
             "symbol": body.symbol, "side": body.side, "qty": float(qty),
-            "price": body.price, "market": market, "order_type": order_type,
+            "price": body.price, "market": market, "exchange": exchange,
+            "order_type": order_type,
         }
 
         # Idempotency key: explicit header if the caller supplied one, else a
@@ -157,7 +158,7 @@ def place_order(
         fp_args = dict(
             user_id=current_user.id, credential_id=body.credential_id,
             symbol=body.symbol, side=body.side, qty=float(qty), price=body.price,
-            market=market, order_type=order_type,
+            market=market, exchange=exchange, order_type=order_type,
         )
         key = idempotency_key or derive_idempotency_key(**fp_args)
         req_hash = request_fingerprint(**fp_args)
@@ -186,16 +187,19 @@ def place_order(
             broker_submit=broker_submit,
             extract_order_id=mapper.extract_broker_order_id,
         )
-        return Resp.ok(
-            {
-                "order_id": order.broker_order_id or "",
-                "symbol": order.symbol,
-                "side": order.side,
-                "qty": qty,
-                "price": order.price,
-                "status": order.status,  # submitted / reserved / rejected / failed
-            }
-        )
+        payload = {
+            "order_id": order.broker_order_id or "",
+            "symbol": order.symbol,
+            "side": order.side,
+            "qty": qty,
+            "price": order.price,
+            "status": order.status,  # submitted / reserved / rejected / failed
+        }
+        if order.status == QT_SUBMITTED:
+            return Resp.ok(payload)
+        # Rejected / reserved(indeterminate) / failed → error envelope so clients
+        # that branch on Resp.err keep detecting failed orders (prior behaviour).
+        return Resp.err(f"Order {order.status}: {order.error or 'no broker order id'}")
     except IdempotencyConflict:
         return Resp.err("Duplicate idempotency key with different parameters")
     except Exception as e:
