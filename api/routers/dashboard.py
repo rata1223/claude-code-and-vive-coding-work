@@ -1,6 +1,5 @@
 """Dashboard endpoints – portfolio summary and pending orders."""
 import logging
-import os
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Query
@@ -28,23 +27,22 @@ def _get_kis_credential(user_id: int, db: Session) -> Optional[Credential]:
 
 def _build_kis_client_from_cred(cred: Credential):
     """
-    Temporarily set env-vars from the stored credential and return
-    (KISClient, KISPortfolio).  Raises on missing fields.
+    Build request-scoped (KISClient, KISPortfolio) from the stored credential.
+
+    Credentials are injected explicitly into the client instance (P0-03); the
+    process-wide ``os.environ`` is never mutated, so concurrent requests from
+    different users cannot leak or overwrite each other's credentials.
     """
-    from kis_adapter import KISClient, KISPortfolio
+    from kis_adapter import KISClient, KISCredentials, KISPortfolio
 
-    app_key = decrypt(cred.app_key_enc) or ""
-    app_secret = decrypt(cred.app_secret_enc) or ""
-    account_no = decrypt(cred.account_no_enc) or ""
-    hts_id = decrypt(cred.hts_id_enc) or ""
-
-    os.environ["KIS_APP_KEY"] = app_key
-    os.environ["KIS_APP_SECRET"] = app_secret
-    os.environ["KIS_ACCOUNT_NO"] = account_no
-    os.environ["KIS_HTS_ID"] = hts_id
-    os.environ["KIS_ENV"] = cred.env
-
-    client = KISClient()
+    creds = KISCredentials(
+        app_key=decrypt(cred.app_key_enc) or "",
+        app_secret=decrypt(cred.app_secret_enc) or "",
+        account_no=decrypt(cred.account_no_enc) or "",
+        hts_id=decrypt(cred.hts_id_enc) or "",
+        env=cred.env,
+    )
+    client = KISClient(creds)
     portfolio = KISPortfolio(client)
     return client, portfolio
 

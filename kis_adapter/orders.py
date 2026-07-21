@@ -1,5 +1,5 @@
-import os
 import logging
+from .auth import KISCredentials
 from .client import KISClient
 
 logger = logging.getLogger(__name__)
@@ -19,10 +19,12 @@ CANCEL_PATH = "/uapi/overseas-stock/v1/trading/order-rvsecncl"
 
 
 class KISOrders:
-    def __init__(self, client: KISClient = None):
-        self._client = client or KISClient()
+    def __init__(self, client: KISClient = None, credentials: "KISCredentials | None" = None):
+        self._client = client or KISClient(credentials)
         self._paper = self._client.auth.env == "paper"
-        self._account = os.environ["KIS_ACCOUNT_NO"]
+        # Account comes from the injected credentials (via the client's auth);
+        # only the env-based Execution path may fall back to the process env.
+        self._account = self._client.auth.require_account()
 
     def _tr(self, key: str) -> str:
         real_tr, paper_tr = TR[key]

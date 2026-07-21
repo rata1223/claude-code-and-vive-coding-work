@@ -5,7 +5,9 @@ import hashlib
 import logging
 import requests
 import redis
+from dataclasses import dataclass
 from datetime import datetime, timedelta
+from threading import Lock
 
 logger = logging.getLogger(__name__)
 
@@ -15,49 +17,91 @@ REAL_BASE = "https://openapi.koreainvestment.com:9443"
 TOKEN_CACHE_KEY = "kis:access_token"
 TOKEN_EXPIRY_KEY = "kis:token_expiry"
 
-# Process-level in-memory fallback when Redis is unavailable
-_MEM_TOKEN: str = ""
-_MEM_EXPIRY: float = 0.0
+# Process-level in-memory token cache fallback when Redis is unavailable.
+# Keyed by a per-credential fingerprint so distinct app-keys never share a token.
+_MEM_TOKENS: dict[str, tuple[str, float]] = {}
+_MEM_TOKENS_LOCK = Lock()
 _TOKEN_REFRESH_BUFFER = 900  # 15 minutes before expiry
 
 
+@dataclass(frozen=True)
+class KISCredentials:
+    """Explicit, per-scope KIS credentials injected into a client instance.
+
+    Replaces the previous pattern of mutating process-wide ``os.environ`` to
+    smuggle per-user credentials into ``KISAuth`` — a cross-request credential
+    bleed under concurrency. ``from_env()`` preserves the Execution Layer's
+    single static-account behaviour unchanged (same ``KeyError`` on a missing
+    ``KIS_APP_KEY`` as before).
+    """
+
+    app_key: str
+    app_secret: str
+    account_no: str = ""
+    hts_id: str = ""
+    env: str = "paper"
+
+    @classmethod
+    def from_env(cls) -> "KISCredentials":
+        return cls(
+            app_key=os.environ["KIS_APP_KEY"],
+            app_secret=os.environ["KIS_APP_SECRET"],
+            account_no=os.environ.get("KIS_ACCOUNT_NO", ""),
+            hts_id=os.environ.get("KIS_HTS_ID", ""),
+            env=os.environ.get("KIS_ENV", "paper"),
+        )
+
+
 class KISAuth:
-    def __init__(self):
-        self.app_key = os.environ["KIS_APP_KEY"]
-        self.app_secret = os.environ["KIS_APP_SECRET"]
-        self.env = os.environ.get("KIS_ENV", "paper")
+    def __init__(self, credentials: "KISCredentials | None" = None):
+        creds = credentials or KISCredentials.from_env()
+        # Only the env-sourced path may fall back to the process env for a
+        # missing account (see require_account) — an explicitly-injected
+        # credential must never read process-wide state.
+        self._env_sourced = credentials is None
+        self.app_key = creds.app_key
+        self.app_secret = creds.app_secret
+        self.account_no = creds.account_no
+        self.hts_id = creds.hts_id
+        self.env = creds.env
         self.base_url = PAPER_BASE if self.env == "paper" else REAL_BASE
         self._redis = redis.from_url(os.environ.get("REDIS_URL", "redis://redis:6379"))
+        # Per-credential cache keys — a distinct app-key/env never shares a token.
+        fp = hashlib.sha256(f"{self.app_key}:{self.env}".encode()).hexdigest()[:16]
+        self._fp = fp
+        self._token_cache_key = f"{TOKEN_CACHE_KEY}:{fp}"
+        self._token_expiry_key = f"{TOKEN_EXPIRY_KEY}:{fp}"
 
     def get_token(self) -> str:
-        global _MEM_TOKEN, _MEM_EXPIRY
-
-        # 1. Try Redis cache
+        # 1. Try Redis cache (per-credential key)
         try:
-            cached = self._redis.get(TOKEN_CACHE_KEY)
+            cached = self._redis.get(self._token_cache_key)
             if cached:
-                expiry = self._redis.get(TOKEN_EXPIRY_KEY)
+                expiry = self._redis.get(self._token_expiry_key)
                 if expiry and float(expiry) - time.time() > _TOKEN_REFRESH_BUFFER:
-                    _MEM_TOKEN = cached.decode()
-                    _MEM_EXPIRY = float(expiry)
-                    return _MEM_TOKEN
+                    token = cached.decode()
+                    with _MEM_TOKENS_LOCK:
+                        _MEM_TOKENS[self._fp] = (token, float(expiry))
+                    return token
         except Exception as e:
             logger.warning("Redis token cache read 실패 (in-memory 폴백): %s", e)
             # Fall through to in-memory cache check
 
-        # 2. In-memory fallback (valid when Redis is down)
-        if _MEM_TOKEN and _MEM_EXPIRY - time.time() > _TOKEN_REFRESH_BUFFER:
+        # 2. In-memory fallback (valid when Redis is down), scoped per credential
+        with _MEM_TOKENS_LOCK:
+            entry = _MEM_TOKENS.get(self._fp)
+        if entry and entry[1] - time.time() > _TOKEN_REFRESH_BUFFER:
             logger.debug("Redis 불가 — in-memory token 사용")
-            return _MEM_TOKEN
+            return entry[0]
 
         # 3. Issue a new token
         token, expires_in = self._issue_token()
         expiry_ts = time.time() + expires_in
-        _MEM_TOKEN = token
-        _MEM_EXPIRY = expiry_ts
+        with _MEM_TOKENS_LOCK:
+            _MEM_TOKENS[self._fp] = (token, expiry_ts)
         try:
-            self._redis.set(TOKEN_CACHE_KEY, token)
-            self._redis.set(TOKEN_EXPIRY_KEY, expiry_ts)
+            self._redis.set(self._token_cache_key, token)
+            self._redis.set(self._token_expiry_key, expiry_ts)
         except Exception as e:
             logger.warning("Redis token cache write 실패 (in-memory のみ): %s", e)
         return token
@@ -75,7 +119,7 @@ class KISAuth:
         return data["access_token"], int(data.get("expires_in", 86400))
 
     def revoke_token(self):
-        token = self._redis.get(TOKEN_CACHE_KEY)
+        token = self._redis.get(self._token_cache_key)
         if not token:
             return
         url = f"{self.base_url}/oauth2/revokeP"
@@ -85,7 +129,24 @@ class KISAuth:
             "token": token.decode(),
         }
         requests.post(url, json=body, timeout=10)
-        self._redis.delete(TOKEN_CACHE_KEY, TOKEN_EXPIRY_KEY)
+        self._redis.delete(self._token_cache_key, self._token_expiry_key)
+        with _MEM_TOKENS_LOCK:
+            _MEM_TOKENS.pop(self._fp, None)
+
+    def require_account(self) -> str:
+        """Resolve the trading account for this credential scope.
+
+        An explicitly-injected (request-scoped) credential must never fall back
+        to ``os.environ`` — doing so could place an order on a different static
+        account under concurrency. Only the env-sourced path reads
+        ``KIS_ACCOUNT_NO``, and it fails fast (``KeyError``) when unset, matching
+        the prior behaviour.
+        """
+        if self.account_no:
+            return self.account_no
+        if self._env_sourced:
+            return os.environ["KIS_ACCOUNT_NO"]
+        raise ValueError("KIS credential has no account_no (request-scoped account required)")
 
     def get_hashkey(self, body: dict) -> str:
         url = f"{self.base_url}/uapi/hashkey"

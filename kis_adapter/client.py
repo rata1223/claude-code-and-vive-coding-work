@@ -3,7 +3,7 @@ import time
 import logging
 import requests
 from threading import Lock
-from .auth import KISAuth
+from .auth import KISAuth, KISCredentials
 
 logger = logging.getLogger(__name__)
 
@@ -25,8 +25,8 @@ class RateLimiter:
 class KISClient:
     MAX_RETRIES = 3
 
-    def __init__(self):
-        self.auth = KISAuth()
+    def __init__(self, credentials: "KISCredentials | None" = None):
+        self.auth = KISAuth(credentials)
         rate = 5 if self.auth.env == "paper" else 15
         self._limiter = RateLimiter(rate)
 

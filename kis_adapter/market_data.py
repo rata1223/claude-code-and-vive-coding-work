@@ -1,5 +1,5 @@
-import os
 import logging
+from .auth import KISCredentials
 from .client import KISClient
 
 logger = logging.getLogger(__name__)
@@ -14,8 +14,8 @@ TR_PENDING_US = ("TTTS3018R", "VTTS3018R")
 
 
 class KISMarketData:
-    def __init__(self, client: KISClient = None):
-        self._client = client or KISClient()
+    def __init__(self, client: KISClient = None, credentials: "KISCredentials | None" = None):
+        self._client = client or KISClient(credentials)
         self._paper = self._client.auth.env == "paper"
 
     def get_price_us(self, symbol: str, excd: str) -> float:
