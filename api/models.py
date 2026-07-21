@@ -12,13 +12,18 @@ QT_RESERVED = "reserved"    # durable idempotency reservation, pre/awaiting brok
 QT_SUBMITTED = "submitted"  # broker acknowledged the submission
 QT_REJECTED = "rejected"    # broker explicitly rejected (terminal)
 QT_FAILED = "failed"        # reconciliation determined the broker never got it
+QT_BLOCKED = "blocked"      # risk gate denied/errored before submit — broker NEVER called (P0-05)
 
 # Legal transitions out of each state (terminal states → empty set).
+# QT_BLOCKED is distinct from QT_REJECTED: BLOCKED means the pre-submit RiskManager
+# gate stopped the order (broker never contacted); REJECTED means the broker itself
+# rejected it. Keeping them separate gives a clean audit trail.
 QT_VALID_TRANSITIONS = {
-    QT_RESERVED: {QT_SUBMITTED, QT_REJECTED, QT_FAILED},
+    QT_RESERVED: {QT_SUBMITTED, QT_REJECTED, QT_FAILED, QT_BLOCKED},
     QT_SUBMITTED: set(),
     QT_REJECTED: set(),
     QT_FAILED: set(),
+    QT_BLOCKED: set(),
 }
 
 

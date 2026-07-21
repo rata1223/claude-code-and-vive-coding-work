@@ -25,6 +25,7 @@ from api.database import Base, get_db
 from api.main import app
 from api.models import User
 from api.routers.auth import limiter as auth_router_limiter
+from api.routers.quick_trade import get_risk_gate
 
 
 @pytest.fixture()
@@ -41,6 +42,10 @@ def db_session():
             db.close()
 
     app.dependency_overrides[get_db] = _override_get_db
+    # Default the P0-05 risk gate to ALLOW so existing HTTP tests exercise the
+    # order path without a live Redis/RiskManager. Risk-specific tests remove
+    # this override to run the real gate against a patched RiskManager.
+    app.dependency_overrides[get_risk_gate] = lambda: (lambda: None)
     # auth.py's rate-limit decorator uses its own Limiter instance, separate
     # from app.state.limiter — both must be disabled so repeated test calls
     # to /login and /register don't hit the real 5/minute production limit.
