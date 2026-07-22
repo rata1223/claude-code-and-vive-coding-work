@@ -11,11 +11,18 @@ TR = {
     "cancel_us": ("TTTT1004U", "JTTT1004U"),
     "buy_kr":    ("TTTC0802U", "VTTC0802U"),
     "sell_kr":   ("TTTC0801U", "VTTC0801U"),
+    # Read-only single-symbol order inquiry (used by Quick Trade reconciliation to
+    # resolve a RESERVED order after an indeterminate submit). Same TRs the
+    # Execution-Layer poller uses in backend/brokers/kis.py.
+    "inquire_us": ("TTTS3035R", "VTTS3035R"),
+    "inquire_kr": ("TTTC8036R", "VTTC8036R"),
 }
 
 ORDER_PATH = "/uapi/overseas-stock/v1/trading/order"
 ORDER_KR_PATH = "/uapi/domestic-stock/v1/trading/order-cash"
 CANCEL_PATH = "/uapi/overseas-stock/v1/trading/order-rvsecncl"
+INQUIRE_US_PATH = "/uapi/overseas-stock/v1/trading/inquire-order"
+INQUIRE_KR_PATH = "/uapi/domestic-stock/v1/trading/inquire-order"
 
 
 class KISOrders:
@@ -81,6 +88,50 @@ class KISOrders:
         }
         logger.info("SELL_KR %s qty=%d price=%d", symbol, qty, price)
         return self._client.post(ORDER_KR_PATH, self._tr("sell_kr"), body)
+
+    def inquire_orders(self, symbol: str, market: str = "us", excd: str = "NASD") -> list:
+        """Read-only inquiry: recent orders for ``symbol``. Returns the raw KIS
+        ``output`` list of order rows (each with ``odno``, ``sll_buy_dvsn_cd``,
+        qty, price). Never places an order.
+
+        Used by Quick Trade reconciliation to determine whether a RESERVED order
+        (submitted with an indeterminate outcome) actually reached the broker.
+        """
+        if market.lower() == "kr":
+            params = {
+                "CANO": self._account[:8],
+                "ACNT_PRDT_CD": self._account[8:],
+                "INQR_STRT_DT": "",
+                "INQR_END_DT": "",
+                "SLL_BUY_DVSN_CD": "00",
+                "INQR_DVSN": "01",
+                "PDNO": symbol,
+                "ORD_GNO_BRNO": "",
+                "ODNO": "",
+                "INQR_DVSN_3": "00",
+                "INQR_DVSN_1": "",
+                "CTX_AREA_FK100": "",
+                "CTX_AREA_NK100": "",
+            }
+            data = self._client.get(INQUIRE_KR_PATH, self._tr("inquire_kr"), params)
+            return data.get("output1") or data.get("output", []) or []
+
+        params = {
+            "CANO": self._account[:8],
+            "ACNT_PRDT_CD": self._account[8:],
+            "OVRS_EXCG_CD": excd,
+            "PDNO": symbol,
+            "ORD_STRT_DT": "",
+            "ORD_END_DT": "",
+            "SLL_BUY_DVSN_CD": "00",
+            "CCL_NCCS_DVSN": "00",
+            "INQR_DVSN": "00",
+            "INQR_DVSN_1": "0",
+            "CTX_AREA_FK200": "",
+            "CTX_AREA_NK200": "",
+        }
+        data = self._client.get(INQUIRE_US_PATH, self._tr("inquire_us"), params)
+        return data.get("output") or []
 
     def cancel_us(self, org_order_no: str, symbol: str, excd: str, qty: int, price: float) -> dict:
         body = {
