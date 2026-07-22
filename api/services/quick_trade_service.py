@@ -33,7 +33,7 @@ from sqlalchemy.orm import Session
 
 from api.models import (
     QuickTradeOrder, qt_transition,
-    QT_RESERVED, QT_SUBMITTED, QT_REJECTED, QT_FAILED,
+    QT_RESERVED, QT_SUBMITTED, QT_REJECTED, QT_FAILED, QT_BLOCKED,
 )
 
 logger = logging.getLogger(__name__)
@@ -50,6 +50,15 @@ class IdempotencyConflict(Exception):
     def __init__(self, existing: QuickTradeOrder):
         self.existing = existing
         super().__init__("idempotency key reused with different request parameters")
+
+
+class RiskDenied(Exception):
+    """The pre-submit RiskManager gate explicitly denied the order (P0-05).
+
+    Raised by the injected ``risk_gate`` to signal a clean deny (e.g. trading
+    halted). ``reserve_and_submit`` catches it, marks the reservation
+    ``QT_BLOCKED``, and never calls the broker.
+    """
 
 
 def _canonical(payload: dict) -> str:
@@ -114,15 +123,25 @@ def reserve_and_submit(
     request: dict,
     idempotency_key: str,
     request_hash: str,
+    risk_gate: Callable[[], None],
     broker_submit: Callable[[], dict],
     extract_order_id: Callable[[dict], str],
 ) -> QuickTradeOrder:
-    """Reserve durably, then submit to the broker exactly once for a fresh key.
+    """Reserve durably, gate on risk, then submit to the broker exactly once.
 
-    ``broker_submit`` is invoked at most once, and only strictly after the
-    reservation row is committed. A duplicate key returns the existing row
-    without calling the broker; a key reused with different params raises
-    :class:`IdempotencyConflict`.
+    Execution order for a fresh key: reserve → COMMIT → ``risk_gate()`` →
+    ``broker_submit()``. ``risk_gate`` is a **required** authoritative pre-submit
+    check (the existing production ``RiskManager``, P0-05): it returns ``None`` to
+    ALLOW, raises :class:`RiskDenied` to DENY, or raises anything else to signal
+    an indeterminate risk state. DENY and ERROR both **fail closed** — the order
+    is marked ``QT_BLOCKED``, the broker is never called, and an audit row is
+    persisted. Making ``risk_gate`` a required argument means a caller can never
+    accidentally submit without a risk decision.
+
+    ``broker_submit`` is invoked at most once, only strictly after the reservation
+    is committed and only when the gate ALLOWS. A duplicate key returns the
+    existing row without evaluating risk or calling the broker; a key reused with
+    different params raises :class:`IdempotencyConflict` (also before the gate).
     """
     order = QuickTradeOrder(
         user_id=user_id,
@@ -159,7 +178,30 @@ def reserve_and_submit(
         return existing
     db.refresh(order)
 
-    # [AFTER COMMIT] the single broker submission for this reservation.
+    # [AFTER COMMIT] authoritative pre-submit risk gate (P0-05). Fail closed:
+    # both an explicit deny and any unexpected error block the broker call and
+    # persist a QT_BLOCKED audit row. Sits below the duplicate/conflict
+    # short-circuits above, so a retry never re-evaluates risk.
+    try:
+        risk_gate()
+    except RiskDenied as e:
+        qt_transition(order, QT_BLOCKED)
+        order.error = f"risk-denied: {e}"
+        db.commit()
+        logger.warning("quick-trade blocked by risk gate (order %s): %s", order.id, e)
+        return order
+    except Exception as e:  # noqa: BLE001 - intentional catch-all: any risk error must fail closed
+        # Indeterminate risk state (e.g. Redis unreachable, missing context) →
+        # fail closed, never submit. Persist only the exception *type* — order.error
+        # is surfaced to the API client via Resp.err, and str(e) on a Redis/connection
+        # error can carry host/credential detail. The full exception goes to the log.
+        qt_transition(order, QT_BLOCKED)
+        order.error = f"risk-error(fail-closed): {type(e).__name__}"
+        db.commit()
+        logger.error("quick-trade risk gate errored, failing closed (order %s): %s", order.id, e)
+        return order
+
+    # [AFTER COMMIT + RISK ALLOWED] the single broker submission for this reservation.
     try:
         result = broker_submit()
     except RuntimeError as e:

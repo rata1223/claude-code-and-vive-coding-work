@@ -101,6 +101,7 @@ def _reserve(db, broker, *, req=_REQ, key=None, request_hash=None, user_id=1, cr
     return reserve_and_submit(
         db, user_id=user_id, credential_id=credential_id, request=req,
         idempotency_key=key, request_hash=request_hash,
+        risk_gate=lambda: None,  # P0-05: allow (these tests target P0-04 persistence)
         broker_submit=broker.submit, extract_order_id=_extract,
     )
 
@@ -163,6 +164,7 @@ def test_broker_submit_only_after_commit(db, SessionLocal):
     order = reserve_and_submit(
         db, user_id=1, credential_id=1, request=_REQ,
         idempotency_key=key, request_hash=h,
+        risk_gate=lambda: None,
         broker_submit=broker_submit, extract_order_id=_extract,
     )
     assert seen["visible"] is True
@@ -236,6 +238,7 @@ def test_concurrent_same_key_single_reservation(SessionLocal):
             reserve_and_submit(
                 s, user_id=1, credential_id=1, request=_REQ,
                 idempotency_key=key, request_hash=h,
+                risk_gate=lambda: None,
                 broker_submit=submit, extract_order_id=_extract,
             )
         finally:

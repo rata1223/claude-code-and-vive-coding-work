@@ -13,15 +13,34 @@ from api.models import Credential, QT_SUBMITTED, Strategy, Trade, User
 from api.schemas import ClosePositionRequest, PlaceOrderRequest, Resp
 from api.services.quick_trade_service import (
     IdempotencyConflict,
+    RiskDenied,
     derive_idempotency_key,
     request_fingerprint,
     reserve_and_submit,
 )
 from backend.brokers.semantic_mapper import KIS_DOMESTIC_MAPPER, KIS_OVERSEAS_MAPPER
+from strategy.risk import RiskManager
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/quick-trade", tags=["quick-trade"])
+
+
+def get_risk_gate():
+    """FastAPI dependency: the authoritative pre-submit risk gate (P0-05).
+
+    Reuses the existing production ``RiskManager`` exactly as-is. The returned
+    callable raises :class:`RiskDenied` when trading is halted (daily-loss limit,
+    kill switch, or SafeMode — all surface via the single Redis halt flag). If
+    ``RiskManager()`` construction or ``is_trading_halted()`` raises (e.g. Redis
+    unreachable), the exception propagates and ``reserve_and_submit`` fails closed.
+    Overridable in tests via ``app.dependency_overrides``.
+    """
+    def risk_gate():
+        if RiskManager().is_trading_halted():
+            raise RiskDenied("trading halted by RiskManager")
+
+    return risk_gate
 
 
 def _load_kis(cred: Credential):
@@ -137,6 +156,7 @@ def place_order(
     idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
+    risk_gate=Depends(get_risk_gate),
 ):
     cred = _get_cred(body.credential_id, current_user.id, db)
     if not cred:
@@ -184,6 +204,7 @@ def place_order(
             request=req,
             idempotency_key=key,
             request_hash=req_hash,
+            risk_gate=risk_gate,
             broker_submit=broker_submit,
             extract_order_id=mapper.extract_broker_order_id,
         )

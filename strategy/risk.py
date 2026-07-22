@@ -1,10 +1,30 @@
 import os
 import json
 import logging
+import math
 import redis
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+
+def _positive_finite_float(raw, default: float) -> float:
+    """Parse ``raw`` as a socket-timeout seconds value, falling back to ``default``.
+
+    A timeout must be a finite number > 0: ``0``/negatives would disable the
+    bound (defeating fail-fast), and ``nan``/``inf``/malformed text would break
+    the Redis client or, since this is read at import time, crash startup. Any
+    invalid input is logged and replaced with ``default`` rather than raising.
+    """
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        logger.warning("invalid REDIS_SOCKET_TIMEOUT %r, using default %s", raw, default)
+        return default
+    if not math.isfinite(value) or value <= 0:
+        logger.warning("REDIS_SOCKET_TIMEOUT %r must be a finite value > 0, using default %s", raw, default)
+        return default
+    return value
 
 DAILY_LOSS_KEY = "risk:daily_loss_pct"
 TRADING_HALTED_KEY = "risk:trading_halted"
@@ -12,6 +32,15 @@ PEAK_EQUITY_KEY = "risk:peak_equity"
 
 DAILY_LOSS_LIMIT = float(os.environ.get("DAILY_LOSS_LIMIT_PCT", 0.03))
 MDD_LIMIT = float(os.environ.get("MDD_LIMIT_PCT", 0.15))
+
+# Bound every Redis call so a slow/unreachable Redis fails fast instead of
+# hanging a caller (e.g. the quick-trade pre-submit risk gate, which relies on
+# a *prompt* exception to fail closed) or the trading bot. Finite by default;
+# validated so a bad env value falls back rather than crashing import.
+_DEFAULT_REDIS_TIMEOUT = 2.0
+_REDIS_TIMEOUT = _positive_finite_float(
+    os.environ.get("REDIS_SOCKET_TIMEOUT", _DEFAULT_REDIS_TIMEOUT), _DEFAULT_REDIS_TIMEOUT
+)
 
 # Redis 재시작에도 peak equity 유지하는 파일 경로
 _DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
@@ -38,7 +67,11 @@ def _save_peak_to_file(peak: float):
 
 class RiskManager:
     def __init__(self):
-        self._redis = redis.from_url(os.environ.get("REDIS_URL", "redis://redis:6379"))
+        self._redis = redis.from_url(
+            os.environ.get("REDIS_URL", "redis://redis:6379"),
+            socket_timeout=_REDIS_TIMEOUT,
+            socket_connect_timeout=_REDIS_TIMEOUT,
+        )
         # 부팅 시 파일 → Redis 복원
         peak = _load_peak_from_file()
         if peak and not self._redis.exists(PEAK_EQUITY_KEY):
