@@ -54,3 +54,43 @@ def test_returns_none_when_single_output_row_mismatches():
     # Non-list response: a single object with an unrelated odno must NOT be adopted.
     resp = {"output1": _row("ORD-999", "000660", 50, 50)}
     assert _broker(resp)._get_kr_order_status("ORD-123") is None
+
+
+# ── Inquiry date bounds ────────────────────────────────────────────────────────
+# Both single-order inquiries must send a bounded YYYYMMDD range, not empty
+# strings. Empty bounds collapse to "today only" on KIS, so an order looked up
+# after a date boundary would look absent. See kis_adapter/dates.py.
+
+class _RecordingClient:
+    def __init__(self, resp):
+        self._resp = resp
+        self.params = None
+
+    def get(self, path, tr_id, params):
+        self.params = params
+        return self._resp
+
+
+def _recording_broker(resp):
+    b = KISBroker.__new__(KISBroker)
+    b._paper = True
+    b._account = "123456789012"
+    c = _RecordingClient(resp)
+    b._client = c
+    return b, c
+
+
+def test_kr_inquiry_sends_bounded_date_range():
+    b, c = _recording_broker({"output1": []})
+    b._get_kr_order_status("ORD-123")
+    assert c.params.get("INQR_STRT_DT") and c.params.get("INQR_END_DT")
+    assert len(c.params["INQR_STRT_DT"]) == 8 and len(c.params["INQR_END_DT"]) == 8
+    assert c.params["INQR_STRT_DT"] <= c.params["INQR_END_DT"]
+
+
+def test_us_inquiry_sends_bounded_date_range():
+    b, c = _recording_broker({"output": []})
+    b._get_us_order_status("ORD-123", "AAPL")
+    assert c.params.get("ORD_STRT_DT") and c.params.get("ORD_END_DT")
+    assert len(c.params["ORD_STRT_DT"]) == 8 and len(c.params["ORD_END_DT"]) == 8
+    assert c.params["ORD_STRT_DT"] <= c.params["ORD_END_DT"]

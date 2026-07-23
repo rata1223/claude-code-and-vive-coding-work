@@ -326,6 +326,12 @@ def test_inquire_orders_us_tr_and_parsing_paper():
     assert tr_id == "VTTS3035R"                   # US paper inquiry TR
     assert "overseas-stock" in path and "inquire" in path
     assert params.get("PDNO") == "AAPL" and params.get("OVRS_EXCG_CD") == "NASD"
+    # Inquiry must be date-bounded: an empty range collapses to "today only",
+    # so a RESERVED order reserved on a prior day would look absent during the
+    # startup recovery sweep → a false QT_FAILED. See kis_adapter/dates.py.
+    assert params.get("ORD_STRT_DT") and params.get("ORD_END_DT")
+    assert len(params["ORD_STRT_DT"]) == 8 and len(params["ORD_END_DT"]) == 8
+    assert params["ORD_STRT_DT"] <= params["ORD_END_DT"]
 
 
 def test_inquire_orders_kr_tr_real():
@@ -333,8 +339,12 @@ def test_inquire_orders_kr_tr_real():
     orders = _make_kis_orders("real", rec)
     out = orders.inquire_orders("005930", market="kr")
     assert out == [_row("KR-1", "buy", 5, market="kr")]
-    _, tr_id, _ = rec.calls[0]
+    _, tr_id, params = rec.calls[0]
     assert tr_id == "TTTC8036R"                    # KR real inquiry TR
+    # Same date-bounding requirement on the domestic inquiry (see US test above).
+    assert params.get("INQR_STRT_DT") and params.get("INQR_END_DT")
+    assert len(params["INQR_STRT_DT"]) == 8 and len(params["INQR_END_DT"]) == 8
+    assert params["INQR_STRT_DT"] <= params["INQR_END_DT"]
 
 
 # ── 11. Startup wiring: env-gated, non-blocking, never crashes on failure ──────

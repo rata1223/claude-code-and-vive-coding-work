@@ -1,6 +1,7 @@
 import logging
 from .auth import KISCredentials
 from .client import KISClient
+from .dates import inquiry_date_range
 
 logger = logging.getLogger(__name__)
 
@@ -97,12 +98,13 @@ class KISOrders:
         Used by Quick Trade reconciliation to determine whether a RESERVED order
         (submitted with an indeterminate outcome) actually reached the broker.
         """
+        strt_dt, end_dt = inquiry_date_range()
         if market.lower() == "kr":
             params = {
                 "CANO": self._account[:8],
                 "ACNT_PRDT_CD": self._account[8:],
-                "INQR_STRT_DT": "",
-                "INQR_END_DT": "",
+                "INQR_STRT_DT": strt_dt,
+                "INQR_END_DT": end_dt,
                 "SLL_BUY_DVSN_CD": "00",
                 "INQR_DVSN": "01",
                 "PDNO": symbol,
@@ -121,8 +123,8 @@ class KISOrders:
             "ACNT_PRDT_CD": self._account[8:],
             "OVRS_EXCG_CD": excd,
             "PDNO": symbol,
-            "ORD_STRT_DT": "",
-            "ORD_END_DT": "",
+            "ORD_STRT_DT": strt_dt,
+            "ORD_END_DT": end_dt,
             "SLL_BUY_DVSN_CD": "00",
             "CCL_NCCS_DVSN": "00",
             "INQR_DVSN": "00",
