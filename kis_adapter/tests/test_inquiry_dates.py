@@ -34,9 +34,13 @@ def test_start_not_after_end():
 
 
 def test_end_is_today_kst():
+    # Capture the KST date on both sides of the call so a KST-midnight tick
+    # during the helper can't make this flake.
+    kst = timezone(timedelta(hours=9))
+    before = datetime.now(kst).date()
     _, end = inquiry_date_range()
-    today_kst = datetime.now(timezone(timedelta(hours=9))).date()
-    assert _parse(end) == today_kst
+    after = datetime.now(kst).date()
+    assert before <= _parse(end) <= after
 
 
 def test_zero_lookback_is_same_day():
