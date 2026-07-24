@@ -8,6 +8,7 @@ from .models import Balance, BrokerCapabilities, Order, OrderStatus, Position
 from .semantic_mapper import KIS_DOMESTIC_MAPPER, KIS_OVERSEAS_MAPPER
 from .validator import BrokerCapabilityValidator, OrderRequest
 from kis_adapter import KISClient, KISMarketData, KISOrders, KISPortfolio
+from kis_adapter.dates import inquiry_date_range
 from backend.execution.circuit_breaker import ConsecutiveFailureBreaker
 from backend.quant.data.universe import EXCD_MAP, KR_ETF
 
@@ -223,11 +224,12 @@ class KISBroker(BrokerAdapter):
         """KIS TR: TTTC8036R (실전) / VTTC8036R (모의)."""
         try:
             tr_id = "VTTC8036R" if self._paper else "TTTC8036R"
+            strt_dt, end_dt = inquiry_date_range()
             params = {
                 "CANO": self._account[:8],
                 "ACNT_PRDT_CD": self._account[8:],
-                "INQR_STRT_DT": "",
-                "INQR_END_DT": "",
+                "INQR_STRT_DT": strt_dt,
+                "INQR_END_DT": end_dt,
                 "SLL_BUY_DVSN_CD": "00",
                 "INQR_DVSN": "01",
                 "PDNO": "",
@@ -275,13 +277,14 @@ class KISBroker(BrokerAdapter):
         try:
             tr_id = "VTTS3035R" if self._paper else "TTTS3035R"
             excd = EXCD_MAP.get(symbol, "NASD")
+            strt_dt, end_dt = inquiry_date_range()
             params = {
                 "CANO": self._account[:8],
                 "ACNT_PRDT_CD": self._account[8:],
                 "OVRS_EXCG_CD": excd,
                 "PDNO": symbol,
-                "ORD_STRT_DT": "",
-                "ORD_END_DT": "",
+                "ORD_STRT_DT": strt_dt,
+                "ORD_END_DT": end_dt,
                 "SLL_BUY_DVSN_CD": "00",
                 "CCL_NCCS_DVSN": "00",
                 "INQR_DVSN": "00",

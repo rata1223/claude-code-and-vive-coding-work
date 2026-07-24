@@ -95,6 +95,18 @@ async def startup_event():
     except Exception as e:
         logger.error("Failed to create tables: %s", e)
 
+    # Reconcile Quick Trade orders left RESERVED by an indeterminate broker submit
+    # before a crash/restart. Runs off the boot critical path (broker I/O must not
+    # block startup) and swallows its own errors, so it can never crash startup.
+    try:
+        import asyncio
+
+        from api.services.quick_trade_recovery import recover_on_startup
+
+        asyncio.get_running_loop().run_in_executor(None, recover_on_startup)
+    except Exception as e:  # noqa: BLE001 - scheduling recovery must never crash startup
+        logger.error("Failed to schedule Quick Trade recovery sweep: %s", e)
+
 
 # ── Health check ─────────────────────────────────────────────────────────
 @app.get("/health")

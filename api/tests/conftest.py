@@ -7,6 +7,10 @@ at import/first-use time.
 import os
 
 os.environ.setdefault("JWT_SECRET_KEY", "test-only-jwt-secret-not-for-production-use-32c")
+# Disable the Quick Trade startup recovery sweep during HTTP tests so a TestClient
+# startup never spawns a background thread hitting the real DATABASE_URL. Tests that
+# exercise the sweep set this explicitly via monkeypatch.
+os.environ.setdefault("QT_RECOVERY_ON_STARTUP", "false")
 
 if "KIS_CREDENTIAL_KEY" not in os.environ:
     from cryptography.fernet import Fernet
