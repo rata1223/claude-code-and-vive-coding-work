@@ -11,7 +11,7 @@
 
 **Classification: documentation / scope-definition gap.**
 
-The string "P0-06" appears in exactly one committed file in this repository, and it belongs to a **different, older numbering scheme**:
+As of baseline `edc921c` — i.e., before this audit document was added — the string "P0-06" appeared in exactly one committed file in the repository, and it belonged to a **different, older numbering scheme**. (The "no document" conclusion below applies to pre-existing documents only; this document itself now defines the Quick Trade track's P0-06.)
 
 | Scheme | Source | P0-06 meaning |
 |---|---|---|
@@ -31,7 +31,7 @@ Additional findings:
 
 All components below were verified by direct code reading against `main` @ `edc921c`.
 
-```
+```text
 Frontend                mobile/src/views/quick-trade/index.vue
                         → quickTradeApi (mobile/src/api/index.js:537-572)
         ↓ POST /api/quick-trade/place-order
