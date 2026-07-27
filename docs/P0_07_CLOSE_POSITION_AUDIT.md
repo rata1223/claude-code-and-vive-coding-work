@@ -38,8 +38,10 @@ CompatMiddleware             api/compat.py:422 — close-position NOT in _ORDERS
    is "a live-trading pricing decision, not a DTO reshape")
   → request passes through UNTRANSLATED
         ↓
-FastAPI validation           api/schemas.py:196-202 — qty/price required, market_type unknown
-  → 422 Unprocessable Entity ON EVERY CLICK (endpoint unreachable from shipped UI)
+FastAPI validation           api/schemas.py:196-202 — required qty/price absent from payload
+  → 422 Unprocessable Entity ON EVERY CLICK (endpoint unreachable from shipped UI).
+  Unknown fields (market_type, position_side, source) pass through untranslated
+  and are silently ignored by Pydantic — they do not themselves cause the 422.
         ↓  (only reachable via direct API call with correct fields)
 close_position handler       api/routers/quick_trade.py:233-266
   _get_cred (:239)           tenant scoping — the ONLY safety layer present
@@ -116,11 +118,11 @@ Every runtime path that bypasses Reservation / RiskManager / Idempotency / Recon
 
 | # | Path | Bypasses | Exposure | Notes |
 |---|---|---|---|---|
-| G1 | **`POST /api/quick-trade/close-position`** (`quick_trade.py:233-266`) | Reservation ✗ Risk ✗ Idempotency ✗ Reconciliation ✗ (persistence ✗) | **The only route in the entire `api/` surface that can submit a live broker order while skipping all four** (exhaustive enumeration: exactly two broker-submit sites exist in `api/`, and `place-order` is fully hardened). Mitigated today only by the fact that the shipped UI 422s on every click (§1.2) — i.e., protected by a bug. Retains tenant credential scoping (P0-03) only. |
-| G2 | **EmergencyFlatten** (`backend/worker/emergency.py`) | Reservation ✗ Idempotency ✗ Risk ✗ (by design) StateMachine/Poller ✗ | Manual-only trigger (`POST /api/admin/flatten`; watchdog never flattens, `backend/worker/watchdog.py:300,318`). Deliberate SAFE_MODE bypass is *correct* for its purpose, but: cost-basis price fallback can post a deeply off-market limit; orders are untracked after submit; duplicate-flatten guard is process-local only (`emergency.py:19-23`). |
-| G3 | **`bot/main.py` sells** (stop-loss, signal, rebalance, MDD flatten) | All four ✗ | Legacy standalone process; disabled in `docker-compose` per CLAUDE.md (P1-08/P5-04) — **runtime deployment state UNVERIFIED from code alone**. Contains the repo's only automatic MDD liquidation (`:274-277`), scheduled at 23:50 KST when KR market is closed. |
-| G4 | **LivePipeline sells** (`backend/quant/live/pipeline.py:182-196`) | Reservation ✗ Idempotency ✗ Reconciliation ✗ (own dedup + own kill switch) | Production wiring **UNVERIFIED** — no non-test call site found; worker scheduler drives `StrategyWorker`, not `LivePipeline`. |
-| G5 | **IndicatorStrategy sells** (`strategy.py:190-242`) | Reservation ✗ Idempotency ✗ (formal store unused) | Least concerning: pending lock + SAFE_MODE + freshness + breaker + state machine + poller + reconciler all engaged. Listed for completeness: the pre-submit durable write and the `IdempotencyStore` from `backend/execution/idempotency.py` remain unwired (ROADMAP P0-02-old territory, not P0-07). |
+| G1 | **`POST /api/quick-trade/close-position`** (`quick_trade.py:233-266`) | Reservation ✗ Risk ✗ Idempotency ✗ Reconciliation ✗ (persistence ✗) | **The only route in the entire `api/` surface that can submit a live broker order while skipping all four** (exhaustive enumeration: exactly two broker-submit sites exist in `api/`, and `place-order` is fully hardened). | Mitigated today only by the fact that the shipped UI 422s on every click (§1.2) — i.e., protected by a bug. Retains tenant credential scoping (P0-03) only. |
+| G2 | **EmergencyFlatten** (`backend/worker/emergency.py`) | Reservation ✗ Idempotency ✗ Risk ✗ (by design) StateMachine/Poller ✗ | Manual-only trigger (`POST /api/admin/flatten`; watchdog never flattens, `backend/worker/watchdog.py:300,318`). | Deliberate SAFE_MODE bypass is *correct* for its purpose, but: cost-basis price fallback can post a deeply off-market limit; orders are untracked after submit; duplicate-flatten guard is process-local only (`emergency.py:19-23`). |
+| G3 | **`bot/main.py` sells** (stop-loss, signal, rebalance, MDD flatten) | All four ✗ | Legacy standalone process; disabled in `docker-compose` per CLAUDE.md (P1-08/P5-04) — **runtime deployment state UNVERIFIED from code alone**. | Contains the repo's only automatic MDD liquidation (`:274-277`), scheduled at 23:50 KST when KR market is closed. |
+| G4 | **LivePipeline sells** (`backend/quant/live/pipeline.py:182-196`) | Reservation ✗ Idempotency ✗ Reconciliation ✗ (own dedup + own kill switch) | Production wiring **UNVERIFIED** — no non-test call site found; worker scheduler drives `StrategyWorker`, not `LivePipeline`. | |
+| G5 | **IndicatorStrategy sells** (`strategy.py:190-242`) | Reservation ✗ Idempotency ✗ (formal store unused) | Least concerning: pending lock + SAFE_MODE + freshness + breaker + state machine + poller + reconciler all engaged. | Listed for completeness: the pre-submit durable write and the `IdempotencyStore` from `backend/execution/idempotency.py` remain unwired (ROADMAP P0-02-old territory, not P0-07). |
 
 Cross-cutting structural gaps discovered (recorded, not in P0-07 implementation scope):
 
