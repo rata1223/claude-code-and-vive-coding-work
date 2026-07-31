@@ -65,6 +65,57 @@ def _load_kis(cred: Credential):
     return client, orders, portfolio
 
 
+def _load_market_data(client):
+    """Live quote source, built from an already request-scoped KIS client."""
+    from kis_adapter import KISMarketData
+
+    return KISMarketData(client)
+
+
+# Live holding quantity field, by market. KIS returns these as strings.
+_QTY_FIELD = {"kr": "hldg_qty", "us": "ovrs_cblc_qty"}
+_SYMBOL_FIELDS = ("pdno", "ovrs_pdno")
+
+
+def _live_held_qty(portfolio, symbol: str, market: str) -> int:
+    """Held quantity for ``symbol`` straight from the broker, or 0 if not held.
+
+    The broker is the only authority on close quantity (P0-07C); the caller's
+    qty is an upper bound at most. Raises on lookup failure so the handler can
+    reject rather than guess.
+    """
+    result = portfolio.get_kr_balance() if market == "kr" else portfolio.get_us_balance()
+    field = _QTY_FIELD["kr" if market == "kr" else "us"]
+    for pos in result.get("positions", []) or []:
+        sym = next((pos.get(f) for f in _SYMBOL_FIELDS if pos.get(f)), "") or ""
+        if sym.upper() == symbol.upper():
+            try:
+                return int(float(pos.get(field) or 0))
+            except (TypeError, ValueError):
+                return 0
+    return 0
+
+
+def _live_close_price(market_data, symbol: str, market: str, exchange: str):
+    """Live quote for the close limit price, or ``None`` if unusable.
+
+    Never falls back to the position's average purchase price: pricing a
+    liquidation off cost basis can post a deeply off-market limit (the defect
+    recorded as G2 in docs/P0_07_CLOSE_POSITION_AUDIT.md).
+    """
+    try:
+        price = (market_data.get_price_kr(symbol) if market == "kr"
+                 else market_data.get_price_us(symbol, exchange))
+    except Exception as e:
+        logger.warning("close price lookup failed %s: %s", symbol, e)
+        return None
+    try:
+        price = float(price)
+    except (TypeError, ValueError):
+        return None
+    return price if price > 0 else None
+
+
 def _get_cred(credential_id: int, user_id: int, db: Session) -> Optional[Credential]:
     return (
         db.query(Credential)
@@ -233,34 +284,111 @@ def place_order(
 @router.post("/close-position")
 def close_position(
     body: ClosePositionRequest,
+    idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
+    risk_gate=Depends(get_risk_gate),
 ):
+    """Close an open position through the hardened order path (P0-07C).
+
+    live position → qty validation → live price → ``reserve_and_submit`` with
+    ``side="sell"`` and the P0-05 risk gate. The backend owns quantity and price
+    outright. The three pre-reservation rejections (no position, over-close, no
+    live price) abort before any DB row is written and before the broker is
+    contacted; qty is never silently clamped and price 0 is never submitted.
+    """
     cred = _get_cred(body.credential_id, current_user.id, db)
     if not cred:
         return Resp.err("Credential not found")
 
+    market = body.market.lower()
+    exchange = body.exchange or "NASD"
+
     try:
-        _, orders, _ = _load_kis(cred)
-        qty = int(body.qty)
+        client, orders, portfolio = _load_kis(cred)
 
-        if body.market.lower() == "kr":
-            result = orders.sell_kr(body.symbol, qty, int(body.price))
+        # 1. Live position — the only authority on how much can be closed.
+        try:
+            held_qty = _live_held_qty(portfolio, body.symbol, market)
+        except Exception as e:
+            logger.warning("close position lookup failed %s: %s", body.symbol, e)
+            return Resp.err(f"Position lookup failed for {body.symbol}: {e}")
+        if held_qty <= 0:
+            return Resp.err(f"No open position for {body.symbol}")
+
+        # 2. Quantity — omitted means close everything; an over-close is
+        #    rejected outright, never silently clamped.
+        if body.qty is None:
+            close_qty = held_qty
         else:
-            exchange = body.exchange or "NASD"
-            result = orders.sell_us(body.symbol, exchange, qty, body.price)
+            requested = int(body.qty)
+            if requested <= 0:
+                return Resp.err("qty must be greater than 0")
+            if requested > held_qty:
+                return Resp.err(
+                    f"Requested qty exceeds held quantity: {requested} > {held_qty}"
+                )
+            close_qty = requested
 
-        mapper = KIS_DOMESTIC_MAPPER if body.market.lower() == "kr" else KIS_OVERSEAS_MAPPER
-        return Resp.ok(
-            {
-                "order_id": mapper.extract_broker_order_id(result),
-                "symbol": body.symbol,
-                "side": "sell",
-                "qty": qty,
-                "price": body.price,
-                "status": "submitted",
-            }
+        # 3. Live price — no quote, no order (never priced off average cost).
+        price = _live_close_price(_load_market_data(client), body.symbol, market, exchange)
+        if price is None:
+            return Resp.err(f"Live price unavailable for {body.symbol}")
+        if market == "kr":
+            price = float(int(price))
+
+        # 4. Same hardened funnel as place-order: durable reservation →
+        #    idempotency → risk gate (fail-closed) → single broker call.
+        req = {
+            "symbol": body.symbol, "side": "sell", "qty": float(close_qty),
+            "price": price, "market": market, "exchange": exchange,
+            "order_type": "limit",
+        }
+        fp_args = dict(
+            user_id=current_user.id, credential_id=body.credential_id,
+            symbol=body.symbol, side="sell", qty=float(close_qty), price=price,
+            market=market, exchange=exchange, order_type="limit",
         )
+        key = idempotency_key or derive_idempotency_key(**fp_args)
+        req_hash = request_fingerprint(**fp_args)
+
+        mapper = KIS_DOMESTIC_MAPPER if market == "kr" else KIS_OVERSEAS_MAPPER
+
+        def broker_submit():
+            # The ONLY broker call site for a close — invoked by the service
+            # strictly after the reservation is committed and risk allowed.
+            if market == "kr":
+                return orders.sell_kr(body.symbol, close_qty, int(price))
+            return orders.sell_us(body.symbol, exchange, close_qty, price)
+
+        order = reserve_and_submit(
+            db,
+            user_id=current_user.id,
+            credential_id=body.credential_id,
+            request=req,
+            idempotency_key=key,
+            request_hash=req_hash,
+            risk_gate=risk_gate,
+            broker_submit=broker_submit,
+            extract_order_id=mapper.extract_broker_order_id,
+        )
+        payload = {
+            "order_id": order.broker_order_id or "",
+            "symbol": order.symbol,
+            "side": order.side,
+            "qty": close_qty,
+            "price": order.price,
+            "status": order.status,
+        }
+        if order.status == QT_SUBMITTED:
+            return Resp.ok(payload)
+        # Blocked / rejected / reserved(indeterminate) / failed — report the real
+        # runtime status instead of asserting a submission that never happened.
+        return Resp.err(
+            f"Close position {order.status}: {order.error or 'no broker order id'}"
+        )
+    except IdempotencyConflict:
+        return Resp.err("Duplicate idempotency key with different parameters")
     except Exception as e:
         logger.error("close position failed: %s", e)
         return Resp.err(f"Close position failed: {e}")
