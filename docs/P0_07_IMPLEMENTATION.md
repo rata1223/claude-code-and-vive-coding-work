@@ -4,7 +4,7 @@
 **Commit:** `feaa8c4`
 **Baseline:** `main` @ `738976d`
 **Governing documents:** `docs/P0_06_SCOPE_AUDIT.md`, `docs/P0_07_CLOSE_POSITION_AUDIT.md`, `docs/P0_07_CLOSE_POSITION_PLAN.md`
-**Method:** TDD — 23 failing tests written first, implementation second.
+**Method:** TDD — 23 tests written and confirmed failing before any implementation; a 24th was added when self-review found a KR price-truncation edge case.
 
 ---
 
@@ -12,9 +12,9 @@
 
 | File | Change | Lines |
 |---|---|---|
-| `api/routers/quick_trade.py` | `close_position` handler rewritten; three module-level helpers added (`_load_market_data`, `_live_held_qty`, `_live_close_price`) | +146 / −24 |
+| `api/routers/quick_trade.py` | `close_position` handler rewritten; three module-level helpers added (`_load_market_data`, `_live_held_qty`, `_live_close_price`) | +151 / −24 |
 | `api/schemas.py` | `ClosePositionRequest`: `price` removed, `qty` → `Optional[float] = None` | +7 / −1 |
-| `api/tests/test_quick_trade_close_position.py` | **New** — 23 close-position cases | +new |
+| `api/tests/test_quick_trade_close_position.py` | **New** — 24 close-position cases | +new |
 | `api/tests/test_compat_orders.py` | Obsolete 422 regression pin replaced with a gap-closed assertion + a compat-still-excluded assertion | +45 / −24 |
 | `docs/P0_07_IMPLEMENTATION.md` | This document | +new |
 
@@ -74,7 +74,7 @@ Steps 1, 2, 6, 8 reuse existing code verbatim. Only steps 3, 4, 5, 7 are new, an
 
 ## 3. Added tests
 
-**`api/tests/test_quick_trade_close_position.py` — 23 cases** (all seven mandated cases covered):
+**`api/tests/test_quick_trade_close_position.py` — 24 cases** (all seven mandated cases covered):
 
 | Mandated case | Tests |
 |---|---|
@@ -86,11 +86,11 @@ Steps 1, 2, 6, 8 reuse existing code verbatim. Only steps 3, 4, 5, 7 are new, an
 | `reserve_and_submit` called exactly once | `test_reserve_and_submit_called_exactly_once_with_sell_and_risk_gate` (spy asserts one call with `side="sell"`, resolved qty/price, `order_type="limit"`, and the **injected** risk gate object) |
 | Broker never invoked on validation failure | `test_no_reservation_and_no_broker_on_validation_failure[no position / no price / price error]`, `test_over_close_never_reaches_reserve_and_submit` |
 
-Additional safety coverage: `test_risk_denied_blocks_broker_and_reports_status` (`QT_BLOCKED` audited, broker untouched), `test_broker_rejection_is_reported_not_masked` (`QT_REJECTED`, error response), `test_credential_scope_is_enforced`. `FakeOrders.buy_kr/buy_us` raise on contact, pinning that a close can never buy.
+Additional safety coverage: `test_kr_sub_unit_price_does_not_truncate_to_zero` (KR int truncation can never yield a price-0 order), `test_risk_denied_blocks_broker_and_reports_status` (`QT_BLOCKED` audited, broker untouched), `test_broker_rejection_is_reported_not_masked` (`QT_REJECTED`, error response), `test_credential_scope_is_enforced`. `FakeOrders.buy_kr/buy_us` raise on contact, pinning that a close can never buy.
 
 **`api/tests/test_compat_orders.py`** — the pin that documented the old 422 now asserts the gap is closed: the exact shipped frontend payload (no `qty`, no `price`, with `market_type`/`position_side`/`source`) returns 200 with server-resolved qty 5 and the live price, plus a second test pinning that `close-position` is still excluded from `_ORDERS_PATH_CONFIG`.
 
-**Results:** `python -m pytest api/tests -q` → **203 passed, 3 skipped, 0 failed** (3 Postgres-only concurrency tests skipped on SQLite, as before). No pre-existing test was weakened or deleted.
+**Results:** `python -m pytest api/tests -q` → **204 passed, 3 skipped, 0 failed** (3 Postgres-only concurrency tests skipped on SQLite, as before). No pre-existing test was weakened or deleted.
 
 ---
 
@@ -138,6 +138,6 @@ Additional safety coverage: `test_risk_denied_blocks_broker_and_reports_status` 
 
 ## 7. Validation performed
 
-- `python -m pytest api/tests -q` → **203 passed, 3 skipped**, including all 23 new cases and the 33 compat-orders tests.
+- `python -m pytest api/tests -q` → **203 passed, 3 skipped**, including all 24 new cases and the 33 compat-orders tests.
 - Constraint audit: `git diff --stat` confirms the change set touches only `api/routers/quick_trade.py`, `api/schemas.py`, and two test files. No forbidden module appears in the diff.
 - TDD discipline: the 23 tests were committed in a failing state first (22 failures against the old handler) and only then made green by the implementation.

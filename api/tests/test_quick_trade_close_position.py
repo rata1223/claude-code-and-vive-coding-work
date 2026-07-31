@@ -288,6 +288,20 @@ def test_non_positive_price_is_rejected(monkeypatch, db, user, bad):
     assert db.query(QuickTradeOrder).count() == 0
 
 
+def test_kr_sub_unit_price_does_not_truncate_to_zero(monkeypatch, db, user):
+    """KR prices are cast to int; truncation must never produce a price-0 order."""
+    orders, _, _ = _wire(monkeypatch,
+                         portfolio=FakePortfolio(kr=KR_POS),
+                         market_data=FakeMarketData(price=0.4))
+
+    resp = quick_trade.close_position(
+        _body(symbol="069500", market="kr"), None, user, db, _allow())
+
+    assert resp.code == -1
+    assert orders.calls == []
+    assert db.query(QuickTradeOrder).count() == 0
+
+
 # ── 5. duplicate request idempotency ──────────────────────────────────────────
 
 def test_duplicate_close_request_submits_to_broker_once(monkeypatch, db, user):

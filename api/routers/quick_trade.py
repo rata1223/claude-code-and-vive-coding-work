@@ -335,7 +335,11 @@ def close_position(
         if price is None:
             return Resp.err(f"Live price unavailable for {body.symbol}")
         if market == "kr":
+            # KIS domestic orders take an integer price; truncation must not be
+            # allowed to turn a valid sub-1 quote into a price-0 order.
             price = float(int(price))
+            if price <= 0:
+                return Resp.err(f"Live price unavailable for {body.symbol}")
 
         # 4. Same hardened funnel as place-order: durable reservation →
         #    idempotency → risk gate (fail-closed) → single broker call.
