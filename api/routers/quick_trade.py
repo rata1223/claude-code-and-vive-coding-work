@@ -218,6 +218,18 @@ def place_order(
         market = body.market.lower()
         order_type = "limit"  # KIS quick-trade submits ORD_DVSN "00" — always limit
         exchange = body.exchange or "NASD"
+
+        # Reject before reserving: a non-positive qty/price must never reach the
+        # broker, and KR orders are cast with int() below, so a sub-1 KRW price
+        # would truncate to a price-0 limit order. Same guard close-position
+        # carries (P0-07C); the buy/direct-sell path was missing it (P0-08 D-1).
+        if qty <= 0:
+            return Resp.err(f"qty must be greater than 0 (got {body.qty})")
+        if body.price <= 0:
+            return Resp.err(f"price must be greater than 0 (got {body.price})")
+        if market == "kr" and int(body.price) <= 0:
+            return Resp.err(f"KR price would truncate to 0 (got {body.price})")
+
         req = {
             "symbol": body.symbol, "side": body.side, "qty": float(qty),
             "price": body.price, "market": market, "exchange": exchange,
