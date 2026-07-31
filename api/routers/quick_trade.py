@@ -223,6 +223,10 @@ def place_order(
         # broker, and KR orders are cast with int() below, so a sub-1 KRW price
         # would truncate to a price-0 limit order. Same guard close-position
         # carries (P0-07C); the buy/direct-sell path was missing it (P0-08 D-1).
+        if qty != body.qty:
+            # KIS trades whole shares. Truncating would submit — and fingerprint,
+            # and persist — a different quantity than the caller requested.
+            return Resp.err(f"qty must be a whole number of shares (got {body.qty})")
         if qty <= 0:
             return Resp.err(f"qty must be greater than 0 (got {body.qty})")
         if body.price <= 0:
@@ -334,6 +338,12 @@ def close_position(
             close_qty = held_qty
         else:
             requested = int(body.qty)
+            if requested != body.qty:
+                # Whole shares only — truncating would close a different quantity
+                # than requested (and record the truncated one).
+                return Resp.err(
+                    f"qty must be a whole number of shares (got {body.qty})"
+                )
             if requested <= 0:
                 return Resp.err("qty must be greater than 0")
             if requested > held_qty:

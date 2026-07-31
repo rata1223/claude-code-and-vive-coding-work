@@ -49,8 +49,8 @@ POST /api/quick-trade/close-position
                                  held_qty = int(hldg_qty | ovrs_cblc_qty)
                                  → no position or held_qty <= 0  → REJECT, broker never called
                                  → close_qty = held_qty            (qty omitted = close all)
-                                 → close_qty = min(requested, held_qty) if qty supplied,
-                                   and requested > held_qty → REJECT (never silently clamp)
+                                 → qty supplied: requested > held_qty → REJECT
+                                   (never silently clamp); else close_qty = requested
         ↓
 [4] LIVE PRICE RESOLUTION        market_data.get_price_kr(symbol) | get_price_us(symbol, excd)
     (backend owns price)         → price <= 0 or exception → REJECT (stale/unavailable).

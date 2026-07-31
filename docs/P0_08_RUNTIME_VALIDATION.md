@@ -146,7 +146,7 @@ Placed before the `req` dict is built, so a rejected request creates **no reserv
 
 Met:
 - Every invariant that governs *what reaches the exchange* holds: durable reservation before submit (I1, I4), always-present idempotency key (I2), fail-closed RiskManager exactly once (I3), and duplicate/retry collapse to a single reservation and a single broker call (I7).
-- **Duplicate reservations: 0. Duplicate submissions: 0.** No broker submission path bypasses `reserve_and_submit` (exhaustively verified).
+- **Duplicate reservations: 0.** Each idempotency key yields exactly one durable reservation and exactly one `broker_submit()` invocation, and no broker submission path bypasses `reserve_and_submit` (exhaustively verified). This is deliberately narrower than "zero duplicate broker orders": `KISClient.post` retries up to 3× beneath the service layer (R-5/RR-7), so a POST that timed out after KIS received it can still reach the exchange twice.
 - All 18 scenarios are accounted for: 14 verified against the QT domain, 4 (10, 16–18) structurally N/A and owned by `backend/execution/*`, which has its own passing coverage.
 - Regression green: 215 passed / 3 skipped (api), 132 passed (execution layer), 0 failures, no test weakened or deleted.
 - The one runtime-correctness defect found (D-1) is fixed with a minimal, tested guard.

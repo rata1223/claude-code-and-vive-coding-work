@@ -90,7 +90,7 @@ Additional safety coverage: `test_kr_sub_unit_price_does_not_truncate_to_zero` (
 
 **`api/tests/test_compat_orders.py`** — the pin that documented the old 422 now asserts the gap is closed: the exact shipped frontend payload (no `qty`, no `price`, with `market_type`/`position_side`/`source`) returns 200 with server-resolved qty 5 and the live price, plus a second test pinning that `close-position` is still excluded from `_ORDERS_PATH_CONFIG`.
 
-**Results:** `python -m pytest api/tests -q` → **204 passed, 3 skipped, 0 failed** (3 Postgres-only concurrency tests skipped on SQLite, as before). No pre-existing test was weakened or deleted.
+**Results:** `python -m pytest api/tests -q` → **218 passed, 3 skipped, 0 failed** (204 at the time of the P0-07C commit; the count rose with the P0-08 validation tests added later on this branch) (3 Postgres-only concurrency tests skipped on SQLite, as before). No pre-existing test was weakened or deleted.
 
 ---
 
@@ -138,6 +138,6 @@ Additional safety coverage: `test_kr_sub_unit_price_does_not_truncate_to_zero` (
 
 ## 7. Validation performed
 
-- `python -m pytest api/tests -q` → **203 passed, 3 skipped**, including all 24 new cases and the 33 compat-orders tests.
+- `python -m pytest api/tests -q` → **218 passed, 3 skipped**, including all 24 new close-position cases and the compat-orders tests.
 - Constraint audit: `git diff --stat` confirms the change set touches only `api/routers/quick_trade.py`, `api/schemas.py`, and two test files. No forbidden module appears in the diff.
 - TDD discipline: the 23 tests were committed in a failing state first (22 failures against the old handler) and only then made green by the implementation.

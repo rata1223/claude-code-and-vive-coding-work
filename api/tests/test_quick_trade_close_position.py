@@ -305,10 +305,18 @@ def test_kr_sub_unit_price_does_not_truncate_to_zero(monkeypatch, db, user):
 # ── 5. duplicate request idempotency ──────────────────────────────────────────
 
 def test_duplicate_close_request_submits_to_broker_once(monkeypatch, db, user):
-    """Same close twice (same 10s bucket) → one broker call, one DB row."""
+    """Same close twice → one broker call, one DB row.
+
+    The derived key is pinned so the assertion cannot fail for a wall-clock
+    reason: two real calls straddling a 10s bucket boundary would legitimately
+    derive different keys, which is a property of ``derive_idempotency_key``,
+    not of the dedupe behaviour under test here.
+    """
     orders, _, _ = _wire(monkeypatch,
                          portfolio=FakePortfolio(us=US_POS),
                          market_data=FakeMarketData(price=175.5))
+    monkeypatch.setattr(quick_trade, "derive_idempotency_key",
+                        lambda **kw: "derived-close-key")
 
     first = quick_trade.close_position(_body(), None, user, db, _allow())
     second = quick_trade.close_position(_body(), None, user, db, _allow())

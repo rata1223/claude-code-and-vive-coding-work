@@ -130,6 +130,21 @@ def test_non_positive_qty_is_rejected_before_reservation(qty, db, user, orders):
     assert db.query(QuickTradeOrder).count() == 0      # no reservation written
 
 
+@pytest.mark.parametrize("qty", [1.9, 0.5, 10.01])
+def test_fractional_qty_is_rejected_not_truncated(qty, db, user, orders):
+    """KIS trades whole shares; a fractional qty must be rejected, never truncated.
+
+    ``int(1.9) == 1`` would submit a different quantity than the caller asked for,
+    and the truncated value would also be what the idempotency fingerprint and the
+    persisted row record — so the audit trail would disagree with the request.
+    """
+    resp = _place(_order(qty=qty), db, user)
+
+    assert resp.code == -1, f"fractional qty {qty} must not be silently truncated"
+    assert orders.calls == []
+    assert db.query(QuickTradeOrder).count() == 0
+
+
 @pytest.mark.parametrize("price", [0, 0.0, -3.5])
 def test_non_positive_price_is_rejected_before_reservation(price, db, user, orders):
     resp = _place(_order(price=price), db, user)
@@ -217,5 +232,5 @@ def test_retry_while_reservation_still_reserved_does_not_resubmit(db, user, orde
 
     assert len(orders.calls) == 1, "retry must not re-submit a live reservation"
     assert db.query(QuickTradeOrder).count() == 1
-    assert second.data is None or second.code == -1     # still reports the real state
+    assert second.code == -1, "a still-RESERVED order must not be reported as success"
     assert db.query(QuickTradeOrder).one().status == QT_RESERVED
