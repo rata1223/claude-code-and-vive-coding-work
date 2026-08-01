@@ -613,28 +613,59 @@ class TestGetHistoryEndToEnd:
         assert data["trades"] == []
 
 
-class TestClosePositionRemainingGap:
-    def test_close_position_without_qty_or_price_still_422s_today(
-        self, client, auth_headers, db_session, fake_kis
+class TestClosePositionGapClosed:
+    """The former 422 gap, closed by P0-07C -- without touching compat or the UI.
+
+    close-position remains deliberately absent from `_ORDERS_PATH_CONFIG`: the
+    adapter still refuses to invent a limit price from stale cost basis. The fix
+    moved that decision server-side (live position + live quote), so the shipped
+    frontend payload -- which sends neither qty nor price -- now validates and
+    executes through the hardened path.
+    """
+
+    def test_frontend_payload_without_qty_or_price_now_executes(
+        self, client, auth_headers, db_session, fake_kis, monkeypatch
     ):
-        # Regression pin, not a feature test: closePosition is deliberately
-        # NOT covered by _ORDERS_PATH_CONFIG (see docs/P5_ORDERS_COMPAT.md's
-        # "remaining gaps" -- the only available price is a stale average
-        # purchase price submitted as an actual broker limit-order price, a
-        # live-trading decision out of this adapter's scope). This documents
-        # the known-unfixed state so a future fix's diff is visible.
         cred_id = _seed_credential(client, auth_headers)
 
-        res = client.post(
-            "/api/quick-trade/close-position",
-            headers=auth_headers,
-            json={
-                "credential_id": cred_id,
-                "symbol": "AAPL",
-                "market_type": "us",
-                "position_side": "long",
-                "source": "manual",
-            },
-        )
+        class _FakeMarketData:
+            def get_price_us(self, symbol, excd):
+                return 175.5
 
-        assert res.status_code == 422
+            def get_price_kr(self, symbol):  # pragma: no cover - us path here
+                return 70000
+
+        monkeypatch.setattr("api.routers.quick_trade._load_market_data",
+                            lambda client: _FakeMarketData())
+
+        from api.main import app
+        from api.routers.quick_trade import get_risk_gate
+        app.dependency_overrides[get_risk_gate] = lambda: (lambda: None)
+        try:
+            res = client.post(
+                "/api/quick-trade/close-position",
+                headers=auth_headers,
+                json={
+                    "credential_id": cred_id,
+                    "symbol": "AAPL",
+                    "market_type": "us",      # still untranslated by compat
+                    "position_side": "long",  # ignored by the schema
+                    "source": "manual",       # ignored by the schema
+                },
+            )
+        finally:
+            app.dependency_overrides.pop(get_risk_gate, None)
+
+        assert res.status_code == 200          # no longer a validation failure
+        body = res.json()
+        assert body["code"] == 1, body["msg"]
+        # qty came from the live holding (_FakePortfolio: ovrs_cblc_qty "5"),
+        # never from the client, and the price is the live quote.
+        assert body["data"]["qty"] == 5
+        assert body["data"]["price"] == 175.5
+        assert body["data"]["side"] == "sell"
+
+    def test_close_position_is_still_excluded_from_compat(self):
+        from api.compat import _ORDERS_PATH_CONFIG
+
+        assert not any("close-position" in p for p in _ORDERS_PATH_CONFIG)

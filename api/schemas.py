@@ -194,10 +194,16 @@ class PlaceOrderRequest(BaseModel):
 
 
 class ClosePositionRequest(BaseModel):
+    """Close an open position (P0-07C).
+
+    Quantity and price are resolved server-side from live broker state — the
+    client can never dictate execution size or price. ``qty`` is an optional
+    upper bound: omit it to close the whole position. Any ``qty`` above the live
+    holding is rejected, never clamped.
+    """
     credential_id: int
     symbol: str
-    qty: float
-    price: float
+    qty: Optional[float] = None  # None = close the entire live position
     market: str = "us"
     exchange: str = "NASD"
 
