@@ -107,6 +107,29 @@ async def startup_event():
     except Exception as e:  # noqa: BLE001 - scheduling recovery must never crash startup
         logger.error("Failed to schedule Quick Trade recovery sweep: %s", e)
 
+    # Liveness: keep sweeping while the process runs, so an order that goes
+    # indeterminate mid-flight is reconciled without waiting for a restart.
+    try:
+        from api.services.quick_trade_recovery import start_periodic_recovery
+
+        app.state.qt_recovery = start_periodic_recovery()
+    except Exception as e:  # noqa: BLE001 - the periodic sweep is best-effort
+        logger.error("Failed to start Quick Trade periodic recovery: %s", e)
+        app.state.qt_recovery = None
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Stop the background recovery sweep so shutdown is not delayed by its wait."""
+    handle = getattr(app.state, "qt_recovery", None)
+    if not handle:
+        return
+    thread, stop_event = handle
+    stop_event.set()
+    thread.join(timeout=10)
+    if thread.is_alive():
+        logger.warning("Quick Trade recovery sweep did not stop within 10s (daemon — exiting anyway)")
+
 
 # ── Health check ─────────────────────────────────────────────────────────
 @app.get("/health")
