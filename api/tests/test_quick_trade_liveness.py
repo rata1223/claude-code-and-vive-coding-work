@@ -335,3 +335,105 @@ def test_start_periodic_returns_stoppable_thread(monkeypatch, SessionLocal):
         stop.set()
         thread.join(timeout=5)
     assert not thread.is_alive()  # the interruptible wait makes shutdown immediate
+
+
+# ── 6. Diagnostics never survive a conclusive transition ──────────────────────
+
+def test_stamp_cleared_when_order_later_resolves_to_submitted(db):
+    """A skip stamp must not outlive the RESERVED state.
+
+    ``error`` is the user-facing failure field, so a stamp left on a SUBMITTED
+    order makes a good order read as failed.
+    """
+    _seed(db, order_id=1)
+    recover_reserved_orders(db, load_kis=_load_kis(FakeOrders(exc=RuntimeError("timeout"))))
+    assert (db.get(QuickTradeOrder, 1).error or "").startswith(rec._DIAG_PREFIX)
+
+    recover_reserved_orders(db, load_kis=_load_kis(FakeOrders(rows=[_row("BRK-9", "buy", 10)])))
+    row = db.get(QuickTradeOrder, 1)
+    assert row.status == QT_SUBMITTED
+    assert row.broker_order_id == "BRK-9"
+    assert not row.error  # a submitted order must not carry recovery diagnostics
+
+
+def test_stamp_does_not_mask_the_real_failure_reason(db):
+    """``reconcile_reserved`` writes its reason with ``error or ...``, so a stale
+    stamp would suppress the genuine 'broker has no matching order' message."""
+    _seed(db, order_id=1)
+    recover_reserved_orders(db, load_kis=_load_kis(FakeOrders(exc=RuntimeError("timeout"))))
+    recover_reserved_orders(db, load_kis=_load_kis(FakeOrders(rows=[])))  # absent → FAILED
+
+    row = db.get(QuickTradeOrder, 1)
+    assert row.status == QT_FAILED
+    assert not (row.error or "").startswith(rec._DIAG_PREFIX)
+    assert "no matching order" in (row.error or "")
+
+
+# ── 7. One failing row cannot starve the sweep (poison pill) ──────────────────
+
+def test_reconcile_failure_is_isolated_per_order(db, monkeypatch):
+    """A raise inside ``reconcile_reserved`` must not abort the remaining rows."""
+    _seed(db, order_id=1, updated_offset=900)   # swept first
+    _seed(db, order_id=2, updated_offset=300)
+
+    real = rec.reconcile_reserved
+
+    def flaky(session, order, **kw):
+        if order.id == 1:
+            raise RuntimeError("integrity error")
+        return real(session, order, **kw)
+
+    monkeypatch.setattr(rec, "reconcile_reserved", flaky)
+    summary = recover_reserved_orders(db, load_kis=_load_kis(FakeOrders(rows=[_row("BRK-1", "buy", 10)])))
+
+    assert summary.submitted == 1                          # order 2 still resolved
+    assert summary.skip_reasons == {rec._REASON_RECONCILE_ERROR: 1}
+    assert db.get(QuickTradeOrder, 1).status == QT_RESERVED  # never guessed terminal
+    assert db.get(QuickTradeOrder, 2).status == QT_SUBMITTED
+
+
+def test_failing_row_rotates_and_cannot_wedge_later_cycles(db, monkeypatch):
+    """The poison-pill regression: the failing row must be stamped so the
+    least-recently-attempted ordering moves it behind the healthy ones."""
+    _seed(db, order_id=1, updated_offset=900)
+    _seed(db, order_id=2, updated_offset=300)
+
+    real = rec.reconcile_reserved
+    monkeypatch.setattr(
+        rec, "reconcile_reserved",
+        lambda s, o, **kw: (_ for _ in ()).throw(RuntimeError("boom")) if o.id == 1 else real(s, o, **kw),
+    )
+    recover_reserved_orders(db, load_kis=_load_kis(FakeOrders(rows=[_row("BRK-1", "buy", 10)])))
+
+    stamped = db.get(QuickTradeOrder, 1)
+    assert (stamped.error or "").startswith(rec._DIAG_PREFIX)
+    assert rec._REASON_RECONCILE_ERROR in stamped.error
+
+    # With limit=1 the next cycle must reach a *different* order, not re-hit #1.
+    _seed(db, order_id=3, updated_offset=600)
+    monkeypatch.setattr(rec, "reconcile_reserved", real)
+    summary = recover_reserved_orders(
+        db, load_kis=_load_kis(FakeOrders(rows=[_row("BRK-3", "buy", 10)])), limit=1,
+    )
+    assert summary.seen == 1
+    assert db.get(QuickTradeOrder, 3).status == QT_SUBMITTED
+
+
+# ── 8. Truncation reporting ───────────────────────────────────────────────────
+
+def test_truncation_counts_the_window_not_the_claimed_rows(db, caplog):
+    """The deferred count is ``eligible - window``; ``seen`` excludes rows another
+    worker claimed, so using it would overstate the backlog."""
+    for i in (1, 2, 3):
+        _seed(db, order_id=i, updated_offset=100 * i)
+
+    with caplog.at_level("WARNING"):
+        summary = recover_reserved_orders(
+            db, load_kis=_load_kis(FakeOrders(exc=RuntimeError("timeout"))), limit=1,
+        )
+
+    assert summary.truncated is True
+    assert summary.eligible == 3
+    warning = [r.getMessage() for r in caplog.records if "truncated" in r.getMessage()]
+    assert warning and "2 of 3" in warning[0]
+    assert "raise the per-cycle limit" in warning[0]  # not "raise the interval"

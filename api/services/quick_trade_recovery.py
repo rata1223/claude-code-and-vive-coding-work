@@ -43,6 +43,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Callable, Dict, List, Optional, Tuple
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from api.models import Notification, QuickTradeOrder, QT_RESERVED, QT_SUBMITTED
@@ -115,6 +116,7 @@ _SKIP = "skip"
 _REASON_INQUIRY_ERROR = "inquiry_error"     # broker inquiry raised (network/auth/rate limit)
 _REASON_AMBIGUOUS = "ambiguous_match"       # 2+ broker orders match side+qty — cannot disambiguate
 _REASON_CLIENT_ERROR = "client_error"       # could not build a broker client from the credential
+_REASON_RECONCILE_ERROR = "reconcile_error"  # the resolving write itself failed (integrity/connection)
 
 
 def _classify(order: QuickTradeOrder, orders_client) -> Tuple[str, Optional[str], Optional[str]]:
@@ -173,7 +175,13 @@ def _claim_reserved_ids(db: Session, cutoff: datetime, limit: int) -> Tuple[List
     eligible_total = base.count()
     rows = (
         base.with_entities(QuickTradeOrder.id)
-        .order_by(QuickTradeOrder.updated_at.asc(), QuickTradeOrder.id.asc())
+        # COALESCE: ``updated_at`` is nullable, and PostgreSQL sorts NULLs LAST on
+        # ASC — a row written outside the ORM would sit permanently behind the
+        # window, which is the exact starvation this ordering exists to prevent.
+        .order_by(
+            func.coalesce(QuickTradeOrder.updated_at, QuickTradeOrder.created_at).asc(),
+            QuickTradeOrder.id.asc(),
+        )
         .limit(limit)
         .all()
     )
@@ -200,6 +208,34 @@ def _stamp_skip(order: QuickTradeOrder, reason: str, now: datetime, escalated: b
         f"{_DIAG_PREFIX} skip({reason}) age={age_min}m "
         f"checked={now.replace(microsecond=0).isoformat()}{mark}"
     )
+
+
+def _stamp_and_commit(
+    db: Session, order: QuickTradeOrder, reason: str, now: datetime, escalated: bool = False
+) -> None:
+    """Stamp the diagnostic and persist it, releasing the row lock. Status is
+    unchanged. A stamp failure must never abort the sweep — but note the row then
+    keeps its old ``updated_at`` and will be retried at the head of the next cycle.
+    """
+    _stamp_skip(order, reason, now, escalated)
+    try:
+        db.commit()
+    except Exception as e:  # noqa: BLE001 - a stamp failure must not abort the sweep
+        logger.warning("QT recovery: could not stamp diagnostic on order %s (%s)", order.id, e)
+        db.rollback()
+
+
+def _clear_diagnostic(order: QuickTradeOrder) -> None:
+    """Drop a recovery stamp before a conclusive transition.
+
+    ``error`` is the user-facing failure field, and :func:`reconcile_reserved`
+    neither clears it when adopting a broker order (SUBMITTED) nor overwrites it
+    on the FAILED path (``order.error or ...``). Left in place, a stale stamp
+    would make a good order read as failed, and would mask the real failure
+    reason on a genuinely failed one.
+    """
+    if (order.error or "").startswith(_DIAG_PREFIX):
+        order.error = None
 
 
 def _escalate(db: Session, order: QuickTradeOrder, reason: str, age_seconds: float) -> bool:
@@ -284,12 +320,33 @@ def recover_reserved_orders(
             logger.warning("QT recovery: cannot build broker client for order %s (%s) — skip", order.id, e)
             outcome, odno, reason = _SKIP, None, _REASON_CLIENT_ERROR
 
-        if outcome == _MATCH:
-            reconcile_reserved(db, order, broker_lookup=lambda _s, _odno=odno: (_odno, QT_SUBMITTED))
-            summary.submitted += 1
-        elif outcome == _ABSENT:
-            reconcile_reserved(db, order, broker_lookup=lambda _s: None)
-            summary.failed += 1
+        if outcome in (_MATCH, _ABSENT):
+            _clear_diagnostic(order)
+            lookup = (
+                (lambda _s, _odno=odno: (_odno, QT_SUBMITTED)) if outcome == _MATCH
+                else (lambda _s: None)
+            )
+            try:
+                reconcile_reserved(db, order, broker_lookup=lookup)
+            except Exception as e:  # noqa: BLE001 - one bad row must not abort the whole sweep
+                # Without this, the exception escapes the sweep: every remaining
+                # order is deferred, and the failing row keeps its old
+                # ``updated_at``, so the fairness ordering hands it back first
+                # next cycle — a poison pill that blocks recovery indefinitely.
+                logger.error(
+                    "QT recovery: reconcile failed for order %s (%s) — left RESERVED", oid, e
+                )
+                db.rollback()
+                summary.skipped += 1
+                summary.skip_reasons[_REASON_RECONCILE_ERROR] = (
+                    summary.skip_reasons.get(_REASON_RECONCILE_ERROR, 0) + 1
+                )
+                _stamp_and_commit(db, order, _REASON_RECONCILE_ERROR, now)  # rotate it out of the head
+                continue
+            if outcome == _MATCH:
+                summary.submitted += 1
+            else:
+                summary.failed += 1
         else:  # _SKIP — inconclusive, leave RESERVED (never guess a terminal status)
             age = _age_seconds(order, now)
             escalated = False
@@ -297,14 +354,9 @@ def recover_reserved_orders(
                 escalated = _escalate(db, order, reason, age)
                 if escalated:
                     summary.escalated += 1
-            _stamp_skip(order, reason, now, escalated)
             summary.skipped += 1
             summary.skip_reasons[reason] = summary.skip_reasons.get(reason, 0) + 1
-            try:
-                db.commit()  # persist the diagnostic + release the row lock; status unchanged
-            except Exception as e:  # noqa: BLE001 - a stamp failure must not abort the sweep
-                logger.warning("QT recovery: could not stamp diagnostic on order %s (%s)", order.id, e)
-                db.rollback()
+            _stamp_and_commit(db, order, reason, now, escalated)
 
     logger.info(
         "QT recovery sweep: seen=%d submitted=%d failed=%d skipped=%d "
@@ -316,10 +368,10 @@ def recover_reserved_orders(
         # The per-cycle window hid part of the backlog. Without this line the
         # sweep looks healthy at exactly `limit` orders while the queue grows.
         logger.warning(
-            "QT recovery sweep truncated: %d of %d eligible orders deferred to the "
-            "next cycle (limit=%d) — backlog growing, raise %s or investigate the "
-            "skip reasons above",
-            summary.eligible - summary.seen, summary.eligible, limit, INTERVAL_ENV,
+            "QT recovery sweep truncated: %d of %d eligible orders were outside this "
+            "cycle's window (limit=%d) — backlog growing, raise the per-cycle limit or "
+            "lower %s, and investigate the skip reasons above",
+            summary.eligible - len(oids), summary.eligible, limit, INTERVAL_ENV,
         )
     return summary
 
@@ -399,8 +451,8 @@ def run_sweep_once(
         if db is not None:
             try:
                 db.close()
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as e:  # noqa: BLE001 - close failure must not mask the result
+                logger.debug("QT recovery (%s): session close failed (%s)", label, e)
         _SWEEP_LOCK.release()
 
 
