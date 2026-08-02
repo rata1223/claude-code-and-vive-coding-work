@@ -1,6 +1,9 @@
 """FastAPI application entry point."""
+import asyncio
 import logging
 import os
+import threading
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -33,11 +36,96 @@ logger = logging.getLogger(__name__)
 # ── Rate limiter (shared across routers) ──────────────────────────────────
 limiter = Limiter(key_func=get_remote_address, default_limits=["200/minute"])
 
+# ── Lifespan ──────────────────────────────────────────────────────────────
+SHUTDOWN_JOIN_TIMEOUT = 10
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Startup/shutdown for the API process.
+
+    The same guarantees the previous ``@app.on_event`` pair provided, now in one
+    scope so the recovery handle is created and torn down in the same place:
+    tables created, the boot sweep scheduled *off* the critical path (broker I/O
+    must not block startup), the periodic sweep started, then signalled and
+    joined on the way out. Every recovery step is best-effort and can never
+    crash startup.
+    """
+    logger.info("Creating database tables…")
+    try:
+        create_tables()
+        logger.info("Database tables ready.")
+    except Exception as e:
+        logger.error("Failed to create tables: %s", e)
+
+    # Reconcile Quick Trade orders left RESERVED by an indeterminate broker
+    # submit before a crash/restart. The future and its own stop signal are kept
+    # so shutdown can cancel and wait for it — an untracked executor task would
+    # otherwise keep running (with a row lock) after the app is gone.
+    boot_sweep = None
+    boot_stop = threading.Event()
+    try:
+        import functools
+
+        from api.services import quick_trade_recovery
+
+        boot_sweep = asyncio.get_running_loop().run_in_executor(
+            None,
+            functools.partial(
+                quick_trade_recovery.recover_on_startup, stop_event=boot_stop
+            ),
+        )
+    except Exception as e:  # noqa: BLE001 - scheduling recovery must never crash startup
+        logger.error("Failed to schedule Quick Trade recovery sweep: %s", e)
+
+    # Liveness: keep sweeping while the process runs, so an order that goes
+    # indeterminate mid-flight is reconciled without waiting for a restart.
+    try:
+        from api.services import quick_trade_recovery
+
+        app.state.qt_recovery = quick_trade_recovery.start_periodic_recovery()
+    except Exception as e:  # noqa: BLE001 - the periodic sweep is best-effort
+        logger.error("Failed to start Quick Trade periodic recovery: %s", e)
+        app.state.qt_recovery = None
+
+    try:
+        yield
+    finally:
+        # Stop the background sweep so shutdown is not delayed by its interval
+        # wait. The sweep checks this same event between orders, so a cycle in
+        # flight ends at the next row boundary instead of running the join out.
+        boot_stop.set()
+        if boot_sweep is not None:
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(boot_sweep), timeout=SHUTDOWN_JOIN_TIMEOUT
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Quick Trade startup sweep did not finish within %ds — exiting anyway",
+                    SHUTDOWN_JOIN_TIMEOUT,
+                )
+            except Exception as e:  # noqa: BLE001 - the sweep already swallows its own errors
+                logger.error("Quick Trade startup sweep failed: %s", e)
+
+        handle = getattr(app.state, "qt_recovery", None)
+        if handle:
+            thread, stop_event = handle
+            stop_event.set()
+            thread.join(timeout=SHUTDOWN_JOIN_TIMEOUT)
+            if thread.is_alive():
+                logger.warning(
+                    "Quick Trade recovery sweep did not stop within %ds "
+                    "(daemon — exiting anyway)", SHUTDOWN_JOIN_TIMEOUT,
+                )
+
+
 app = FastAPI(
     title="KIS Trading API",
     version="1.0.0",
     docs_url="/docs",
     redoc_url="/redoc",
+    lifespan=lifespan,
 )
 
 app.state.limiter = limiter
@@ -83,29 +171,6 @@ async def global_exception_handler(request: Request, exc: Exception):
         status_code=500,
         content={"code": -1, "data": None, "msg": str(exc)},
     )
-
-
-# ── Startup ───────────────────────────────────────────────────────────────
-@app.on_event("startup")
-async def startup_event():
-    logger.info("Creating database tables…")
-    try:
-        create_tables()
-        logger.info("Database tables ready.")
-    except Exception as e:
-        logger.error("Failed to create tables: %s", e)
-
-    # Reconcile Quick Trade orders left RESERVED by an indeterminate broker submit
-    # before a crash/restart. Runs off the boot critical path (broker I/O must not
-    # block startup) and swallows its own errors, so it can never crash startup.
-    try:
-        import asyncio
-
-        from api.services.quick_trade_recovery import recover_on_startup
-
-        asyncio.get_running_loop().run_in_executor(None, recover_on_startup)
-    except Exception as e:  # noqa: BLE001 - scheduling recovery must never crash startup
-        logger.error("Failed to schedule Quick Trade recovery sweep: %s", e)
 
 
 # ── Health check ─────────────────────────────────────────────────────────

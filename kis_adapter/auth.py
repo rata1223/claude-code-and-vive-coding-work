@@ -1,3 +1,4 @@
+import math
 import os
 import time
 import json
@@ -10,6 +11,34 @@ from datetime import datetime, timedelta
 from threading import Lock
 
 logger = logging.getLogger(__name__)
+
+# Explicit deadline for every KIS HTTP call — token issuance included, since a
+# hung token request blocks the inquiry that triggered it. Without a bound, a
+# stalled broker holds the reconciliation sweep past shutdown. Tunable per
+# environment; a bad value falls back rather than removing the deadline.
+HTTP_TIMEOUT_ENV = "KIS_HTTP_TIMEOUT_SECONDS"
+HTTP_TIMEOUT_SECONDS = 10.0
+
+
+def _http_timeout() -> float:
+    """Resolve the HTTP deadline, falling back on any value that would remove it."""
+    raw = os.environ.get(HTTP_TIMEOUT_ENV)
+    if raw is None:
+        return HTTP_TIMEOUT_SECONDS
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        logger.warning("invalid %s=%r, using %ss", HTTP_TIMEOUT_ENV, raw, HTTP_TIMEOUT_SECONDS)
+        return HTTP_TIMEOUT_SECONDS
+    # nan/inf parse fine but are not deadlines: inf removes the bound entirely
+    # and nan raises inside urllib3 — both defeat the point of setting one.
+    if not math.isfinite(value) or value <= 0:
+        logger.warning(
+            "%s must be a finite value > 0 (got %r), using %ss",
+            HTTP_TIMEOUT_ENV, raw, HTTP_TIMEOUT_SECONDS,
+        )
+        return HTTP_TIMEOUT_SECONDS
+    return value
 
 PAPER_BASE = "https://openapivts.koreainvestment.com:9443"
 REAL_BASE = "https://openapi.koreainvestment.com:9443"
@@ -136,7 +165,7 @@ class KISAuth:
             "appkey": self.app_key,
             "appsecret": self.app_secret,
         }
-        resp = requests.post(url, json=body, timeout=10)
+        resp = requests.post(url, json=body, timeout=_http_timeout())
         resp.raise_for_status()
         data = resp.json()
         return data["access_token"], int(data.get("expires_in", 86400))
@@ -160,7 +189,7 @@ class KISAuth:
             "appsecret": self.app_secret,
             "token": token.decode(),
         }
-        requests.post(url, json=body, timeout=10)
+        requests.post(url, json=body, timeout=_http_timeout())
         try:
             self._redis.delete(self._token_cache_key, self._token_expiry_key)
         except Exception as e:
@@ -188,7 +217,7 @@ class KISAuth:
             "appkey": self.app_key,
             "appsecret": self.app_secret,
         }
-        resp = requests.post(url, json=body, headers=headers, timeout=10)
+        resp = requests.post(url, json=body, headers=headers, timeout=_http_timeout())
         resp.raise_for_status()
         return resp.json()["HASH"]
 

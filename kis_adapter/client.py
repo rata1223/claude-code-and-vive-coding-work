@@ -3,9 +3,10 @@ import time
 import logging
 import requests
 from threading import Lock
-from .auth import KISAuth, KISCredentials
+from .auth import KISAuth, KISCredentials, HTTP_TIMEOUT_ENV, HTTP_TIMEOUT_SECONDS, _http_timeout  # noqa: F401 - re-exported
 
 logger = logging.getLogger(__name__)
+
 
 
 class RateLimiter:
@@ -41,7 +42,7 @@ class KISClient:
         for attempt in range(self.MAX_RETRIES):
             self._limiter.wait()
             try:
-                resp = requests.get(url, headers=headers, params=params, timeout=10)
+                resp = requests.get(url, headers=headers, params=params, timeout=_http_timeout())
                 resp.raise_for_status()
                 data = resp.json()
                 if data.get("rt_cd") != "0":
@@ -67,7 +68,7 @@ class KISClient:
         for attempt in range(self.MAX_RETRIES):
             self._limiter.wait()
             try:
-                resp = requests.post(url, headers=headers, json=body, timeout=10)
+                resp = requests.post(url, headers=headers, json=body, timeout=_http_timeout())
                 resp.raise_for_status()
                 data = resp.json()
             except Exception as e:
