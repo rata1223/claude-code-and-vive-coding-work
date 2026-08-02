@@ -429,6 +429,7 @@ def recover_on_startup(
     session_factory=None,
     load_kis: Optional[Callable] = None,
     enabled: Optional[bool] = None,
+    stop_event: Optional[threading.Event] = None,
 ) -> Optional[RecoverySummary]:
     """Env-gated startup entry point. Opens its own DB session, runs the sweep,
     and **swallows every error** — a recovery failure must never crash or block
@@ -444,7 +445,10 @@ def recover_on_startup(
         # Lazy import avoids an import cycle (router imports the service layer).
         from api.routers.quick_trade import _load_kis as load_kis  # noqa: N806
 
-    return run_sweep_once(session_factory=session_factory, load_kis=load_kis, label="startup")
+    return run_sweep_once(
+        session_factory=session_factory, load_kis=load_kis, label="startup",
+        stop_event=stop_event,
+    )
 
 
 def run_sweep_once(

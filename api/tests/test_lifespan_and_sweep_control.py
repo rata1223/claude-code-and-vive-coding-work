@@ -159,6 +159,7 @@ def test_lifespan_survives_a_failing_recovery_start(monkeypatch):
     import api.main as main_mod
 
     monkeypatch.setattr(main_mod, "create_tables", lambda: None)
+    monkeypatch.setattr(rec, "recover_on_startup", lambda *a, **kw: None)
     monkeypatch.setattr(
         rec, "start_periodic_recovery",
         lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("no thread for you")),
@@ -320,7 +321,10 @@ def test_timeout_is_logged_with_order_context(db, caplog):
         recover_reserved_orders(
             db, load_kis=_load_kis(FakeOrders(exc=requests.exceptions.Timeout("boom"))),
         )
-    line = next(r.getMessage() for r in caplog.records if "timed out" in r.getMessage())
+    line = next(
+        (r.getMessage() for r in caplog.records if "timed out" in r.getMessage()), None
+    )
+    assert line is not None, "no timeout log line was emitted"
     assert "42" in line and "TSLA" in line
 
 
@@ -385,3 +389,63 @@ def test_every_kis_http_call_sends_a_timeout(monkeypatch):
     client.get("/p", "TR")
     client.post("/p", "TR", {})
     assert sent == {"get": 7.0, "post": 7.0}
+
+
+def test_non_finite_deadlines_are_rejected(monkeypatch):
+    """``nan``/``inf`` parse as floats but are not deadlines: ``inf`` removes the
+    bound entirely and ``nan`` raises inside urllib3."""
+    from kis_adapter import client as kis_client_mod
+
+    for bad in ("nan", "inf", "-inf", "+inf", "Infinity"):
+        monkeypatch.setenv(kis_client_mod.HTTP_TIMEOUT_ENV, bad)
+        got = kis_client_mod._http_timeout()
+        assert got == kis_client_mod.HTTP_TIMEOUT_SECONDS, f"{bad} -> {got}"
+
+
+def test_auth_http_calls_are_bounded_too(monkeypatch):
+    """Token issuance sits on the inquiry path — an unbounded token request would
+    hang the sweep just as surely as an unbounded inquiry."""
+    from kis_adapter import auth as kis_auth_mod
+
+    monkeypatch.setenv(kis_auth_mod.HTTP_TIMEOUT_ENV, "6")
+    seen = []
+
+    class FakeResp:
+        status_code = 200
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"access_token": "t", "expires_in": 86400, "HASH": "h"}
+
+    def fake_post(url, **kw):
+        seen.append(kw.get("timeout"))
+        return FakeResp()
+
+    monkeypatch.setattr(kis_auth_mod.requests, "post", fake_post)
+
+    auth = kis_auth_mod.KISAuth.__new__(kis_auth_mod.KISAuth)
+    auth.base_url = "https://example.invalid"
+    auth.app_key = "k"
+    auth.app_secret = "s"
+
+    auth.get_hashkey({"a": 1})
+    assert seen and all(t == 6.0 for t in seen), seen
+
+
+def test_startup_sweep_accepts_a_stop_event(db, SessionLocal, monkeypatch):
+    """The boot sweep must be cancellable too — lifespan signals it on shutdown."""
+    seen = {}
+
+    def spy(session, **kwargs):
+        seen.update(kwargs)
+        return rec.RecoverySummary()
+
+    monkeypatch.setattr(rec, "recover_reserved_orders", spy)
+    stop = threading.Event()
+    rec.recover_on_startup(
+        session_factory=SessionLocal, load_kis=_load_kis(FakeOrders()),
+        enabled=True, stop_event=stop,
+    )
+    assert seen.get("stop_event") is stop

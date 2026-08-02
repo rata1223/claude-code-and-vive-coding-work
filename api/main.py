@@ -1,6 +1,8 @@
 """FastAPI application entry point."""
+import asyncio
 import logging
 import os
+import threading
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
@@ -57,14 +59,21 @@ async def lifespan(app: FastAPI):
         logger.error("Failed to create tables: %s", e)
 
     # Reconcile Quick Trade orders left RESERVED by an indeterminate broker
-    # submit before a crash/restart.
+    # submit before a crash/restart. The future and its own stop signal are kept
+    # so shutdown can cancel and wait for it — an untracked executor task would
+    # otherwise keep running (with a row lock) after the app is gone.
+    boot_sweep = None
+    boot_stop = threading.Event()
     try:
-        import asyncio
+        import functools
 
         from api.services import quick_trade_recovery
 
-        asyncio.get_running_loop().run_in_executor(
-            None, quick_trade_recovery.recover_on_startup
+        boot_sweep = asyncio.get_running_loop().run_in_executor(
+            None,
+            functools.partial(
+                quick_trade_recovery.recover_on_startup, stop_event=boot_stop
+            ),
         )
     except Exception as e:  # noqa: BLE001 - scheduling recovery must never crash startup
         logger.error("Failed to schedule Quick Trade recovery sweep: %s", e)
@@ -85,6 +94,20 @@ async def lifespan(app: FastAPI):
         # Stop the background sweep so shutdown is not delayed by its interval
         # wait. The sweep checks this same event between orders, so a cycle in
         # flight ends at the next row boundary instead of running the join out.
+        boot_stop.set()
+        if boot_sweep is not None:
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(boot_sweep), timeout=SHUTDOWN_JOIN_TIMEOUT
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Quick Trade startup sweep did not finish within %ds — exiting anyway",
+                    SHUTDOWN_JOIN_TIMEOUT,
+                )
+            except Exception as e:  # noqa: BLE001 - the sweep already swallows its own errors
+                logger.error("Quick Trade startup sweep failed: %s", e)
+
         handle = getattr(app.state, "qt_recovery", None)
         if handle:
             thread, stop_event = handle

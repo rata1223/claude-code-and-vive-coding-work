@@ -1,3 +1,4 @@
+import math
 import os
 import time
 import json
@@ -20,6 +21,7 @@ HTTP_TIMEOUT_SECONDS = 10.0
 
 
 def _http_timeout() -> float:
+    """Resolve the HTTP deadline, falling back on any value that would remove it."""
     raw = os.environ.get(HTTP_TIMEOUT_ENV)
     if raw is None:
         return HTTP_TIMEOUT_SECONDS
@@ -28,8 +30,13 @@ def _http_timeout() -> float:
     except (TypeError, ValueError):
         logger.warning("invalid %s=%r, using %ss", HTTP_TIMEOUT_ENV, raw, HTTP_TIMEOUT_SECONDS)
         return HTTP_TIMEOUT_SECONDS
-    if value <= 0:
-        logger.warning("%s must be > 0, using %ss", HTTP_TIMEOUT_ENV, HTTP_TIMEOUT_SECONDS)
+    # nan/inf parse fine but are not deadlines: inf removes the bound entirely
+    # and nan raises inside urllib3 — both defeat the point of setting one.
+    if not math.isfinite(value) or value <= 0:
+        logger.warning(
+            "%s must be a finite value > 0 (got %r), using %ss",
+            HTTP_TIMEOUT_ENV, raw, HTTP_TIMEOUT_SECONDS,
+        )
         return HTTP_TIMEOUT_SECONDS
     return value
 
