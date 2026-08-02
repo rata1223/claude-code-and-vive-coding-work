@@ -43,6 +43,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Callable, Dict, List, Optional, Tuple
 
+import requests  # exception types only — the HTTP call itself lives in kis_adapter
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
@@ -102,6 +103,9 @@ class RecoverySummary:
     eligible: int = 0
     truncated: bool = False
     escalated: int = 0
+    #: True when a shutdown signal ended the cycle early. Without it an aborted
+    #: sweep is indistinguishable from a clean full pass in logs and callers.
+    aborted: bool = False
     #: skip reason → count, so "skipped=7" is never an undiagnosable number.
     skip_reasons: Dict[str, int] = field(default_factory=dict)
 
@@ -117,6 +121,7 @@ _REASON_INQUIRY_ERROR = "inquiry_error"     # broker inquiry raised (network/aut
 _REASON_AMBIGUOUS = "ambiguous_match"       # 2+ broker orders match side+qty — cannot disambiguate
 _REASON_CLIENT_ERROR = "client_error"       # could not build a broker client from the credential
 _REASON_RECONCILE_ERROR = "reconcile_error"  # the resolving write itself failed (integrity/connection)
+_REASON_INQUIRY_TIMEOUT = "inquiry_timeout"  # the inquiry hit its HTTP deadline — outcome unknown
 
 
 def _classify(order: QuickTradeOrder, orders_client) -> Tuple[str, Optional[str], Optional[str]]:
@@ -130,6 +135,16 @@ def _classify(order: QuickTradeOrder, orders_client) -> Tuple[str, Optional[str]
     mapper = KIS_DOMESTIC_MAPPER if order.market.lower() == "kr" else KIS_OVERSEAS_MAPPER
     try:
         rows = orders_client.inquire_orders(order.symbol, market=order.market, excd=order.exchange)
+    except requests.exceptions.Timeout as e:
+        # The deadline (KIS_HTTP_TIMEOUT_SECONDS, enforced in kis_adapter) fired.
+        # Bounding the call is what keeps one hung broker from stalling the cycle;
+        # the outcome is unknown, so the order stays RESERVED like any other skip.
+        logger.warning(
+            "QT recovery: broker inquiry timed out for order %s (%s %s x%s market=%s) "
+            "after the HTTP deadline (%s) — inconclusive, left RESERVED",
+            order.id, order.side, order.symbol, order.qty, order.market, e,
+        )
+        return _SKIP, None, _REASON_INQUIRY_TIMEOUT
     except Exception as e:  # noqa: BLE001 - any broker/inquiry error is inconclusive → skip (fail-safe)
         logger.warning("QT recovery: broker inquiry failed for order %s (%s) — skip", order.id, e)
         return _SKIP, None, _REASON_INQUIRY_ERROR
@@ -279,6 +294,7 @@ def recover_reserved_orders(
     grace_seconds: int = DEFAULT_GRACE_SECONDS,
     limit: int = DEFAULT_LIMIT,
     escalate_seconds: int = DEFAULT_ESCALATE_SECONDS,
+    stop_event: Optional[threading.Event] = None,
 ) -> RecoverySummary:
     """Reconcile RESERVED orders older than ``grace_seconds``.
 
@@ -298,6 +314,19 @@ def recover_reserved_orders(
     summary.truncated = summary.eligible > len(oids)
 
     for oid in oids:
+        # Shutdown asked us to stop: end at this row boundary. Everything already
+        # committed stands; the rest stay RESERVED and are picked up next cycle.
+        # Checking here (not mid-order) is what keeps the join from expiring while
+        # a row lock is still held.
+        if stop_event is not None and stop_event.is_set():
+            summary.aborted = True
+            logger.info(
+                "QT recovery sweep interrupted by shutdown after %d of %d claimed "
+                "orders — remaining deferred to the next sweep",
+                summary.seen, len(oids),
+            )
+            break
+
         # Claim this row so a concurrent worker skips it (no-op degrade on SQLite).
         order = (
             db.query(QuickTradeOrder)
@@ -359,8 +388,9 @@ def recover_reserved_orders(
             _stamp_and_commit(db, order, reason, now, escalated)
 
     logger.info(
-        "QT recovery sweep: seen=%d submitted=%d failed=%d skipped=%d "
+        "QT recovery sweep%s: seen=%d submitted=%d failed=%d skipped=%d "
         "escalated=%d eligible=%d reasons=%s",
+        " (ABORTED — shutdown)" if summary.aborted else "",
         summary.seen, summary.submitted, summary.failed, summary.skipped,
         summary.escalated, summary.eligible, summary.skip_reasons or "{}",
     )
@@ -476,7 +506,7 @@ def run_periodic_recovery(
     while not stop_event.is_set():
         run_sweep_once(
             session_factory=session_factory, load_kis=load_kis,
-            label="periodic", **sweep_kwargs,
+            label="periodic", stop_event=stop_event, **sweep_kwargs,
         )
         cycles += 1
         if max_cycles is not None and cycles >= max_cycles:
