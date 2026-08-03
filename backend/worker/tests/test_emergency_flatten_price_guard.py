@@ -185,6 +185,31 @@ def test_invalid_live_price_is_rejected(db_factory, bad):
     assert len(res["failed"]) == 1
 
 
+def test_unconvertible_huge_int_price_is_rejected_not_raised(db_factory):
+    """``float()`` on a huge int raises OverflowError. That must be reported as a
+    rejected price, not escape and abort the flatten."""
+    broker = _Broker(positions=[_pos()], price=10 ** 10000)
+    mgr = EmergencyFlattenManager(broker, db_factory, dry_run=False)
+
+    res = mgr.flatten_all("g2")          # must not raise
+
+    assert broker.placed == []
+    assert res["submitted"] == 0 and len(res["failed"]) == 1
+
+
+def test_conversion_failure_does_not_stop_later_positions(db_factory):
+    def price(symbol):
+        return 10 ** 10000 if symbol == "SPY" else 200.0
+
+    broker = _Broker(positions=[_pos("SPY"), _pos("QQQ")], price=price)
+    mgr = EmergencyFlattenManager(broker, db_factory, dry_run=False)
+
+    res = mgr.flatten_all("g2")
+
+    assert broker.placed == [("QQQ", "sell", 10, 200.0)]
+    assert res["submitted"] == 1 and len(res["failed"]) == 1
+
+
 def test_price_is_not_rounded_or_coerced_to_pass_validation(db_factory):
     """A sub-tick positive price is still a real quote — pass it through as-is,
     do not round it to make it 'valid'."""

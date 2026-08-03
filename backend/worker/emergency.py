@@ -104,7 +104,12 @@ class EmergencyFlattenManager:
         # bool is an int subclass — it would pass a bare ``> 0`` check.
         if isinstance(raw, bool) or not isinstance(raw, (int, float)):
             return None, f"실시간 가격이 숫자가 아님: {raw!r}"
-        value = float(raw)
+        try:
+            value = float(raw)
+        except (OverflowError, ValueError) as e:
+            # An int too large for a float still has to be rejected per position —
+            # letting it raise here would abort the rest of the liquidation.
+            return None, f"실시간 가격 변환 실패: {type(e).__name__}"
         if not math.isfinite(value):          # NaN / ±inf
             return None, f"실시간 가격이 유한하지 않음: {raw!r}"
         if value <= 0:
