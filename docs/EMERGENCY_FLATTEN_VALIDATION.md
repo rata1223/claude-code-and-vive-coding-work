@@ -29,7 +29,9 @@ trigger ─┬─ MDD / daily / weekly loss breach   (engine.py LossTracker._eva
             broker.get_positions()                             (KIS get_positions)
                                 │
                   for each position:
-                    price = broker.get_price()  (fallback → pos.avg_price on circuit-break)
+                    price = broker.get_price()  (P0-07 G2: live quote is the ONLY
+                      source; missing/raising/non-finite/non-positive → NO order,
+                      reported in `failed` + audited. Never falls back to avg_price.)
                     broker.place_order(sym, "sell", qty, price)   ← order_type defaults "limit"
                                 │
                                 ▼
@@ -40,7 +42,8 @@ trigger ─┬─ MDD / daily / weekly loss breach   (engine.py LossTracker._eva
                                 │
                                 ▼
             AuditLog: emergency_flatten_start / _order / _failed /
-                      _positions_error / _complete / _rejected
+                      _positions_error / _complete / _rejected /
+                      _price_rejected  (P0-07 G2: priced-out, nothing submitted)
 ```
 
 The flatten path **submits sell orders and returns** — it does not poll for fills,

@@ -13,7 +13,8 @@ Scenarios:
 
 Verify:
   - Re-entry lock prevents duplicate liquidation orders
-  - No fail-open: price fallback uses avg_price, not skipping the order
+  - Fail-closed pricing (P0-07 G2): no live quote → no order, reported as a
+    failure. The cost basis is never used as an execution price.
   - Audit log writes per event; DB failure does not abort flatten
   - Audit logs survive simulated restart (persistent DB)
 """
@@ -169,7 +170,10 @@ class TestPartialFailure:
         assert "AAPL" in result["failed"][0]
         assert "insufficient margin" in result["failed"][0]
 
-    def test_price_failure_falls_back_to_avg_price_and_still_places_order(self, broker, db_factory):
+    def test_price_failure_submits_nothing_and_reports_failure(self, broker, db_factory):
+        """P0-07 G2: a dead quote must not be papered over with the cost basis —
+        the position is left unsubmitted and reported (see
+        test_emergency_flatten_price_guard.py for the full matrix)."""
         broker.get_positions.return_value = [_pos("AAPL", qty=10, avg_price=88.0)]
         broker.get_price.side_effect = Exception("market data unavailable")
         broker.place_order.return_value = _order("AAPL")
@@ -177,10 +181,12 @@ class TestPartialFailure:
         mgr = EmergencyFlattenManager(broker, db_factory, dry_run=False)
         result = mgr.flatten_all()
 
-        assert result["success"] == 1
-        broker.place_order.assert_called_once_with("AAPL", "sell", 10, 88.0)
+        assert result["success"] == 0
+        assert result["submitted"] == 0
+        broker.place_order.assert_not_called()
+        assert "AAPL" in result["failed"][0]
 
-    def test_circuit_breaker_price_falls_back_to_avg_price(self, broker, db_factory):
+    def test_circuit_breaker_price_does_not_fall_back_to_avg_price(self, broker, db_factory):
         broker.get_positions.return_value = [_pos("AAPL", qty=10, avg_price=77.0)]
         broker.get_price.side_effect = RuntimeError("circuit breaker open — get_price")
         broker.place_order.return_value = _order("AAPL")
@@ -188,8 +194,8 @@ class TestPartialFailure:
         mgr = EmergencyFlattenManager(broker, db_factory, dry_run=False)
         result = mgr.flatten_all()
 
-        assert result["success"] == 1
-        broker.place_order.assert_called_once_with("AAPL", "sell", 10, 77.0)
+        assert result["success"] == 0
+        broker.place_order.assert_not_called()
 
 
 # ─── 4. Idempotency / re-entry ────────────────────────────────────────────────
