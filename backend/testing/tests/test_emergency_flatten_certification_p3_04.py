@@ -168,9 +168,10 @@ def test_audit_failure_does_not_block_or_duplicate_liquidation():
     assert broker.get_positions() == []   # exactly closed, not oversold
 
 
-def test_get_price_failure_falls_back_and_liquidates_once(monkeypatch, db_factory):
-    """A degraded price source must not stop an emergency liquidation, and each
-    position is sold exactly once (fallback to avg_price, single submission)."""
+def test_get_price_failure_blocks_submission_and_never_double_sends(monkeypatch, db_factory):
+    """P0-07 G2: a degraded price source fails closed — nothing is submitted at a
+    fabricated (cost-basis) price. The no-duplicate-submission guarantee still
+    holds: zero sends here, and one send per symbol on the healthy path."""
     broker = _broker_with_positions()
     submits: list[str] = []
     real_place = broker.place_order
@@ -186,6 +187,14 @@ def test_get_price_failure_falls_back_and_liquidates_once(monkeypatch, db_factor
     mgr = EmergencyFlattenManager(broker, db_factory=db_factory, dry_run=False)
     res = mgr.flatten_all("price-down")
 
-    assert res["submitted"] == 2
+    assert res["submitted"] == 0
+    assert submits == []                            # no order at an invented price
+    assert len(res["failed"]) == 2                  # both positions reported, not hidden
+
+    # Quotes recover → the same manager liquidates each symbol exactly once.
+    monkeypatch.setattr(broker, "get_price", lambda symbol: 100.0)
+    res2 = mgr.flatten_all("price-back")
+
+    assert res2["submitted"] == 2
     assert sorted(submits) == ["069500", "SPY"]     # each symbol exactly once
     assert len(submits) == len(set(submits))

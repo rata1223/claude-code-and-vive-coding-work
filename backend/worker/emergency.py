@@ -8,13 +8,19 @@ NOTE (R-11): the former ``StaleDataWatchdog`` lived here but was dead code
 ``backend/data/freshness_gate.FreshnessGate`` wired into the execution path.
 """
 import logging
+import math
 import threading
 from contextlib import contextmanager
-from typing import Callable, Optional
+from typing import Callable, Optional, Tuple
 
 from backend.brokers.base import BrokerAdapter
 
 logger = logging.getLogger(__name__)
+
+# Audit event for a position that could not be priced. Distinct from
+# ``emergency_flatten_failed`` (broker rejected a *submitted* order) because
+# nothing was sent to the broker at all — the forensic questions differ.
+PRICE_REJECTED_EVENT = "emergency_flatten_price_rejected"
 
 # In-process guard against duplicate concurrent flatten runs (e.g. two
 # /api/admin/flatten calls inside the rate-limit window, or auto+manual).
@@ -76,6 +82,41 @@ class EmergencyFlattenManager:
         self.last_failed_count = failed_count
         self.last_status = status
 
+    def _executable_price(self, symbol: str) -> Tuple[Optional[float], Optional[str]]:
+        """Resolve the price this position may actually be sold at.
+
+        Returns ``(price, None)`` for a usable live quote, else ``(None, cause)``.
+
+        There is deliberately no fallback. The former code substituted
+        ``position.avg_price`` whenever the quote was unavailable, but a cost
+        basis is not a price: KIS accepts no market sell (``ORD_DVSN`` is always
+        ``"00"``), so that value went out as a *limit* price. During the crash
+        that triggers a flatten, the cost basis is precisely when it is furthest
+        from the market, so the order rested unfilled while the position kept
+        moving — a liquidation that reported success without liquidating.
+        Rejecting is strictly safer than selling at an invented price.
+        """
+        try:
+            raw = self._broker.get_price(symbol)
+        except Exception as e:  # noqa: BLE001 - any quote failure is fail-closed
+            return None, f"실시간 가격 조회 실패: {e}"
+
+        # bool is an int subclass — it would pass a bare ``> 0`` check.
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            return None, f"실시간 가격이 숫자가 아님: {raw!r}"
+        try:
+            value = float(raw)
+        except (OverflowError, ValueError) as e:
+            # An int too large for a float still has to be rejected per position —
+            # letting it raise here would abort the rest of the liquidation.
+            return None, f"실시간 가격 변환 실패: {type(e).__name__}"
+        if not math.isfinite(value):          # NaN / ±inf
+            return None, f"실시간 가격이 유한하지 않음: {raw!r}"
+        if value <= 0:
+            return None, f"실시간 가격이 양수가 아님: {raw!r}"
+        # Returned verbatim — never rounded or clamped to make it pass.
+        return value, None
+
     def flatten_all(self, reason: str = "비상청산") -> dict:
         """
         모든 포지션 시장가 매도.
@@ -87,7 +128,9 @@ class EmergencyFlattenManager:
                              closed/filled (see EMERGENCY_FLATTEN_VALIDATION.md).
           - ``submitted``  : real broker orders actually sent (0 in dry-run)
           - ``dry_run``    : whether this was a dry run
-          - ``failed``     : list of "symbol: error" strings
+          - ``failed``     : list of "symbol: error" strings — includes positions
+                             skipped because no valid live price was available
+                             (fail-closed, nothing submitted for them)
           - ``status``     : "already_in_progress" if a flatten is already running
         """
         # Duplicate-flatten guard: never run two flattens concurrently in this
@@ -134,17 +177,21 @@ class EmergencyFlattenManager:
         self._reset_last_run(attempted=len(positions), dry_run=self._dry_run)
 
         for pos in positions:
-            try:
-                price = self._broker.get_price(pos.symbol)
-            except RuntimeError as e:
-                if "circuit breaker" in str(e).lower():
-                    logger.warning("[flatten] 회로차단 — %s 평균단가 사용 (%.4f)", pos.symbol, pos.avg_price)
-                else:
-                    logger.warning("[flatten] get_price 실패 %s — 평균단가 사용: %s", pos.symbol, e)
-                price = pos.avg_price
-            except Exception as e:
-                logger.warning("[flatten] get_price 오류 %s — 평균단가 사용: %s", pos.symbol, e)
-                price = pos.avg_price
+            # P0-07 G2: the live quote is the ONLY source of an executable sell
+            # price. Validation runs before the dry-run branch so a dry run
+            # surfaces the same rejection instead of reporting a flatten it
+            # could not actually have performed.
+            price, cause = self._executable_price(pos.symbol)
+            if price is None:
+                logger.error(
+                    "[flatten] %s 실행가 확보 실패 — 주문 미제출(fail-closed): %s",
+                    pos.symbol, cause,
+                )
+                results["failed"].append(f"{pos.symbol}: {cause}")
+                self.last_failed_count += 1
+                self._audit(PRICE_REJECTED_EVENT, symbol=pos.symbol,
+                            detail={"qty": pos.qty, "price": None, "cause": cause})
+                continue
 
             if self._dry_run:
                 logger.critical("[DRY RUN] 비상청산: %s qty=%d @%.2f", pos.symbol, pos.qty, price)
