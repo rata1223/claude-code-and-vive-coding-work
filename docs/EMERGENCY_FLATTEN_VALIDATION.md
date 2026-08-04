@@ -103,7 +103,9 @@ reconstructable from the audit log.
 
 **R1 — limit-not-market fill risk (most severe).** `place_order` defaults to
 `order_type="limit"` and KIS reports `supports_market_sell=False`
-(`brokers/capabilities.py`). The flatten sell is priced at last/avg price. In a fast
+(`brokers/capabilities.py`). The flatten sell is priced at the live quote (since
+P0-07 G2; there is no avg-price fallback — an unpriceable position is skipped, not
+sold at a fabricated price). In a fast
 down-market — precisely when a flatten fires — a limit at last price **may not fill**,
 so positions are *not actually liquidated* even though the API reports
 `success == attempted`. There is no fill check or price-chase/re-submit. This is the
