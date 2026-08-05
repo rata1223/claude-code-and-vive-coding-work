@@ -125,8 +125,16 @@ existing pending-order recovery, but un-submitted ones are not.
 
 **R7 — kill switch never auto-invokes flatten.** `LossTracker._fire_kill_switch_alert`
 disables `SAFE_MODE` and sends alerts; it does not call `flatten_all`. So under MDD/
-daily/weekly breach the system halts but holds its positions until an operator acts.
+daily/weekly breach the system halts new entries but does not liquidate; an operator
+must still invoke `/api/admin/flatten` for a full liquidation.
 Wiring auto-flatten is a **policy/feature decision** → recommended next task.
+
+> Updated by P0-07 S1 (Policy B, `docs/P0_07_S1_HALT_POLICY.md`): the kill switch now
+> declares its halt cause as `RISK_BREACH`, so the strategy's own stop-losses and
+> other **proven** risk-reducing exits keep running while entries stay blocked. The
+> book is no longer frozen at maximum drawdown waiting on an operator. A halt caused
+> by `UNTRUSTED_STATE` (startup recovery incomplete) still blocks exits, and
+> EmergencyFlatten remains immune to every halt cause.
 
 **R3 — cross-process duplicate flatten.** The new guard is in-process. Two worker/API
 processes could still both flatten. A DB/redis-backed lock (or routing flatten through

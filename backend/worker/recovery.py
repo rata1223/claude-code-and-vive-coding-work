@@ -23,6 +23,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
+from backend.risk.halt_policy import HaltCause
+
 _BROKER_STARTUP_TIMEOUT = int(os.environ.get("BROKER_STARTUP_TIMEOUT", "30"))
 _RECOVERY_STALE_ORDER_HOURS = float(os.environ.get("RECOVERY_STALE_ORDER_HOURS", "24"))
 
@@ -39,28 +41,48 @@ class ReconcileAction:
 
 
 class SafeModeState:
-    """전략 실행 허용 여부를 전역으로 관리한다."""
+    """전략 실행 허용 여부를 전역으로 관리한다.
+
+    P0-07 S1: a halt now carries *why* it happened, not just that it happened.
+    The cause decides whether risk-reducing exits survive the halt — see
+    ``backend/risk/halt_policy``. ``disable()`` keeps its single-argument form
+    for existing callers and defaults to the most restrictive cause
+    (``UNTRUSTED_STATE``, which blocks exits too), so an un-migrated caller can
+    never accidentally widen what is permitted.
+    """
 
     def __init__(self):
         self._can_trade = False
         self._reason = "초기화 중"
+        # Startup begins in the untrusted state: recovery has not run yet, so
+        # position data cannot be relied on for an exit decision.
+        self._cause: Optional[HaltCause] = HaltCause.UNTRUSTED_STATE
 
     @property
     def can_trade(self) -> bool:
         return self._can_trade
 
+    @property
+    def halt_cause(self) -> Optional[HaltCause]:
+        """The active halt cause, or ``None`` when trading is allowed."""
+        return None if self._can_trade else self._cause
+
     def enable(self) -> None:
         self._can_trade = True
         self._reason = "정상"
+        self._cause = None
         logger.info("SafeMode 해제 — 매매 허용")
 
-    def disable(self, reason: str) -> None:
+    def disable(self, reason: str,
+                cause: Optional[HaltCause] = HaltCause.UNTRUSTED_STATE) -> None:
         self._can_trade = False
         self._reason = reason
-        logger.warning("SafeMode 활성화: %s", reason)
+        self._cause = cause or HaltCause.UNTRUSTED_STATE
+        logger.warning("SafeMode 활성화 [%s]: %s", self._cause.value, reason)
 
     def __repr__(self) -> str:
-        return f"SafeModeState(can_trade={self._can_trade}, reason={self._reason!r})"
+        return (f"SafeModeState(can_trade={self._can_trade}, "
+                f"reason={self._reason!r}, cause={self._cause})")
 
 
 # Process-level safe mode gate — strategies should check this before placing orders

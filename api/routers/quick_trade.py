@@ -20,24 +20,60 @@ from api.services.quick_trade_service import (
 )
 from backend.brokers.semantic_mapper import KIS_DOMESTIC_MAPPER, KIS_OVERSEAS_MAPPER
 from strategy.risk import RiskManager
+from backend.risk.halt_policy import HaltCause, OperationClass, is_allowed
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/quick-trade", tags=["quick-trade"])
 
 
-def get_risk_gate():
-    """FastAPI dependency: the authoritative pre-submit risk gate (P0-05).
+def _halt_cause():
+    """The active halt cause for the QuickTrade path, or ``None``.
 
-    Reuses the existing production ``RiskManager`` exactly as-is. The returned
-    callable raises :class:`RiskDenied` when trading is halted (daily-loss limit,
-    kill switch, or SafeMode — all surface via the single Redis halt flag). If
+    The signal is the Redis flag ``risk:trading_halted``, whose only writer is
+    ``RiskManager.record_daily_loss`` — i.e. a risk-limit breach. It is
+    therefore reported as ``RISK_BREACH``. Untrusted state is a worker-process
+    concept (``SAFE_MODE``); unifying the two halt stores is out of S1 scope,
+    so it is not consulted here.
+
+    Raises whatever ``RiskManager`` raises — the caller must let that propagate
+    so an unevaluatable gate fails closed (R3).
+    """
+    return HaltCause.RISK_BREACH if RiskManager().is_trading_halted() else None
+
+
+def get_risk_gate():
+    """FastAPI dependency: the ENTRY pre-submit risk gate (P0-05).
+
+    Used by ``place-order``, which carries no position proof: an order that
+    cannot be shown to reduce exposure is ENTRY, and every halt blocks it
+    (P0-07 S1 R1). Reuses the existing production ``RiskManager`` as-is. If
     ``RiskManager()`` construction or ``is_trading_halted()`` raises (e.g. Redis
     unreachable), the exception propagates and ``reserve_and_submit`` fails closed.
     Overridable in tests via ``app.dependency_overrides``.
     """
     def risk_gate():
-        if RiskManager().is_trading_halted():
+        if not is_allowed(_halt_cause(), OperationClass.ENTRY):
+            raise RiskDenied("trading halted by RiskManager")
+
+    return risk_gate
+
+
+def get_exit_risk_gate():
+    """FastAPI dependency: the EXIT pre-submit risk gate (P0-07 S1, Policy B).
+
+    Used by ``close-position`` only. A halt must stop new risk without removing
+    the ability to reduce risk already held — trapping a user in a position
+    during a drawdown halt is what this gate exists to prevent.
+
+    This is safe *because the caller has already proven the exit*: the handler
+    looks up the live held quantity, rejects an over-close outright, and refuses
+    to price off anything but a live quote, all before reserving. The gate is
+    still evaluated on every call so that an unevaluatable halt state (Redis
+    down) fails closed exactly like the ENTRY gate (R3).
+    """
+    def risk_gate():
+        if not is_allowed(_halt_cause(), OperationClass.EXIT):
             raise RiskDenied("trading halted by RiskManager")
 
     return risk_gate
@@ -303,7 +339,7 @@ def close_position(
     idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
-    risk_gate=Depends(get_risk_gate),
+    risk_gate=Depends(get_exit_risk_gate),
 ):
     """Close an open position through the hardened order path (P0-07C).
 

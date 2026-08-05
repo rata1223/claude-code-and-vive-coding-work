@@ -639,8 +639,9 @@ class TestClosePositionGapClosed:
                             lambda client: _FakeMarketData())
 
         from api.main import app
-        from api.routers.quick_trade import get_risk_gate
-        app.dependency_overrides[get_risk_gate] = lambda: (lambda: None)
+        # close-position runs the EXIT gate (P0-07 S1), not the ENTRY gate.
+        from api.routers.quick_trade import get_exit_risk_gate
+        app.dependency_overrides[get_exit_risk_gate] = lambda: (lambda: None)
         try:
             res = client.post(
                 "/api/quick-trade/close-position",
@@ -654,7 +655,7 @@ class TestClosePositionGapClosed:
                 },
             )
         finally:
-            app.dependency_overrides.pop(get_risk_gate, None)
+            app.dependency_overrides.pop(get_exit_risk_gate, None)
 
         assert res.status_code == 200          # no longer a validation failure
         body = res.json()
