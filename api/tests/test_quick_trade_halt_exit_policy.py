@@ -63,7 +63,10 @@ def test_entry_gate_fails_closed_when_evaluation_raises(patch_rm):
     """R3: a gate that cannot evaluate must not let the order through. The
     exception propagates and reserve_and_submit records QT_BLOCKED."""
     patch_rm(exc=RuntimeError("redis unreachable"))
-    with pytest.raises(Exception):
+    # Narrow on purpose: RiskDenied would also satisfy `Exception`, and a gate
+    # that converted an unevaluatable halt into a clean deny is a different
+    # (and wrong) outcome from propagating.
+    with pytest.raises(RuntimeError, match="redis unreachable"):
         quick_trade.get_risk_gate()()
 
 
@@ -86,7 +89,7 @@ def test_exit_gate_allows_a_proven_exit_during_a_risk_halt(patch_rm):
 def test_exit_gate_fails_closed_when_evaluation_raises(patch_rm):
     """R3 applies to exits too — an unevaluatable gate blocks."""
     patch_rm(exc=RuntimeError("redis unreachable"))
-    with pytest.raises(Exception):
+    with pytest.raises(RuntimeError, match="redis unreachable"):
         quick_trade.get_exit_risk_gate()()
 
 

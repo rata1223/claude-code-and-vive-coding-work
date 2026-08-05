@@ -111,7 +111,13 @@ def prove_exit(
     """
     if isinstance(qty, bool) or not isinstance(qty, (int, float)):
         return False, f"수량이 숫자가 아님: {qty!r}"
-    if not math.isfinite(float(qty)) or qty <= 0:
+    try:
+        qty_f = float(qty)
+    except (OverflowError, ValueError):
+        # An int too large to convert must still be a BLOCK, not an escaping
+        # exception — the "any failure is a BLOCK" contract has no exceptions.
+        return False, f"수량이 표현 범위를 초과: {qty!r}"
+    if not math.isfinite(qty_f) or qty_f <= 0:
         return False, f"수량이 양수가 아님: {qty!r}"
 
     try:

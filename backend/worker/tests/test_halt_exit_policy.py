@@ -138,6 +138,26 @@ def test_exit_proof_never_clamps():
     assert proven is False
 
 
+def test_exit_proof_rejects_unconvertible_qty_without_raising():
+    """float() on a huge int raises OverflowError. "Any failure is a BLOCK" has
+    no exceptions — it must come back as a rejection, not escape into the
+    strategy loop."""
+    broker = _FakeBroker(positions=[_pos(qty=10)])
+    proven, reason = prove_exit(broker.get_positions, "SPY", 10 ** 400)
+    assert proven is False and reason
+
+
+def test_unconvertible_qty_blocks_the_sell_without_raising(strat):
+    SAFE_MODE.disable("MDD", cause=HaltCause.RISK_BREACH)
+    broker = _FakeBroker(positions=[_pos(qty=10)])
+    strat._broker = broker
+
+    result = strat.sell("SPY", 10 ** 400, price=100.0)   # must not raise
+
+    assert result.status == OrderStatus.REJECTED
+    assert broker.placed == []
+
+
 # ── 3. Worker gate: ENTRY blocked under every halt ───────────────────────────
 
 @pytest.mark.parametrize("cause", list(HaltCause))
