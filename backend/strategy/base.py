@@ -10,26 +10,75 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _live_trade_allowed(broker, name: str, symbol: str, side: str):
+def _live_trade_allowed(broker, name: str, symbol: str, side: str,
+                        qty=None, price=None):
     """
     Returns (allowed: bool, rejected_order_or_None).
     Only enforced when broker.is_live is True (KISBroker).
     Skipped entirely for SimulatedBroker (backtests, dry-runs).
+
+    P0-07 S1 (Policy B): a halt blocks the creation of new risk but not its
+    reduction. A buy is always ENTRY. A sell counts as EXIT only when a *live*
+    position lookup proves it reduces an existing long (0 < qty <= held_qty);
+    otherwise it is treated as ENTRY and blocked (R1). Under UNTRUSTED_STATE
+    even a proven exit is blocked, because the position data behind the proof
+    is exactly what cannot be trusted. Any failure while evaluating the gate
+    fails closed (R3).
     """
     from backend.brokers.models import Order, OrderStatus
+    from backend.risk.halt_policy import (
+        HaltCause, OperationClass, is_allowed, is_valid_execution_price, prove_exit,
+    )
+
+    def _reject():
+        return False, Order(id="", symbol=symbol, side=side, qty=0,
+                            price=0, status=OrderStatus.REJECTED)
+
     if not getattr(broker, "is_live", True):
         return True, None
 
     # 1. SAFE_MODE gate (startup recovery must complete first)
     try:
         from backend.worker.recovery import SAFE_MODE
-        if not SAFE_MODE.can_trade:
-            logger.warning("[%s] SAFE_MODE — %s 차단: %s (%s)",
-                           name, side, symbol, SAFE_MODE._reason)
-            return False, Order(id="", symbol=symbol, side=side, qty=0,
-                                price=0, status=OrderStatus.REJECTED)
+        cause = SAFE_MODE.halt_cause
     except ImportError:
-        pass  # not running in worker context
+        cause = None  # not running in worker context
+
+    if cause is not None:
+        # Classify the operation. Only a proven risk-reducing sell is EXIT.
+        op = OperationClass.ENTRY
+        proof_reason = ""
+        if side == "sell":
+            proven, proof_reason = prove_exit(
+                getattr(broker, "get_positions", None) or (lambda: []), symbol, qty
+            )
+            if proven:
+                op = OperationClass.EXIT
+
+        if not is_allowed(cause, op):
+            logger.warning("[%s] SAFE_MODE[%s] — %s %s 차단 (%s)%s",
+                           name, cause.value, side, symbol, op.value,
+                           f": {proof_reason}" if proof_reason else "")
+            return _reject()
+
+        # A stale feed may still be exited, but only at a validated live price
+        # (P0-07 G2 rules) — never at a stale, missing or fabricated one.
+        if cause is HaltCause.DEGRADED_FEED and op is OperationClass.EXIT:
+            resolved = price
+            if resolved is None:
+                try:
+                    resolved = broker.get_price(symbol)
+                except Exception as e:  # noqa: BLE001 - no quote, no order
+                    logger.warning("[%s] DEGRADED_FEED — %s 시세 조회 실패, 매도 차단: %s",
+                                   name, symbol, e)
+                    return _reject()
+            if not is_valid_execution_price(resolved):
+                logger.warning("[%s] DEGRADED_FEED — %s 유효 실행가 없음(%r), 매도 차단",
+                               name, symbol, resolved)
+                return _reject()
+
+        logger.warning("[%s] SAFE_MODE[%s] — %s %s 허용 (위험 감소)",
+                       name, cause.value, side, symbol)
 
     # 2. Shadow execution gate (ENABLE_LIVE_TRADING env var)
     if os.environ.get("ENABLE_LIVE_TRADING", "false").lower() != "true":
@@ -101,7 +150,8 @@ class StrategyBase(ABC):
     def buy(self, symbol: str, qty: int, price: Optional[float] = None, order_type: str = "limit"):
         from backend.brokers.models import Order, OrderStatus
         from backend.brokers.validator import BrokerCapabilityValidator, OrderRequest, UnsupportedCapabilityError
-        allowed, rejected = _live_trade_allowed(self._broker, self.name, symbol, "buy")
+        allowed, rejected = _live_trade_allowed(self._broker, self.name, symbol, "buy",
+                                                qty=qty, price=price)
         if not allowed:
             return rejected
         if price is None:
@@ -124,7 +174,8 @@ class StrategyBase(ABC):
     def sell(self, symbol: str, qty: int, price: Optional[float] = None, order_type: str = "limit"):
         from backend.brokers.models import Order, OrderStatus
         from backend.brokers.validator import BrokerCapabilityValidator, OrderRequest, UnsupportedCapabilityError
-        allowed, rejected = _live_trade_allowed(self._broker, self.name, symbol, "sell")
+        allowed, rejected = _live_trade_allowed(self._broker, self.name, symbol, "sell",
+                                                qty=qty, price=price)
         if not allowed:
             return rejected
         if price is None:

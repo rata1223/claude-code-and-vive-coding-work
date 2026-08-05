@@ -275,10 +275,15 @@ class LossTracker:
 
     def _fire_kill_switch_alert(self, reason: str) -> None:
         """Telegram + WebSocket 동시 발행 — 실패해도 킬스위치 자체는 영향 없음."""
-        # Disable SAFE_MODE first so all subsequent buy()/sell() calls are blocked
+        # Disable SAFE_MODE first so all subsequent *entries* are blocked.
+        # P0-07 S1: this is a RISK_BREACH, not untrusted state — position data
+        # is still reliable, the exposure is the problem. Declaring the cause is
+        # what lets stop-losses and other proven risk-reducing exits keep
+        # running; blocking them would freeze the book at maximum drawdown.
         try:
+            from backend.risk.halt_policy import HaltCause
             from backend.worker.recovery import SAFE_MODE
-            SAFE_MODE.disable(f"킬스위치: {reason}")
+            SAFE_MODE.disable(f"킬스위치: {reason}", cause=HaltCause.RISK_BREACH)
         except Exception as e:
             logger.warning("SAFE_MODE 비활성화 실패: %s", e)
         try:
