@@ -2,6 +2,7 @@ import dataclasses
 from dataclasses import dataclass, field
 from datetime import time
 from enum import Enum
+from typing import Optional
 
 
 class Market(str, Enum):
@@ -92,6 +93,13 @@ class Position:
     avg_price: float
     market: str  # "KR" | "US"
     current_price: float = 0.0
+    #: How much of ``qty`` the broker will actually let us sell right now
+    #: (P0-07 S2). ``None`` means the broker reported no orderable figure —
+    #: callers must fail closed rather than fall back to ``qty``, since held
+    #: shares can be unsettled or already committed to a resting sell order.
+    #: Adapters where held is sellable by construction (the simulator, the
+    #: in-memory tracker) set this equal to ``qty``.
+    sellable_qty: Optional[int] = None
 
     @property
     def unrealized_pnl(self) -> float:
