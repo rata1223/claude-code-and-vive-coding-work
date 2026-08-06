@@ -21,6 +21,7 @@ from api.services.quick_trade_service import (
 from backend.brokers.semantic_mapper import KIS_DOMESTIC_MAPPER, KIS_OVERSEAS_MAPPER
 from strategy.risk import RiskManager
 from backend.risk.halt_policy import HaltCause, OperationClass, is_allowed
+from backend.risk.sellable_qty import validate_sell_qty
 
 logger = logging.getLogger(__name__)
 
@@ -335,6 +336,20 @@ def place_order(
             return Resp.err(f"price must be greater than 0 (got {body.price})")
         if market == "kr" and int(body.price) <= 0:
             return Resp.err(f"KR price would truncate to 0 (got {body.price})")
+
+        # P0-07 S2: a direct sell may not exceed what the broker will actually
+        # sell. Held is not sellable — shares can be unsettled or already
+        # committed to a resting order. Buys are unaffected.
+        if body.side.lower() == "sell":
+            _, _, portfolio = _load_kis(cred)
+            try:
+                sellable = _live_sellable(portfolio, body.symbol, market)
+            except Exception as e:
+                logger.warning("sellable lookup failed %s: %s", body.symbol, e)
+                return Resp.err(f"Sellable lookup failed for {body.symbol}: {e}")
+            ok, why = validate_sell_qty(qty, sellable)
+            if not ok:
+                return Resp.err(why)
 
         req = {
             "symbol": body.symbol, "side": body.side, "qty": float(qty),

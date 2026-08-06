@@ -217,3 +217,90 @@ def test_t10_pending_reservation_is_recomputed_from_durable_rows(monkeypatch, db
     resp = quick_trade.close_position(_body(qty=7), None, user, db, _allow())
 
     assert resp.code == -1 and orders.calls == []
+
+
+# ── T5: a direct/manual SELL cannot exceed sellable either ───────────────────
+
+def _place_body(**kw):
+    from api.schemas import PlaceOrderRequest
+    payload = {"credential_id": 1, "symbol": "AAPL", "side": "sell", "qty": 5,
+               "price": 175.5, "market": "us", "exchange": "NASD"}
+    payload.update(kw)
+    return PlaceOrderRequest(**payload)
+
+
+class _PlaceOrders:
+    """Records both sides. The close-position module's fake refuses buys by
+    design, so place-order needs its own."""
+
+    def __init__(self):
+        self.calls = []
+
+    def _record(self, name, *args):
+        self.calls.append((name, *args))
+        return {"output": {"ODNO": "BRK-1"}}
+
+    def sell_us(self, symbol, excd, qty, price):
+        return self._record("sell_us", symbol, excd, qty, price)
+
+    def buy_us(self, symbol, excd, qty, price):
+        return self._record("buy_us", symbol, excd, qty, price)
+
+    def sell_kr(self, symbol, qty, price):
+        return self._record("sell_kr", symbol, qty, price)
+
+    def buy_kr(self, symbol, qty, price):
+        return self._record("buy_kr", symbol, qty, price)
+
+
+def _wire_place(monkeypatch, portfolio, orders=None):
+    orders = orders or _PlaceOrders()
+    monkeypatch.setattr(quick_trade, "_load_kis",
+                        lambda cred: (object(), orders, portfolio))
+    return orders
+
+
+def test_t5_direct_sell_within_sellable_is_accepted(monkeypatch, db, user):
+    orders = _wire_place(monkeypatch, FakePortfolio(us=_us_row(held="10", orderable="10")))
+
+    resp = quick_trade.place_order(_place_body(qty=5), None, user, db, _allow())
+
+    assert resp.code == 1, resp.msg
+    assert orders.calls == [("sell_us", "AAPL", "NASD", 5, 175.5)]
+
+
+def test_t5_direct_sell_above_sellable_is_blocked(monkeypatch, db, user):
+    """10 held but only 4 orderable → a 5-share manual sell is refused."""
+    orders = _wire_place(monkeypatch, FakePortfolio(us=_us_row(held="10", orderable="4")))
+
+    resp = quick_trade.place_order(_place_body(qty=5), None, user, db, _allow())
+
+    assert resp.code == -1
+    assert "매도가능수량 초과" in resp.msg or "sellable" in resp.msg.lower()
+    assert orders.calls == []                    # broker never contacted
+
+
+def test_t5_direct_sell_with_unreported_orderable_fails_closed(monkeypatch, db, user):
+    orders = _wire_place(monkeypatch, FakePortfolio(us=_us_row(held="10", orderable=None)))
+
+    resp = quick_trade.place_order(_place_body(qty=1), None, user, db, _allow())
+
+    assert resp.code == -1 and orders.calls == []
+
+
+def test_t5_direct_sell_of_an_unheld_symbol_is_blocked(monkeypatch, db, user):
+    orders = _wire_place(monkeypatch, FakePortfolio(us=[]))
+
+    resp = quick_trade.place_order(_place_body(qty=1), None, user, db, _allow())
+
+    assert resp.code == -1 and orders.calls == []
+
+
+def test_t5_buys_are_unaffected_by_the_sellable_guard(monkeypatch, db, user):
+    """The guard is sell-only — a buy must not need a position at all."""
+    orders = _wire_place(monkeypatch, FakePortfolio(us=[]))
+
+    resp = quick_trade.place_order(_place_body(side="buy", qty=5), None, user, db, _allow())
+
+    assert resp.code == 1, resp.msg
+    assert orders.calls == [("buy_us", "AAPL", "NASD", 5, 175.5)]

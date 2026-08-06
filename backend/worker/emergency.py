@@ -267,7 +267,7 @@ class EmergencyFlattenManager:
                 results["failed"].append(f"{pos.symbol}: {e}")
                 self.last_failed_count += 1
                 self._audit("emergency_flatten_failed", symbol=pos.symbol,
-                            detail={"qty": pos.qty, "price": price, "error": str(e)})
+                            detail={"qty": sell_qty, "price": price, "error": str(e)})
 
         self._alert(reason, results)
         self._audit("emergency_flatten_complete",
