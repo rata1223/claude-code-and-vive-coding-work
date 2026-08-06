@@ -31,6 +31,16 @@ logger = logging.getLogger(__name__)
 #: must fail closed — never substitute the held quantity.
 UNKNOWN = None
 
+#: Why a result is not ``known``. Both are a BLOCK on every ordinary sell path;
+#: they are distinguished because EmergencyFlatten treats them differently and
+#: because they are different forensic events.
+#:   ``UNREPORTED`` — the broker returned no orderable figure at all (field
+#:                    absent/empty; e.g. a KIS response-shape change).
+#:   ``UNTRUSTED``  — a figure was returned but could not be read as an exact,
+#:                    finite, non-negative share count.
+CAUSE_UNREPORTED = "unreported"
+CAUSE_UNTRUSTED = "untrusted"
+
 
 @dataclass(frozen=True)
 class SellableResult:
@@ -38,10 +48,13 @@ class SellableResult:
 
     ``qty is None`` means the answer is unknown, which is always a BLOCK.
     ``reason`` explains an unknown, or records how a known figure was derived.
+    ``cause`` is the machine-readable counterpart of ``reason`` for an unknown
+    (``CAUSE_UNREPORTED`` / ``CAUSE_UNTRUSTED``); it is ``None`` when known.
     """
 
     qty: Optional[int]
     reason: str = ""
+    cause: Optional[str] = None
 
     @property
     def known(self) -> bool:
@@ -88,21 +101,25 @@ def resolve_sellable(
     """
     held = _as_count(held_qty)
     if held is None:
-        return SellableResult(None, f"보유 수량을 신뢰할 수 없음: {held_qty!r}")
+        return SellableResult(None, f"보유 수량을 신뢰할 수 없음: {held_qty!r}",
+                              CAUSE_UNTRUSTED)
 
     if broker_sellable is UNKNOWN:
         return SellableResult(
             None,
             "브로커가 주문가능수량을 보고하지 않음 — 보유수량으로 대체하지 않고 차단",
+            CAUSE_UNREPORTED,
         )
 
     orderable = _as_count(broker_sellable)
     if orderable is None:
-        return SellableResult(None, f"주문가능수량을 신뢰할 수 없음: {broker_sellable!r}")
+        return SellableResult(None, f"주문가능수량을 신뢰할 수 없음: {broker_sellable!r}",
+                              CAUSE_UNTRUSTED)
 
     pending = _as_count(pending_sell_qty)
     if pending is None:
-        return SellableResult(None, f"대기 매도 수량을 신뢰할 수 없음: {pending_sell_qty!r}")
+        return SellableResult(None, f"대기 매도 수량을 신뢰할 수 없음: {pending_sell_qty!r}",
+                              CAUSE_UNTRUSTED)
 
     # A broker reporting more orderable than held is inconsistent; trust the
     # smaller number rather than over-asking.
@@ -158,9 +175,17 @@ def sellable_from_position(position, pending_sell_qty=0,
     )
 
 
-#: Quick Trade order statuses that still hold quantity at (or on the way to)
-#: the broker. Terminal states release it.
-_OPEN_SELL_STATUSES = frozenset({"reserved", "submitted"})
+#: Quick Trade order statuses that have *released* their quantity. Mirrors
+#: ``QT_REJECTED``/``QT_FAILED``/``QT_BLOCKED`` in ``api/models.py``; this module
+#: stays import-free by design, so the values are repeated rather than imported.
+#:
+#: The set is written as the terminal states, not the open ones, so that the
+#: default is fail-closed: any status this module does not recognise — a
+#: renamed constant, or a non-terminal state added later such as a
+#: partially-filled one — is assumed to still hold quantity. Listing the open
+#: states instead would make both of those silently report 0 pending, which
+#: permits an over-ask.
+_RELEASED_SELL_STATUSES = frozenset({"rejected", "failed", "blocked"})
 
 
 def pending_sell_qty_from_rows(rows: Iterable[Sequence], symbol: str) -> int:
@@ -168,7 +193,9 @@ def pending_sell_qty_from_rows(rows: Iterable[Sequence], symbol: str) -> int:
 
     ``rows`` are ``(symbol, side, qty, status)`` tuples — typically
     ``quick_trade_orders`` records. Only non-terminal sells for this symbol
-    count; ``rejected``/``failed``/``blocked`` released their quantity.
+    count; ``rejected``/``failed``/``blocked`` released their quantity. An
+    unrecognised status counts as still holding quantity (see
+    ``_RELEASED_SELL_STATUSES``).
 
     Raises :class:`ValueError` on a row whose quantity cannot be read: an
     unreadable pending row means we cannot bound our own outstanding exposure,
@@ -182,7 +209,7 @@ def pending_sell_qty_from_rows(rows: Iterable[Sequence], symbol: str) -> int:
             continue
         if (side or "").lower() != "sell":
             continue
-        if (status or "").lower() not in _OPEN_SELL_STATUSES:
+        if (status or "").lower() in _RELEASED_SELL_STATUSES:
             continue
         counted = _as_count(qty)
         if counted is None:

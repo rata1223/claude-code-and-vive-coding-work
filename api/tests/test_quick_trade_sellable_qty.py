@@ -304,3 +304,92 @@ def test_t5_buys_are_unaffected_by_the_sellable_guard(monkeypatch, db, user):
 
     assert resp.code == 1, resp.msg
     assert orders.calls == [("buy_us", "AAPL", "NASD", 5, 175.5)]
+
+
+def test_t5_direct_sell_subtracts_our_own_pending_sells(monkeypatch, db, user):
+    """10 orderable, 6 already committed to an open sell → a 5-share direct
+    sell is refused. The broker figure lags a resting order, so without this
+    subtraction two consecutive full-size sells would both pass."""
+    _seed_open_sell(db, user, qty=6, status=QT_SUBMITTED)
+    orders = _wire_place(monkeypatch, FakePortfolio(us=_us_row(held="10", orderable="10")))
+
+    resp = quick_trade.place_order(_place_body(qty=5), None, user, db, _allow())
+
+    assert resp.code == -1
+    assert "대기매도" in resp.msg or "pending" in resp.msg.lower()
+    assert orders.calls == []
+
+
+def test_t5_direct_sell_within_the_remaining_quantity_is_accepted(monkeypatch, db, user):
+    _seed_open_sell(db, user, qty=6, status=QT_SUBMITTED)
+    orders = _wire_place(monkeypatch, FakePortfolio(us=_us_row(held="10", orderable="10")))
+
+    resp = quick_trade.place_order(_place_body(qty=4), None, user, db, _allow())
+
+    assert resp.code == 1, resp.msg
+    assert orders.calls == [("sell_us", "AAPL", "NASD", 4, 175.5)]
+
+
+def test_t5_direct_sell_retry_is_not_blocked_by_its_own_reservation(monkeypatch, db, user):
+    """The replay must not count the row it is replaying as somebody else's."""
+    orders = _wire_place(monkeypatch, FakePortfolio(us=_us_row(held="10", orderable="10")))
+
+    first = quick_trade.place_order(_place_body(qty=10), "fixed-key", user, db, _allow())
+    second = quick_trade.place_order(_place_body(qty=10), "fixed-key", user, db, _allow())
+
+    assert first.code == 1 and second.code == 1, (first.msg, second.msg)
+    assert len(orders.calls) == 1                # exactly one broker submission
+
+
+# ── Pending lookup is case-insensitive ───────────────────────────────────────
+
+def test_pending_sell_is_matched_regardless_of_symbol_case(db, user):
+    """Symbol and side are persisted verbatim from the request, so a lowercase
+    order and an uppercase one describe one holding. Matching exactly would
+    under-report pending and admit an over-ask."""
+    _seed_open_sell(db, user, qty=4, status=QT_SUBMITTED, key="lower", symbol="aapl")
+
+    assert quick_trade._open_sell_qty(db, user.id, "AAPL") == 4
+    assert quick_trade._open_sell_qty(db, user.id, "aapl") == 4
+
+
+def test_differently_cased_pending_sell_still_reserves_on_the_close(monkeypatch, db, user):
+    _seed_open_sell(db, user, qty=4, status=QT_SUBMITTED, key="lower", symbol="aapl")
+    orders, _, _ = _wire(monkeypatch,
+                         portfolio=FakePortfolio(us=_us_row(held="10", orderable="10")),
+                         market_data=FakeMarketData(price=175.5))
+
+    resp = quick_trade.close_position(_body(qty=7), None, user, db, _allow())
+
+    assert resp.code == -1                       # 10 sellable - 4 pending = 6
+    assert orders.calls == []
+
+
+def test_pending_sell_side_is_matched_regardless_of_case(db, user):
+    db.add(QuickTradeOrder(
+        user_id=user.id, credential_id=1, idempotency_key="upper-side",
+        request_hash="h-upper-side", symbol="AAPL", side="SELL", market="us",
+        exchange="NASD", order_type="limit", qty=4, price=175.5,
+        status=QT_SUBMITTED,
+    ))
+    db.commit()
+
+    assert quick_trade._open_sell_qty(db, user.id, "AAPL") == 4
+
+
+# ── Zero orderable is not the same answer as no position ─────────────────────
+
+def test_zero_orderable_is_reported_as_nothing_sellable_not_no_position(
+        monkeypatch, db, user):
+    """Telling an operator mid-close that a position they hold does not exist
+    is a different — and worse — answer than 'none of it can be sold yet'."""
+    orders, _, _ = _wire(monkeypatch,
+                         portfolio=FakePortfolio(us=_us_row(held="10", orderable="0")),
+                         market_data=FakeMarketData(price=175.5))
+
+    resp = quick_trade.close_position(_body(), None, user, db, _allow())
+
+    assert resp.code == -1
+    assert "no sellable quantity" in resp.msg.lower()
+    assert "no open position" not in resp.msg.lower()
+    assert orders.calls == []

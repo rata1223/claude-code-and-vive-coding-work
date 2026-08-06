@@ -138,6 +138,16 @@ def prove_exit(
     # holding. Unsettled shares and quantity already committed to a resting
     # order are held but not sellable, and an exit proved against `held` would
     # over-ask. An unknown orderable figure is a BLOCK, never a fallback.
+    #
+    # No `pending_sell_qty` term here, deliberately. On this path a duplicate
+    # sell is prevented one layer up by the per-symbol pending lock —
+    # `PositionTracker.try_mark_pending` (backend/execution/position_tracker.py),
+    # claimed at backend/strategy/indicator/strategy.py before the sell and
+    # released on fill — so a second sell for the same symbol cannot start.
+    # The positions this resolves against come from that same tracker, which
+    # models no settlement or broker-side reservation and therefore reports no
+    # independent pending figure to subtract. Giving this module a pending
+    # source would make a deliberately pure, stateless policy stateful.
     from backend.risk.sellable_qty import sellable_from_position, validate_sell_qty
 
     sellable = sellable_from_position(match)

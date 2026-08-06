@@ -11,6 +11,8 @@ emergency that rejection is indistinguishable from "we liquidated".
 
 Per-path enforcement (T4–T7, T12) lives with each path's own suite.
 """
+import dataclasses
+
 import pytest
 
 from backend.brokers.models import Position
@@ -212,7 +214,7 @@ def test_t11_resolution_is_pure_and_repeatable():
 def test_t11_result_is_immutable():
     res = resolve_sellable(held_qty=10, broker_sellable=10)
     assert isinstance(res, SellableResult)
-    with pytest.raises(Exception):
+    with pytest.raises(dataclasses.FrozenInstanceError):
         res.qty = 999          # type: ignore[misc]
 
 

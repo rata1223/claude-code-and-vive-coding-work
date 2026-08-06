@@ -2,6 +2,7 @@ import os
 import logging
 import threading
 import time
+from decimal import Decimal, InvalidOperation
 from .base import BrokerAdapter
 from .capabilities import KIS_LIVE_CAPABILITIES, KIS_PAPER_CAPABILITIES
 from .models import Balance, BrokerCapabilities, Order, OrderStatus, Position
@@ -42,17 +43,24 @@ _ORDERABLE_FIELD = "ord_psbl_qty"
 
 
 def _orderable_qty(row: dict, held: int):
+    """Parse ``ord_psbl_qty`` into an exact share count, or ``None``.
+
+    Parsed with ``Decimal`` rather than ``int(float(...))``: the latter accepts
+    ``True``, silently truncates ``"1.9"`` to 1, and lets ``"inf"`` raise
+    ``OverflowError`` out of ``get_positions()``. A quantity we cannot read
+    exactly is not a quantity — it must fail closed, not authorise a sell.
+    """
     raw = row.get(_ORDERABLE_FIELD)
-    if raw is None or raw == "":
+    if raw is None or raw == "" or isinstance(raw, bool):
         return None
     try:
-        value = int(float(raw))
-    except (TypeError, ValueError):
+        value = Decimal(str(raw))
+    except (InvalidOperation, TypeError, ValueError):
         return None
-    if value < 0:
+    if not value.is_finite() or value < 0 or value != value.to_integral_value():
         return None
     # Never report more orderable than held — the smaller number is the safe one.
-    return min(value, held)
+    return min(int(value), held)
 
 
 class KISBroker(BrokerAdapter):

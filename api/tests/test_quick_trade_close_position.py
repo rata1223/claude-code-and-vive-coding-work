@@ -150,7 +150,8 @@ def _body(**kw):
 
 # ``ord_psbl_qty`` is KIS's own orderable (매도가능) figure. P0-07 S2 made it the
 # authority on close quantity, so these rows state it; a row without it models a
-# broker that reports none, which fails closed (see test_close_position_sellable).
+# broker that reports none, which fails closed (see
+# api/tests/test_quick_trade_sellable_qty.py::test_unreported_orderable_blocks_the_close).
 US_POS = [{"ovrs_pdno": "AAPL", "ovrs_cblc_qty": "10", "ord_psbl_qty": "10",
            "pchs_avg_pric": "150.0"}]
 KR_POS = [{"pdno": "069500", "hldg_qty": "7", "ord_psbl_qty": "7",

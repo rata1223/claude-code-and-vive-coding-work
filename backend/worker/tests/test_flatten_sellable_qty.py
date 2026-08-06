@@ -161,3 +161,68 @@ def test_dry_run_reports_the_sellable_quantity_without_submitting(db_factory):
 
     assert broker.placed == []
     assert res["dry_run"] is True
+
+
+# ── Unreported vs unreadable are different failures ──────────────────────────
+
+class _FailingPriceBroker(_Broker):
+    def get_price(self, symbol):
+        raise RuntimeError("quote feed down")
+
+
+def test_untrusted_orderable_is_audited_separately_from_unreported(db_factory):
+    """A field the broker never sent and a field that came back unreadable want
+    different follow-up, so they must not share one audit event."""
+    broker = _Broker([_pos(symbol="SPY", qty=10, sellable="garbage")])
+    EmergencyFlattenManager(broker, db_factory, dry_run=False).flatten_all("t")
+
+    assert _audit(db_factory, "emergency_flatten_sellable_untrusted")
+    assert not _audit(db_factory, "emergency_flatten_sellable_unknown")
+
+
+def test_unreported_orderable_keeps_its_own_audit_event(db_factory):
+    broker = _Broker([_pos(symbol="SPY", qty=10, sellable=None)])
+    EmergencyFlattenManager(broker, db_factory, dry_run=False).flatten_all("t")
+
+    assert _audit(db_factory, "emergency_flatten_sellable_unknown")
+    assert not _audit(db_factory, "emergency_flatten_sellable_untrusted")
+
+
+def test_untrusted_orderable_still_falls_back_to_held(db_factory):
+    """Flatten is the one path where refusing to sell is the worse outcome:
+    freezing the last-resort liquidation over a malformed field is exactly what
+    the fallback exists to prevent. ``held`` is a real count from the same row."""
+    broker = _Broker([_pos(symbol="SPY", qty=10, sellable=float("nan"))])
+    res = EmergencyFlattenManager(broker, db_factory, dry_run=False).flatten_all("t")
+
+    assert broker.placed == [("SPY", "sell", 10, 100.0)]
+    assert res["submitted"] == 1
+
+
+# ── Shortfall is resolved before the quote ───────────────────────────────────
+
+def test_zero_sellable_is_reported_even_when_the_quote_also_fails(db_factory):
+    """Resolving the quantity after the price check would record only the price
+    failure and lose the shortfall entirely."""
+    broker = _FailingPriceBroker([_pos(symbol="SPY", qty=10, sellable=0)])
+    res = EmergencyFlattenManager(broker, db_factory, dry_run=False).flatten_all("t")
+
+    assert broker.placed == []
+    assert len(res["failed"]) == 1
+    assert "SPY" in res["failed"][0]
+    assert _audit(db_factory, "emergency_flatten_partial_sellable")
+
+
+def test_zero_sellable_skips_the_quote_request_entirely(db_factory):
+    class _CountingBroker(_Broker):
+        quotes = 0
+
+        def get_price(self, symbol):
+            type(self).quotes += 1
+            return 100.0
+
+    broker = _CountingBroker([_pos(symbol="SPY", qty=10, sellable=0)])
+    EmergencyFlattenManager(broker, db_factory, dry_run=False).flatten_all("t")
+
+    assert type(broker).quotes == 0
+    assert broker.placed == []

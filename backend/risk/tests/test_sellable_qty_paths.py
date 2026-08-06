@@ -181,3 +181,51 @@ def test_kis_adapter_parses_orderable_quantity():
     assert _orderable_qty({"ord_psbl_qty": ""}, held=10) is None
     assert _orderable_qty({"ord_psbl_qty": "oops"}, held=10) is None
     assert _orderable_qty({"ord_psbl_qty": "-1"}, held=10) is None
+
+
+def test_orderable_qty_rejects_values_it_cannot_read_exactly():
+    """``int(float(raw))`` accepted a bool, truncated "1.9" to 1, and let "inf"
+    raise OverflowError out of get_positions(). A count we cannot read exactly
+    must fail closed, not authorise a sell."""
+    from backend.brokers.kis import _orderable_qty
+
+    assert _orderable_qty({"ord_psbl_qty": True}, held=10) is None
+    assert _orderable_qty({"ord_psbl_qty": "1.9"}, held=10) is None
+    assert _orderable_qty({"ord_psbl_qty": 1.9}, held=10) is None
+    assert _orderable_qty({"ord_psbl_qty": "inf"}, held=10) is None
+    assert _orderable_qty({"ord_psbl_qty": "nan"}, held=10) is None
+    assert _orderable_qty({"ord_psbl_qty": float("inf")}, held=10) is None
+    assert _orderable_qty({"ord_psbl_qty": None}, held=10) is None
+
+
+def test_orderable_qty_still_reads_the_shapes_kis_actually_sends():
+    from backend.brokers.kis import _orderable_qty
+
+    assert _orderable_qty({"ord_psbl_qty": "7"}, held=10) == 7
+    assert _orderable_qty({"ord_psbl_qty": 7}, held=10) == 7
+    assert _orderable_qty({"ord_psbl_qty": "7.0"}, held=10) == 7
+    assert _orderable_qty({"ord_psbl_qty": "0"}, held=10) == 0
+
+
+def test_an_unrecognised_order_status_still_reserves_quantity():
+    """Listing the *open* statuses would make a renamed constant — or a
+    partially-filled state added later — silently report 0 pending, which
+    permits an over-ask. Only the terminal states release quantity."""
+    from backend.risk.sellable_qty import pending_sell_qty_from_rows
+
+    rows = [("AAPL", "sell", 4, "partially_filled")]
+    assert pending_sell_qty_from_rows(rows, "AAPL") == 4
+
+    for released in ("rejected", "failed", "blocked"):
+        assert pending_sell_qty_from_rows([("AAPL", "sell", 4, released)], "AAPL") == 0
+
+
+def test_unknown_sellable_causes_are_distinguishable():
+    from backend.risk.sellable_qty import (
+        CAUSE_UNREPORTED, CAUSE_UNTRUSTED, UNKNOWN, resolve_sellable,
+    )
+
+    assert resolve_sellable(10, UNKNOWN).cause == CAUSE_UNREPORTED
+    assert resolve_sellable(10, "garbage").cause == CAUSE_UNTRUSTED
+    assert resolve_sellable(10, float("nan")).cause == CAUSE_UNTRUSTED
+    assert resolve_sellable(10, 4).cause is None          # known → no cause

@@ -21,7 +21,7 @@ from api.services.quick_trade_service import (
 from backend.brokers.semantic_mapper import KIS_DOMESTIC_MAPPER, KIS_OVERSEAS_MAPPER
 from strategy.risk import RiskManager
 from backend.risk.halt_policy import HaltCause, OperationClass, is_allowed
-from backend.risk.sellable_qty import validate_sell_qty
+from backend.risk.sellable_qty import resolve_sellable, validate_sell_qty
 
 logger = logging.getLogger(__name__)
 
@@ -156,21 +156,24 @@ def _live_held_qty(portfolio, symbol: str, market: str) -> int:
 def _live_sellable(portfolio, symbol: str, market: str, pending_sell_qty: int = 0):
     """Resolve how much of ``symbol`` may actually be sold right now (P0-07 S2).
 
-    Returns a :class:`SellableResult`; an unknown figure fails closed rather
-    than falling back to the held quantity — only EmergencyFlatten does that.
+    Returns ``(SellableResult, held_qty)``. An unknown figure fails closed
+    rather than falling back to the held quantity — only EmergencyFlatten does
+    that. ``held_qty`` is returned alongside so a caller can tell "nothing is
+    sellable right now" from "there is no position", without a second broker
+    round trip.
     """
     from backend.risk.sellable_qty import UNKNOWN, resolve_sellable
 
     row = _live_position_row(portfolio, symbol, market)
     if not row:
         # No holding at all — a known zero, not an unreported figure.
-        return resolve_sellable(held_qty=0, broker_sellable=0)
+        return resolve_sellable(held_qty=0, broker_sellable=0), 0
     held = _int_field(row, _QTY_FIELD["kr" if market == "kr" else "us"]) or 0
     orderable = _int_field(row, _ORDERABLE_FIELD)
     if orderable is None:
         orderable = UNKNOWN
     return resolve_sellable(held_qty=held, broker_sellable=orderable,
-                            pending_sell_qty=pending_sell_qty)
+                            pending_sell_qty=pending_sell_qty), held
 
 
 def _open_sell_qty(db, user_id: int, symbol: str, exclude_key: Optional[str] = None) -> int:
@@ -183,7 +186,14 @@ def _open_sell_qty(db, user_id: int, symbol: str, exclude_key: Optional[str] = N
     idempotent retry would be blocked by its own reservation: the first call
     reserves the quantity, and the identical retry — which submits nothing and
     just returns the existing order — would look like a second ask.
+
+    Symbol and side are compared case-insensitively **in SQL**. Both are
+    persisted verbatim from the request, so ``aapl`` and ``AAPL`` produce two
+    rows for one holding; an exact match would sum only some of them, under-
+    report pending, and admit the over-ask this whole path exists to refuse.
     """
+    from sqlalchemy import func
+
     from api.models import QuickTradeOrder
     from backend.risk.sellable_qty import pending_sell_qty_from_rows
 
@@ -191,8 +201,8 @@ def _open_sell_qty(db, user_id: int, symbol: str, exclude_key: Optional[str] = N
         db.query(QuickTradeOrder.symbol, QuickTradeOrder.side,
                  QuickTradeOrder.qty, QuickTradeOrder.status)
         .filter(QuickTradeOrder.user_id == user_id,
-                QuickTradeOrder.symbol == symbol,
-                QuickTradeOrder.side == "sell")
+                func.upper(QuickTradeOrder.symbol) == (symbol or "").upper(),
+                func.lower(QuickTradeOrder.side) == "sell")
     )
     if exclude_key:
         q = q.filter(QuickTradeOrder.idempotency_key != exclude_key)
@@ -337,20 +347,6 @@ def place_order(
         if market == "kr" and int(body.price) <= 0:
             return Resp.err(f"KR price would truncate to 0 (got {body.price})")
 
-        # P0-07 S2: a direct sell may not exceed what the broker will actually
-        # sell. Held is not sellable — shares can be unsettled or already
-        # committed to a resting order. Buys are unaffected.
-        if body.side.lower() == "sell":
-            _, _, portfolio = _load_kis(cred)
-            try:
-                sellable = _live_sellable(portfolio, body.symbol, market)
-            except Exception as e:
-                logger.warning("sellable lookup failed %s: %s", body.symbol, e)
-                return Resp.err(f"Sellable lookup failed for {body.symbol}: {e}")
-            ok, why = validate_sell_qty(qty, sellable)
-            if not ok:
-                return Resp.err(why)
-
         req = {
             "symbol": body.symbol, "side": body.side, "qty": float(qty),
             "price": body.price, "market": market, "exchange": exchange,
@@ -359,6 +355,8 @@ def place_order(
 
         # Idempotency key: explicit header if the caller supplied one, else a
         # server-derived double-click fingerprint (no frontend change needed).
+        # Derived before the sell guard below, which needs it to exclude the row
+        # a retry is replaying.
         fp_args = dict(
             user_id=current_user.id, credential_id=body.credential_id,
             symbol=body.symbol, side=body.side, qty=float(qty), price=body.price,
@@ -367,12 +365,47 @@ def place_order(
         key = idempotency_key or derive_idempotency_key(**fp_args)
         req_hash = request_fingerprint(**fp_args)
 
+        # Built at most once per request and shared with broker_submit below —
+        # each _load_kis call decrypts four credential fields and constructs
+        # three clients. Lazy so a buy still builds them inside broker_submit,
+        # exactly as before: constructing them earlier would move a credential
+        # failure from "order failed" to "rejected before reservation".
+        _clients = []
+
+        def _kis():
+            if not _clients:
+                _clients.append(_load_kis(cred))
+            return _clients[0]
+
+        # P0-07 S2: a direct sell may not exceed what the broker will actually
+        # sell. Held is not sellable — shares can be unsettled or already
+        # committed to a resting order — and quantity already committed to our
+        # own open sells is subtracted on top, because the broker figure may not
+        # reflect a resting order yet. ``exclude_key`` keeps an idempotent retry
+        # from being blocked by its own reservation. Buys are unaffected.
+        if body.side.lower() == "sell":
+            try:
+                pending = _open_sell_qty(db, current_user.id, body.symbol,
+                                         exclude_key=key)
+            except ValueError as e:
+                return Resp.err(f"Pending sell lookup failed for {body.symbol}: {e}")
+            try:
+                _, _, portfolio = _kis()
+                sellable, _held = _live_sellable(portfolio, body.symbol, market,
+                                                 pending_sell_qty=pending)
+            except Exception as e:  # noqa: BLE001 - any lookup failure fails closed
+                logger.warning("sellable lookup failed %s: %s", body.symbol, e)
+                return Resp.err(f"Sellable lookup failed for {body.symbol}: {e}")
+            ok, why = validate_sell_qty(qty, sellable)
+            if not ok:
+                return Resp.err(f"{why} (대기매도 {pending})" if pending else why)
+
         mapper = KIS_DOMESTIC_MAPPER if market == "kr" else KIS_OVERSEAS_MAPPER
 
         def broker_submit():
             # The ONLY broker call site — invoked by the service strictly after
             # the reservation is committed, at most once per idempotency key.
-            _, orders, _ = _load_kis(cred)
+            _, orders, _ = _kis()
             if market == "kr":
                 if body.side.lower() == "buy":
                     return orders.buy_kr(body.symbol, qty, int(body.price))
@@ -446,21 +479,27 @@ def close_position(
         #    one. Shares can be unsettled or already committed to a resting
         #    sell order; asking for the full holding gets the order rejected.
         try:
-            sellable = _live_sellable(portfolio, body.symbol, market)
+            sellable, held_qty = _live_sellable(portfolio, body.symbol, market)
         except Exception as e:
             logger.warning("close position lookup failed %s: %s", body.symbol, e)
             return Resp.err(f"Position lookup failed for {body.symbol}: {e}")
         if not sellable.known:
             return Resp.err(f"Sellable quantity unavailable for {body.symbol}: "
                             f"{sellable.reason}")
-        held_qty = sellable.qty
-        if held_qty <= 0:
+        sellable_qty = sellable.qty
+        if sellable_qty <= 0:
+            # Holding nothing and holding something that cannot be sold right
+            # now are different answers. Reporting the second as the first tells
+            # an operator mid-close that their position is gone.
+            if held_qty > 0:
+                return Resp.err(f"No sellable quantity for {body.symbol}: "
+                                f"{sellable.reason}")
             return Resp.err(f"No open position for {body.symbol}")
 
         # 2. Quantity — omitted means close everything; an over-close is
         #    rejected outright, never silently clamped.
         if body.qty is None:
-            close_qty = held_qty
+            close_qty = sellable_qty
         else:
             requested = int(body.qty)
             if requested != body.qty:
@@ -471,9 +510,9 @@ def close_position(
                 )
             if requested <= 0:
                 return Resp.err("qty must be greater than 0")
-            if requested > held_qty:
+            if requested > sellable_qty:
                 return Resp.err(
-                    f"Requested qty exceeds sellable quantity: {requested} > {held_qty}"
+                    f"Requested qty exceeds sellable quantity: {requested} > {sellable_qty}"
                 )
             close_qty = requested
 
@@ -506,16 +545,22 @@ def close_position(
         # P0-07 S2: quantity already committed to our own open sells reserves
         # sellable quantity. The row this request replays is excluded, so an
         # idempotent retry is not blocked by its own reservation.
+        #
+        # Applied here rather than in the _live_sellable call above because
+        # ``exclude_key`` needs the idempotency key, which is derived from
+        # ``close_qty``, which needs the broker figure. Re-resolving through
+        # resolve_sellable keeps the subtraction rule in one place instead of
+        # reimplementing it against numbers already in hand.
         try:
             pending = _open_sell_qty(db, current_user.id, body.symbol, exclude_key=key)
         except ValueError as e:
             return Resp.err(f"Pending sell lookup failed for {body.symbol}: {e}")
-        if pending and close_qty > max(0, held_qty - pending):
-            return Resp.err(
-                f"Requested qty exceeds sellable quantity after pending sells: "
-                f"{close_qty} > {max(0, held_qty - pending)} "
-                f"(sellable {held_qty}, pending {pending})"
-            )
+        if pending:
+            net = resolve_sellable(held_qty=sellable_qty, broker_sellable=sellable_qty,
+                                   pending_sell_qty=pending)
+            ok, why = validate_sell_qty(close_qty, net)
+            if not ok:
+                return Resp.err(f"{why} — pending sells {pending}")
 
         mapper = KIS_DOMESTIC_MAPPER if market == "kr" else KIS_OVERSEAS_MAPPER
 
