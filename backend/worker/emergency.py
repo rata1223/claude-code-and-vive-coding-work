@@ -117,6 +117,51 @@ class EmergencyFlattenManager:
         # Returned verbatim — never rounded or clamped to make it pass.
         return value, None
 
+    def _sellable_for(self, pos) -> Tuple[int, Optional[str]]:
+        """How much of ``pos`` to actually submit, and any shortfall to report.
+
+        Held is not sellable — shares can be unsettled or already committed to a
+        resting order, and asking for the full holding gets the whole order
+        rejected (P0-07 S2). Two rules are specific to this path:
+
+        * **Shortfall**: sell what the broker says is orderable and report the
+          remainder. A partial liquidation using the broker's own number beats
+          no liquidation, and no quantity is invented.
+        * **Unknown**: EmergencyFlatten — and only EmergencyFlatten — falls back
+          to the held quantity, so a KIS field change can never freeze the
+          last-resort liquidation. Every other sell path fails closed. This
+          mirrors S1, where flatten is the one halt-immune path.
+        """
+        from backend.risk.sellable_qty import sellable_from_position
+
+        held = getattr(pos, "qty", 0) or 0
+        result = sellable_from_position(pos)
+
+        if not result.known:
+            logger.warning(
+                "[flatten] %s 주문가능수량 미확인 — 비상청산은 보유수량(%s)으로 진행: %s",
+                pos.symbol, held, result.reason,
+            )
+            self._audit("emergency_flatten_sellable_unknown", symbol=pos.symbol,
+                        detail={"held_qty": held, "cause": result.reason})
+            return held, None
+
+        sellable = result.qty
+        if sellable >= held:
+            return held, None
+
+        shortfall = held - sellable
+        logger.error(
+            "[flatten] %s 매도가능수량 부족 — 보유 %s 중 %s 만 제출, %s 미청산",
+            pos.symbol, held, sellable, shortfall,
+        )
+        self._audit("emergency_flatten_partial_sellable", symbol=pos.symbol,
+                    detail={"held_qty": held, "sellable_qty": sellable,
+                            "shortfall": shortfall, "cause": result.reason})
+        note = (f"매도가능수량 부족 — 보유 {held} 중 {sellable} 제출, "
+                f"{shortfall} 미청산")
+        return sellable, note
+
     def flatten_all(self, reason: str = "비상청산") -> dict:
         """
         모든 포지션 시장가 매도.
@@ -193,22 +238,30 @@ class EmergencyFlattenManager:
                             detail={"qty": pos.qty, "price": None, "cause": cause})
                 continue
 
+            # P0-07 S2: never ask for more than the broker will actually sell.
+            sell_qty, shortfall_note = self._sellable_for(pos)
+            if shortfall_note:
+                results["failed"].append(f"{pos.symbol}: {shortfall_note}")
+                self.last_failed_count += 1
+            if sell_qty <= 0:
+                continue
+
             if self._dry_run:
-                logger.critical("[DRY RUN] 비상청산: %s qty=%d @%.2f", pos.symbol, pos.qty, price)
+                logger.critical("[DRY RUN] 비상청산: %s qty=%d @%.2f", pos.symbol, sell_qty, price)
                 results["success"] += 1
                 self.last_success += 1
                 continue
 
             try:
-                order = self._broker.place_order(pos.symbol, "sell", pos.qty, price)
+                order = self._broker.place_order(pos.symbol, "sell", sell_qty, price)
                 logger.critical("비상청산 주문: %s qty=%d @%.2f id=%s",
-                                pos.symbol, pos.qty, price, order.id)
+                                pos.symbol, sell_qty, price, order.id)
                 results["success"] += 1
                 results["submitted"] += 1
                 self.last_success += 1
                 self.last_submitted += 1
                 self._audit("emergency_flatten_order", symbol=pos.symbol,
-                            detail={"qty": pos.qty, "price": price, "order_id": order.id})
+                            detail={"qty": sell_qty, "price": price, "order_id": order.id})
             except Exception as e:
                 logger.error("비상청산 실패 %s: %s", pos.symbol, e)
                 results["failed"].append(f"{pos.symbol}: {e}")

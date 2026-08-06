@@ -33,6 +33,28 @@ def get_kis_broker() -> "KISBroker":
     return _KIS_BROKER_INSTANCE
 
 
+# P0-07 S2: KIS reports how much of a holding is actually orderable
+# (주문가능수량) alongside the held quantity. The balance rows reach us
+# untouched, so the field is already in the payload — it was simply never read.
+# Absent or unreadable → ``None``, which makes callers fail closed rather than
+# fall back to the held quantity.
+_ORDERABLE_FIELD = "ord_psbl_qty"
+
+
+def _orderable_qty(row: dict, held: int):
+    raw = row.get(_ORDERABLE_FIELD)
+    if raw is None or raw == "":
+        return None
+    try:
+        value = int(float(raw))
+    except (TypeError, ValueError):
+        return None
+    if value < 0:
+        return None
+    # Never report more orderable than held — the smaller number is the safe one.
+    return min(value, held)
+
+
 class KISBroker(BrokerAdapter):
 
     @staticmethod
@@ -88,7 +110,9 @@ class KISBroker(BrokerAdapter):
                         cur = float(self._market.get_price_kr(sym))
                     except Exception:
                         cur = avg
-                    positions.append(Position(symbol=sym, qty=qty, avg_price=avg, market="KR", current_price=cur))
+                    positions.append(Position(symbol=sym, qty=qty, avg_price=avg,
+                                              market="KR", current_price=cur,
+                                              sellable_qty=_orderable_qty(p, qty)))
         except Exception as e:
             logger.warning("KR 포지션 조회 실패: %s", e)
 
@@ -104,7 +128,9 @@ class KISBroker(BrokerAdapter):
                         cur = self._market.get_price_us(sym, excd)
                     except Exception:
                         cur = avg
-                    positions.append(Position(symbol=sym, qty=qty, avg_price=avg, market="US", current_price=cur))
+                    positions.append(Position(symbol=sym, qty=qty, avg_price=avg,
+                                              market="US", current_price=cur,
+                                              sellable_qty=_orderable_qty(p, qty)))
         except Exception as e:
             logger.warning("US 포지션 조회 실패: %s", e)
 

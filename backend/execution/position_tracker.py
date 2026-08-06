@@ -23,6 +23,21 @@ class Fill:
     market: str  # KR/US
 
 
+
+def _with_sellable(pos):
+    """Stamp ``sellable_qty`` on a tracked position (P0-07 S2).
+
+    The tracker models no settlement or resting-order reservation, so every
+    tracked share is orderable. Applied at the read boundary because ``qty`` is
+    mutated in place as fills arrive — a value stamped at construction would go
+    stale. Callers must never see ``sellable_qty=None`` from here, since that
+    means "the broker did not say" and fails closed.
+    """
+    from dataclasses import replace
+    if pos is None:
+        return None
+    return replace(pos, sellable_qty=pos.qty)
+
 class PositionTracker:
     """
     체결 이벤트를 받아 인메모리 포지션을 유지.
@@ -44,11 +59,11 @@ class PositionTracker:
     # ── 포지션 조회 ────────────────────────────────────────────────────────
     def get_position(self, symbol: str) -> Optional[Position]:
         with self._lock:
-            return self._positions.get(symbol)
+            return _with_sellable(self._positions.get(symbol))
 
     def all_positions(self) -> list[Position]:
         with self._lock:
-            return list(self._positions.values())
+            return [_with_sellable(p) for p in self._positions.values()]
 
     # ── 중복 주문 방지 ────────────────────────────────────────────────────
     def can_place_order(self, symbol: str) -> bool:

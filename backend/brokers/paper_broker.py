@@ -178,7 +178,10 @@ class ScriptedPaperBroker(BrokerAdapter):
             out = []
             for p in self._positions.values():
                 price = self._prices.get(p.symbol, p.avg_price)
-                out.append(replace(p, current_price=price))
+                # P0-07 S2: the simulator models no settlement or reservation,
+                # so every held share is orderable. Stated explicitly at the
+                # read boundary (qty is mutated in place after construction).
+                out.append(replace(p, current_price=price, sellable_qty=p.qty))
             return out
 
     def get_price(self, symbol: str) -> float:
