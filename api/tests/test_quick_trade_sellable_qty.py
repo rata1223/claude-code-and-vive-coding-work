@@ -209,7 +209,7 @@ def test_t10_pending_reservation_is_recomputed_from_durable_rows(monkeypatch, db
     _seed_open_sell(db, user, qty=4, status=QT_RESERVED)
 
     # A fresh session over the same data == the post-restart view.
-    assert quick_trade._open_sell_qty(db, user.id, "AAPL") == 4
+    assert quick_trade._open_sell_qty(db, user.id, 1, "us", "AAPL") == 4
 
     orders, _, _ = _wire(monkeypatch,
                          portfolio=FakePortfolio(us=_us_row(held="10", orderable="10")),
@@ -349,8 +349,8 @@ def test_pending_sell_is_matched_regardless_of_symbol_case(db, user):
     under-report pending and admit an over-ask."""
     _seed_open_sell(db, user, qty=4, status=QT_SUBMITTED, key="lower", symbol="aapl")
 
-    assert quick_trade._open_sell_qty(db, user.id, "AAPL") == 4
-    assert quick_trade._open_sell_qty(db, user.id, "aapl") == 4
+    assert quick_trade._open_sell_qty(db, user.id, 1, "us", "AAPL") == 4
+    assert quick_trade._open_sell_qty(db, user.id, 1, "us", "aapl") == 4
 
 
 def test_differently_cased_pending_sell_still_reserves_on_the_close(monkeypatch, db, user):
@@ -374,7 +374,7 @@ def test_pending_sell_side_is_matched_regardless_of_case(db, user):
     ))
     db.commit()
 
-    assert quick_trade._open_sell_qty(db, user.id, "AAPL") == 4
+    assert quick_trade._open_sell_qty(db, user.id, 1, "us", "AAPL") == 4
 
 
 # ── Zero orderable is not the same answer as no position ─────────────────────
@@ -393,3 +393,50 @@ def test_zero_orderable_is_reported_as_nothing_sellable_not_no_position(
     assert "no sellable quantity" in resp.msg.lower()
     assert "no open position" not in resp.msg.lower()
     assert orders.calls == []
+
+
+# ── Pending reservations are scoped to one account and market ────────────────
+
+def _seed_scoped_sell(db, user, qty, key, credential_id=1, market="us", symbol="AAPL"):
+    db.add(QuickTradeOrder(
+        user_id=user.id, credential_id=credential_id, idempotency_key=key,
+        request_hash="h" + key, symbol=symbol, side="sell", market=market,
+        exchange="NASD", order_type="limit", qty=qty, price=175.5,
+        status=QT_SUBMITTED,
+    ))
+    db.commit()
+
+
+def test_pending_sell_on_another_credential_does_not_reserve(db, user):
+    """The broker figure it is subtracted from describes one account. Counting
+    a second account's resting sell against this one refuses a valid sell."""
+    _seed_scoped_sell(db, user, qty=9, key="other-cred", credential_id=2)
+
+    assert quick_trade._open_sell_qty(db, user.id, 1, "us", "AAPL") == 0
+    assert quick_trade._open_sell_qty(db, user.id, 2, "us", "AAPL") == 9
+
+
+def test_pending_sell_in_another_market_does_not_reserve(db, user):
+    """The same ticker can be held in both KR and US."""
+    _seed_scoped_sell(db, user, qty=9, key="other-market", market="kr")
+
+    assert quick_trade._open_sell_qty(db, user.id, 1, "us", "AAPL") == 0
+    assert quick_trade._open_sell_qty(db, user.id, 1, "kr", "AAPL") == 9
+
+
+def test_market_is_matched_regardless_of_case(db, user):
+    _seed_scoped_sell(db, user, qty=4, key="upper-market", market="US")
+
+    assert quick_trade._open_sell_qty(db, user.id, 1, "us", "AAPL") == 4
+
+
+def test_a_close_is_not_blocked_by_another_credentials_pending_sell(monkeypatch, db, user):
+    _seed_scoped_sell(db, user, qty=9, key="other-cred", credential_id=2)
+    orders, _, _ = _wire(monkeypatch,
+                         portfolio=FakePortfolio(us=_us_row(held="10", orderable="10")),
+                         market_data=FakeMarketData(price=175.5))
+
+    resp = quick_trade.close_position(_body(qty=10), None, user, db, _allow())
+
+    assert resp.code == 1, resp.msg
+    assert orders.calls == [("sell_us", "AAPL", "NASD", 10, 175.5)]

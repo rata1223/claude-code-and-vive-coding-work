@@ -176,7 +176,8 @@ def _live_sellable(portfolio, symbol: str, market: str, pending_sell_qty: int = 
                             pending_sell_qty=pending_sell_qty), held
 
 
-def _open_sell_qty(db, user_id: int, symbol: str, exclude_key: Optional[str] = None) -> int:
+def _open_sell_qty(db, user_id: int, credential_id: int, market: str, symbol: str,
+                   exclude_key: Optional[str] = None) -> int:
     """Quantity already committed to our own open SELL orders for ``symbol``.
 
     Reads the durable ``quick_trade_orders`` rows, so the figure survives a
@@ -186,6 +187,11 @@ def _open_sell_qty(db, user_id: int, symbol: str, exclude_key: Optional[str] = N
     idempotent retry would be blocked by its own reservation: the first call
     reserves the quantity, and the identical retry — which submits nothing and
     just returns the existing order — would look like a second ask.
+
+    Scoped to one ``credential_id`` and ``market``, because that is the scope
+    the broker figure it is subtracted from describes. The same ticker can be
+    held in two accounts, or in both KR and US; counting another account's
+    resting sell against this one would refuse a perfectly valid sell.
 
     Symbol and side are compared case-insensitively **in SQL**. Both are
     persisted verbatim from the request, so ``aapl`` and ``AAPL`` produce two
@@ -201,6 +207,8 @@ def _open_sell_qty(db, user_id: int, symbol: str, exclude_key: Optional[str] = N
         db.query(QuickTradeOrder.symbol, QuickTradeOrder.side,
                  QuickTradeOrder.qty, QuickTradeOrder.status)
         .filter(QuickTradeOrder.user_id == user_id,
+                QuickTradeOrder.credential_id == credential_id,
+                func.lower(QuickTradeOrder.market) == (market or "").lower(),
                 func.upper(QuickTradeOrder.symbol) == (symbol or "").upper(),
                 func.lower(QuickTradeOrder.side) == "sell")
     )
@@ -385,8 +393,8 @@ def place_order(
         # from being blocked by its own reservation. Buys are unaffected.
         if body.side.lower() == "sell":
             try:
-                pending = _open_sell_qty(db, current_user.id, body.symbol,
-                                         exclude_key=key)
+                pending = _open_sell_qty(db, current_user.id, body.credential_id,
+                                         market, body.symbol, exclude_key=key)
             except ValueError as e:
                 return Resp.err(f"Pending sell lookup failed for {body.symbol}: {e}")
             try:
@@ -552,7 +560,8 @@ def close_position(
         # resolve_sellable keeps the subtraction rule in one place instead of
         # reimplementing it against numbers already in hand.
         try:
-            pending = _open_sell_qty(db, current_user.id, body.symbol, exclude_key=key)
+            pending = _open_sell_qty(db, current_user.id, body.credential_id,
+                                     market, body.symbol, exclude_key=key)
         except ValueError as e:
             return Resp.err(f"Pending sell lookup failed for {body.symbol}: {e}")
         if pending:

@@ -64,6 +64,14 @@ The status filter names the **terminal** states (`rejected`/`failed`/`blocked`) 
 
 Symbol and side are matched **case-insensitively in SQL**. Both are persisted verbatim from the request, so `aapl` and `AAPL` produce two rows for one holding; an exact match would sum only some of them and under-report pending.
 
+The sum is scoped to one `credential_id` and `market` — the scope the broker figure it is subtracted from describes. The same ticker can be held in two accounts, or in both KR and US, and counting another account's resting sell against this one would refuse a valid sell.
+
+## Known residual: the check and the reservation are not one atomic step
+
+Both sell paths read the pending quantity, validate, and then call `reserve_and_submit`. Two concurrent sells carrying **different** idempotency keys can read the same pending figure, both pass, and both reserve. The `(user_id, idempotency_key)` unique constraint does not serialise them, because the keys differ.
+
+Not closed here: doing so needs a per-account position lock or a serialisable transaction spanning the read and the insert, which is precisely the "order persistence / idempotency transaction semantics" this task is scoped not to alter. Worth noting what the window actually is — before S2 there was **no** capacity check on either path at all, so this narrows a pre-existing hole rather than opening one, and the remaining exposure is two genuinely simultaneous distinct-key sells. The duplicate-click case, which is the common one, is still fully closed by the derived idempotency key. Fixing it properly belongs with whichever task owns the reservation transaction.
+
 The row a request would **replay is excluded** from that sum. Without that exclusion the first close reserves the quantity and the identical retry — which submits nothing and just returns the existing order — looks like a second ask and is refused. `broker_nets_pending=True` is available for a broker whose orderable figure already excludes resting orders, so it is not subtracted twice.
 
 ## Not changed
