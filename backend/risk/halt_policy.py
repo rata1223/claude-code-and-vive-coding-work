@@ -125,18 +125,23 @@ def prove_exit(
     except Exception as e:  # noqa: BLE001 - any lookup failure is fail-closed
         return False, f"포지션 조회 실패: {e}"
 
-    held = None
+    match = None
     for pos in positions or []:
         if getattr(pos, "symbol", None) == symbol:
-            held = getattr(pos, "qty", 0)
+            match = pos
             break
 
-    if held is None:
+    if match is None:
         return False, f"{symbol} 보유 포지션 없음"
-    if isinstance(held, bool) or not isinstance(held, (int, float)):
-        return False, f"보유 수량이 숫자가 아님: {held!r}"
-    if held <= 0:
-        return False, f"{symbol} 보유 수량이 0 이하: {held}"
-    if qty > held:
-        return False, f"보유 수량 초과: {qty} > {held}"
+
+    # P0-07 S2: prove against what the broker will actually sell, not the raw
+    # holding. Unsettled shares and quantity already committed to a resting
+    # order are held but not sellable, and an exit proved against `held` would
+    # over-ask. An unknown orderable figure is a BLOCK, never a fallback.
+    from backend.risk.sellable_qty import sellable_from_position, validate_sell_qty
+
+    sellable = sellable_from_position(match)
+    ok, reason = validate_sell_qty(qty, sellable)
+    if not ok:
+        return False, reason
     return True, ""

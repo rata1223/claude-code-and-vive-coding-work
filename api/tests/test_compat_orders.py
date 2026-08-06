@@ -73,13 +73,16 @@ class _FakePortfolio:
     def get_us_balance(self):
         return {
             "summary": {"tot_evlu_amt": "1000.50", "frcr_dncl_amt_2": "200.25"},
-            "positions": [{"ovrs_pdno": "AAPL", "ovrs_cblc_qty": "5", "pchs_avg_pric": "150.0"}],
+            "positions": [{"ovrs_pdno": "AAPL", "ovrs_cblc_qty": "5",
+                           "ord_psbl_qty": "5",   # P0-07 S2: broker-reported 매도가능
+                           "pchs_avg_pric": "150.0"}],
         }
 
     def get_kr_balance(self):
         return {
             "summary": {"tot_evlu_amt": "500", "dnca_tot_amt": "100"},
-            "positions": [{"pdno": "005930", "hldg_qty": "3", "pchs_avg_pric": "70000"}],
+            "positions": [{"pdno": "005930", "hldg_qty": "3", "ord_psbl_qty": "3",
+                           "pchs_avg_pric": "70000"}],
         }
 
 
@@ -660,7 +663,7 @@ class TestClosePositionGapClosed:
         assert res.status_code == 200          # no longer a validation failure
         body = res.json()
         assert body["code"] == 1, body["msg"]
-        # qty came from the live holding (_FakePortfolio: ovrs_cblc_qty "5"),
+        # qty came from the live sellable figure (_FakePortfolio: ord_psbl_qty "5"),
         # never from the client, and the price is the live quote.
         assert body["data"]["qty"] == 5
         assert body["data"]["price"] == 175.5

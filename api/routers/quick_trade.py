@@ -111,6 +111,33 @@ def _load_market_data(client):
 # Live holding quantity field, by market. KIS returns these as strings.
 _QTY_FIELD = {"kr": "hldg_qty", "us": "ovrs_cblc_qty"}
 _SYMBOL_FIELDS = ("pdno", "ovrs_pdno")
+# P0-07 S2: KIS states how much of a holding is actually orderable
+# (주문가능수량) in the same row. Held is not sellable — shares can be unsettled
+# or already committed to a resting order.
+_ORDERABLE_FIELD = "ord_psbl_qty"
+
+
+def _live_position_row(portfolio, symbol: str, market: str) -> dict:
+    """The raw broker balance row for ``symbol``, or ``{}`` if not held.
+
+    Raises on lookup failure so the handler can reject rather than guess.
+    """
+    result = portfolio.get_kr_balance() if market == "kr" else portfolio.get_us_balance()
+    for pos in result.get("positions", []) or []:
+        sym = next((pos.get(f) for f in _SYMBOL_FIELDS if pos.get(f)), "") or ""
+        if sym.upper() == symbol.upper():
+            return pos
+    return {}
+
+
+def _int_field(row: dict, field: str):
+    raw = row.get(field)
+    if raw is None or raw == "":
+        return None
+    try:
+        return int(float(raw))
+    except (TypeError, ValueError):
+        return None
 
 
 def _live_held_qty(portfolio, symbol: str, market: str) -> int:
@@ -120,16 +147,55 @@ def _live_held_qty(portfolio, symbol: str, market: str) -> int:
     qty is an upper bound at most. Raises on lookup failure so the handler can
     reject rather than guess.
     """
-    result = portfolio.get_kr_balance() if market == "kr" else portfolio.get_us_balance()
+    row = _live_position_row(portfolio, symbol, market)
     field = _QTY_FIELD["kr" if market == "kr" else "us"]
-    for pos in result.get("positions", []) or []:
-        sym = next((pos.get(f) for f in _SYMBOL_FIELDS if pos.get(f)), "") or ""
-        if sym.upper() == symbol.upper():
-            try:
-                return int(float(pos.get(field) or 0))
-            except (TypeError, ValueError):
-                return 0
-    return 0
+    return _int_field(row, field) or 0
+
+
+def _live_sellable(portfolio, symbol: str, market: str, pending_sell_qty: int = 0):
+    """Resolve how much of ``symbol`` may actually be sold right now (P0-07 S2).
+
+    Returns a :class:`SellableResult`; an unknown figure fails closed rather
+    than falling back to the held quantity — only EmergencyFlatten does that.
+    """
+    from backend.risk.sellable_qty import UNKNOWN, resolve_sellable
+
+    row = _live_position_row(portfolio, symbol, market)
+    if not row:
+        # No holding at all — a known zero, not an unreported figure.
+        return resolve_sellable(held_qty=0, broker_sellable=0)
+    held = _int_field(row, _QTY_FIELD["kr" if market == "kr" else "us"]) or 0
+    orderable = _int_field(row, _ORDERABLE_FIELD)
+    if orderable is None:
+        orderable = UNKNOWN
+    return resolve_sellable(held_qty=held, broker_sellable=orderable,
+                            pending_sell_qty=pending_sell_qty)
+
+
+def _open_sell_qty(db, user_id: int, symbol: str, exclude_key: Optional[str] = None) -> int:
+    """Quantity already committed to our own open SELL orders for ``symbol``.
+
+    Reads the durable ``quick_trade_orders`` rows, so the figure survives a
+    restart. Terminal statuses have released their quantity.
+
+    ``exclude_key`` drops the row this request would be replaying. Without it an
+    idempotent retry would be blocked by its own reservation: the first call
+    reserves the quantity, and the identical retry — which submits nothing and
+    just returns the existing order — would look like a second ask.
+    """
+    from api.models import QuickTradeOrder
+    from backend.risk.sellable_qty import pending_sell_qty_from_rows
+
+    q = (
+        db.query(QuickTradeOrder.symbol, QuickTradeOrder.side,
+                 QuickTradeOrder.qty, QuickTradeOrder.status)
+        .filter(QuickTradeOrder.user_id == user_id,
+                QuickTradeOrder.symbol == symbol,
+                QuickTradeOrder.side == "sell")
+    )
+    if exclude_key:
+        q = q.filter(QuickTradeOrder.idempotency_key != exclude_key)
+    return pending_sell_qty_from_rows(q.all(), symbol)
 
 
 def _live_close_price(market_data, symbol: str, market: str, exchange: str):
@@ -343,7 +409,8 @@ def close_position(
 ):
     """Close an open position through the hardened order path (P0-07C).
 
-    live position → qty validation → live price → ``reserve_and_submit`` with
+    live *sellable* qty (P0-07 S2) → qty validation → live price →
+    ``reserve_and_submit`` with
     ``side="sell"`` and the P0-05 risk gate. The backend owns quantity and price
     outright. The three pre-reservation rejections (no position, over-close, no
     live price) abort before any DB row is written and before the broker is
@@ -360,11 +427,18 @@ def close_position(
         client, orders, portfolio = _load_kis(cred)
 
         # 1. Live position — the only authority on how much can be closed.
+        #    P0-07 S2: that authority is the *sellable* quantity, not the held
+        #    one. Shares can be unsettled or already committed to a resting
+        #    sell order; asking for the full holding gets the order rejected.
         try:
-            held_qty = _live_held_qty(portfolio, body.symbol, market)
+            sellable = _live_sellable(portfolio, body.symbol, market)
         except Exception as e:
             logger.warning("close position lookup failed %s: %s", body.symbol, e)
             return Resp.err(f"Position lookup failed for {body.symbol}: {e}")
+        if not sellable.known:
+            return Resp.err(f"Sellable quantity unavailable for {body.symbol}: "
+                            f"{sellable.reason}")
+        held_qty = sellable.qty
         if held_qty <= 0:
             return Resp.err(f"No open position for {body.symbol}")
 
@@ -384,7 +458,7 @@ def close_position(
                 return Resp.err("qty must be greater than 0")
             if requested > held_qty:
                 return Resp.err(
-                    f"Requested qty exceeds held quantity: {requested} > {held_qty}"
+                    f"Requested qty exceeds sellable quantity: {requested} > {held_qty}"
                 )
             close_qty = requested
 
@@ -413,6 +487,20 @@ def close_position(
         )
         key = idempotency_key or derive_idempotency_key(**fp_args)
         req_hash = request_fingerprint(**fp_args)
+
+        # P0-07 S2: quantity already committed to our own open sells reserves
+        # sellable quantity. The row this request replays is excluded, so an
+        # idempotent retry is not blocked by its own reservation.
+        try:
+            pending = _open_sell_qty(db, current_user.id, body.symbol, exclude_key=key)
+        except ValueError as e:
+            return Resp.err(f"Pending sell lookup failed for {body.symbol}: {e}")
+        if pending and close_qty > max(0, held_qty - pending):
+            return Resp.err(
+                f"Requested qty exceeds sellable quantity after pending sells: "
+                f"{close_qty} > {max(0, held_qty - pending)} "
+                f"(sellable {held_qty}, pending {pending})"
+            )
 
         mapper = KIS_DOMESTIC_MAPPER if market == "kr" else KIS_OVERSEAS_MAPPER
 
