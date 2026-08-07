@@ -398,6 +398,17 @@ def test_zero_orderable_is_reported_as_nothing_sellable_not_no_position(
 # ── Pending reservations are scoped to one account and market ────────────────
 
 def _seed_scoped_sell(db, user, qty, key, credential_id=1, market="us", symbol="AAPL"):
+    # ``QuickTradeOrder.credential_id`` is a real foreign key and the shared
+    # fixture only creates credential 1, so a second account has to be created
+    # before its order can be. Without this the row only inserts where foreign
+    # keys happen not to be enforced.
+    from api.models import Credential
+
+    if not db.query(Credential).filter(Credential.id == credential_id).first():
+        db.add(Credential(id=credential_id, user_id=user.id, name=f"kis-{credential_id}",
+                          exchange_id="kis", env="paper"))
+        db.commit()
+
     db.add(QuickTradeOrder(
         user_id=user.id, credential_id=credential_id, idempotency_key=key,
         request_hash="h" + key, symbol=symbol, side="sell", market=market,
