@@ -176,6 +176,25 @@ def _live_sellable(portfolio, symbol: str, market: str, pending_sell_qty: int = 
                             pending_sell_qty=pending_sell_qty), held
 
 
+def _existing_order(db, user_id: int, idempotency_key: str):
+    """The already-reserved order for this key, if any.
+
+    A replay must reach ``reserve_and_submit``'s duplicate-key short-circuit,
+    which returns the existing row without re-evaluating anything. Re-running
+    the live sellable guard first would re-validate the retry against a broker
+    figure the *first* submission has already reduced, and reject it — turning
+    a safe idempotent retry into a spurious "sellable exceeded".
+    """
+    from api.models import QuickTradeOrder
+
+    return (
+        db.query(QuickTradeOrder)
+        .filter(QuickTradeOrder.user_id == user_id,
+                QuickTradeOrder.idempotency_key == idempotency_key)
+        .first()
+    )
+
+
 def _open_sell_qty(db, user_id: int, credential_id: int, market: str, symbol: str,
                    exclude_key: Optional[str] = None) -> int:
     """Quantity already committed to our own open SELL orders for ``symbol``.
@@ -391,7 +410,7 @@ def place_order(
         # own open sells is subtracted on top, because the broker figure may not
         # reflect a resting order yet. ``exclude_key`` keeps an idempotent retry
         # from being blocked by its own reservation. Buys are unaffected.
-        if body.side.lower() == "sell":
+        if body.side.lower() == "sell" and not _existing_order(db, current_user.id, key):
             try:
                 pending = _open_sell_qty(db, current_user.id, body.credential_id,
                                          market, body.symbol, exclude_key=key)
@@ -476,6 +495,27 @@ def close_position(
     if not cred:
         return Resp.err("Credential not found")
 
+    # An explicit replay short-circuits before any broker lookup. This handler
+    # derives its quantity from the live figure, so re-running the resolution
+    # would judge the retry against a broker figure the first submission has
+    # already reduced — and reject it as "no sellable quantity" instead of
+    # returning the order that call created. Only possible for a caller-supplied
+    # key: a server-derived one is a function of the resolved quantity.
+    if idempotency_key:
+        replay = _existing_order(db, current_user.id, idempotency_key)
+        if replay is not None:
+            payload = {
+                "order_id": replay.broker_order_id or "",
+                "symbol": replay.symbol, "side": replay.side,
+                "qty": int(replay.qty), "price": replay.price,
+                "status": replay.status,
+            }
+            if replay.status == QT_SUBMITTED:
+                return Resp.ok(payload)
+            return Resp.err(
+                f"Close position {replay.status}: {replay.error or 'no broker order id'}"
+            )
+
     market = body.market.lower()
     exchange = body.exchange or "NASD"
 
@@ -559,9 +599,14 @@ def close_position(
         # ``close_qty``, which needs the broker figure. Re-resolving through
         # resolve_sellable keeps the subtraction rule in one place instead of
         # reimplementing it against numbers already in hand.
+        #
+        # Skipped entirely for a replay: that request must reach
+        # ``reserve_and_submit``'s duplicate-key short-circuit, not be re-judged
+        # against a broker figure its own first submission already reduced.
         try:
-            pending = _open_sell_qty(db, current_user.id, body.credential_id,
-                                     market, body.symbol, exclude_key=key)
+            pending = (0 if _existing_order(db, current_user.id, key)
+                       else _open_sell_qty(db, current_user.id, body.credential_id,
+                                           market, body.symbol, exclude_key=key))
         except ValueError as e:
             return Resp.err(f"Pending sell lookup failed for {body.symbol}: {e}")
         if pending:

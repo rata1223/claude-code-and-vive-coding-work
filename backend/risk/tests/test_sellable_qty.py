@@ -139,15 +139,24 @@ def test_t9_only_open_sells_for_this_symbol_reserve_quantity():
                             QT_SUBMITTED)
 
     rows = [
-        ("SPY", "sell", 3, QT_RESERVED),    # counts
-        ("SPY", "sell", 2, QT_SUBMITTED),   # counts
+        ("SPY", "sell", 3, QT_RESERVED),    # counts — broker not told yet
+        ("SPY", "sell", 2, QT_SUBMITTED),   # acknowledged — the broker's own
+                                            # ord_psbl_qty accounts for it, and
+                                            # this state is terminal, so counting
+                                            # it would reserve 2 forever
         ("SPY", "sell", 5, QT_REJECTED),    # terminal — released
         ("SPY", "sell", 5, QT_FAILED),      # terminal — released
         ("SPY", "sell", 5, QT_BLOCKED),     # never reached the broker
         ("SPY", "buy", 9, QT_RESERVED),     # wrong side
         ("QQQ", "sell", 7, QT_RESERVED),    # wrong symbol
     ]
-    assert pending_sell_qty_from_rows(rows, "SPY") == 5
+    assert pending_sell_qty_from_rows(rows, "SPY") == 3
+
+
+def test_an_unrecognised_status_still_reserves():
+    """The released set is the closed list, so anything new fails closed."""
+    assert pending_sell_qty_from_rows([("SPY", "sell", 4, "partially_filled")],
+                                      "SPY") == 4
 
 
 def test_t9_symbol_match_is_case_insensitive():

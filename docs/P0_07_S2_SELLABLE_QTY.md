@@ -60,7 +60,13 @@ A held position with **zero** orderable is reported as `No sellable quantity`, n
 
 Both QuickTrade sell paths — `close-position` and a direct `place-order` sell — subtract quantity already committed to their own open sells, read from the durable `quick_trade_orders` rows, so the figure survives a restart. Without it, two consecutive full-size sells both pass whenever the broker's orderable figure has not yet reflected the first resting order.
 
-The status filter names the **terminal** states (`rejected`/`failed`/`blocked`) rather than the open ones, so the default is fail-closed: any status the module does not recognise — a renamed constant, or a non-terminal state added later such as a partially-filled one — still counts as holding quantity. Listing the open states instead would make both of those silently report 0 pending, which permits an over-ask.
+**Only `reserved` reserves.** The local pending figure exists for exactly one window: we have committed to a sell and the broker has not been told yet. Once the broker acknowledges (`submitted`), its own `ord_psbl_qty` accounts for the resting order and subtracting ours again double-counts.
+
+That distinction is not cosmetic. `QT_SUBMITTED` is a **terminal** state in `api/models.py` (`QT_SUBMITTED: set()`) with no fill tracking and no row cleanup, so counting it would reserve that quantity *permanently* — sell 3 today and 7 tomorrow against a 10-share holding and the symbol becomes unsellable for good. A guard that eventually refuses every legitimate sell is worse than the over-ask it was added to prevent.
+
+The status filter is still written as the **released** list rather than the open one, so the default stays fail-closed: a status the module does not recognise — a renamed constant, or a non-terminal state added later such as a partially-filled one — still counts as holding quantity.
+
+> **Assumption, UNVERIFIED:** that KIS's `ord_psbl_qty` excludes quantity tied up in resting sell orders. It is the standard meaning of 주문가능수량, but no live call is possible from here. If it turns out *not* to net resting orders, the window between broker acknowledgement and the figure updating is uncovered — the same exposure that existed before S2, and narrower than the permanent breakage the alternative guarantees.
 
 Symbol and side are matched **case-insensitively in SQL**. Both are persisted verbatim from the request, so `aapl` and `AAPL` produce two rows for one holding; an exact match would sum only some of them and under-report pending.
 

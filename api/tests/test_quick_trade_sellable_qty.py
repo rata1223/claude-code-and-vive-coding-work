@@ -137,7 +137,7 @@ def test_no_position_is_still_reported_as_no_position(monkeypatch, db, user):
 # ── T9: our own open sell orders reserve sellable quantity ───────────────────
 
 def test_t9_open_sell_order_reduces_the_closeable_quantity(monkeypatch, db, user):
-    _seed_open_sell(db, user, qty=4, status=QT_SUBMITTED)
+    _seed_open_sell(db, user, qty=4, status=QT_RESERVED)
     orders, _, _ = _wire(monkeypatch,
                          portfolio=FakePortfolio(us=_us_row(held="10", orderable="10")),
                          market_data=FakeMarketData(price=175.5))
@@ -150,7 +150,7 @@ def test_t9_open_sell_order_reduces_the_closeable_quantity(monkeypatch, db, user
 
 
 def test_t9_within_the_remaining_quantity_is_accepted(monkeypatch, db, user):
-    _seed_open_sell(db, user, qty=4, status=QT_SUBMITTED)
+    _seed_open_sell(db, user, qty=4, status=QT_RESERVED)
     orders, _, _ = _wire(monkeypatch,
                          portfolio=FakePortfolio(us=_us_row(held="10", orderable="10")),
                          market_data=FakeMarketData(price=175.5))
@@ -310,7 +310,7 @@ def test_t5_direct_sell_subtracts_our_own_pending_sells(monkeypatch, db, user):
     """10 orderable, 6 already committed to an open sell → a 5-share direct
     sell is refused. The broker figure lags a resting order, so without this
     subtraction two consecutive full-size sells would both pass."""
-    _seed_open_sell(db, user, qty=6, status=QT_SUBMITTED)
+    _seed_open_sell(db, user, qty=6, status=QT_RESERVED)
     orders = _wire_place(monkeypatch, FakePortfolio(us=_us_row(held="10", orderable="10")))
 
     resp = quick_trade.place_order(_place_body(qty=5), None, user, db, _allow())
@@ -321,7 +321,7 @@ def test_t5_direct_sell_subtracts_our_own_pending_sells(monkeypatch, db, user):
 
 
 def test_t5_direct_sell_within_the_remaining_quantity_is_accepted(monkeypatch, db, user):
-    _seed_open_sell(db, user, qty=6, status=QT_SUBMITTED)
+    _seed_open_sell(db, user, qty=6, status=QT_RESERVED)
     orders = _wire_place(monkeypatch, FakePortfolio(us=_us_row(held="10", orderable="10")))
 
     resp = quick_trade.place_order(_place_body(qty=4), None, user, db, _allow())
@@ -347,14 +347,14 @@ def test_pending_sell_is_matched_regardless_of_symbol_case(db, user):
     """Symbol and side are persisted verbatim from the request, so a lowercase
     order and an uppercase one describe one holding. Matching exactly would
     under-report pending and admit an over-ask."""
-    _seed_open_sell(db, user, qty=4, status=QT_SUBMITTED, key="lower", symbol="aapl")
+    _seed_open_sell(db, user, qty=4, status=QT_RESERVED, key="lower", symbol="aapl")
 
     assert quick_trade._open_sell_qty(db, user.id, 1, "us", "AAPL") == 4
     assert quick_trade._open_sell_qty(db, user.id, 1, "us", "aapl") == 4
 
 
 def test_differently_cased_pending_sell_still_reserves_on_the_close(monkeypatch, db, user):
-    _seed_open_sell(db, user, qty=4, status=QT_SUBMITTED, key="lower", symbol="aapl")
+    _seed_open_sell(db, user, qty=4, status=QT_RESERVED, key="lower", symbol="aapl")
     orders, _, _ = _wire(monkeypatch,
                          portfolio=FakePortfolio(us=_us_row(held="10", orderable="10")),
                          market_data=FakeMarketData(price=175.5))
@@ -370,7 +370,7 @@ def test_pending_sell_side_is_matched_regardless_of_case(db, user):
         user_id=user.id, credential_id=1, idempotency_key="upper-side",
         request_hash="h-upper-side", symbol="AAPL", side="SELL", market="us",
         exchange="NASD", order_type="limit", qty=4, price=175.5,
-        status=QT_SUBMITTED,
+        status=QT_RESERVED,
     ))
     db.commit()
 
@@ -413,7 +413,7 @@ def _seed_scoped_sell(db, user, qty, key, credential_id=1, market="us", symbol="
         user_id=user.id, credential_id=credential_id, idempotency_key=key,
         request_hash="h" + key, symbol=symbol, side="sell", market=market,
         exchange="NASD", order_type="limit", qty=qty, price=175.5,
-        status=QT_SUBMITTED,
+        status=QT_RESERVED,
     ))
     db.commit()
 
@@ -451,3 +451,94 @@ def test_a_close_is_not_blocked_by_another_credentials_pending_sell(monkeypatch,
 
     assert resp.code == 1, resp.msg
     assert orders.calls == [("sell_us", "AAPL", "NASD", 10, 175.5)]
+
+
+# ── An idempotent replay must not be re-judged against a moved broker figure ──
+
+class _DecrementingPortfolio:
+    """Models what a real broker does: orderable drops once a sell is resting.
+
+    The static fake hid the replay bug — with it, a retry re-ran the guard
+    against the original figure and happened to pass.
+    """
+
+    def __init__(self, held=10, orderable=10):
+        self._held, self._orderable = held, orderable
+
+    def sell_happened(self, qty):
+        self._orderable = max(0, self._orderable - qty)
+
+    def get_us_balance(self):
+        return {"positions": [{"ovrs_pdno": "AAPL",
+                               "ovrs_cblc_qty": str(self._held),
+                               "ord_psbl_qty": str(self._orderable),
+                               "pchs_avg_pric": "150.0"}]}
+
+    def get_kr_balance(self):
+        return {"positions": []}
+
+
+def test_direct_sell_replay_survives_the_broker_figure_dropping(monkeypatch, db, user):
+    """After the first sell rests, orderable is 0. The identical retry must
+    short-circuit to the existing order, not be refused as an over-ask."""
+    portfolio = _DecrementingPortfolio(held=10, orderable=10)
+    orders = _wire_place(monkeypatch, portfolio)
+
+    first = quick_trade.place_order(_place_body(qty=10), "replay-key", user, db, _allow())
+    assert first.code == 1, first.msg
+    portfolio.sell_happened(10)                  # broker now reports 0 orderable
+
+    second = quick_trade.place_order(_place_body(qty=10), "replay-key", user, db, _allow())
+
+    assert second.code == 1, second.msg
+    assert len(orders.calls) == 1                # exactly one broker submission
+
+
+def test_close_replay_survives_the_broker_figure_dropping(monkeypatch, db, user):
+    portfolio = _DecrementingPortfolio(held=10, orderable=10)
+    orders, _, _ = _wire(monkeypatch, portfolio=portfolio,
+                         market_data=FakeMarketData(price=175.5))
+
+    first = quick_trade.close_position(_body(qty=10), "replay-close", user, db, _allow())
+    assert first.code == 1, first.msg
+    portfolio.sell_happened(10)
+
+    second = quick_trade.close_position(_body(qty=10), "replay-close", user, db, _allow())
+
+    assert second.code == 1, second.msg
+    assert len(orders.calls) == 1
+
+
+# ── An acknowledged sell does not reserve quantity forever ───────────────────
+
+def test_submitted_sells_do_not_reserve_quantity(db, user):
+    """``QT_SUBMITTED`` is terminal in api/models.py — no fill tracking, no row
+    cleanup. Counting it as pending would reserve that quantity permanently:
+    sell 3 today and 7 tomorrow and the symbol is unsellable for good. Once the
+    broker has acknowledged, its own ``ord_psbl_qty`` accounts for the resting
+    order, so subtracting it again also double-counts."""
+    _seed_open_sell(db, user, qty=4, status=QT_SUBMITTED, key="ack")
+
+    assert quick_trade._open_sell_qty(db, user.id, 1, "us", "AAPL") == 0
+
+
+def test_a_history_of_submitted_sells_still_leaves_the_position_sellable(
+        monkeypatch, db, user):
+    """The regression this guards: three past sells must not add up to a block."""
+    for i, q in enumerate((3, 4, 3)):
+        _seed_open_sell(db, user, qty=q, status=QT_SUBMITTED, key=f"past-{i}")
+    orders, _, _ = _wire(monkeypatch,
+                         portfolio=FakePortfolio(us=_us_row(held="10", orderable="10")),
+                         market_data=FakeMarketData(price=175.5))
+
+    resp = quick_trade.close_position(_body(qty=10), None, user, db, _allow())
+
+    assert resp.code == 1, resp.msg
+    assert orders.calls == [("sell_us", "AAPL", "NASD", 10, 175.5)]
+
+
+def test_a_reserved_sell_still_reserves(db, user):
+    """The pre-acknowledgement window is exactly what local pending is for."""
+    _seed_open_sell(db, user, qty=4, status=QT_RESERVED, key="inflight")
+
+    assert quick_trade._open_sell_qty(db, user.id, 1, "us", "AAPL") == 4

@@ -260,7 +260,10 @@ class EmergencyFlattenManager:
                     pos.symbol, cause,
                 )
                 results["failed"].append(f"{pos.symbol}: {cause}")
-                self.last_failed_count += 1
+                # Only count the position once. A shortfall already counted it,
+                # and counting again here can push failed_count past attempted.
+                if not shortfall_note:
+                    self.last_failed_count += 1
                 self._audit(PRICE_REJECTED_EVENT, symbol=pos.symbol,
                             detail={"qty": sell_qty, "price": None, "cause": cause})
                 continue

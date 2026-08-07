@@ -175,17 +175,26 @@ def sellable_from_position(position, pending_sell_qty=0,
     )
 
 
-#: Quick Trade order statuses that have *released* their quantity. Mirrors
-#: ``QT_REJECTED``/``QT_FAILED``/``QT_BLOCKED`` in ``api/models.py``; this module
-#: stays import-free by design, so the values are repeated rather than imported.
+#: Quick Trade order statuses that no longer reserve quantity *for us*. Mirrors
+#: ``api/models.py``; this module stays import-free by design, so the values are
+#: repeated rather than imported.
 #:
-#: The set is written as the terminal states, not the open ones, so that the
-#: default is fail-closed: any status this module does not recognise — a
-#: renamed constant, or a non-terminal state added later such as a
-#: partially-filled one — is assumed to still hold quantity. Listing the open
-#: states instead would make both of those silently report 0 pending, which
-#: permits an over-ask.
-_RELEASED_SELL_STATUSES = frozenset({"rejected", "failed", "blocked"})
+#: The set is written as the released states, not the open ones, so the default
+#: is fail-closed: a status this module does not recognise — a renamed constant,
+#: or a non-terminal state added later — is assumed to still hold quantity.
+#: Listing the open states instead would make both silently report 0 pending,
+#: which permits an over-ask.
+#:
+#: ``submitted`` is in here, which deserves an explanation. It is not a
+#: rejection — it means the broker **acknowledged** the order, and from that
+#: moment the broker's own ``ord_psbl_qty`` accounts for the resting quantity.
+#: Subtracting it again double-counts. More importantly ``QT_SUBMITTED`` is a
+#: terminal state in ``api/models.py`` with no fill tracking and no row cleanup,
+#: so counting it would reserve that quantity *forever*: sell 3 today and 7
+#: tomorrow and the symbol becomes permanently unsellable. A local pending
+#: figure only makes sense for the window where we have committed and the broker
+#: has not been told yet — which is exactly ``reserved``.
+_RELEASED_SELL_STATUSES = frozenset({"submitted", "rejected", "failed", "blocked"})
 
 
 def pending_sell_qty_from_rows(rows: Iterable[Sequence], symbol: str) -> int:
