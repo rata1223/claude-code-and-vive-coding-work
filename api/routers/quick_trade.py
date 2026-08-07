@@ -508,14 +508,27 @@ def close_position(
     # stored request_hash covers the *resolved* qty and price, which cannot be
     # recomputed without the broker lookup this path is skipping — so compare the
     # client-supplied parameters that are persisted verbatim instead.
-    if idempotency_key:
-        replay = _existing_order(db, current_user.id, idempotency_key)
-        if replay is not None:
+    # Wrapped: this runs before the handler's own try/except, so an unusable
+    # body value here would escape as a 500 instead of an error envelope.
+    try:
+        replay = (_existing_order(db, current_user.id, idempotency_key)
+                  if idempotency_key else None)
+    except Exception as e:  # noqa: BLE001 - a lookup failure must not 500
+        logger.warning("close replay lookup failed: %s", e)
+        return Resp.err(f"Close position failed: {e}")
+    if replay is not None:
+        try:
             same_request = (
                 replay.credential_id == body.credential_id
+                # A close only ever creates a sell. A key whose row is a buy is
+                # somebody else's order, not this close's replay — returning it
+                # would tell the caller their position was closed by a buy.
+                and (replay.side or "").lower() == "sell"
                 and (replay.symbol or "").upper() == (body.symbol or "").upper()
                 and (replay.market or "").lower() == (body.market or "").lower()
-                and (body.qty is None or int(replay.qty) == int(body.qty))
+                # Exact, not int()-truncated: 5.9 must not match a stored 5 here
+                # when the same 5.9 is refused as a fractional share below.
+                and (body.qty is None or float(replay.qty) == float(body.qty))
             )
             if not same_request:
                 return Resp.err("Duplicate idempotency key with different parameters")
@@ -530,6 +543,9 @@ def close_position(
             return Resp.err(
                 f"Close position {replay.status}: {replay.error or 'no broker order id'}"
             )
+        except Exception as e:  # noqa: BLE001 - an unusable body must not 500
+            logger.warning("close replay comparison failed: %s", e)
+            return Resp.err(f"Close position failed: {e}")
 
     market = body.market.lower()
     exchange = body.exchange or "NASD"
@@ -559,29 +575,18 @@ def close_position(
                                 f"{sellable.reason}")
             return Resp.err(f"No open position for {body.symbol}")
 
-        # 2. Subtract quantity already committed to our own in-flight sells,
-        #    *before* choosing the quantity. Resolving it afterwards made "close
-        #    everything" pick the broker figure and then fail its own check
-        #    whenever a reservation existed — 10 sellable with 4 reserved refused
-        #    the close instead of closing the 6 that really are sellable.
-        try:
-            pending = _open_sell_qty(db, current_user.id, body.credential_id,
-                                     market, body.symbol)
-        except ValueError as e:
-            return Resp.err(f"Pending sell lookup failed for {body.symbol}: {e}")
-        net = resolve_sellable(held_qty=sellable_qty, broker_sellable=sellable_qty,
-                               pending_sell_qty=pending)
-        net_qty = net.qty if net.known else 0
-        if net_qty <= 0:
-            return Resp.err(
-                f"No sellable quantity for {body.symbol} after pending sells: "
-                f"sellable {sellable_qty}, pending {pending}"
-            )
-
-        # 3. Quantity — omitted means close everything *sellable*; an explicit
-        #    over-close is rejected outright, never silently clamped.
+        # 2. Quantity — omitted means close everything the *broker* says is
+        #    sellable; an over-close is rejected outright, never silently clamped.
+        #
+        #    Deliberately independent of local pending state. Netting pending in
+        #    here was tried and reverted: the server-derived idempotency key is a
+        #    function of this quantity, so letting local state move it means two
+        #    identical close-all clicks derive different keys, dedup never fires,
+        #    and the position is sold twice. A close refused while one of our own
+        #    sells is still in flight is the safe outcome; a duplicate order is
+        #    not. Pending is applied below, after the key is fixed.
         if body.qty is None:
-            close_qty = net_qty
+            close_qty = sellable_qty
         else:
             requested = int(body.qty)
             if requested != body.qty:
@@ -592,12 +597,9 @@ def close_position(
                 )
             if requested <= 0:
                 return Resp.err("qty must be greater than 0")
-            ok, why = validate_sell_qty(requested, net)
-            if not ok:
+            if requested > sellable_qty:
                 return Resp.err(
-                    f"Requested qty exceeds sellable quantity: {requested} > {net_qty}"
-                    + (f" (sellable {sellable_qty}, pending sells {pending})"
-                       if pending else "")
+                    f"Requested qty exceeds sellable quantity: {requested} > {sellable_qty}"
                 )
             close_qty = requested
 
@@ -626,6 +628,26 @@ def close_position(
         )
         key = idempotency_key or derive_idempotency_key(**fp_args)
         req_hash = request_fingerprint(**fp_args)
+
+        # P0-07 S2: quantity committed to our own in-flight sells reserves
+        # sellable quantity. Applied after the key so the key stays a function
+        # of broker state only (see above), and skipped for a replay — which
+        # must reach ``reserve_and_submit``'s duplicate-key short-circuit rather
+        # than be blocked by the very reservation it is replaying. That skip
+        # covers the server-derived key too, which is why it lives here and not
+        # only in the caller-supplied short-circuit above.
+        try:
+            pending = (0 if _existing_order(db, current_user.id, key)
+                       else _open_sell_qty(db, current_user.id, body.credential_id,
+                                           market, body.symbol, exclude_key=key))
+        except ValueError as e:
+            return Resp.err(f"Pending sell lookup failed for {body.symbol}: {e}")
+        if pending:
+            net = resolve_sellable(held_qty=sellable_qty, broker_sellable=sellable_qty,
+                                   pending_sell_qty=pending)
+            ok, why = validate_sell_qty(close_qty, net)
+            if not ok:
+                return Resp.err(f"{why} — pending sells {pending}")
 
         mapper = KIS_DOMESTIC_MAPPER if market == "kr" else KIS_OVERSEAS_MAPPER
 

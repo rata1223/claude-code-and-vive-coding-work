@@ -546,9 +546,11 @@ def test_a_reserved_sell_still_reserves(db, user):
 
 # ── Close-all closes the net, and a replay still checks its parameters ───────
 
-def test_close_all_closes_the_net_when_a_reservation_is_in_flight(monkeypatch, db, user):
-    """10 sellable with 4 reserved: "close everything" means the 6 that really
-    are sellable, not the broker figure it would then reject itself for."""
+def test_close_all_is_refused_while_one_of_our_sells_is_in_flight(monkeypatch, db, user):
+    """Netting pending into the close-all quantity was tried and reverted: the
+    server-derived key is a function of that quantity, so local state moving it
+    makes two identical clicks derive different keys and sell the position
+    twice. Refusing while our own sell is in flight is the safe outcome."""
     _seed_open_sell(db, user, qty=4, status=QT_RESERVED, key="inflight-close")
     orders, _, _ = _wire(monkeypatch,
                          portfolio=FakePortfolio(us=_us_row(held="10", orderable="10")),
@@ -556,9 +558,23 @@ def test_close_all_closes_the_net_when_a_reservation_is_in_flight(monkeypatch, d
 
     resp = quick_trade.close_position(_body(), None, user, db, _allow())
 
-    assert resp.code == 1, resp.msg
-    assert resp.data["qty"] == 6
-    assert orders.calls == [("sell_us", "AAPL", "NASD", 6, 175.5)]
+    assert resp.code == -1
+    assert "pending" in resp.msg.lower()
+    assert orders.calls == []
+
+
+def test_repeated_close_all_clicks_submit_exactly_one_order(monkeypatch, db, user):
+    """The regression that reversal guards: the derived key must not move with
+    local pending state between two identical clicks."""
+    orders, _, _ = _wire(monkeypatch,
+                         portfolio=FakePortfolio(us=_us_row(held="10", orderable="10")),
+                         market_data=FakeMarketData(price=175.5))
+
+    first = quick_trade.close_position(_body(), None, user, db, _allow())
+    second = quick_trade.close_position(_body(), None, user, db, _allow())
+
+    assert first.code == 1, first.msg
+    assert len(orders.calls) == 1, orders.calls
 
 
 def test_close_all_with_everything_reserved_is_refused(monkeypatch, db, user):
@@ -601,4 +617,56 @@ def test_a_replay_key_reused_for_another_quantity_is_a_conflict(monkeypatch, db,
 
     assert clash.code == -1
     assert "duplicate idempotency key" in clash.msg.lower()
+    assert len(orders.calls) == 1
+
+
+def test_a_derived_key_retry_is_not_blocked_by_its_own_reservation(monkeypatch, db, user):
+    """The replay skip has to cover the server-derived key too. Without it a
+    retry after an indeterminate submit is refused by the very reservation it
+    is replaying, and can never make progress."""
+    orders, _, _ = _wire(monkeypatch,
+                         portfolio=FakePortfolio(us=_us_row(held="10", orderable="10")),
+                         market_data=FakeMarketData(price=175.5))
+
+    first = quick_trade.close_position(_body(qty=10), None, user, db, _allow())
+    second = quick_trade.close_position(_body(qty=10), None, user, db, _allow())
+
+    assert first.code == 1, first.msg
+    assert second.code == 1, second.msg
+    assert len(orders.calls) == 1
+
+
+def test_a_replay_key_whose_order_is_a_buy_is_a_conflict(monkeypatch, db, user):
+    """Returning a buy row as a close replay would tell the caller their
+    position was closed — by a purchase."""
+    db.add(QuickTradeOrder(
+        user_id=user.id, credential_id=1, idempotency_key="buy-key",
+        request_hash="h-buy", symbol="AAPL", side="buy", market="us",
+        exchange="NASD", order_type="limit", qty=5, price=175.5,
+        status=QT_SUBMITTED,
+    ))
+    db.commit()
+    orders, _, _ = _wire(monkeypatch,
+                         portfolio=FakePortfolio(us=_us_row(held="10", orderable="10")),
+                         market_data=FakeMarketData(price=175.5))
+
+    resp = quick_trade.close_position(_body(qty=5), "buy-key", user, db, _allow())
+
+    assert resp.code == -1
+    assert "duplicate idempotency key" in resp.msg.lower()
+    assert orders.calls == []
+
+
+def test_a_fractional_replay_qty_does_not_match_a_stored_whole_one(monkeypatch, db, user):
+    """5.9 must not short-circuit onto a stored 5 when the same 5.9 is refused
+    as a fractional share on a fresh key."""
+    orders, _, _ = _wire(monkeypatch,
+                         portfolio=FakePortfolio(us=_us_row(held="10", orderable="10")),
+                         market_data=FakeMarketData(price=175.5))
+    assert quick_trade.close_position(_body(qty=5), "frac-key", user, db, _allow()).code == 1
+
+    resp = quick_trade.close_position(_body(qty=5.9), "frac-key", user, db, _allow())
+
+    assert resp.code == -1
+    assert "duplicate idempotency key" in resp.msg.lower()
     assert len(orders.calls) == 1
