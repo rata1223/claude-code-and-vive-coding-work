@@ -501,9 +501,24 @@ def close_position(
     # already reduced — and reject it as "no sellable quantity" instead of
     # returning the order that call created. Only possible for a caller-supplied
     # key: a server-derived one is a function of the resolved quantity.
+    # The short-circuit must not weaken the conflict check it is bypassing.
+    # ``reserve_and_submit`` raises IdempotencyConflict when a key is reused with
+    # different parameters; returning unconditionally here would hand back an
+    # unrelated order for a key reused against another symbol or account. The
+    # stored request_hash covers the *resolved* qty and price, which cannot be
+    # recomputed without the broker lookup this path is skipping — so compare the
+    # client-supplied parameters that are persisted verbatim instead.
     if idempotency_key:
         replay = _existing_order(db, current_user.id, idempotency_key)
         if replay is not None:
+            same_request = (
+                replay.credential_id == body.credential_id
+                and (replay.symbol or "").upper() == (body.symbol or "").upper()
+                and (replay.market or "").lower() == (body.market or "").lower()
+                and (body.qty is None or int(replay.qty) == int(body.qty))
+            )
+            if not same_request:
+                return Resp.err("Duplicate idempotency key with different parameters")
             payload = {
                 "order_id": replay.broker_order_id or "",
                 "symbol": replay.symbol, "side": replay.side,
@@ -544,10 +559,29 @@ def close_position(
                                 f"{sellable.reason}")
             return Resp.err(f"No open position for {body.symbol}")
 
-        # 2. Quantity — omitted means close everything; an over-close is
-        #    rejected outright, never silently clamped.
+        # 2. Subtract quantity already committed to our own in-flight sells,
+        #    *before* choosing the quantity. Resolving it afterwards made "close
+        #    everything" pick the broker figure and then fail its own check
+        #    whenever a reservation existed — 10 sellable with 4 reserved refused
+        #    the close instead of closing the 6 that really are sellable.
+        try:
+            pending = _open_sell_qty(db, current_user.id, body.credential_id,
+                                     market, body.symbol)
+        except ValueError as e:
+            return Resp.err(f"Pending sell lookup failed for {body.symbol}: {e}")
+        net = resolve_sellable(held_qty=sellable_qty, broker_sellable=sellable_qty,
+                               pending_sell_qty=pending)
+        net_qty = net.qty if net.known else 0
+        if net_qty <= 0:
+            return Resp.err(
+                f"No sellable quantity for {body.symbol} after pending sells: "
+                f"sellable {sellable_qty}, pending {pending}"
+            )
+
+        # 3. Quantity — omitted means close everything *sellable*; an explicit
+        #    over-close is rejected outright, never silently clamped.
         if body.qty is None:
-            close_qty = sellable_qty
+            close_qty = net_qty
         else:
             requested = int(body.qty)
             if requested != body.qty:
@@ -558,9 +592,12 @@ def close_position(
                 )
             if requested <= 0:
                 return Resp.err("qty must be greater than 0")
-            if requested > sellable_qty:
+            ok, why = validate_sell_qty(requested, net)
+            if not ok:
                 return Resp.err(
-                    f"Requested qty exceeds sellable quantity: {requested} > {sellable_qty}"
+                    f"Requested qty exceeds sellable quantity: {requested} > {net_qty}"
+                    + (f" (sellable {sellable_qty}, pending sells {pending})"
+                       if pending else "")
                 )
             close_qty = requested
 
@@ -589,32 +626,6 @@ def close_position(
         )
         key = idempotency_key or derive_idempotency_key(**fp_args)
         req_hash = request_fingerprint(**fp_args)
-
-        # P0-07 S2: quantity already committed to our own open sells reserves
-        # sellable quantity. The row this request replays is excluded, so an
-        # idempotent retry is not blocked by its own reservation.
-        #
-        # Applied here rather than in the _live_sellable call above because
-        # ``exclude_key`` needs the idempotency key, which is derived from
-        # ``close_qty``, which needs the broker figure. Re-resolving through
-        # resolve_sellable keeps the subtraction rule in one place instead of
-        # reimplementing it against numbers already in hand.
-        #
-        # Skipped entirely for a replay: that request must reach
-        # ``reserve_and_submit``'s duplicate-key short-circuit, not be re-judged
-        # against a broker figure its own first submission already reduced.
-        try:
-            pending = (0 if _existing_order(db, current_user.id, key)
-                       else _open_sell_qty(db, current_user.id, body.credential_id,
-                                           market, body.symbol, exclude_key=key))
-        except ValueError as e:
-            return Resp.err(f"Pending sell lookup failed for {body.symbol}: {e}")
-        if pending:
-            net = resolve_sellable(held_qty=sellable_qty, broker_sellable=sellable_qty,
-                                   pending_sell_qty=pending)
-            ok, why = validate_sell_qty(close_qty, net)
-            if not ok:
-                return Resp.err(f"{why} — pending sells {pending}")
 
         mapper = KIS_DOMESTIC_MAPPER if market == "kr" else KIS_OVERSEAS_MAPPER
 

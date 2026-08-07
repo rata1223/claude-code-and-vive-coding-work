@@ -542,3 +542,63 @@ def test_a_reserved_sell_still_reserves(db, user):
     _seed_open_sell(db, user, qty=4, status=QT_RESERVED, key="inflight")
 
     assert quick_trade._open_sell_qty(db, user.id, 1, "us", "AAPL") == 4
+
+
+# ── Close-all closes the net, and a replay still checks its parameters ───────
+
+def test_close_all_closes_the_net_when_a_reservation_is_in_flight(monkeypatch, db, user):
+    """10 sellable with 4 reserved: "close everything" means the 6 that really
+    are sellable, not the broker figure it would then reject itself for."""
+    _seed_open_sell(db, user, qty=4, status=QT_RESERVED, key="inflight-close")
+    orders, _, _ = _wire(monkeypatch,
+                         portfolio=FakePortfolio(us=_us_row(held="10", orderable="10")),
+                         market_data=FakeMarketData(price=175.5))
+
+    resp = quick_trade.close_position(_body(), None, user, db, _allow())
+
+    assert resp.code == 1, resp.msg
+    assert resp.data["qty"] == 6
+    assert orders.calls == [("sell_us", "AAPL", "NASD", 6, 175.5)]
+
+
+def test_close_all_with_everything_reserved_is_refused(monkeypatch, db, user):
+    _seed_open_sell(db, user, qty=10, status=QT_RESERVED, key="all-inflight")
+    orders, _, _ = _wire(monkeypatch,
+                         portfolio=FakePortfolio(us=_us_row(held="10", orderable="10")),
+                         market_data=FakeMarketData(price=175.5))
+
+    resp = quick_trade.close_position(_body(), None, user, db, _allow())
+
+    assert resp.code == -1
+    assert "pending" in resp.msg.lower()
+    assert orders.calls == []
+
+
+def test_a_replay_key_reused_for_another_symbol_is_a_conflict(monkeypatch, db, user):
+    """The short-circuit must not weaken the conflict check it bypasses —
+    otherwise a reused key hands back an unrelated order."""
+    orders, _, _ = _wire(monkeypatch,
+                         portfolio=FakePortfolio(us=_us_row(held="10", orderable="10")),
+                         market_data=FakeMarketData(price=175.5))
+    first = quick_trade.close_position(_body(qty=5), "shared-key", user, db, _allow())
+    assert first.code == 1, first.msg
+
+    clash = quick_trade.close_position(_body(qty=5, symbol="MSFT"), "shared-key",
+                                       user, db, _allow())
+
+    assert clash.code == -1
+    assert "duplicate idempotency key" in clash.msg.lower()
+    assert len(orders.calls) == 1
+
+
+def test_a_replay_key_reused_for_another_quantity_is_a_conflict(monkeypatch, db, user):
+    orders, _, _ = _wire(monkeypatch,
+                         portfolio=FakePortfolio(us=_us_row(held="10", orderable="10")),
+                         market_data=FakeMarketData(price=175.5))
+    assert quick_trade.close_position(_body(qty=5), "qty-key", user, db, _allow()).code == 1
+
+    clash = quick_trade.close_position(_body(qty=6), "qty-key", user, db, _allow())
+
+    assert clash.code == -1
+    assert "duplicate idempotency key" in clash.msg.lower()
+    assert len(orders.calls) == 1
