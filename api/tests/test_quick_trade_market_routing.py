@@ -1,0 +1,162 @@
+"""
+P1 — QuickTrade market routing (KR reachability).
+
+Every QuickTrade endpoint took ``market`` straight from the request and treated
+anything that was not ``"kr"`` as US. The UI cannot supply that value: its
+toggle is ``spot``/``swap`` (crypto vocabulary inherited from QuantDinger), and
+there is no ``kr``/``us`` notion anywhere in the view or the API client.
+
+Three different mechanisms produced the same result:
+
+* ``place-order`` / ``balance`` / ``position`` — ``api/compat.py`` faithfully
+  renames ``market_type`` → ``market``, so the handler receives ``"spot"``.
+* ``close-position`` — deliberately not in compat, and ``ClosePositionRequest``
+  does not forbid extra fields, so ``market_type`` is dropped and ``market``
+  falls back to its ``"us"`` default.
+
+Either way ``market.lower() == "kr"`` is False and a KR request is served by the
+US path. These tests pin the resolution rule that fixes all of them at once.
+
+Deriving from the symbol rather than demanding a UI change is deliberate: the
+rule already exists in the broker layer (``KISBroker._is_kr``), which is what
+routes cancels and quotes today, so this reuses it rather than inventing one.
+"""
+import pytest
+
+from api.routers import quick_trade
+from api.routers.quick_trade import _resolve_market
+from api.schemas import ClosePositionRequest, PlaceOrderRequest
+from api.tests.test_quick_trade_close_position import (  # reuse the proven harness
+    FakeMarketData,
+    FakePortfolio,
+    _allow,
+    _wire,
+    db,          # noqa: F401 - pytest fixtures
+    engine,      # noqa: F401
+    user,        # noqa: F401
+)
+
+KR_ROW = [{"pdno": "069500", "hldg_qty": "7", "pchs_avg_pric": "9000"}]
+US_ROW = [{"ovrs_pdno": "AAPL", "ovrs_cblc_qty": "10", "pchs_avg_pric": "150.0"}]
+
+
+# ── the resolution rule itself ────────────────────────────────────────────────
+
+@pytest.mark.parametrize("symbol,requested,expected", [
+    # The crypto vocabulary the UI actually sends — neither value is a market.
+    ("069500", "spot", "kr"),
+    ("069500", "swap", "kr"),
+    ("AAPL", "spot", "us"),
+    ("AAPL", "swap", "us"),
+    # Absent / empty → derive.
+    ("069500", None, "kr"),
+    ("069500", "", "kr"),
+    ("AAPL", None, "us"),
+    # An explicit, valid market is always honoured over the symbol.
+    ("069500", "us", "us"),
+    ("AAPL", "kr", "kr"),
+    ("069500", "KR", "kr"),
+    ("AAPL", "US", "us"),
+])
+def test_market_resolution(symbol, requested, expected):
+    assert _resolve_market(symbol, requested) == expected
+
+
+def test_kr_etf_names_resolve_kr_even_when_not_six_digits():
+    """Mirrors KISBroker._is_kr, which also accepts the KR_ETF list."""
+    from backend.quant.data.universe import KR_ETF
+
+    for sym in list(KR_ETF)[:3]:
+        assert _resolve_market(sym, "spot") == "kr"
+
+
+# ── close-position: the reported defect ───────────────────────────────────────
+
+def test_kr_close_position_reaches_the_kr_broker_path(monkeypatch, db, user):
+    """The regression: a KR close used to resolve against the US balance, find
+    nothing, and report "No open position" for a position the user holds."""
+    orders, _, _ = _wire(monkeypatch,
+                         portfolio=FakePortfolio(kr=KR_ROW),
+                         market_data=FakeMarketData(price=9500))
+
+    # Exactly what the UI produces today: no usable market in the payload.
+    body = ClosePositionRequest(credential_id=1, symbol="069500")
+    resp = quick_trade.close_position(body, None, user, db, _allow())
+
+    assert resp.code == 1, resp.msg
+    assert orders.calls == [("sell_kr", "069500", 7, 9500)]
+
+
+def test_us_close_position_is_unaffected(monkeypatch, db, user):
+    orders, _, _ = _wire(monkeypatch,
+                         portfolio=FakePortfolio(us=US_ROW),
+                         market_data=FakeMarketData(price=175.5))
+
+    body = ClosePositionRequest(credential_id=1, symbol="AAPL")
+    resp = quick_trade.close_position(body, None, user, db, _allow())
+
+    assert resp.code == 1, resp.msg
+    assert orders.calls == [("sell_us", "AAPL", "NASD", 10, 175.5)]
+
+
+def test_an_explicit_market_still_wins_on_close(monkeypatch, db, user):
+    """A caller that does know the market keeps control of it."""
+    orders, _, _ = _wire(monkeypatch,
+                         portfolio=FakePortfolio(kr=KR_ROW),
+                         market_data=FakeMarketData(price=9500))
+
+    body = ClosePositionRequest(credential_id=1, symbol="069500", market="kr")
+    resp = quick_trade.close_position(body, None, user, db, _allow())
+
+    assert resp.code == 1, resp.msg
+    assert orders.calls == [("sell_kr", "069500", 7, 9500)]
+
+
+# ── place-order: same root cause, reached via compat ──────────────────────────
+
+class _PlaceOrders:
+    def __init__(self):
+        self.calls = []
+
+    def _record(self, name, *args):
+        self.calls.append((name, *args))
+        return {"output": {"ODNO": "BRK-1"}}
+
+    def buy_kr(self, s, q, p):
+        return self._record("buy_kr", s, q, p)
+
+    def sell_kr(self, s, q, p):
+        return self._record("sell_kr", s, q, p)
+
+    def buy_us(self, s, e, q, p):
+        return self._record("buy_us", s, e, q, p)
+
+    def sell_us(self, s, e, q, p):
+        return self._record("sell_us", s, e, q, p)
+
+
+def test_kr_buy_reaches_the_kr_broker_path(monkeypatch, db, user):
+    """compat renames market_type→market, so the handler sees "spot"."""
+    orders = _PlaceOrders()
+    monkeypatch.setattr(quick_trade, "_load_kis",
+                        lambda cred: (object(), orders, FakePortfolio(kr=KR_ROW)))
+
+    body = PlaceOrderRequest(credential_id=1, symbol="069500", side="buy",
+                             qty=3, price=9000, market="spot")
+    resp = quick_trade.place_order(body, None, user, db, _allow())
+
+    assert resp.code == 1, resp.msg
+    assert orders.calls == [("buy_kr", "069500", 3, 9000)]
+
+
+def test_us_buy_is_unaffected(monkeypatch, db, user):
+    orders = _PlaceOrders()
+    monkeypatch.setattr(quick_trade, "_load_kis",
+                        lambda cred: (object(), orders, FakePortfolio(us=US_ROW)))
+
+    body = PlaceOrderRequest(credential_id=1, symbol="AAPL", side="buy",
+                             qty=3, price=175.5, market="spot")
+    resp = quick_trade.place_order(body, None, user, db, _allow())
+
+    assert resp.code == 1, resp.msg
+    assert orders.calls == [("buy_us", "AAPL", "NASD", 3, 175.5)]
