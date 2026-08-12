@@ -45,6 +45,34 @@ def test_a_genuinely_empty_account_still_reports_ok(monkeypatch, db, user):
     assert resp.data["total_eval"] == 0.0
 
 
+@pytest.mark.parametrize("requested", ["kr", "KR", " kr ", "  Kr  "])
+def test_a_market_naming_kr_reaches_the_kr_balance(monkeypatch, db, user, requested):
+    """The handler must branch on the *normalised* market.
+
+    Validating `` KR `` while retaining the raw string passed the check and
+    then failed the ``== "kr"`` comparison, quietly serving the US balance for
+    an explicit KR request.
+    """
+    _wire_portfolio(monkeypatch, FakePortfolio(
+        kr=[{"pdno": "069500", "hldg_qty": "7"}]))
+
+    resp = quick_trade.get_balance(1, requested, user, db)
+
+    assert resp.code == 1, resp.msg
+    assert resp.data["currency"] == "KRW"
+
+
+@pytest.mark.parametrize("requested", [None, "", "spot", "swap", "nonsense"])
+def test_an_unusable_market_falls_back_to_us(monkeypatch, db, user, requested):
+    """No symbol to derive from, so anything that isn't a market means US."""
+    _wire_portfolio(monkeypatch, FakePortfolio(us=[]))
+
+    resp = quick_trade.get_balance(1, requested, user, db)
+
+    assert resp.code == 1, resp.msg
+    assert resp.data["currency"] == "USD"
+
+
 def test_kr_balance_failure_is_also_reported(monkeypatch, db, user):
     _wire_portfolio(monkeypatch, FakePortfolio(exc=RuntimeError("KR down")))
 

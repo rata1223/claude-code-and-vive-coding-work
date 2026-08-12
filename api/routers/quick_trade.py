@@ -115,6 +115,17 @@ _SYMBOL_FIELDS = ("pdno", "ovrs_pdno")
 _MARKETS = ("kr", "us")
 
 
+def _normalize_market(requested: Optional[str]) -> Optional[str]:
+    """``"kr"`` / ``"us"`` when ``requested`` names a market, else ``None``.
+
+    Callers must use the *returned* value, never the raw input: `` KR `` names
+    a market but is not one, and comparing the raw string against ``"kr"``
+    would silently route it to the US path.
+    """
+    value = (requested or "").strip().lower()
+    return value if value in _MARKETS else None
+
+
 def _resolve_market(symbol: str, requested: Optional[str]) -> str:
     """The market this request is actually about — ``"kr"`` or ``"us"``.
 
@@ -131,8 +142,9 @@ def _resolve_market(symbol: str, requested: Optional[str]) -> str:
     (``backend/brokers/kis.py``), which already decides how cancels and quotes
     are routed. Reusing it keeps one definition of "is this a KR symbol".
     """
-    if requested and requested.strip().lower() in _MARKETS:
-        return requested.strip().lower()
+    explicit = _normalize_market(requested)
+    if explicit:
+        return explicit
     from backend.brokers.kis import KISBroker
 
     return "kr" if KISBroker._is_kr(symbol or "") else "us"
@@ -202,11 +214,11 @@ def get_balance(
     # an unusable value (the UI's "spot"/"swap") can only fall back to US.
     # KNOWN GAP: the balance screen therefore still shows US only. Closing it
     # needs a market selector in the UI, which is outside this change.
-    market = market if (market or "").strip().lower() in _MARKETS else "us"
+    market = _normalize_market(market) or "us"
 
     try:
         _, _, portfolio = _load_kis(cred)
-        if market.lower() == "kr":
+        if market == "kr":
             result = portfolio.get_kr_balance()
             summary = result.get("summary", {})
             return Resp.ok(

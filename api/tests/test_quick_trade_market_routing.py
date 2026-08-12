@@ -57,6 +57,10 @@ US_ROW = [{"ovrs_pdno": "AAPL", "ovrs_cblc_qty": "10", "pchs_avg_pric": "150.0"}
     ("AAPL", "kr", "kr"),
     ("069500", "KR", "kr"),
     ("AAPL", "US", "us"),
+    # Surrounding whitespace names a market too — and the *normalised* value is
+    # what callers must compare against, never the raw string.
+    ("AAPL", " kr ", "kr"),
+    ("069500", "  US  ", "us"),
 ])
 def test_market_resolution(symbol, requested, expected):
     assert _resolve_market(symbol, requested) == expected
@@ -100,16 +104,24 @@ def test_us_close_position_is_unaffected(monkeypatch, db, user):
 
 
 def test_an_explicit_market_still_wins_on_close(monkeypatch, db, user):
-    """A caller that does know the market keeps control of it."""
+    """A caller that does know the market keeps control of it.
+
+    The symbol is deliberately one that *derives* to US, and the balance holds
+    it on the KR side only: the KR path can be reached here solely by honouring
+    ``body.market``. Passing a KR-deriving symbol would prove nothing, since
+    derivation alone would produce the same call.
+    """
     orders, _, _ = _wire(monkeypatch,
-                         portfolio=FakePortfolio(kr=KR_ROW),
+                         portfolio=FakePortfolio(
+                             kr=[{"pdno": "AAPL", "hldg_qty": "7",
+                                  "pchs_avg_pric": "9000"}]),
                          market_data=FakeMarketData(price=9500))
 
-    body = ClosePositionRequest(credential_id=1, symbol="069500", market="kr")
+    body = ClosePositionRequest(credential_id=1, symbol="AAPL", market="kr")
     resp = quick_trade.close_position(body, None, user, db, _allow())
 
     assert resp.code == 1, resp.msg
-    assert orders.calls == [("sell_kr", "069500", 7, 9500)]
+    assert orders.calls == [("sell_kr", "AAPL", 7, 9500)]
 
 
 # ── place-order: same root cause, reached via compat ──────────────────────────
