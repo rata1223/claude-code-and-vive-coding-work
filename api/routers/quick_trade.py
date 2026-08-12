@@ -112,6 +112,43 @@ def _load_market_data(client):
 _QTY_FIELD = {"kr": "hldg_qty", "us": "ovrs_cblc_qty"}
 _SYMBOL_FIELDS = ("pdno", "ovrs_pdno")
 
+_MARKETS = ("kr", "us")
+
+
+def _normalize_market(requested: Optional[str]) -> Optional[str]:
+    """``"kr"`` / ``"us"`` when ``requested`` names a market, else ``None``.
+
+    Callers must use the *returned* value, never the raw input: `` KR `` names
+    a market but is not one, and comparing the raw string against ``"kr"``
+    would silently route it to the US path.
+    """
+    value = (requested or "").strip().lower()
+    return value if value in _MARKETS else None
+
+
+def _resolve_market(symbol: str, requested: Optional[str]) -> str:
+    """The market this request is actually about — ``"kr"`` or ``"us"``.
+
+    Honours ``requested`` when it names a market, and otherwise derives it from
+    the symbol. Deriving is not a convenience: the UI has no market concept to
+    send. Its toggle is ``spot``/``swap`` (crypto vocabulary inherited from
+    QuantDinger), and there is no ``kr``/``us`` anywhere in the view or the API
+    client. So every QuickTrade endpoint received either ``"spot"`` (renamed
+    from ``market_type`` by ``api/compat.py``) or nothing at all, both of which
+    failed the ``== "kr"`` test and routed KR requests to the US path — leaving
+    KR positions impossible to see, buy, sell or close from the UI.
+
+    The rule is not a new invention: it is ``KISBroker._is_kr``
+    (``backend/brokers/kis.py``), which already decides how cancels and quotes
+    are routed. Reusing it keeps one definition of "is this a KR symbol".
+    """
+    explicit = _normalize_market(requested)
+    if explicit:
+        return explicit
+    from backend.brokers.kis import KISBroker
+
+    return "kr" if KISBroker._is_kr(symbol or "") else "us"
+
 
 def _live_held_qty(portfolio, symbol: str, market: str) -> int:
     """Held quantity for ``symbol`` straight from the broker, or 0 if not held.
@@ -165,7 +202,7 @@ def _get_cred(credential_id: int, user_id: int, db: Session) -> Optional[Credent
 @router.get("/balance")
 def get_balance(
     credential_id: int = Query(...),
-    market: str = Query("us"),
+    market: Optional[str] = Query(None),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -173,9 +210,15 @@ def get_balance(
     if not cred:
         return Resp.err("Credential not found")
 
+    # No symbol to derive from — a balance request is inherently per-market, so
+    # an unusable value (the UI's "spot"/"swap") can only fall back to US.
+    # KNOWN GAP: the balance screen therefore still shows US only. Closing it
+    # needs a market selector in the UI, which is outside this change.
+    market = _normalize_market(market) or "us"
+
     try:
         _, _, portfolio = _load_kis(cred)
-        if market.lower() == "kr":
+        if market == "kr":
             result = portfolio.get_kr_balance()
             summary = result.get("summary", {})
             return Resp.ok(
@@ -197,9 +240,12 @@ def get_balance(
                     "positions": result.get("positions", []),
                 }
             )
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - reported, never masked
+        # Reporting zeros here made a broker outage, an expired token and a
+        # genuinely empty account identical on the wire. On a trading screen
+        # that reads as "you hold nothing", which is acted on. Surface it.
         logger.warning("balance fetch failed: %s", e)
-        return Resp.ok({"currency": "USD", "total_eval": 0.0, "cash": 0.0, "positions": []})
+        return Resp.err(f"Balance lookup failed: {e}")
 
 
 # ── Position ──────────────────────────────────────────────────────────────
@@ -208,7 +254,7 @@ def get_balance(
 def get_position(
     credential_id: int = Query(...),
     symbol: str = Query(...),
-    market: str = Query("us"),
+    market: Optional[str] = Query(None),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -218,7 +264,7 @@ def get_position(
 
     try:
         _, _, portfolio = _load_kis(cred)
-        if market.lower() == "kr":
+        if _resolve_market(symbol, market) == "kr":
             result = portfolio.get_kr_balance()
         else:
             result = portfolio.get_us_balance()
@@ -251,7 +297,7 @@ def place_order(
 
     try:
         qty = int(body.qty)
-        market = body.market.lower()
+        market = _resolve_market(body.symbol, body.market)
         order_type = "limit"  # KIS quick-trade submits ORD_DVSN "00" — always limit
         exchange = body.exchange or "NASD"
 
@@ -353,7 +399,7 @@ def close_position(
     if not cred:
         return Resp.err("Credential not found")
 
-    market = body.market.lower()
+    market = _resolve_market(body.symbol, body.market)
     exchange = body.exchange or "NASD"
 
     try:
