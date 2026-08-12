@@ -607,6 +607,25 @@ def test_a_replay_key_reused_for_another_symbol_is_a_conflict(monkeypatch, db, u
     assert len(orders.calls) == 1
 
 
+def test_a_replay_key_reused_for_another_exchange_is_a_conflict(monkeypatch, db, user):
+    """``exchange`` is part of the order identity — ``request_fingerprint``
+    includes it because the same symbol on NASD and on NYSE is a distinct order.
+    The short-circuit bypasses that fingerprint, so it has to check the same
+    thing itself or a reused key returns an order placed on another venue."""
+    orders, _, _ = _wire(monkeypatch,
+                         portfolio=FakePortfolio(us=_us_row(held="10", orderable="10")),
+                         market_data=FakeMarketData(price=175.5))
+    first = quick_trade.close_position(_body(qty=5), "venue-key", user, db, _allow())
+    assert first.code == 1, first.msg
+
+    clash = quick_trade.close_position(_body(qty=5, exchange="NYSE"), "venue-key",
+                                       user, db, _allow())
+
+    assert clash.code == -1
+    assert "duplicate idempotency key" in clash.msg.lower()
+    assert len(orders.calls) == 1
+
+
 def test_a_replay_key_reused_for_another_quantity_is_a_conflict(monkeypatch, db, user):
     orders, _, _ = _wire(monkeypatch,
                          portfolio=FakePortfolio(us=_us_row(held="10", orderable="10")),

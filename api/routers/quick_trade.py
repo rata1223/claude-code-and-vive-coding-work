@@ -548,6 +548,11 @@ def close_position(
     # legitimate retry the moment the UI sends "spot" or omits the field.
     # Safe to hoist: ``_resolve_market`` is pure and contacts no broker.
     market = _resolve_market(body.symbol, body.market)
+    # Hoisted for the same reason, and because ``exchange`` is part of the order
+    # identity: ``request_fingerprint`` includes it precisely because the same
+    # symbol on NASD and on NYSE is a distinct order. The replay short-circuit
+    # must not be weaker than the conflict check it bypasses.
+    exchange = body.exchange or "NASD"
 
     # An explicit replay short-circuits before any broker lookup. This handler
     # derives its quantity from the live figure, so re-running the resolution
@@ -580,8 +585,16 @@ def close_position(
                 and (replay.side or "").lower() == "sell"
                 and (replay.symbol or "").upper() == (body.symbol or "").upper()
                 and (replay.market or "").lower() == market
+                and (replay.exchange or "").upper() == exchange.upper()
                 # Exact, not int()-truncated: 5.9 must not match a stored 5 here
                 # when the same 5.9 is refused as a fractional share below.
+                #
+                # RESIDUAL: an omitted qty (close-all) matches whatever quantity
+                # is stored, so a close-all cannot be told apart from an explicit
+                # request whose qty happened to equal the resolved one. Nothing
+                # persisted records which of the two was asked for, and adding
+                # that is a schema change to the order table — out of scope here.
+                # Documented in docs/P0_07_S2_SELLABLE_QTY.md.
                 and (body.qty is None or float(replay.qty) == float(body.qty))
             )
             if not same_request:
@@ -600,8 +613,6 @@ def close_position(
         except Exception as e:  # noqa: BLE001 - an unusable body must not 500
             logger.warning("close replay comparison failed: %s", e)
             return Resp.err(f"Close position failed: {e}")
-
-    exchange = body.exchange or "NASD"
 
     try:
         client, orders, portfolio = _load_kis(cred)

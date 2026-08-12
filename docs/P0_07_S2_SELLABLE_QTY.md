@@ -82,7 +82,15 @@ The close-all quantity is deliberately **independent of local pending state** �
 
 The row a request would **replay is excluded** from the pending sum, for both key kinds. Without that, a retry is refused by the very reservation it is replaying and can never make progress. A caller-supplied key additionally short-circuits *before any broker lookup*, since re-running the quantity resolution would judge the retry against a figure its own first submission already reduced.
 
-That short-circuit still enforces the conflict check it bypasses. `reserve_and_submit` raises `IdempotencyConflict` on a key reused with different parameters; the stored `request_hash` covers the resolved qty and price, which cannot be recomputed without the skipped broker call, so the short-circuit compares the client parameters persisted verbatim — `credential_id`, **side**, symbol, market, and qty when supplied, compared exactly rather than `int()`-truncated. A mismatch returns `Duplicate idempotency key with different parameters` instead of an unrelated order.
+That short-circuit still enforces the conflict check it bypasses. `reserve_and_submit` raises `IdempotencyConflict` on a key reused with different parameters; the stored `request_hash` covers the resolved qty and price, which cannot be recomputed without the skipped broker call, so the short-circuit compares the client parameters persisted verbatim — `credential_id`, **side**, symbol, market, **exchange**, and qty when supplied, compared exactly rather than `int()`-truncated. A mismatch returns `Duplicate idempotency key with different parameters` instead of an unrelated order.
+
+`market` and `exchange` are compared against the values the handler *resolves*, not the raw body fields, because the resolved values are what the row persists. Since #149 the market is derived from the symbol when the client does not send one, so matching the raw field would refuse a legitimate retry the moment the UI omits it. `exchange` is included because `request_fingerprint` includes it: the same symbol on NASD and on NYSE is a distinct order, and the short-circuit must not be weaker than the check it stands in for.
+
+### Known residual: an omitted close-all quantity is a wildcard on replay
+
+A replay whose body omits `qty` matches whatever quantity the stored row holds, so a close-all cannot be distinguished from an explicit request whose qty happened to equal the originally resolved quantity. Nothing persisted records *which of the two was asked for* — `quick_trade_orders.qty` holds the resolved figure either way.
+
+Closing it means persisting the raw client intent (a distinct null for close-all) as a separate immutable fingerprint written before the reservation — a new column and a change to what the reservation commits, i.e. the same "order persistence / idempotency transaction semantics" this task is scoped not to alter. The exposure is narrow: it requires a caller to deliberately reuse one explicit idempotency key across two *different* close requests for the same credential, symbol, market and exchange, and the outcome is an accurate report of the order that key did create. It belongs with whichever task owns the reservation transaction.
 
 `broker_nets_pending=True` is available for a broker whose orderable figure already excludes resting orders, so it is not subtracted twice.
 

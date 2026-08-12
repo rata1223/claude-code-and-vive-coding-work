@@ -71,12 +71,28 @@ def test_market_resolution(symbol, requested, expected):
     assert _resolve_market(symbol, requested) == expected
 
 
-def test_kr_etf_names_resolve_kr_even_when_not_six_digits():
-    """Mirrors KISBroker._is_kr, which also accepts the KR_ETF list."""
+def test_every_kr_etf_member_resolves_kr():
     from backend.quant.data.universe import KR_ETF
 
-    for sym in list(KR_ETF)[:3]:
+    for sym in KR_ETF:
         assert _resolve_market(sym, "spot") == "kr"
+
+
+def test_the_etf_list_branch_is_honoured_for_a_non_six_digit_name(monkeypatch):
+    """``_is_kr`` accepts a symbol *either* six-digit-numeric or in ``KR_ETF``.
+
+    Today every real ``KR_ETF`` entry is six digits (``["069500", "360750",
+    "091160"]``), so iterating the live list exercises only the first branch and
+    proves nothing about the second — a broken ``KR_ETF`` lookup would still
+    pass. Substituting a name that cannot satisfy the digit rule is the only way
+    to reach the branch.
+    """
+    from backend.brokers import kis
+
+    monkeypatch.setattr(kis, "KR_ETF", ["KODEX200"])
+
+    assert _resolve_market("KODEX200", "spot") == "kr"
+    assert _resolve_market("KODEX999", "spot") == "us", "not in the list, not KR"
 
 
 # ── close-position: the reported defect ───────────────────────────────────────
