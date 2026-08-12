@@ -20,6 +20,11 @@ from api.tests.test_quick_trade_close_position import (
 )
 
 
+# Deliberately distinguishable, so a response can name the broker it came from.
+KR_ROWS = [{"pdno": "069500", "hldg_qty": "7"}]
+US_ROWS = [{"ovrs_pdno": "AAPL", "ovrs_cblc_qty": "10"}]
+
+
 def _wire_portfolio(monkeypatch, portfolio):
     monkeypatch.setattr(quick_trade, "_load_kis",
                         lambda cred: (object(), object(), portfolio))
@@ -53,24 +58,28 @@ def test_a_market_naming_kr_reaches_the_kr_balance(monkeypatch, db, user, reques
     then failed the ``== "kr"`` comparison, quietly serving the US balance for
     an explicit KR request.
     """
-    _wire_portfolio(monkeypatch, FakePortfolio(
-        kr=[{"pdno": "069500", "hldg_qty": "7"}]))
+    _wire_portfolio(monkeypatch, FakePortfolio(kr=KR_ROWS, us=US_ROWS))
 
     resp = quick_trade.get_balance(1, requested, user, db)
 
     assert resp.code == 1, resp.msg
     assert resp.data["currency"] == "KRW"
+    # ``currency`` alone proves nothing: it is hard-coded per branch, so a
+    # branch calling the wrong broker would still report "KRW". The positions
+    # come from the broker that was actually asked.
+    assert resp.data["positions"] == KR_ROWS
 
 
 @pytest.mark.parametrize("requested", [None, "", "spot", "swap", "nonsense"])
 def test_an_unusable_market_falls_back_to_us(monkeypatch, db, user, requested):
     """No symbol to derive from, so anything that isn't a market means US."""
-    _wire_portfolio(monkeypatch, FakePortfolio(us=[]))
+    _wire_portfolio(monkeypatch, FakePortfolio(kr=KR_ROWS, us=US_ROWS))
 
     resp = quick_trade.get_balance(1, requested, user, db)
 
     assert resp.code == 1, resp.msg
     assert resp.data["currency"] == "USD"
+    assert resp.data["positions"] == US_ROWS
 
 
 def test_kr_balance_failure_is_also_reported(monkeypatch, db, user):
