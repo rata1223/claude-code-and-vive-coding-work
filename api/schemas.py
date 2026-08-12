@@ -189,7 +189,11 @@ class PlaceOrderRequest(BaseModel):
     side: str               # buy / sell
     qty: float
     price: float
-    market: str = "us"      # us / kr
+    # None = not supplied. The default used to be "us", which was
+    # indistinguishable from a caller explicitly choosing US and so
+    # silently routed every KR order to the US path. Resolved by
+    # api.routers.quick_trade._resolve_market.
+    market: Optional[str] = None      # us / kr / None = derive from symbol
     exchange: str = "NASD"  # NASD / NYSE / KRX
 
 
@@ -204,7 +208,7 @@ class ClosePositionRequest(BaseModel):
     credential_id: int
     symbol: str
     qty: Optional[float] = None  # None = close the entire live position
-    market: str = "us"
+    market: Optional[str] = None   # None = derive from symbol (see _resolve_market)
     exchange: str = "NASD"
 
 
