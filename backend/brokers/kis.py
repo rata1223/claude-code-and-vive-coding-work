@@ -2,6 +2,7 @@ import os
 import logging
 import threading
 import time
+from decimal import Decimal, InvalidOperation
 from .base import BrokerAdapter
 from .capabilities import KIS_LIVE_CAPABILITIES, KIS_PAPER_CAPABILITIES
 from .models import Balance, BrokerCapabilities, Order, OrderStatus, Position
@@ -31,6 +32,35 @@ def get_kis_broker() -> "KISBroker":
             if _KIS_BROKER_INSTANCE is None:
                 _KIS_BROKER_INSTANCE = KISBroker()
     return _KIS_BROKER_INSTANCE
+
+
+# P0-07 S2: KIS reports how much of a holding is actually orderable
+# (주문가능수량) alongside the held quantity. The balance rows reach us
+# untouched, so the field is already in the payload — it was simply never read.
+# Absent or unreadable → ``None``, which makes callers fail closed rather than
+# fall back to the held quantity.
+_ORDERABLE_FIELD = "ord_psbl_qty"
+
+
+def _orderable_qty(row: dict, held: int):
+    """Parse ``ord_psbl_qty`` into an exact share count, or ``None``.
+
+    Parsed with ``Decimal`` rather than ``int(float(...))``: the latter accepts
+    ``True``, silently truncates ``"1.9"`` to 1, and lets ``"inf"`` raise
+    ``OverflowError`` out of ``get_positions()``. A quantity we cannot read
+    exactly is not a quantity — it must fail closed, not authorise a sell.
+    """
+    raw = row.get(_ORDERABLE_FIELD)
+    if raw is None or raw == "" or isinstance(raw, bool):
+        return None
+    try:
+        value = Decimal(str(raw))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    if not value.is_finite() or value < 0 or value != value.to_integral_value():
+        return None
+    # Never report more orderable than held — the smaller number is the safe one.
+    return min(int(value), held)
 
 
 class KISBroker(BrokerAdapter):
@@ -88,7 +118,9 @@ class KISBroker(BrokerAdapter):
                         cur = float(self._market.get_price_kr(sym))
                     except Exception:
                         cur = avg
-                    positions.append(Position(symbol=sym, qty=qty, avg_price=avg, market="KR", current_price=cur))
+                    positions.append(Position(symbol=sym, qty=qty, avg_price=avg,
+                                              market="KR", current_price=cur,
+                                              sellable_qty=_orderable_qty(p, qty)))
         except Exception as e:
             logger.warning("KR 포지션 조회 실패: %s", e)
 
@@ -104,7 +136,9 @@ class KISBroker(BrokerAdapter):
                         cur = self._market.get_price_us(sym, excd)
                     except Exception:
                         cur = avg
-                    positions.append(Position(symbol=sym, qty=qty, avg_price=avg, market="US", current_price=cur))
+                    positions.append(Position(symbol=sym, qty=qty, avg_price=avg,
+                                              market="US", current_price=cur,
+                                              sellable_qty=_orderable_qty(p, qty)))
         except Exception as e:
             logger.warning("US 포지션 조회 실패: %s", e)
 

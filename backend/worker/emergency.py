@@ -117,6 +117,67 @@ class EmergencyFlattenManager:
         # Returned verbatim — never rounded or clamped to make it pass.
         return value, None
 
+    def _sellable_for(self, pos) -> Tuple[int, Optional[str]]:
+        """How much of ``pos`` to actually submit, and any shortfall to report.
+
+        Held is not sellable — shares can be unsettled or already committed to a
+        resting order, and asking for the full holding gets the whole order
+        rejected (P0-07 S2). Two rules are specific to this path:
+
+        * **Shortfall**: sell what the broker says is orderable and report the
+          remainder. A partial liquidation using the broker's own number beats
+          no liquidation, and no quantity is invented.
+        * **Unknown**: EmergencyFlatten — and only EmergencyFlatten — falls back
+          to the held quantity, so a KIS field change can never freeze the
+          last-resort liquidation. Every other sell path fails closed. This
+          mirrors S1, where flatten is the one halt-immune path.
+
+        The two kinds of unknown are audited separately. A figure the broker
+        never reported (``CAUSE_UNREPORTED``) and one that came back unreadable
+        (``CAUSE_UNTRUSTED``) are different failures and want different
+        follow-up, so they must not land in one event. Both still fall back to
+        held: on this path refusing to sell is the *worse* outcome — freezing
+        the last-resort liquidation over a malformed field is exactly what the
+        fallback exists to prevent, and ``held`` is a real count read from the
+        same broker row, not an invented one.
+        """
+        from backend.risk.sellable_qty import CAUSE_UNTRUSTED, sellable_from_position
+
+        held = getattr(pos, "qty", 0) or 0
+        result = sellable_from_position(pos)
+
+        if not result.known:
+            untrusted = result.cause == CAUSE_UNTRUSTED
+            logger.log(
+                logging.ERROR if untrusted else logging.WARNING,
+                "[flatten] %s 주문가능수량 %s — 비상청산은 보유수량(%s)으로 진행: %s",
+                pos.symbol, "판독 불가" if untrusted else "미보고", held, result.reason,
+            )
+            self._audit(
+                "emergency_flatten_sellable_untrusted" if untrusted
+                else "emergency_flatten_sellable_unknown",
+                symbol=pos.symbol,
+                detail={"held_qty": held, "cause": result.reason,
+                        "cause_code": result.cause},
+            )
+            return held, None
+
+        sellable = result.qty
+        if sellable >= held:
+            return held, None
+
+        shortfall = held - sellable
+        logger.error(
+            "[flatten] %s 매도가능수량 부족 — 보유 %s 중 %s 만 제출, %s 미청산",
+            pos.symbol, held, sellable, shortfall,
+        )
+        self._audit("emergency_flatten_partial_sellable", symbol=pos.symbol,
+                    detail={"held_qty": held, "sellable_qty": sellable,
+                            "shortfall": shortfall, "cause": result.reason})
+        note = (f"매도가능수량 부족 — 보유 {held} 중 {sellable} 제출, "
+                f"{shortfall} 미청산")
+        return sellable, note
+
     def flatten_all(self, reason: str = "비상청산") -> dict:
         """
         모든 포지션 시장가 매도.
@@ -177,6 +238,17 @@ class EmergencyFlattenManager:
         self._reset_last_run(attempted=len(positions), dry_run=self._dry_run)
 
         for pos in positions:
+            # P0-07 S2: never ask for more than the broker will actually sell.
+            # Resolved before the quote so a shortfall is still audited when the
+            # price lookup also fails, and so a zero-sellable position skips the
+            # quote request entirely.
+            sell_qty, shortfall_note = self._sellable_for(pos)
+            if shortfall_note:
+                results["failed"].append(f"{pos.symbol}: {shortfall_note}")
+                self.last_failed_count += 1
+            if sell_qty <= 0:
+                continue
+
             # P0-07 G2: the live quote is the ONLY source of an executable sell
             # price. Validation runs before the dry-run branch so a dry run
             # surfaces the same rejection instead of reporting a flatten it
@@ -188,33 +260,36 @@ class EmergencyFlattenManager:
                     pos.symbol, cause,
                 )
                 results["failed"].append(f"{pos.symbol}: {cause}")
-                self.last_failed_count += 1
+                # Only count the position once. A shortfall already counted it,
+                # and counting again here can push failed_count past attempted.
+                if not shortfall_note:
+                    self.last_failed_count += 1
                 self._audit(PRICE_REJECTED_EVENT, symbol=pos.symbol,
-                            detail={"qty": pos.qty, "price": None, "cause": cause})
+                            detail={"qty": sell_qty, "price": None, "cause": cause})
                 continue
 
             if self._dry_run:
-                logger.critical("[DRY RUN] 비상청산: %s qty=%d @%.2f", pos.symbol, pos.qty, price)
+                logger.critical("[DRY RUN] 비상청산: %s qty=%d @%.2f", pos.symbol, sell_qty, price)
                 results["success"] += 1
                 self.last_success += 1
                 continue
 
             try:
-                order = self._broker.place_order(pos.symbol, "sell", pos.qty, price)
+                order = self._broker.place_order(pos.symbol, "sell", sell_qty, price)
                 logger.critical("비상청산 주문: %s qty=%d @%.2f id=%s",
-                                pos.symbol, pos.qty, price, order.id)
+                                pos.symbol, sell_qty, price, order.id)
                 results["success"] += 1
                 results["submitted"] += 1
                 self.last_success += 1
                 self.last_submitted += 1
                 self._audit("emergency_flatten_order", symbol=pos.symbol,
-                            detail={"qty": pos.qty, "price": price, "order_id": order.id})
-            except Exception as e:
+                            detail={"qty": sell_qty, "price": price, "order_id": order.id})
+            except Exception as e:  # noqa: BLE001 - continue remaining positions after broker failure
                 logger.error("비상청산 실패 %s: %s", pos.symbol, e)
                 results["failed"].append(f"{pos.symbol}: {e}")
                 self.last_failed_count += 1
                 self._audit("emergency_flatten_failed", symbol=pos.symbol,
-                            detail={"qty": pos.qty, "price": price, "error": str(e)})
+                            detail={"qty": sell_qty, "price": price, "error": str(e)})
 
         self._alert(reason, results)
         self._audit("emergency_flatten_complete",

@@ -95,10 +95,30 @@ class FakeOrders:
         return {"output": {"ODNO": "BRK-SELL-US"}}
 
 
+class _SellablePortfolio:
+    """A broker that reports its orderable (매도가능) quantity, as KIS does.
+
+    P0-07 S2 made a direct sell prove itself against that figure, so the sell
+    tests here need a portfolio rather than a bare stand-in.
+    """
+
+    _US = [{"ovrs_pdno": "AAPL", "ovrs_cblc_qty": "100", "ord_psbl_qty": "100",
+            "pchs_avg_pric": "150.0"}]
+    _KR = [{"pdno": "069500", "hldg_qty": "100", "ord_psbl_qty": "100",
+            "pchs_avg_pric": "9000"}]
+
+    def get_us_balance(self):
+        return {"positions": self._US, "summary": {}}
+
+    def get_kr_balance(self):
+        return {"positions": self._KR, "summary": {}}
+
+
 @pytest.fixture()
 def orders(monkeypatch):
     fake = FakeOrders()
-    monkeypatch.setattr(quick_trade, "_load_kis", lambda cred: (object(), fake, object()))
+    monkeypatch.setattr(quick_trade, "_load_kis",
+                        lambda cred: (object(), fake, _SellablePortfolio()))
     return fake
 
 

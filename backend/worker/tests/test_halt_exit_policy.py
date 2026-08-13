@@ -54,8 +54,18 @@ class _FakeBroker:
                      status=OrderStatus.SUBMITTED)
 
 
-def _pos(symbol="SPY", qty=10, avg=100.0):
-    return Position(symbol=symbol, qty=qty, avg_price=avg, market="US")
+_SAME_AS_HELD = object()
+
+
+def _pos(symbol="SPY", qty=10, avg=100.0, sellable=_SAME_AS_HELD):
+    """A position from a broker that reports its orderable quantity.
+
+    P0-07 S2 made the exit proof run against the *sellable* quantity, so these
+    fixtures state one; ``sellable=None`` models a broker that reports none,
+    which fails closed (covered in test_sellable_qty_paths.py).
+    """
+    return Position(symbol=symbol, qty=qty, avg_price=avg, market="US",
+                    sellable_qty=qty if sellable is _SAME_AS_HELD else sellable)
 
 
 @pytest.fixture(autouse=True)

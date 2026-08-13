@@ -36,8 +36,13 @@ from api.tests.test_quick_trade_close_position import (  # reuse the proven harn
     user,        # noqa: F401
 )
 
-KR_ROW = [{"pdno": "069500", "hldg_qty": "7", "pchs_avg_pric": "9000"}]
-US_ROW = [{"ovrs_pdno": "AAPL", "ovrs_cblc_qty": "10", "pchs_avg_pric": "150.0"}]
+# ``ord_psbl_qty`` is required by the P0-07 S2 sellable-quantity rule: a row
+# that does not state it is blocked rather than fall back to the held figure.
+# A real KIS balance row carries it, so these mirror the broker faithfully.
+KR_ROW = [{"pdno": "069500", "hldg_qty": "7", "ord_psbl_qty": "7",
+           "pchs_avg_pric": "9000"}]
+US_ROW = [{"ovrs_pdno": "AAPL", "ovrs_cblc_qty": "10", "ord_psbl_qty": "10",
+           "pchs_avg_pric": "150.0"}]
 
 
 # ── the resolution rule itself ────────────────────────────────────────────────
@@ -66,12 +71,28 @@ def test_market_resolution(symbol, requested, expected):
     assert _resolve_market(symbol, requested) == expected
 
 
-def test_kr_etf_names_resolve_kr_even_when_not_six_digits():
-    """Mirrors KISBroker._is_kr, which also accepts the KR_ETF list."""
+def test_every_kr_etf_member_resolves_kr():
     from backend.quant.data.universe import KR_ETF
 
-    for sym in list(KR_ETF)[:3]:
+    for sym in KR_ETF:
         assert _resolve_market(sym, "spot") == "kr"
+
+
+def test_the_etf_list_branch_is_honoured_for_a_non_six_digit_name(monkeypatch):
+    """``_is_kr`` accepts a symbol *either* six-digit-numeric or in ``KR_ETF``.
+
+    Today every real ``KR_ETF`` entry is six digits (``["069500", "360750",
+    "091160"]``), so iterating the live list exercises only the first branch and
+    proves nothing about the second — a broken ``KR_ETF`` lookup would still
+    pass. Substituting a name that cannot satisfy the digit rule is the only way
+    to reach the branch.
+    """
+    from backend.brokers import kis
+
+    monkeypatch.setattr(kis, "KR_ETF", ["KODEX200"])
+
+    assert _resolve_market("KODEX200", "spot") == "kr"
+    assert _resolve_market("KODEX999", "spot") == "us", "not in the list, not KR"
 
 
 # ── close-position: the reported defect ───────────────────────────────────────
@@ -114,6 +135,7 @@ def test_an_explicit_market_still_wins_on_close(monkeypatch, db, user):
     orders, _, _ = _wire(monkeypatch,
                          portfolio=FakePortfolio(
                              kr=[{"pdno": "AAPL", "hldg_qty": "7",
+                                  "ord_psbl_qty": "7",
                                   "pchs_avg_pric": "9000"}]),
                          market_data=FakeMarketData(price=9500))
 
@@ -122,6 +144,30 @@ def test_an_explicit_market_still_wins_on_close(monkeypatch, db, user):
 
     assert resp.code == 1, resp.msg
     assert orders.calls == [("sell_kr", "AAPL", 7, 9500)]
+
+
+def test_a_close_replay_matches_when_the_body_carries_no_market(monkeypatch, db, user):
+    """The persisted row stores the *resolved* market, so a replay must be
+    compared against that.
+
+    P0-07 S2's replay short-circuit checks ``replay.market == body.market``.
+    Once the market is derived rather than sent, those two differ for exactly
+    the payload the UI produces — stored ``"kr"`` versus a body carrying
+    ``None`` — and an honest retry is refused as "different parameters".
+    """
+    orders, _, _ = _wire(monkeypatch,
+                         portfolio=FakePortfolio(kr=KR_ROW),
+                         market_data=FakeMarketData(price=9500))
+
+    body = ClosePositionRequest(credential_id=1, symbol="069500", qty=7)
+
+    first = quick_trade.close_position(body, "replay-kr", user, db, _allow())
+    assert first.code == 1, first.msg
+
+    second = quick_trade.close_position(body, "replay-kr", user, db, _allow())
+
+    assert second.code == 1, second.msg
+    assert len(orders.calls) == 1, "the replay must not reach the broker again"
 
 
 # ── place-order: same root cause, reached via compat ──────────────────────────
