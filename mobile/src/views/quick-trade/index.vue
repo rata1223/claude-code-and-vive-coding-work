@@ -485,13 +485,27 @@ export default {
         const d = res?.data || {}
         // dry_run must never be silently swallowed: reporting "liquidated" when
         // nothing was submitted is the worst possible outcome on this control.
-        const message = d.dry_run
-          ? this.$t('quick_trade.emergency_dry_run', { attempted: d.attempted ?? 0 })
-          : this.$t('quick_trade.emergency_done', {
-              submitted: d.submitted ?? 0,
-              failed: d.failed_count ?? 0
-            })
-        showToast({ message, type: d.dry_run ? 'warning' : 'success', duration: 5000 })
+        // Three outcomes, three signals. Green for a clean flatten only:
+        // positions left open after an emergency liquidation is exactly the
+        // state an operator must not mistake for "done".
+        const failed = Number(d.failed_count ?? 0)
+        const partial = d.status === 'partial' || failed > 0
+        let message
+        let type
+        if (d.dry_run) {
+          message = this.$t('quick_trade.emergency_dry_run', { attempted: d.attempted ?? 0 })
+          type = 'warning'
+        } else if (partial) {
+          message = this.$t('quick_trade.emergency_partial', {
+            submitted: d.submitted ?? 0,
+            failed
+          })
+          type = 'fail'
+        } else {
+          message = this.$t('quick_trade.emergency_done', { submitted: d.submitted ?? 0 })
+          type = 'success'
+        }
+        showToast({ message, type, duration: 5000 })
         await this.refreshTradeData()
       } catch (error) {
         console.error('Emergency flatten failed:', error)
@@ -539,7 +553,8 @@ export default {
       const map = {
         filled: this.$t('quick_trade.status_filled'),
         submitted: this.$t('quick_trade.status_submitted'),
-        failed: this.$t('quick_trade.status_failed')
+        failed: this.$t('quick_trade.status_failed'),
+        canceled: this.$t('quick_trade.status_canceled')
       }
       return map[value] || (value || '-')
     },

@@ -110,7 +110,27 @@ def test_a_kr_order_routes_to_the_kr_cancel(monkeypatch, db, user):
 
 # ── truthfulness: a refusal is never reported as success ──────────────────────
 
-def test_a_broker_refusal_leaves_the_order_resting(monkeypatch, db, user):
+def test_a_real_broker_refusal_leaves_the_order_resting(monkeypatch, db, user):
+    """How a refusal actually arrives: ``KISClient.post`` raises on any non-zero
+    ``rt_cd``, so the reason reaches us as ``RuntimeError("KIS API error: …")``.
+    The operator must still see the broker's own words, and the order — which is
+    still resting in the market — must not be marked canceled."""
+    row = _seed(db)
+    _wire(monkeypatch, _FakeOrders(
+        exc=RuntimeError("KIS API error: 취소할 수 있는 수량이 없습니다")))
+
+    resp = quick_trade.cancel_order(_body(row.id), user, db)
+
+    assert resp.code == -1
+    assert "취소할 수 있는 수량이 없습니다" in resp.msg
+    db.refresh(row)
+    assert row.status == QT_SUBMITTED
+
+
+def test_a_returned_refusal_also_leaves_the_order_resting(monkeypatch, db, user):
+    """Defence in depth. The production client raises rather than returning a
+    bad ``rt_cd``, but the handler must not assume that — a mock, a paper
+    client, or a transport change could return instead."""
     row = _seed(db)
     refusal = {"rt_cd": "1", "msg1": "취소할 수 있는 수량이 없습니다"}
     _wire(monkeypatch, _FakeOrders(response=refusal))

@@ -55,14 +55,57 @@ class _FakePoster:
         return self.response
 
 
-def _wire(monkeypatch, poster, api_key="secret-key"):
+def _wire(monkeypatch, poster, api_key="secret-key", admins="a@example.com"):
     monkeypatch.setattr(quick_trade, "_admin_post", poster)
     monkeypatch.setenv("KIS_API_KEY", api_key)
+    monkeypatch.setenv("EMERGENCY_FLATTEN_ADMINS", admins)
     return poster
 
 
 def _body(confirm=True):
     return EmergencyFlattenRequest(confirm=confirm)
+
+
+# ── authorization: this is not a per-user action ──────────────────────────────
+
+def test_nobody_is_authorized_by_default(monkeypatch, db, user):
+    """Fail closed. The upstream manager liquidates the *deployment's* book via
+    the worker's process-level broker, not the caller's positions, so an
+    unconfigured allowlist must mean nobody — never everybody."""
+    poster = _wire(monkeypatch, _FakePoster(), admins="")
+
+    resp = quick_trade.emergency_flatten(_body(), user, db)
+
+    assert resp.code == -1
+    assert "authorized" in resp.msg.lower()
+    assert poster.calls == [], "an unauthorized caller must never reach the control"
+
+
+def test_a_user_outside_the_allowlist_is_refused(monkeypatch, db, user):
+    poster = _wire(monkeypatch, _FakePoster(), admins="someone-else@example.com")
+
+    resp = quick_trade.emergency_flatten(_body(), user, db)
+
+    assert resp.code == -1
+    assert poster.calls == []
+
+
+def test_the_allowlist_is_case_insensitive(monkeypatch, db, user):
+    """Emails are not case sensitive; a capitalised entry must not lock out the
+    one operator who is supposed to have the break-glass."""
+    _wire(monkeypatch, _FakePoster(), admins="  A@Example.COM , other@x.com ")
+
+    assert quick_trade.emergency_flatten(_body(), user, db).code == 1
+
+
+def test_authorization_is_checked_before_confirmation(monkeypatch, db, user):
+    """An unauthorized caller should not be able to probe the control's shape."""
+    poster = _wire(monkeypatch, _FakePoster(), admins="")
+
+    resp = quick_trade.emergency_flatten(_body(confirm=False), user, db)
+
+    assert "authorized" in resp.msg.lower()
+    assert poster.calls == []
 
 
 # ── the control works and reports the truth ───────────────────────────────────
@@ -151,3 +194,48 @@ def test_no_secret_leaks_when_the_upstream_fails(monkeypatch, db, user):
 
     assert resp.code == -1
     assert "super-secret" not in resp.msg
+
+
+# ── HTTP level: the JWT dependency actually runs ──────────────────────────────
+#
+# Everything above calls the handler directly, which bypasses
+# `Depends(get_current_user)`. These two go through the real app so the route's
+# authentication is exercised rather than assumed — on a liquidation control,
+# "we injected a user object" is not evidence that a stranger is refused.
+
+def test_unauthenticated_requests_are_rejected(client, monkeypatch):
+    called = []
+    monkeypatch.setattr(quick_trade, "_admin_post", lambda *a, **k: called.append(1))
+    monkeypatch.setenv("EMERGENCY_FLATTEN_ADMINS", "rider@example.com")
+
+    resp = client.post("/api/quick-trade/emergency-flatten", json={"confirm": True})
+
+    assert resp.status_code in (401, 403), resp.text
+    assert called == [], "no token must never reach the liquidation control"
+
+
+def test_an_authenticated_admin_reaches_the_control(client, auth_headers, monkeypatch):
+    poster = _FakePoster()
+    monkeypatch.setattr(quick_trade, "_admin_post", poster)
+    monkeypatch.setenv("KIS_API_KEY", "secret-key")
+    monkeypatch.setenv("EMERGENCY_FLATTEN_ADMINS", "rider@example.com")
+
+    resp = client.post("/api/quick-trade/emergency-flatten",
+                       json={"confirm": True}, headers=auth_headers)
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["code"] == 1, resp.text
+    assert len(poster.calls) == 1
+
+
+def test_an_authenticated_non_admin_is_refused_over_http(client, auth_headers, monkeypatch):
+    poster = _FakePoster()
+    monkeypatch.setattr(quick_trade, "_admin_post", poster)
+    monkeypatch.setenv("EMERGENCY_FLATTEN_ADMINS", "someone-else@example.com")
+
+    resp = client.post("/api/quick-trade/emergency-flatten",
+                       json={"confirm": True}, headers=auth_headers)
+
+    assert resp.status_code == 200
+    assert resp.json()["code"] == -1
+    assert poster.calls == []

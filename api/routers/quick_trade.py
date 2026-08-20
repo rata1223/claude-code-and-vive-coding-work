@@ -890,6 +890,11 @@ def cancel_order(
             QuickTradeOrder.user_id == current_user.id,
             QuickTradeOrder.credential_id == body.credential_id,
         )
+        # Serialise concurrent cancels of the same row: without the lock two
+        # requests can both read QT_SUBMITTED and both reach the broker. (A
+        # no-op on SQLite, which is only the test backend; Postgres is the
+        # canonical DB and honours it.)
+        .with_for_update()
         .first()
     )
     if not order:
@@ -917,6 +922,11 @@ def cancel_order(
         logger.warning("cancel failed %s: %s", order.broker_order_id, e)
         return Resp.err(f"Cancel failed: {e}")
 
+    # NOTE ON REACHABILITY: ``KISClient.post`` raises ``RuntimeError`` on any
+    # non-zero ``rt_cd``, so a real broker refusal arrives through the ``except``
+    # above (carrying ``msg1``), not here. This branch is defence in depth for a
+    # client that returns instead of raising — a paper/mock client, or a future
+    # transport change. Either way the order stays QT_SUBMITTED.
     # Absent rt_cd is not consent — fail closed and leave the order resting.
     rt_cd = (result or {}).get("rt_cd")
     if rt_cd != "0":
@@ -938,7 +948,42 @@ def cancel_order(
 
 #: Where the Flask ops API lives. Compose service name by default; the browser
 #: never learns this address and never holds the key used against it.
+#:
+#: DEPLOYMENT NOTE: the default is plaintext HTTP on the container network,
+#: which is where ``KIS_API_KEY`` travels in the ``X-API-Key`` header. That is
+#: acceptable only for a single-host compose deployment where the network is
+#: not shared. Split the services across hosts and this must be set to an
+#: ``https://`` base via ``KIS_ADMIN_API_BASE``.
 _ADMIN_API_BASE = "http://kis-api:5001"
+
+
+def _flatten_authorized(user) -> bool:
+    """Whether ``user`` may trigger the shared emergency liquidation.
+
+    Emergency flatten is **not** a per-user action. The upstream manager runs
+    against the worker's process-level broker, so it liquidates the deployment's
+    positions — not the caller's. Exposing it to every authenticated account
+    would let any registered user flatten a book that is not theirs.
+
+    This app has no role or admin column (``api/models.py:User``), and inventing
+    an authorization model is well beyond a UI safety fix. So the gate is a
+    fail-closed break-glass allowlist: ``EMERGENCY_FLATTEN_ADMINS`` holds
+    comma-separated emails, and while it is unset — the default — **nobody** is
+    authorized and the control is dormant.
+
+    That is deliberate. A dormant control is recoverable by setting one env var;
+    a control every user can fire is not recoverable at all.
+    """
+    import os
+
+    allowed = {
+        e.strip().lower()
+        for e in os.environ.get("EMERGENCY_FLATTEN_ADMINS", "").split(",")
+        if e.strip()
+    }
+    if not allowed:
+        return False
+    return (getattr(user, "email", "") or "").lower() in allowed
 
 
 def _admin_post(url, json=None, headers=None, timeout=None):
@@ -978,6 +1023,14 @@ def emergency_flatten(
     reachable directly. See docs and the plan's blocker note.
     """
     import os
+
+    if not _flatten_authorized(current_user):
+        # Checked before `confirm` so an unauthorized caller learns nothing
+        # about the control's shape beyond "you may not".
+        logger.warning(
+            "unauthorized emergency flatten attempt by user_id=%s", current_user.id
+        )
+        return Resp.err("Not authorized to trigger emergency liquidation")
 
     if body.confirm is not True:
         return Resp.err("confirm=true is required to trigger emergency liquidation")

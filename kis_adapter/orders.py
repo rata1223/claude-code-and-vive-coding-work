@@ -144,11 +144,18 @@ class KISOrders:
         lives here so a multi-tenant caller can cancel through its
         request-scoped client instead of the process singleton.
 
-        Returns the **raw** KIS response. The broker's version collapses every
-        outcome into a bool, which loses the distinction between "cancelled"
-        and "the broker refused" — on a cancel that is the difference between
-        an order being gone and still resting in the market. The caller checks
-        ``rt_cd`` and surfaces ``msg1``.
+        Returns the **raw** KIS response rather than a bool. ``KISBroker``'s
+        version collapses every outcome into ``False``, which loses both the
+        reason and the distinction between "cancelled" and "the broker refused"
+        — on a cancel that is the difference between an order being gone and
+        still resting in the market.
+
+        Note where a refusal actually surfaces: ``KISClient.post`` raises
+        ``RuntimeError("KIS API error: …")`` on any non-zero ``rt_cd``, so in
+        production the caller sees an **exception** carrying ``msg1``, not a
+        response with a bad ``rt_cd``. Returning the raw dict still matters —
+        it lets the caller verify ``rt_cd == "0"`` rather than assuming success,
+        which holds for any client that returns instead of raising.
 
         ``qty``/``price`` are accepted for signature symmetry with
         ``cancel_us`` and for logging; ``QTY_ALL_ORD_YN="Y"`` cancels the whole
