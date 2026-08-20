@@ -561,6 +561,17 @@ export const quickTradeApi = {
     }
   },
   placeOrder: (payload) => http.post('/api/quick-trade/place-order', payload),
+  getOpenOrders: async (credentialId) => {
+    const res = await http.get('/api/quick-trade/open-orders', {
+      params: { credential_id: credentialId }
+    })
+    return {
+      ...res,
+      data: unwrapItems(res.data)
+    }
+  },
+  cancelOrder: (payload) => http.post('/api/quick-trade/cancel-order', payload),
+  emergencyFlatten: (payload) => http.post('/api/quick-trade/emergency-flatten', payload),
   closePosition: (payload) => http.post('/api/quick-trade/close-position', payload),
   getHistory: async (params = {}) => {
     const res = await http.get('/api/quick-trade/history', { params })

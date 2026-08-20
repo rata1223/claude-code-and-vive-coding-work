@@ -48,7 +48,7 @@
       <div class="balance-card">
         <div>
           <span class="balance-label">{{ $t('quick_trade.available') }}</span>
-          <p class="balance-value">{{ formatNumber(balance?.available) }} {{ balance?.currency || 'USDT' }}</p>
+          <p class="balance-value">{{ formatNumber(balance?.available) }} {{ balance?.currency || '' }}</p>
         </div>
         <div class="balance-side">
           <span class="balance-label">{{ $t('quick_trade.total') }}</span>
@@ -67,35 +67,18 @@
         @click="openSymbolPicker"
       />
       <van-field
-        v-model="form.amount"
-        :label="$t('quick_trade.amount')"
-        type="number"
-        :placeholder="$t('quick_trade.amount_placeholder')"
+        v-model="form.qty"
+        :label="$t('quick_trade.qty')"
+        type="digit"
+        :placeholder="$t('quick_trade.qty_placeholder')"
       />
       <van-field
-        v-if="form.order_type === 'limit'"
         v-model="form.price"
         :label="$t('quick_trade.price')"
         type="number"
         :placeholder="$t('quick_trade.price_placeholder')"
       />
-      <van-field
-        v-if="marketType === 'swap'"
-        v-model="form.leverage"
-        :label="$t('quick_trade.leverage')"
-        type="number"
-        :placeholder="$t('quick_trade.leverage_placeholder')"
-      />
-      <div class="market-toggle compact">
-        <span
-          v-for="item in orderTypeOptions"
-          :key="item.value"
-          :class="['toggle-item', { active: form.order_type === item.value }]"
-          @click="form.order_type = item.value"
-        >
-          {{ item.label }}
-        </span>
-      </div>
+      <p class="helper-text limit-only-note">{{ $t('quick_trade.limit_only_note') }}</p>
       <div class="action-row">
         <van-button type="success" block :loading="submitting" @click="submitOrder('buy')">
           {{ $t('quick_trade.buy') }}
@@ -132,6 +115,50 @@
 
     <div class="panel-card">
       <div class="section-head">
+        <span class="panel-title">{{ $t('quick_trade.open_orders') }}</span>
+        <span class="helper-text">{{ $t('quick_trade.open_orders_tip') }}</span>
+      </div>
+      <div v-if="openOrders.length" class="list-wrap">
+        <div v-for="order in openOrders" :key="order.id" class="list-row">
+          <div>
+            <span class="row-title">{{ order.symbol }}</span>
+            <p class="row-subtitle">
+              {{ getSideText(order.side) }} · {{ formatShares(order.qty) }} @ {{ formatNumber(order.price) }}
+            </p>
+          </div>
+          <div class="row-actions">
+            <van-button
+              size="mini"
+              plain
+              type="warning"
+              :loading="cancelling === order.id"
+              @click="cancelOrder(order)"
+            >
+              {{ $t('quick_trade.cancel_order') }}
+            </van-button>
+          </div>
+        </div>
+      </div>
+      <van-empty v-else :description="$t('quick_trade.open_orders_empty')" />
+    </div>
+
+    <div class="panel-card danger-card">
+      <div class="section-head">
+        <span class="panel-title">{{ $t('quick_trade.emergency') }}</span>
+        <span class="helper-text">{{ $t('quick_trade.emergency_tip') }}</span>
+      </div>
+      <van-button
+        block
+        type="danger"
+        :loading="flattening"
+        @click="emergencyFlatten"
+      >
+        {{ $t('quick_trade.emergency_action') }}
+      </van-button>
+    </div>
+
+    <div class="panel-card">
+      <div class="section-head">
         <span class="panel-title">{{ $t('quick_trade.history') }}</span>
         <span class="helper-text">{{ $t('quick_trade.history_count', { count: history.length }) }}</span>
       </div>
@@ -142,7 +169,7 @@
             <p class="row-subtitle">{{ getSideText(item.side) }} · {{ formatTime(item.created_at) }}</p>
           </div>
           <div class="history-side">
-            <span class="row-value">{{ formatNumber(item.amount) }} USDT</span>
+            <span class="row-value">{{ formatShares(item.qty) }}</span>
             <small>{{ getStatusText(item.status) }}</small>
           </div>
         </div>
@@ -184,12 +211,13 @@ export default {
       showCredentialPicker: false,
       showSymbolPicker: false,
       submitting: false,
+      cancelling: null,
+      flattening: false,
+      openOrders: [],
       form: {
         symbol: '',
-        amount: '',
-        price: '',
-        leverage: '1',
-        order_type: 'market'
+        qty: '',
+        price: ''
       }
     }
   },
@@ -199,12 +227,6 @@ export default {
       return [
         { label: this.$t('quick_trade.market_spot'), value: 'spot' },
         { label: this.$t('quick_trade.market_swap'), value: 'swap' }
-      ]
-    },
-    orderTypeOptions() {
-      return [
-        { label: this.$t('quick_trade.order_market'), value: 'market' },
-        { label: this.$t('quick_trade.order_limit'), value: 'limit' }
       ]
     },
     credentialsStore() {
@@ -331,9 +353,6 @@ export default {
 
     setMarketType(value) {
       this.quickTradeStore.setMarketType(value)
-      if (value === 'spot') {
-        this.form.leverage = '1'
-      }
     },
 
     onSelectCredential(payload) {
@@ -355,7 +374,8 @@ export default {
       try {
         const tasks = [
           quickTradeApi.getBalance(this.selectedCredentialId, this.marketType),
-          quickTradeApi.getHistory()
+          quickTradeApi.getHistory(),
+          quickTradeApi.getOpenOrders(this.selectedCredentialId)
         ]
         if (this.form.symbol.trim()) {
           tasks.push(quickTradeApi.getPosition({
@@ -364,9 +384,11 @@ export default {
             marketType: this.marketType
           }))
         }
-        const [balanceRes, historyRes, positionRes] = await Promise.allSettled(tasks)
+        // Order matters: this destructuring must stay aligned with `tasks`.
+        const [balanceRes, historyRes, openRes, positionRes] = await Promise.allSettled(tasks)
         this.quickTradeStore.setBalance(balanceRes.status === 'fulfilled' ? (balanceRes.value.data || null) : null)
         this.quickTradeStore.setHistory(historyRes.status === 'fulfilled' ? (historyRes.value.data || []) : [])
+        this.openOrders = openRes?.status === 'fulfilled' ? (openRes.value.data || []) : []
         this.quickTradeStore.setPositions(positionRes?.status === 'fulfilled' ? (positionRes.value.data || []) : [])
       } catch (error) {
         console.error('Refresh quick trade data failed:', error)
@@ -382,11 +404,14 @@ export default {
         showToast({ message: this.$t('quick_trade.need_symbol'), type: 'fail' })
         return false
       }
-      if (!Number(this.form.amount)) {
-        showToast({ message: this.$t('quick_trade.need_amount'), type: 'fail' })
+      const qty = Number(this.form.qty)
+      if (!Number.isInteger(qty) || qty <= 0) {
+        showToast({ message: this.$t('quick_trade.need_qty'), type: 'fail' })
         return false
       }
-      if (this.form.order_type === 'limit' && !Number(this.form.price)) {
+      // Price is unconditional: quick-trade submits ORD_DVSN "00" (limit) only,
+      // so a blank price would go out as a limit order at 0 and be refused.
+      if (!(Number(this.form.price) > 0)) {
         showToast({ message: this.$t('quick_trade.need_price'), type: 'fail' })
         return false
       }
@@ -401,10 +426,8 @@ export default {
           credential_id: this.selectedCredentialId,
           symbol: this.form.symbol.trim(),
           side,
-          order_type: this.form.order_type,
-          amount: Number(this.form.amount),
-          price: Number(this.form.price || 0),
-          leverage: this.marketType === 'swap' ? Number(this.form.leverage || 1) : 1,
+          qty: Number(this.form.qty),
+          price: Number(this.form.price),
           market_type: this.marketType,
           source: 'manual'
         })
@@ -415,6 +438,65 @@ export default {
         console.error('Submit quick trade failed:', error)
       } finally {
         this.submitting = false
+      }
+    },
+
+    async cancelOrder(order) {
+      try {
+        await showConfirmDialog({
+          title: this.$t('quick_trade.cancel_confirm_title'),
+          message: this.$t('quick_trade.cancel_confirm_msg', {
+            symbol: order.symbol,
+            qty: order.qty
+          })
+        })
+      } catch (e) {
+        return                                   // dialog dismissed, not an error
+      }
+      this.cancelling = order.id
+      try {
+        await quickTradeApi.cancelOrder({
+          credential_id: this.selectedCredentialId,
+          order_id: order.id
+        })
+        showToast({ message: this.$t('quick_trade.cancel_success'), type: 'success' })
+        await this.refreshTradeData()
+      } catch (error) {
+        // The interceptor has already surfaced the broker's reason. A refused
+        // cancel means the order is still resting — never imply otherwise.
+        console.error('Cancel order failed:', error)
+      } finally {
+        this.cancelling = null
+      }
+    },
+
+    async emergencyFlatten() {
+      try {
+        await showConfirmDialog({
+          title: this.$t('quick_trade.emergency_confirm_title'),
+          message: this.$t('quick_trade.emergency_confirm_msg')
+        })
+      } catch (e) {
+        return
+      }
+      this.flattening = true
+      try {
+        const res = await quickTradeApi.emergencyFlatten({ confirm: true })
+        const d = res?.data || {}
+        // dry_run must never be silently swallowed: reporting "liquidated" when
+        // nothing was submitted is the worst possible outcome on this control.
+        const message = d.dry_run
+          ? this.$t('quick_trade.emergency_dry_run', { attempted: d.attempted ?? 0 })
+          : this.$t('quick_trade.emergency_done', {
+              submitted: d.submitted ?? 0,
+              failed: d.failed_count ?? 0
+            })
+        showToast({ message, type: d.dry_run ? 'warning' : 'success', duration: 5000 })
+        await this.refreshTradeData()
+      } catch (error) {
+        console.error('Emergency flatten failed:', error)
+      } finally {
+        this.flattening = false
       }
     },
 
@@ -464,6 +546,11 @@ export default {
 
     formatNumber(value) {
       return Number(value || 0).toFixed(2)
+    },
+
+    formatShares(value) {
+      const n = Number(value || 0)
+      return this.$t('quick_trade.shares_unit', { count: n })
     },
 
     formatSigned(value) {
@@ -546,6 +633,15 @@ export default {
 .chart-placeholder .van-icon {
   font-size: 26px;
   color: var(--text-3);
+}
+
+.danger-card {
+  border: 1px solid rgba(238, 10, 36, 0.35);
+}
+
+.limit-only-note {
+  padding: 4px 16px 12px;
+  margin: 0;
 }
 
 .panel-card {

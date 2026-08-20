@@ -13,6 +13,7 @@ QT_SUBMITTED = "submitted"  # broker acknowledged the submission
 QT_REJECTED = "rejected"    # broker explicitly rejected (terminal)
 QT_FAILED = "failed"        # reconciliation determined the broker never got it
 QT_BLOCKED = "blocked"      # risk gate denied/errored before submit — broker NEVER called (P0-05)
+QT_CANCELED = "canceled"    # broker confirmed the resting order was pulled (terminal)
 
 # Legal transitions out of each state (terminal states → empty set).
 # QT_BLOCKED is distinct from QT_REJECTED: BLOCKED means the pre-submit RiskManager
@@ -20,10 +21,17 @@ QT_BLOCKED = "blocked"      # risk gate denied/errored before submit — broker 
 # rejected it. Keeping them separate gives a clean audit trail.
 QT_VALID_TRANSITIONS = {
     QT_RESERVED: {QT_SUBMITTED, QT_REJECTED, QT_FAILED, QT_BLOCKED},
-    QT_SUBMITTED: set(),
+    # The one edge a cancel path needs. QT_SUBMITTED is otherwise terminal, and
+    # stays that way for every other target: only a broker-confirmed cancel
+    # (rt_cd == "0") may move it, so a resting order cannot be resurrected.
+    # QT_RESERVED deliberately has no edge here — the broker was never told
+    # about that row, so there is nothing to cancel; it belongs to the
+    # reconciler.
+    QT_SUBMITTED: {QT_CANCELED},
     QT_REJECTED: set(),
     QT_FAILED: set(),
     QT_BLOCKED: set(),
+    QT_CANCELED: set(),
 }
 
 

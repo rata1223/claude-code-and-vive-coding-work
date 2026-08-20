@@ -194,7 +194,14 @@ def sellable_from_position(position, pending_sell_qty=0,
 #: tomorrow and the symbol becomes permanently unsellable. A local pending
 #: figure only makes sense for the window where we have committed and the broker
 #: has not been told yet — which is exactly ``reserved``.
-_RELEASED_SELL_STATUSES = frozenset({"submitted", "rejected", "failed", "blocked"})
+#: ``canceled`` releases for the plainest reason of all: the broker confirmed
+#: the resting order was pulled, so neither we nor the broker are holding that
+#: quantity any more. It must be listed explicitly — this set is the *released*
+#: list, so an absent status keeps reserving, and a cancelled sell would
+#: otherwise reserve its quantity forever.
+_RELEASED_SELL_STATUSES = frozenset(
+    {"submitted", "rejected", "failed", "blocked", "canceled"}
+)
 
 
 def pending_sell_qty_from_rows(rows: Iterable[Sequence], symbol: str) -> int:

@@ -9,8 +9,13 @@ from sqlalchemy.orm import Session
 from api.crypto import decrypt
 from api.database import get_db
 from api.deps import get_current_user
-from api.models import Credential, QT_SUBMITTED, Strategy, Trade, User
-from api.schemas import ClosePositionRequest, PlaceOrderRequest, Resp
+from api.models import (
+    Credential, QT_CANCELED, QT_SUBMITTED, Strategy, Trade, User, qt_transition,
+)
+from api.schemas import (
+    CancelOrderRequest, ClosePositionRequest, EmergencyFlattenRequest,
+    PlaceOrderRequest, Resp,
+)
 from api.services.quick_trade_service import (
     IdempotencyConflict,
     RiskDenied,
@@ -789,3 +794,217 @@ def get_history(
         for t in trades
     ]
     return Resp.ok({"total": total, "items": items})
+
+
+# ── Open orders ───────────────────────────────────────────────────────────
+
+@router.get("/open-orders")
+def get_open_orders(
+    credential_id: int = Query(...),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Resting QuickTrade orders that can still be cancelled.
+
+    Deliberately narrow: only ``QT_SUBMITTED`` rows that carry a
+    ``broker_order_id``. A reserved row was never sent to the broker (it belongs
+    to the reconciler, not to a cancel), and a terminal row is already finished
+    — listing either would offer the user an action that cannot succeed.
+
+    This is not the ``/history`` fix. ``get_history`` still reads strategy
+    trades only; this is the minimum read path that makes cancellation
+    reachable at all, since without it the UI has no row to attach a Cancel
+    button to.
+    """
+    from api.models import QuickTradeOrder
+
+    cred = _get_cred(credential_id, current_user.id, db)
+    if not cred:
+        return Resp.err("Credential not found")
+
+    rows = (
+        db.query(QuickTradeOrder)
+        .filter(
+            QuickTradeOrder.user_id == current_user.id,
+            QuickTradeOrder.credential_id == credential_id,
+            QuickTradeOrder.status == QT_SUBMITTED,
+            QuickTradeOrder.broker_order_id.isnot(None),
+        )
+        .order_by(QuickTradeOrder.created_at.desc())
+        .all()
+    )
+    items = [
+        {
+            "id": r.id,
+            "symbol": r.symbol,
+            "side": r.side,
+            "qty": r.qty,
+            "price": r.price,
+            "market": r.market,
+            "exchange": r.exchange,
+            "broker_order_id": r.broker_order_id,
+            "status": r.status,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+        }
+        for r in rows
+    ]
+    return Resp.ok({"total": len(items), "items": items})
+
+
+# ── Cancel order ──────────────────────────────────────────────────────────
+
+@router.post("/cancel-order")
+def cancel_order(
+    body: CancelOrderRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Pull a resting order on the **caller's own** credential.
+
+    Deliberately does not use ``KISBroker.cancel_order``. That is reached via
+    ``get_kis_broker()`` — a process-level singleton built from ``os.environ``
+    — so on a multi-tenant path it would cancel against whatever account the
+    process holds rather than the caller's (P0-03). Clients are built per
+    request from the stored credential, exactly as every other handler here
+    does it.
+
+    Cancellation is a NON_EXPOSURE operation: it removes a resting order and
+    can only reduce exposure, so no halt state gates it (P0-07 S1 R6) and no
+    risk gate is evaluated.
+
+    The broker's answer is checked, not assumed. ``rt_cd != "0"`` means the
+    order is *still resting*; reporting that as success would tell the user
+    they are flat while they are not, which is worse than any error message.
+    Only a confirmed cancel moves the row to ``QT_CANCELED``.
+    """
+    from api.models import QuickTradeOrder
+
+    cred = _get_cred(body.credential_id, current_user.id, db)
+    if not cred:
+        return Resp.err("Credential not found")
+
+    order = (
+        db.query(QuickTradeOrder)
+        .filter(
+            QuickTradeOrder.id == body.order_id,
+            QuickTradeOrder.user_id == current_user.id,
+            QuickTradeOrder.credential_id == body.credential_id,
+        )
+        .first()
+    )
+    if not order:
+        return Resp.err("Order not found")
+    if order.status != QT_SUBMITTED:
+        # Reserved was never sent to the broker; the other states are finished.
+        return Resp.err(f"Order is not cancellable (status: {order.status})")
+    if not order.broker_order_id:
+        return Resp.err("Order has no broker order id — nothing to cancel")
+
+    market = _resolve_market(order.symbol, order.market)
+    exchange = order.exchange or "NASD"
+    qty = int(order.qty or 0)
+    price = float(order.price or 0.0)
+
+    try:
+        _, orders, _ = _load_kis(cred)
+        if market == "kr":
+            result = orders.cancel_kr(order.broker_order_id, order.symbol, qty, price)
+        else:
+            result = orders.cancel_us(
+                order.broker_order_id, order.symbol, exchange, qty, price
+            )
+    except Exception as e:  # noqa: BLE001 - reported, never masked
+        logger.warning("cancel failed %s: %s", order.broker_order_id, e)
+        return Resp.err(f"Cancel failed: {e}")
+
+    # Absent rt_cd is not consent — fail closed and leave the order resting.
+    rt_cd = (result or {}).get("rt_cd")
+    if rt_cd != "0":
+        reason = (result or {}).get("msg1") or f"rt_cd={rt_cd}"
+        logger.warning("broker refused cancel %s: %s", order.broker_order_id, reason)
+        return Resp.err(f"Broker refused the cancel: {reason}")
+
+    qt_transition(order, QT_CANCELED)
+    db.commit()
+    return Resp.ok({
+        "order_id": order.id,
+        "broker_order_id": order.broker_order_id,
+        "symbol": order.symbol,
+        "status": order.status,
+    })
+
+
+# ── Emergency flatten (authenticated proxy) ───────────────────────────────
+
+#: Where the Flask ops API lives. Compose service name by default; the browser
+#: never learns this address and never holds the key used against it.
+_ADMIN_API_BASE = "http://kis-api:5001"
+
+
+def _admin_post(url, json=None, headers=None, timeout=None):
+    """Seam for the outbound admin call — replaced wholesale in tests.
+
+    Kept as a module-level function rather than an inline ``requests.post`` so
+    the emergency path can be exercised without a network stack, and so no test
+    can accidentally reach a real ops API.
+    """
+    import requests
+
+    return requests.post(url, json=json, headers=headers, timeout=timeout)
+
+
+@router.post("/emergency-flatten")
+def emergency_flatten(
+    body: EmergencyFlattenRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Authenticated path to the existing emergency liquidation control.
+
+    A **thin proxy**, on purpose. ``POST /api/admin/flatten`` on the Flask ops
+    API already enforces ``confirm=true``, rate-limits to 3 calls per 300s,
+    derives ``dry_run`` from ``ENABLE_LIVE_TRADING`` and returns only
+    integer/boolean counters so no exception text can escape. Re-implementing
+    any of that here would fork the safety rules. What was missing is only
+    reachability: the UI speaks JWT to this app, the control speaks
+    ``X-API-Key`` on another port, and the browser must never hold that key.
+
+    The upstream response is passed through verbatim, 429 included — an
+    operator being throttled needs to know the control is intact but rate
+    limited, not see a generic failure.
+
+    ⚠️ This is a convenience and an audit point, not a security boundary: while
+    ``KIS_API_KEY`` is unset, Flask's own guard is disabled and :5001 is
+    reachable directly. See docs and the plan's blocker note.
+    """
+    import os
+
+    if body.confirm is not True:
+        return Resp.err("confirm=true is required to trigger emergency liquidation")
+
+    api_key = os.environ.get("KIS_API_KEY", "")
+    url = f"{os.environ.get('KIS_ADMIN_API_BASE', _ADMIN_API_BASE)}/api/admin/flatten"
+    logger.warning(
+        "emergency flatten requested by user_id=%s", current_user.id
+    )
+
+    try:
+        resp = _admin_post(
+            url,
+            json={"confirm": True, "reason": f"UI 비상청산 (user {current_user.id})"},
+            headers={"X-API-Key": api_key},
+            timeout=120,
+        )
+        payload = resp.json()
+    except Exception as e:  # noqa: BLE001 - never surface the key in an error
+        # The exception text can carry the URL and, in some clients, headers.
+        # Scrub the key rather than trusting the message.
+        detail = str(e).replace(api_key, "***") if api_key else str(e)
+        logger.error("emergency flatten proxy failed: %s", detail)
+        return Resp.err(f"Emergency flatten failed: {detail}")
+
+    if resp.status_code != 200:
+        reason = (payload or {}).get("error") or f"HTTP {resp.status_code}"
+        return Resp.err(reason)
+
+    return Resp.ok(payload)
