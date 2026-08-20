@@ -185,6 +185,23 @@
       />
     </van-popup>
 
+    <!--
+      KNOWN BLOCKER (not fixed here): `only-crypto` locks this picker to crypto,
+      so no KIS-tradable equity can be selected — the share-based limit order
+      above is unreachable for the market it targets.
+
+      It is not a one-flag fix. The picker's market tabs are Crypto / USStock /
+      HKStock / Forex / Futures, while the backend catalogue
+      (`api/routers/watchlist.py:HOT_SYMBOLS`) is keyed NASD / NYSE / KRX. The
+      two taxonomies do not intersect, so `symbols/hot` already returns nothing
+      and `symbols/search` only works via its yfinance fallback. Flipping the
+      flag would expose HK / Forex / Futures symbols that the KIS equities
+      backend cannot route — strictly worse than the current dead end.
+
+      Fixing it properly means giving SymbolPicker a caller-supplied market list
+      (NASD / NYSE / KRX here) and retiring the crypto taxonomy — the Stage 7
+      "mobile 브로커 UI 교체" work, deliberately outside this P0 safety change.
+    -->
     <SymbolPicker
       v-model:show="showSymbolPicker"
       :only-crypto="true"

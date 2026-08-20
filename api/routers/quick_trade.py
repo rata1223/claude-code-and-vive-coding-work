@@ -954,6 +954,37 @@ def cancel_order(
 #: acceptable only for a single-host compose deployment where the network is
 #: not shared. Split the services across hosts and this must be set to an
 #: ``https://`` base via ``KIS_ADMIN_API_BASE``.
+#:
+#: ⚠️ REQUIRED DEPLOYMENT WIRING — NOT DONE IN THIS CHANGE.
+#: The ``api`` service in ``docker-compose.yml`` declares an explicit
+#: ``environment:`` block and no ``env_file``, so a variable absent from that
+#: block never reaches this process no matter what ``.env`` holds. Three of the
+#: variables this module reads are absent from it today:
+#:
+#:   ``EMERGENCY_FLATTEN_ADMINS``  → unset ⇒ ``_flatten_authorized`` denies
+#:                                   everyone and the control stays dormant.
+#:                                   This is the intended default, but it means
+#:                                   the feature cannot be enabled by editing
+#:                                   ``.env`` alone.
+#:   ``KIS_API_KEY``               → unset ⇒ the proxy sends an empty
+#:                                   ``X-API-Key``. Only reaches the upstream
+#:                                   because Flask's own guard is *also*
+#:                                   disabled while its ``KIS_API_KEY`` is
+#:                                   empty (``backend/api/server.py``), i.e. it
+#:                                   works by two failures cancelling out, not
+#:                                   by design. Setting it on ``kis-api`` alone
+#:                                   — which compose already does — turns the
+#:                                   guard on and this proxy starts getting 401s.
+#:   ``KIS_ADMIN_API_BASE``        → unset ⇒ the compose default above, which is
+#:                                   correct for single-host only.
+#:
+#: Enabling emergency flatten therefore requires a compose change declaring all
+#: three on the ``api`` service (``EMERGENCY_FLATTEN_ADMINS: ${EMERGENCY_FLATTEN_ADMINS:-}``
+#: and the same for the other two, so the fail-closed default is preserved).
+#: That edit is deliberately out of scope here: this task excludes Docker and
+#: deployment-pipeline modifications, and the ``KIS_API_KEY`` interaction above
+#: means it is not a one-line addition — turning the key on changes the
+#: authentication posture of the ops API for every caller, not just this one.
 _ADMIN_API_BASE = "http://kis-api:5001"
 
 
