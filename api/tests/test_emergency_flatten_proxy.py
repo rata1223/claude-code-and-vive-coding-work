@@ -120,6 +120,45 @@ def test_a_confirmed_flatten_is_forwarded(monkeypatch, db, user):
     assert poster.calls[0]["json"]["confirm"] is True
 
 
+def test_an_unset_admin_base_falls_back_to_the_compose_default(monkeypatch, db, user):
+    poster = _wire(monkeypatch, _FakePoster())
+    monkeypatch.delenv("KIS_ADMIN_API_BASE", raising=False)
+
+    quick_trade.emergency_flatten(_body(), user, db)
+
+    assert poster.calls[0]["url"] == f"{quick_trade._ADMIN_API_BASE}/api/admin/flatten"
+
+
+def test_an_empty_admin_base_falls_back_rather_than_building_a_relative_url(
+    monkeypatch, db, user
+):
+    """``KIS_ADMIN_API_BASE: ${KIS_ADMIN_API_BASE:-}`` in compose sets the
+    variable to an **empty string**, not absent — so ``os.environ.get(key,
+    default)`` returns ``""`` and the default never applies. Left unguarded the
+    URL collapses to ``/api/admin/flatten``, a relative path that cannot be
+    posted to, and the last-resort liquidation fails on a deployment that simply
+    did not override the base.
+
+    Treat empty as unset."""
+    poster = _wire(monkeypatch, _FakePoster())
+    monkeypatch.setenv("KIS_ADMIN_API_BASE", "")
+
+    resp = quick_trade.emergency_flatten(_body(), user, db)
+
+    assert resp.code == 1, resp.msg
+    assert poster.calls[0]["url"] == f"{quick_trade._ADMIN_API_BASE}/api/admin/flatten"
+
+
+def test_an_explicit_admin_base_still_wins(monkeypatch, db, user):
+    """The https escape hatch for a multi-host deployment must keep working."""
+    poster = _wire(monkeypatch, _FakePoster())
+    monkeypatch.setenv("KIS_ADMIN_API_BASE", "https://ops.internal:5001")
+
+    quick_trade.emergency_flatten(_body(), user, db)
+
+    assert poster.calls[0]["url"] == "https://ops.internal:5001/api/admin/flatten"
+
+
 def test_the_upstream_counters_are_passed_through_verbatim(monkeypatch, db, user):
     """The operator must see what actually happened, not our summary of it."""
     payload = {"attempted": 5, "success": 3, "submitted": 3,

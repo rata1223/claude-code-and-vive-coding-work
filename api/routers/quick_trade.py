@@ -955,36 +955,29 @@ def cancel_order(
 #: not shared. Split the services across hosts and this must be set to an
 #: ``https://`` base via ``KIS_ADMIN_API_BASE``.
 #:
-#: ⚠️ REQUIRED DEPLOYMENT WIRING — NOT DONE IN THIS CHANGE.
-#: The ``api`` service in ``docker-compose.yml`` declares an explicit
-#: ``environment:`` block and no ``env_file``, so a variable absent from that
-#: block never reaches this process no matter what ``.env`` holds. Three of the
-#: variables this module reads are absent from it today:
+#: DEPLOYMENT WIRING. The ``api`` service declares an explicit ``environment:``
+#: block and no ``env_file``, so a variable absent from that block never reaches
+#: this process no matter what ``.env`` holds. The three variables this module
+#: reads — ``EMERGENCY_FLATTEN_ADMINS``, ``KIS_ADMIN_API_BASE``, ``KIS_API_KEY``
+#: — are now declared there, each defaulting to empty, so the feature can be
+#: enabled from ``.env`` without another compose change. Empty is fail-closed:
+#: an unset allowlist authorizes nobody.
 #:
-#:   ``EMERGENCY_FLATTEN_ADMINS``  → unset ⇒ ``_flatten_authorized`` denies
-#:                                   everyone and the control stays dormant.
-#:                                   This is the intended default, but it means
-#:                                   the feature cannot be enabled by editing
-#:                                   ``.env`` alone.
-#:   ``KIS_API_KEY``               → unset ⇒ the proxy sends an empty
-#:                                   ``X-API-Key``. Only reaches the upstream
-#:                                   because Flask's own guard is *also*
-#:                                   disabled while its ``KIS_API_KEY`` is
-#:                                   empty (``backend/api/server.py``), i.e. it
-#:                                   works by two failures cancelling out, not
-#:                                   by design. Setting it on ``kis-api`` alone
-#:                                   — which compose already does — turns the
-#:                                   guard on and this proxy starts getting 401s.
-#:   ``KIS_ADMIN_API_BASE``        → unset ⇒ the compose default above, which is
-#:                                   correct for single-host only.
+#: Note ``${KIS_ADMIN_API_BASE:-}`` sets the variable to an **empty string**, not
+#: absent, which is why the URL below falls back with ``or`` rather than an
+#: ``os.environ.get`` default — the latter never fires and yields a relative URL.
 #:
-#: Enabling emergency flatten therefore requires a compose change declaring all
-#: three on the ``api`` service (``EMERGENCY_FLATTEN_ADMINS: ${EMERGENCY_FLATTEN_ADMINS:-}``
-#: and the same for the other two, so the fail-closed default is preserved).
-#: That edit is deliberately out of scope here: this task excludes Docker and
-#: deployment-pipeline modifications, and the ``KIS_API_KEY`` interaction above
-#: means it is not a one-line addition — turning the key on changes the
-#: authentication posture of the ops API for every caller, not just this one.
+#: ⚠️ ``KIS_API_KEY`` is not an independent knob. While it is empty the proxy
+#: sends an empty ``X-API-Key``, and that only reaches the upstream because
+#: Flask's own guard is *also* disabled when its key is empty
+#: (``backend/api/server.py``) — two failures cancelling out, not a working
+#: configuration. Setting it turns the ops API's guard on for **every** caller,
+#: so it must be set on ``api`` and ``kis-api`` together or this proxy 401s.
+#:
+#: Still open, and still gating the UI: port ``5001`` is published, so
+#: ``/api/admin/flatten`` is reachable directly and bypasses the allowlist
+#: entirely. No code in this router can close that. Do not expose the flatten
+#: button until the port is restricted and the key is set.
 _ADMIN_API_BASE = "http://kis-api:5001"
 
 
@@ -1067,7 +1060,12 @@ def emergency_flatten(
         return Resp.err("confirm=true is required to trigger emergency liquidation")
 
     api_key = os.environ.get("KIS_API_KEY", "")
-    url = f"{os.environ.get('KIS_ADMIN_API_BASE', _ADMIN_API_BASE)}/api/admin/flatten"
+    # `or`, not a get() default: compose declares this as
+    # `${KIS_ADMIN_API_BASE:-}`, which sets it to an *empty string* rather than
+    # leaving it absent, so a default keyed on absence would never fire and the
+    # URL would collapse to a relative "/api/admin/flatten".
+    base = os.environ.get("KIS_ADMIN_API_BASE", "").strip() or _ADMIN_API_BASE
+    url = f"{base.rstrip('/')}/api/admin/flatten"
     logger.warning(
         "emergency flatten requested by user_id=%s", current_user.id
     )

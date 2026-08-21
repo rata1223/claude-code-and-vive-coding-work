@@ -66,6 +66,21 @@ services:
       JWT_EXPIRE_MINUTES: ${JWT_EXPIRE_MINUTES:-1440}
       KIS_CREDENTIAL_KEY: '${KIS_CREDENTIAL_KEY:?KIS_CREDENTIAL_KEY must be set. Generate: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"}'
       CORS_ORIGINS: ${CORS_ORIGINS:-}
+      # Emergency-flatten proxy (api/routers/quick_trade.py). This service has no
+      # env_file, so anything not listed here never reaches the process — these
+      # three were read by the code but never declared.
+      #
+      # All default to empty, which is fail-closed: an unset allowlist authorizes
+      # nobody and the control ships dormant. Declaring them changes no behaviour
+      # on a deployment that sets nothing; it only makes the feature reachable by
+      # editing .env instead of requiring another compose change.
+      EMERGENCY_FLATTEN_ADMINS: ${EMERGENCY_FLATTEN_ADMINS:-}
+      KIS_ADMIN_API_BASE: ${KIS_ADMIN_API_BASE:-}
+      # ⚠️ Not an independent knob. Setting this turns ON the ops API's auth guard
+      # for EVERY caller: backend/api/server.py disables the guard entirely while
+      # its own KIS_API_KEY is empty. Set it here and on kis-api together, or this
+      # proxy starts getting 401s. See the note at _ADMIN_API_BASE.
+      KIS_API_KEY: ${KIS_API_KEY:-}
     depends_on:
       postgres:
         condition: service_healthy
