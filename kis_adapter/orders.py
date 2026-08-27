@@ -12,6 +12,7 @@ TR = {
     "cancel_us": ("TTTT1004U", "JTTT1004U"),
     "buy_kr":    ("TTTC0802U", "VTTC0802U"),
     "sell_kr":   ("TTTC0801U", "VTTC0801U"),
+    "cancel_kr": ("TTTC0803U", "VTTC0803U"),
     # Read-only single-symbol order inquiry (used by Quick Trade reconciliation to
     # resolve a RESERVED order after an indeterminate submit). Same TRs the
     # Execution-Layer poller uses in backend/brokers/kis.py.
@@ -22,6 +23,7 @@ TR = {
 ORDER_PATH = "/uapi/overseas-stock/v1/trading/order"
 ORDER_KR_PATH = "/uapi/domestic-stock/v1/trading/order-cash"
 CANCEL_PATH = "/uapi/overseas-stock/v1/trading/order-rvsecncl"
+CANCEL_KR_PATH = "/uapi/domestic-stock/v1/trading/order-rvsecncl"
 INQUIRE_US_PATH = "/uapi/overseas-stock/v1/trading/inquire-order"
 INQUIRE_KR_PATH = "/uapi/domestic-stock/v1/trading/inquire-order"
 
@@ -134,6 +136,44 @@ class KISOrders:
         }
         data = self._client.get(INQUIRE_US_PATH, self._tr("inquire_us"), params)
         return data.get("output") or []
+
+    def cancel_kr(self, org_order_no: str, symbol: str, qty: int, price: float) -> dict:
+        """Cancel a resting KR order, on the caller's own credential.
+
+        Mirrors the body already proven inside ``KISBroker.cancel_order``, but
+        lives here so a multi-tenant caller can cancel through its
+        request-scoped client instead of the process singleton.
+
+        Returns the **raw** KIS response rather than a bool. ``KISBroker``'s
+        version collapses every outcome into ``False``, which loses both the
+        reason and the distinction between "cancelled" and "the broker refused"
+        — on a cancel that is the difference between an order being gone and
+        still resting in the market.
+
+        Note where a refusal actually surfaces: ``KISClient.post`` raises
+        ``RuntimeError("KIS API error: …")`` on any non-zero ``rt_cd``, so in
+        production the caller sees an **exception** carrying ``msg1``, not a
+        response with a bad ``rt_cd``. Returning the raw dict still matters —
+        it lets the caller verify ``rt_cd == "0"`` rather than assuming success,
+        which holds for any client that returns instead of raising.
+
+        ``qty``/``price`` are accepted for signature symmetry with
+        ``cancel_us`` and for logging; ``QTY_ALL_ORD_YN="Y"`` cancels the whole
+        resting quantity, which is the only cancel this path offers.
+        """
+        body = {
+            "CANO": self._account[:8],
+            "ACNT_PRDT_CD": self._account[8:],
+            "KRX_FWDG_ORD_ORGNO": "",
+            "ORGN_ODNO": org_order_no,
+            "ORD_DVSN": "00",
+            "RVSE_CNCL_DVSN_CD": "02",   # 02 = 취소 (01 = 정정)
+            "ORD_QTY": "0",
+            "ORD_UNPR": "0",
+            "QTY_ALL_ORD_YN": "Y",
+        }
+        logger.info("CANCEL_KR %s order=%s qty=%s", symbol, org_order_no, qty)
+        return self._client.post(CANCEL_KR_PATH, self._tr("cancel_kr"), body)
 
     def cancel_us(self, org_order_no: str, symbol: str, excd: str, qty: int, price: float) -> dict:
         body = {

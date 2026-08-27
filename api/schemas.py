@@ -187,14 +187,35 @@ class PlaceOrderRequest(BaseModel):
     credential_id: int
     symbol: str
     side: str               # buy / sell
-    qty: float
-    price: float
+    qty: float              # a whole number of SHARES, never a currency amount
+    price: float            # limit price; quick-trade submits ORD_DVSN "00" only
     # None = not supplied. The default used to be "us", which was
     # indistinguishable from a caller explicitly choosing US and so
     # silently routed every KR order to the US path. Resolved by
     # api.routers.quick_trade._resolve_market.
     market: Optional[str] = None      # us / kr / None = derive from symbol
     exchange: str = "NASD"  # NASD / NYSE / KRX
+
+
+class EmergencyFlattenRequest(BaseModel):
+    """Trigger the emergency liquidation of every position.
+
+    ``confirm`` is required and must be ``True`` — the same explicit opt-in the
+    upstream Flask control demands. It is not a default anywhere in the chain.
+    """
+    confirm: bool = False
+
+
+class CancelOrderRequest(BaseModel):
+    """Cancel a resting QuickTrade order.
+
+    ``order_id`` is the **local** ``quick_trade_orders.id``, never a
+    broker-supplied ODNO. The broker id is read from the row after it has been
+    scoped to the caller, so a client cannot name an arbitrary order at the
+    brokerage and have us cancel it.
+    """
+    credential_id: int
+    order_id: int
 
 
 class ClosePositionRequest(BaseModel):
