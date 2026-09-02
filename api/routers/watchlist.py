@@ -10,6 +10,11 @@ from api.database import get_db
 from api.deps import get_current_user
 from api.models import User, WatchlistItem
 from api.schemas import Resp, WatchlistAdd, WatchlistRemove
+from backend.market.symbols import (
+    provider_symbol_candidates,
+    resolve_exchange,
+    to_backend_symbol,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -171,21 +176,28 @@ def search_symbols(
         if len(matched) >= limit:
             break
 
-    # If no match from catalogue, try yfinance lookup
+    # If no match from catalogue, try yfinance lookup. The query is a *raw*
+    # symbol, so it is resolved to the provider's spelling first — a bare
+    # six-digit KR code means nothing to yfinance, and searching for one used
+    # to return no result at all. A query that is not a tradable equity yields
+    # no candidates and is not looked up.
     if not matched and q:
-        try:
-            ticker = yf.Ticker(q.upper())
-            info = ticker.info
+        for provider_symbol in provider_symbol_candidates(q):
+            try:
+                info = yf.Ticker(provider_symbol).info
+            except Exception:
+                continue
             if info.get("symbol"):
                 matched.append(
                     {
-                        "symbol": info["symbol"],
+                        # Report the raw symbol, never the provider spelling:
+                        # this row is what the client sends back to order entry.
+                        "symbol": to_backend_symbol(q),
                         "name": info.get("shortName") or info.get("longName") or q.upper(),
-                        "market": market or "NASD",
+                        "market": resolve_exchange(q) or market or "NASD",
                     }
                 )
-        except Exception:
-            pass
+                break
 
     return Resp.ok({"items": matched, "total": len(matched)})
 

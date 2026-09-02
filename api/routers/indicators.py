@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, Query
 from api.deps import get_current_user
 from api.models import User
 from api.schemas import Resp
+from backend.market.symbols import provider_symbol_candidates
 
 logger = logging.getLogger(__name__)
 
@@ -154,14 +155,32 @@ _PERIOD_MAP = {
 
 
 def _fetch_kline_yf(symbol: str, timeframe: str, limit: int = 200) -> list:
-    """Fetch OHLCV from yfinance and return list of bar dicts."""
+    """Fetch OHLCV from yfinance and return list of bar dicts.
+
+    ``symbol`` is a *raw* symbol — what the user picked. yfinance needs its own
+    spelling, which for KIS domestic codes is neither obvious nor unique:
+    ``005930`` is ``005930.KS`` on KOSPI and ``.KQ`` on KOSDAQ, and a six-digit
+    code does not say which. Passing the raw code through is what made every
+    Korean symbol render an empty chart.
+
+    Resolution is delegated to ``backend.market.symbols`` rather than done by
+    appending a suffix here, so the provider spelling has one definition. It
+    returns the candidates in try-order; the first with data wins, and a symbol
+    that is not a tradable equity yields no candidates and no provider call.
+    """
     tf_key = timeframe if timeframe in _TF_MAP else "1h"
     interval = _TF_MAP[tf_key]
     period = _PERIOD_MAP[tf_key]
 
-    ticker = yf.Ticker(symbol)
-    df = ticker.history(period=period, interval=interval, auto_adjust=True)
-    if df.empty:
+    df = None
+    for provider_symbol in provider_symbol_candidates(symbol):
+        candidate = yf.Ticker(provider_symbol).history(
+            period=period, interval=interval, auto_adjust=True
+        )
+        if not candidate.empty:
+            df = candidate
+            break
+    if df is None or df.empty:
         return []
     df = df.tail(limit)
     df = df.reset_index()
@@ -191,7 +210,17 @@ def get_kline(
     market: str = Query("us"),
     limit: int = Query(200, ge=1, le=1000),
 ):
-    """Return OHLCV bars. Uses yfinance for US; KIS for KR if available."""
+    """Return OHLCV bars for ``symbol``, from yfinance.
+
+    ``market`` is accepted for API compatibility and **not used**: the exchange
+    is derived from the symbol itself by ``backend.market.symbols``, which is
+    the same rule order routing uses, so a client that sends the wrong market
+    cannot make the chart disagree with the order.
+
+    There is no KIS branch. An earlier version of this docstring claimed "KIS
+    for KR if available" — no such code has ever existed here, and believing it
+    is what let the empty-KR-chart bug sit unexamined.
+    """
     try:
         bars = _fetch_kline_yf(symbol, timeframe, limit)
         return Resp.ok({"symbol": symbol, "timeframe": timeframe, "items": bars})
