@@ -3,7 +3,7 @@
     <div class="watchlist-bar">
       <div class="watchlist-scroll">
         <div
-          v-for="item in watchlistCrypto"
+          v-for="item in watchlistTradable"
           :key="item.symbol"
           :class="['wl-chip', { active: form.symbol === item.symbol }]"
           @click="selectWatchlist(item)"
@@ -17,7 +17,7 @@
     <div class="chart-wrap">
       <KlineChart
         v-if="form.symbol"
-        :market="'Crypto'"
+        :market="chartMarket"
         :symbol="form.symbol"
         :height="170"
       />
@@ -185,26 +185,10 @@
       />
     </van-popup>
 
-    <!--
-      KNOWN BLOCKER (not fixed here): `only-crypto` locks this picker to crypto,
-      so no KIS-tradable equity can be selected — the share-based limit order
-      above is unreachable for the market it targets.
-
-      It is not a one-flag fix. The picker's market tabs are Crypto / USStock /
-      HKStock / Forex / Futures, while the backend catalogue
-      (`api/routers/watchlist.py:HOT_SYMBOLS`) is keyed NASD / NYSE / KRX. The
-      two taxonomies do not intersect, so `symbols/hot` already returns nothing
-      and `symbols/search` only works via its yfinance fallback. Flipping the
-      flag would expose HK / Forex / Futures symbols that the KIS equities
-      backend cannot route — strictly worse than the current dead end.
-
-      Fixing it properly means giving SymbolPicker a caller-supplied market list
-      (NASD / NYSE / KRX here) and retiring the crypto taxonomy — the Stage 7
-      "mobile 브로커 UI 교체" work, deliberately outside this P0 safety change.
-    -->
     <SymbolPicker
       v-model:show="showSymbolPicker"
-      :only-crypto="true"
+      :markets="KIS_MARKETS"
+      default-market="NASD"
       :title="$t('watchlist.picker_title')"
       @pick="onPickSymbol"
     />
@@ -218,6 +202,21 @@ import { useCredentialsStore, useQuickTradeStore, useWatchlistStore } from '@/st
 import KlineChart from '@/components/KlineChart.vue'
 import SymbolPicker from '@/components/SymbolPicker.vue'
 
+// The exchanges KIS can actually route an order to — the same three
+// `backend/market/symbols.CANONICAL_EXCHANGES` defines and
+// `api/routers/watchlist.py:HOT_SYMBOLS` is keyed by. The picker's historical
+// Crypto / USStock / HKStock / Forex / Futures tabs intersected that set
+// nowhere, which is why its hot list came back empty for every tab.
+const KIS_MARKETS = [
+  { value: 'NASD', label: 'US · NASDAQ' },
+  { value: 'NYSE', label: 'US · NYSE' },
+  { value: 'KRX', label: 'KR · KRX' }
+]
+const KIS_MARKET_VALUES = KIS_MARKETS.map((m) => m.value.toLowerCase())
+// Where a market is unknown, assume the busiest US board rather than a crypto
+// label the backend cannot route.
+const DEFAULT_MARKET = 'NASD'
+
 export default {
   name: 'QuickTrade',
 
@@ -226,6 +225,7 @@ export default {
   data() {
     return {
       showCredentialPicker: false,
+      KIS_MARKETS,
       showSymbolPicker: false,
       submitting: false,
       cancelling: null,
@@ -255,8 +255,17 @@ export default {
     watchlistStore() {
       return useWatchlistStore()
     },
-    watchlistCrypto() {
-      return this.watchlistStore.items.filter((i) => (i.market || '').toLowerCase() === 'crypto')
+    chartMarket() {
+      // The chart must describe the instrument on screen, not a leftover
+      // crypto default. The backend derives the exchange from the symbol
+      // anyway, so this only has to be honest, never authoritative.
+      const active = this.watchlistStore.items.find((i) => i.symbol === this.form.symbol)
+      return active?.market || DEFAULT_MARKET
+    },
+    watchlistTradable() {
+      return this.watchlistStore.items.filter(
+        (i) => KIS_MARKET_VALUES.includes(String(i.market || '').toLowerCase())
+      )
     },
     credentials() {
       return this.credentialsStore.cryptoItems
@@ -325,9 +334,9 @@ export default {
           this.watchlistStore.setItems(wlRes.value.data || [])
           if (!this.form.symbol && this.watchlistStore.activeSymbol) {
             this.form.symbol = this.watchlistStore.activeSymbol
-          } else if (!this.form.symbol && this.watchlistCrypto.length > 0) {
-            this.form.symbol = this.watchlistCrypto[0].symbol
-            this.watchlistStore.setActive(this.form.symbol, 'Crypto')
+          } else if (!this.form.symbol && this.watchlistTradable.length > 0) {
+            this.form.symbol = this.watchlistTradable[0].symbol
+            this.watchlistStore.setActive(this.form.symbol, DEFAULT_MARKET)
           }
         }
         if (!this.selectedCredentialId && this.credentials.length) {
@@ -353,12 +362,12 @@ export default {
 
     onPickSymbol(item) {
       this.form.symbol = item.symbol
-      this.watchlistStore.setActive(item.symbol, item.market || 'Crypto')
+      this.watchlistStore.setActive(item.symbol, item.market || DEFAULT_MARKET)
     },
 
     selectWatchlist(item) {
       this.form.symbol = item.symbol
-      this.watchlistStore.setActive(item.symbol, item.market || 'Crypto')
+      this.watchlistStore.setActive(item.symbol, item.market || DEFAULT_MARKET)
     },
 
     shortSymbol(symbol) {

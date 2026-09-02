@@ -122,6 +122,20 @@ export default {
     show: { type: Boolean, default: false },
     title: { type: String, default: '' },
     onlyCrypto: { type: Boolean, default: false },
+    // Which markets this caller may pick from. Defaults to the historical
+    // crypto-era list so BotForm / BotFromIndicator / BotAIRecommend, which
+    // pass only-crypto, see exactly what they saw before. Quick trade narrows
+    // it to the exchanges KIS can actually route to.
+    markets: {
+      type: Array,
+      default: () => [
+        { value: 'Crypto', label: 'Crypto' },
+        { value: 'USStock', label: 'US' },
+        { value: 'HKStock', label: 'HK' },
+        { value: 'Forex', label: 'Forex' },
+        { value: 'Futures', label: 'Futures' }
+      ]
+    },
     autoAdd: { type: Boolean, default: true },
     defaultMarket: { type: String, default: 'Crypto' },
     searchMarket: { type: String, default: '' }
@@ -141,23 +155,25 @@ export default {
   },
   computed: {
     marketOptions() {
-      return [
-        { value: 'Crypto', label: 'Crypto' },
-        { value: 'USStock', label: 'US' },
-        { value: 'HKStock', label: 'HK' },
-        { value: 'Forex', label: 'Forex' },
-        { value: 'Futures', label: 'Futures' }
-      ]
+      return this.markets
+    },
+    allowedMarkets() {
+      return this.markets.map((m) => String(m.value || '').toLowerCase())
     },
     watchlistStore() {
       return useWatchlistStore()
     },
     displayedList() {
+      // Filter unconditionally. This used to return every saved item whenever
+      // `onlyCrypto` was false, so a saved crypto symbol stayed selectable on
+      // an equities-only screen and could be carried into order entry — where
+      // the backend has no exchange to route it to.
       const items = this.watchlistStore.items
       if (this.onlyCrypto) {
         return items.filter((i) => (i.market || '').toLowerCase() === 'crypto')
       }
-      return items
+      const allowed = this.allowedMarkets
+      return items.filter((i) => allowed.includes(String(i.market || '').toLowerCase()))
     }
   },
   watch: {
@@ -191,7 +207,9 @@ export default {
     },
     async loadHot() {
       try {
-        const market = this.onlyCrypto ? 'Crypto' : (this.defaultMarket || 'Crypto')
+        const market = this.onlyCrypto
+          ? 'Crypto'
+          : (this.defaultMarket || this.markets[0]?.value || 'Crypto')
         const res = await watchlistApi.getHot({ market, limit: 8 })
         this.hotList = res.data || []
       } catch {
