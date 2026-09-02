@@ -124,3 +124,69 @@ def test_the_picker_filters_saved_items_when_not_crypto_only(app):
         f"{app}: displayedList ignores the allowed markets — saved crypto "
         "symbols would remain selectable on the equities screen"
     )
+
+
+# ── regressions found in review ───────────────────────────────────────────────
+
+def test_the_catalogue_and_excd_map_agree_per_symbol():
+    """Key sets matching is not enough. SPY sat under NASD in the catalogue
+    while EXCD_MAP — the canonical source — says NYSE, so one instrument had
+    two exchanges depending on which path you came in through. SPY trades on
+    NYSE Arca, so the catalogue was the wrong one."""
+    from backend.quant.data.universe import EXCD_MAP
+
+    conflicts = [
+        (row["symbol"], exchange, EXCD_MAP[row["symbol"]])
+        for exchange, rows in HOT_SYMBOLS.items()
+        for row in rows
+        if row["symbol"] in EXCD_MAP and EXCD_MAP[row["symbol"]] != exchange
+    ]
+    assert conflicts == [], f"catalogue disagrees with EXCD_MAP: {conflicts}"
+
+
+@pytest.mark.parametrize("app", _APPS)
+def test_a_picker_with_no_market_list_filters_nothing(app):
+    """``home`` and ``ai-analysis`` pass neither ``markets`` nor ``only-crypto``.
+    Before this change they saw every saved row. If the new filter applies its
+    own default to them, every NASD/NYSE/KRX row vanishes from their list —
+    a regression in screens this task never meant to touch."""
+    source = _read(app, _PICKER)
+
+    # Two halves of one guarantee: an absent list resolves to "unconstrained"
+    # rather than an empty allow-list, and the filter passes everything through
+    # in that case. An empty list would read as "nothing is allowed" and hide
+    # every saved row — the exact regression this guards.
+    assert "if (!this.markets) return null" in source, (
+        f"{app}: an absent `markets` prop must mean unconstrained, not empty"
+    )
+    assert "if (!allowed) return items" in source, (
+        f"{app}: displayedList must pass everything through when unconstrained"
+    )
+
+
+@pytest.mark.parametrize("app", _APPS)
+def test_quick_trade_only_prefills_a_tradable_symbol(app):
+    """``activeSymbol`` persists in localStorage and the watchlist store's
+    ``setItems`` explicitly prefers a crypto item, so the remembered symbol can
+    be crypto. Prefilling it lands a crypto symbol in the now-unlocked KIS order
+    form, where ``validateOrder`` only checks that it is non-empty."""
+    source = _read(app, _QUICK_TRADE)
+    block = source[source.index("activeSymbol"):]
+    block = block[:400]
+
+    assert "watchlistTradable" in block, (
+        f"{app}: the remembered symbol is prefilled without checking it is "
+        "tradable — a crypto symbol can reach the KIS order form"
+    )
+
+
+@pytest.mark.parametrize("app", _APPS)
+def test_the_auto_selected_symbol_keeps_its_own_market(app):
+    """Auto-selecting the first tradable row recorded DEFAULT_MARKET rather
+    than the row's market, so a KRX or NYSE symbol was persisted as NASD."""
+    source = _read(app, _QUICK_TRADE)
+    block = source[source.index("watchlistTradable.length > 0"):]
+    block = block[:400]
+
+    assert "first.market" in block, \
+        f"{app}: auto-select overwrites the symbol's real market with a default"

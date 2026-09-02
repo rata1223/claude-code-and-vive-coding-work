@@ -116,6 +116,14 @@ import { showToast } from 'vant'
 import { watchlistApi } from '@/api'
 import { useWatchlistStore } from '@/stores'
 
+const DEFAULT_MARKET_OPTIONS = [
+  { value: 'Crypto', label: 'Crypto' },
+  { value: 'USStock', label: 'US' },
+  { value: 'HKStock', label: 'HK' },
+  { value: 'Forex', label: 'Forex' },
+  { value: 'Futures', label: 'Futures' }
+]
+
 export default {
   name: 'SymbolPicker',
   props: {
@@ -126,16 +134,11 @@ export default {
     // crypto-era list so BotForm / BotFromIndicator / BotAIRecommend, which
     // pass only-crypto, see exactly what they saw before. Quick trade narrows
     // it to the exchanges KIS can actually route to.
-    markets: {
-      type: Array,
-      default: () => [
-        { value: 'Crypto', label: 'Crypto' },
-        { value: 'USStock', label: 'US' },
-        { value: 'HKStock', label: 'HK' },
-        { value: 'Forex', label: 'Forex' },
-        { value: 'Futures', label: 'Futures' }
-      ]
-    },
+    // `null` means the caller has no opinion: show every tab and filter
+    // nothing, which is what `home` and `ai-analysis` relied on before this
+    // prop existed. Supplying a list both narrows the tabs and filters the
+    // saved-items list to match.
+    markets: { type: Array, default: null },
     autoAdd: { type: Boolean, default: true },
     defaultMarket: { type: String, default: 'Crypto' },
     searchMarket: { type: String, default: '' }
@@ -155,9 +158,12 @@ export default {
   },
   computed: {
     marketOptions() {
-      return this.markets
+      return this.markets || DEFAULT_MARKET_OPTIONS
     },
     allowedMarkets() {
+      // Null, not [], when unconstrained — an empty list would read as
+      // "nothing is allowed" and hide every saved row.
+      if (!this.markets) return null
       return this.markets.map((m) => String(m.value || '').toLowerCase())
     },
     watchlistStore() {
@@ -173,6 +179,7 @@ export default {
         return items.filter((i) => (i.market || '').toLowerCase() === 'crypto')
       }
       const allowed = this.allowedMarkets
+      if (!allowed) return items
       return items.filter((i) => allowed.includes(String(i.market || '').toLowerCase()))
     }
   },
@@ -209,7 +216,7 @@ export default {
       try {
         const market = this.onlyCrypto
           ? 'Crypto'
-          : (this.defaultMarket || this.markets[0]?.value || 'Crypto')
+          : (this.defaultMarket || this.marketOptions[0]?.value || 'Crypto')
         const res = await watchlistApi.getHot({ market, limit: 8 })
         this.hotList = res.data || []
       } catch {

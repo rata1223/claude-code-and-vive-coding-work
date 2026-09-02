@@ -234,26 +234,36 @@ def get_price(
     symbol: str = Query(...),
     market: str = Query("us"),
 ):
-    """Return latest price for a symbol."""
-    try:
-        ticker = yf.Ticker(symbol)
-        info = ticker.fast_info
-        price = float(info.last_price or 0)
-        prev_close = float(info.previous_close or 0)
+    """Return latest price for a symbol.
+
+    ``symbol`` is raw, so it is resolved to the provider's spelling first —
+    otherwise every KR symbol prices at 0.00. ``market`` is accepted for API
+    compatibility and unused; the exchange comes from the symbol.
+    """
+    for provider_symbol in provider_symbol_candidates(symbol):
+        try:
+            info = yf.Ticker(provider_symbol).fast_info
+            price = float(info.last_price or 0)
+            prev_close = float(info.previous_close or 0)
+        except Exception as e:
+            logger.warning("price fetch failed for %s (%s): %s", symbol, provider_symbol, e)
+            continue
+        if not price and not prev_close:
+            # Wrong board for a KR code; try the next candidate.
+            continue
         change = round(price - prev_close, 4)
-        change_pct = round(change / prev_close * 100, 4) if prev_close else 0.0
         return Resp.ok(
             {
+                # The raw symbol, never the provider spelling — the caller
+                # asked about 005930, not 005930.KS.
                 "symbol": symbol,
                 "price": price,
                 "change": change,
-                "change_pct": change_pct,
+                "change_pct": round(change / prev_close * 100, 4) if prev_close else 0.0,
                 "prev_close": prev_close,
             }
         )
-    except Exception as e:
-        logger.warning("price fetch failed for %s: %s", symbol, e)
-        return Resp.ok({"symbol": symbol, "price": 0.0, "change": 0.0, "change_pct": 0.0})
+    return Resp.ok({"symbol": symbol, "price": 0.0, "change": 0.0, "change_pct": 0.0})
 
 
 @router.post("/parseStrategyConfig")

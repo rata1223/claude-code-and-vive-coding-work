@@ -332,11 +332,22 @@ export default {
         this.quickTradeStore.setHistory(historyRes.status === 'fulfilled' ? (historyRes.value.data || []) : [])
         if (wlRes.status === 'fulfilled') {
           this.watchlistStore.setItems(wlRes.value.data || [])
-          if (!this.form.symbol && this.watchlistStore.activeSymbol) {
-            this.form.symbol = this.watchlistStore.activeSymbol
+          // The remembered symbol persists in localStorage and the store's
+          // setItems explicitly prefers a crypto row, so activeSymbol can be
+          // crypto. Prefilling it blindly lands a symbol the backend cannot
+          // route in the order form, where validateOrder only checks that it
+          // is non-empty. Only accept it if it is one we can actually trade.
+          const remembered = this.watchlistTradable.find(
+            (i) => i.symbol === this.watchlistStore.activeSymbol
+          )
+          if (!this.form.symbol && remembered) {
+            this.form.symbol = remembered.symbol
           } else if (!this.form.symbol && this.watchlistTradable.length > 0) {
-            this.form.symbol = this.watchlistTradable[0].symbol
-            this.watchlistStore.setActive(this.form.symbol, DEFAULT_MARKET)
+            const first = this.watchlistTradable[0]
+            this.form.symbol = first.symbol
+            // Its own market, not a default — persisting NASD over a KRX row
+            // would misfile it in localStorage.
+            this.watchlistStore.setActive(first.symbol, first.market || DEFAULT_MARKET)
           }
         }
         if (!this.selectedCredentialId && this.credentials.length) {
