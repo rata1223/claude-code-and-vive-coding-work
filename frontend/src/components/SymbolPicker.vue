@@ -116,12 +116,29 @@ import { showToast } from 'vant'
 import { watchlistApi } from '@/api'
 import { useWatchlistStore } from '@/stores'
 
+const DEFAULT_MARKET_OPTIONS = [
+  { value: 'Crypto', label: 'Crypto' },
+  { value: 'USStock', label: 'US' },
+  { value: 'HKStock', label: 'HK' },
+  { value: 'Forex', label: 'Forex' },
+  { value: 'Futures', label: 'Futures' }
+]
+
 export default {
   name: 'SymbolPicker',
   props: {
     show: { type: Boolean, default: false },
     title: { type: String, default: '' },
     onlyCrypto: { type: Boolean, default: false },
+    // Which markets this caller may pick from. Defaults to the historical
+    // crypto-era list so BotForm / BotFromIndicator / BotAIRecommend, which
+    // pass only-crypto, see exactly what they saw before. Quick trade narrows
+    // it to the exchanges KIS can actually route to.
+    // `null` means the caller has no opinion: show every tab and filter
+    // nothing, which is what `home` and `ai-analysis` relied on before this
+    // prop existed. Supplying a list both narrows the tabs and filters the
+    // saved-items list to match.
+    markets: { type: Array, default: null },
     autoAdd: { type: Boolean, default: true },
     defaultMarket: { type: String, default: 'Crypto' },
     searchMarket: { type: String, default: '' }
@@ -136,28 +153,34 @@ export default {
       searchResults: [],
       hotList: [],
       searchTimer: null,
-      searchMarketInner: this.defaultMarket || 'Crypto'
+      searchMarketInner: this.initialMarket()
     }
   },
   computed: {
     marketOptions() {
-      return [
-        { value: 'Crypto', label: 'Crypto' },
-        { value: 'USStock', label: 'US' },
-        { value: 'HKStock', label: 'HK' },
-        { value: 'Forex', label: 'Forex' },
-        { value: 'Futures', label: 'Futures' }
-      ]
+      return this.markets || DEFAULT_MARKET_OPTIONS
+    },
+    allowedMarkets() {
+      // Null, not [], when unconstrained — an empty list would read as
+      // "nothing is allowed" and hide every saved row.
+      if (!this.markets) return null
+      return this.markets.map((m) => String(m.value || '').toLowerCase())
     },
     watchlistStore() {
       return useWatchlistStore()
     },
     displayedList() {
+      // Filter unconditionally. This used to return every saved item whenever
+      // `onlyCrypto` was false, so a saved crypto symbol stayed selectable on
+      // an equities-only screen and could be carried into order entry — where
+      // the backend has no exchange to route it to.
       const items = this.watchlistStore.items
       if (this.onlyCrypto) {
         return items.filter((i) => (i.market || '').toLowerCase() === 'crypto')
       }
-      return items
+      const allowed = this.allowedMarkets
+      if (!allowed) return items
+      return items.filter((i) => allowed.includes(String(i.market || '').toLowerCase()))
     }
   },
   watch: {
@@ -171,6 +194,17 @@ export default {
     }
   },
   methods: {
+    initialMarket() {
+      // `defaultMarket` defaults to 'Crypto', so honouring it blindly puts a
+      // caller that narrowed `markets` on a tab outside its own list — the
+      // hot chips and the first keyword search would both offer symbols it
+      // said it could not use. Accept it only if it is actually on offer.
+      const options = this.marketOptions
+      const wanted = this.defaultMarket
+      if (wanted && options.some((m) => m.value === wanted)) return wanted
+      return options[0]?.value || 'Crypto'
+    },
+
     onUpdateShow(val) {
       this.$emit('update:show', val)
       if (!val) this.$emit('close')
@@ -191,7 +225,7 @@ export default {
     },
     async loadHot() {
       try {
-        const market = this.onlyCrypto ? 'Crypto' : (this.defaultMarket || 'Crypto')
+        const market = this.onlyCrypto ? 'Crypto' : this.initialMarket()
         const res = await watchlistApi.getHot({ market, limit: 8 })
         this.hotList = res.data || []
       } catch {

@@ -10,6 +10,11 @@ from api.database import get_db
 from api.deps import get_current_user
 from api.models import User, WatchlistItem
 from api.schemas import Resp, WatchlistAdd, WatchlistRemove
+from backend.market.symbols import (
+    provider_symbol_candidates,
+    resolve_exchange,
+    to_backend_symbol,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -27,9 +32,9 @@ HOT_SYMBOLS = {
         {"symbol": "META", "name": "Meta Platforms", "market": "NASD"},
         {"symbol": "TSLA", "name": "Tesla Inc.", "market": "NASD"},
         {"symbol": "QQQ", "name": "Invesco QQQ Trust", "market": "NASD"},
-        {"symbol": "SPY", "name": "SPDR S&P 500 ETF", "market": "NASD"},
     ],
     "NYSE": [
+        {"symbol": "SPY", "name": "SPDR S&P 500 ETF", "market": "NYSE"},
         {"symbol": "BRK.B", "name": "Berkshire Hathaway B", "market": "NYSE"},
         {"symbol": "JPM", "name": "JPMorgan Chase", "market": "NYSE"},
         {"symbol": "V", "name": "Visa Inc.", "market": "NYSE"},
@@ -123,27 +128,37 @@ def get_watchlist_prices(
     market: str = Query("us"),
     current_user: User = Depends(get_current_user),
 ):
-    """Bulk price fetch for watchlist symbols (yfinance)."""
+    """Bulk price fetch for watchlist symbols (yfinance).
+
+    Symbols arrive raw, so each is resolved to the provider's spelling before
+    the lookup — a bare six-digit KR code returns nothing from yfinance, which
+    would show every Korean row on the watchlist as 0.00 / 0.00%.
+
+    The reported ``symbol`` is always the raw one the caller asked about, never
+    the provider spelling, so the response lines up with the request.
+    """
     sym_list = [s.strip() for s in symbols.split(",") if s.strip()]
     result = []
     for sym in sym_list:
-        try:
-            ticker = yf.Ticker(sym)
-            info = ticker.fast_info
-            price = float(info.last_price or 0)
-            prev = float(info.previous_close or 0)
-            change_pct = round((price - prev) / prev * 100, 2) if prev else 0.0
-            result.append(
-                {
+        quote = None
+        for provider_symbol in provider_symbol_candidates(sym):
+            try:
+                info = yf.Ticker(provider_symbol).fast_info
+                price = float(info.last_price or 0)
+                prev = float(info.previous_close or 0)
+            except Exception as e:
+                logger.debug("price skip %s (%s): %s", sym, provider_symbol, e)
+                continue
+            if price or prev:
+                change_pct = round((price - prev) / prev * 100, 2) if prev else 0.0
+                quote = {
                     "symbol": sym,
                     "price": price,
                     "change_pct": change_pct,
                     "prev_close": prev,
                 }
-            )
-        except Exception as e:
-            logger.debug("price skip %s: %s", sym, e)
-            result.append({"symbol": sym, "price": 0.0, "change_pct": 0.0})
+                break
+        result.append(quote or {"symbol": sym, "price": 0.0, "change_pct": 0.0})
     return Resp.ok({"items": result})
 
 
@@ -171,21 +186,35 @@ def search_symbols(
         if len(matched) >= limit:
             break
 
-    # If no match from catalogue, try yfinance lookup
-    if not matched and q:
-        try:
-            ticker = yf.Ticker(q.upper())
-            info = ticker.info
+    # If no match from catalogue, try yfinance lookup. The query is a *raw*
+    # symbol, so it is resolved to the provider's spelling first — a bare
+    # six-digit KR code means nothing to yfinance, and searching for one used
+    # to return no result at all. A query that is not a tradable equity yields
+    # no candidates and is not looked up.
+    resolved_market = resolve_exchange(q)
+    if not matched and q and not (market and resolved_market != market.upper()):
+        # The market filter has to bind here too, not just on the catalogue
+        # branch. Ask for market=NYSE&q=AAPL and the catalogue rightly drops
+        # AAPL (it is NASD) — without this guard the fallback finds it anyway
+        # and the NYSE tab offers a NASD symbol. The row a search returns is
+        # what the client hands to order entry, so a wrong market here is not
+        # a cosmetic mislabel.
+        for provider_symbol in provider_symbol_candidates(q):
+            try:
+                info = yf.Ticker(provider_symbol).info
+            except Exception:
+                continue
             if info.get("symbol"):
                 matched.append(
                     {
-                        "symbol": info["symbol"],
+                        # Report the raw symbol, never the provider spelling:
+                        # this row is what the client sends back to order entry.
+                        "symbol": to_backend_symbol(q),
                         "name": info.get("shortName") or info.get("longName") or q.upper(),
-                        "market": market or "NASD",
+                        "market": resolved_market or market or "NASD",
                     }
                 )
-        except Exception:
-            pass
+                break
 
     return Resp.ok({"items": matched, "total": len(matched)})
 

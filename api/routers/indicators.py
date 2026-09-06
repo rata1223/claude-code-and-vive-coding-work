@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, Query
 from api.deps import get_current_user
 from api.models import User
 from api.schemas import Resp
+from backend.market.symbols import provider_symbol_candidates
 
 logger = logging.getLogger(__name__)
 
@@ -154,14 +155,40 @@ _PERIOD_MAP = {
 
 
 def _fetch_kline_yf(symbol: str, timeframe: str, limit: int = 200) -> list:
-    """Fetch OHLCV from yfinance and return list of bar dicts."""
+    """Fetch OHLCV from yfinance and return list of bar dicts.
+
+    ``symbol`` is a *raw* symbol — what the user picked. yfinance needs its own
+    spelling, which for KIS domestic codes is neither obvious nor unique:
+    ``005930`` is ``005930.KS`` on KOSPI and ``.KQ`` on KOSDAQ, and a six-digit
+    code does not say which. Passing the raw code through is what made every
+    Korean symbol render an empty chart.
+
+    Resolution is delegated to ``backend.market.symbols`` rather than done by
+    appending a suffix here, so the provider spelling has one definition. It
+    returns the candidates in try-order; the first with data wins, and a symbol
+    that is not a tradable equity yields no candidates and no provider call.
+    """
     tf_key = timeframe if timeframe in _TF_MAP else "1h"
     interval = _TF_MAP[tf_key]
     period = _PERIOD_MAP[tf_key]
 
-    ticker = yf.Ticker(symbol)
-    df = ticker.history(period=period, interval=interval, auto_adjust=True)
-    if df.empty:
+    df = None
+    for provider_symbol in provider_symbol_candidates(symbol):
+        try:
+            candidate = yf.Ticker(provider_symbol).history(
+                period=period, interval=interval, auto_adjust=True
+            )
+        except Exception as e:
+            # A provider error on one board is not evidence the symbol has no
+            # data. Letting it escape would skip the remaining candidate, so a
+            # KOSDAQ symbol charts empty whenever the .KS lookup happens to
+            # error — the same empty-chart bug, by another route.
+            logger.warning("kline candidate %s failed: %s", provider_symbol, e)
+            continue
+        if not candidate.empty:
+            df = candidate
+            break
+    if df is None or df.empty:
         return []
     df = df.tail(limit)
     df = df.reset_index()
@@ -191,7 +218,17 @@ def get_kline(
     market: str = Query("us"),
     limit: int = Query(200, ge=1, le=1000),
 ):
-    """Return OHLCV bars. Uses yfinance for US; KIS for KR if available."""
+    """Return OHLCV bars for ``symbol``, from yfinance.
+
+    ``market`` is accepted for API compatibility and **not used**: the exchange
+    is derived from the symbol itself by ``backend.market.symbols``, which is
+    the same rule order routing uses, so a client that sends the wrong market
+    cannot make the chart disagree with the order.
+
+    There is no KIS branch. An earlier version of this docstring claimed "KIS
+    for KR if available" — no such code has ever existed here, and believing it
+    is what let the empty-KR-chart bug sit unexamined.
+    """
     try:
         bars = _fetch_kline_yf(symbol, timeframe, limit)
         return Resp.ok({"symbol": symbol, "timeframe": timeframe, "items": bars})
@@ -205,26 +242,36 @@ def get_price(
     symbol: str = Query(...),
     market: str = Query("us"),
 ):
-    """Return latest price for a symbol."""
-    try:
-        ticker = yf.Ticker(symbol)
-        info = ticker.fast_info
-        price = float(info.last_price or 0)
-        prev_close = float(info.previous_close or 0)
+    """Return latest price for a symbol.
+
+    ``symbol`` is raw, so it is resolved to the provider's spelling first —
+    otherwise every KR symbol prices at 0.00. ``market`` is accepted for API
+    compatibility and unused; the exchange comes from the symbol.
+    """
+    for provider_symbol in provider_symbol_candidates(symbol):
+        try:
+            info = yf.Ticker(provider_symbol).fast_info
+            price = float(info.last_price or 0)
+            prev_close = float(info.previous_close or 0)
+        except Exception as e:
+            logger.warning("price fetch failed for %s (%s): %s", symbol, provider_symbol, e)
+            continue
+        if not price and not prev_close:
+            # Wrong board for a KR code; try the next candidate.
+            continue
         change = round(price - prev_close, 4)
-        change_pct = round(change / prev_close * 100, 4) if prev_close else 0.0
         return Resp.ok(
             {
+                # The raw symbol, never the provider spelling — the caller
+                # asked about 005930, not 005930.KS.
                 "symbol": symbol,
                 "price": price,
                 "change": change,
-                "change_pct": change_pct,
+                "change_pct": round(change / prev_close * 100, 4) if prev_close else 0.0,
                 "prev_close": prev_close,
             }
         )
-    except Exception as e:
-        logger.warning("price fetch failed for %s: %s", symbol, e)
-        return Resp.ok({"symbol": symbol, "price": 0.0, "change": 0.0, "change_pct": 0.0})
+    return Resp.ok({"symbol": symbol, "price": 0.0, "change": 0.0, "change_pct": 0.0})
 
 
 @router.post("/parseStrategyConfig")
