@@ -190,3 +190,26 @@ def test_the_auto_selected_symbol_keeps_its_own_market(app):
 
     assert "first.market" in block, \
         f"{app}: auto-select overwrites the symbol's real market with a default"
+
+
+@pytest.mark.parametrize("app", _APPS)
+def test_the_initial_market_is_one_the_caller_allows(app):
+    """``defaultMarket``'s prop default is ``'Crypto'``, so a caller that
+    narrows ``markets`` but omits ``default-market`` gets Crypto as the initial
+    search tab and hot-list market — outside its own allowed list. Quick trade
+    passes ``default-market="NASD"`` and so escapes it today, but the trap is
+    the same one the ``markets`` default sprang earlier: a default that quietly
+    wins over the caller's constraint.
+
+    Both entry points — ``searchMarketInner`` and ``loadHot()`` — must resolve
+    through the allowed options.
+    """
+    source = _read(app, _PICKER)
+
+    assert "initialMarket" in source, (
+        f"{app}: no shared allowed-options-aware initial market resolution"
+    )
+    assert "searchMarketInner: this.defaultMarket || 'Crypto'" not in source, (
+        f"{app}: searchMarketInner still defaults to Crypto regardless of the "
+        "caller's market list"
+    )

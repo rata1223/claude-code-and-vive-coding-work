@@ -153,7 +153,7 @@ export default {
       searchResults: [],
       hotList: [],
       searchTimer: null,
-      searchMarketInner: this.defaultMarket || 'Crypto'
+      searchMarketInner: this.initialMarket()
     }
   },
   computed: {
@@ -194,6 +194,17 @@ export default {
     }
   },
   methods: {
+    initialMarket() {
+      // `defaultMarket` defaults to 'Crypto', so honouring it blindly puts a
+      // caller that narrowed `markets` on a tab outside its own list — the
+      // hot chips and the first keyword search would both offer symbols it
+      // said it could not use. Accept it only if it is actually on offer.
+      const options = this.marketOptions
+      const wanted = this.defaultMarket
+      if (wanted && options.some((m) => m.value === wanted)) return wanted
+      return options[0]?.value || 'Crypto'
+    },
+
     onUpdateShow(val) {
       this.$emit('update:show', val)
       if (!val) this.$emit('close')
@@ -214,9 +225,7 @@ export default {
     },
     async loadHot() {
       try {
-        const market = this.onlyCrypto
-          ? 'Crypto'
-          : (this.defaultMarket || this.marketOptions[0]?.value || 'Crypto')
+        const market = this.onlyCrypto ? 'Crypto' : this.initialMarket()
         const res = await watchlistApi.getHot({ market, limit: 8 })
         this.hotList = res.data || []
       } catch {

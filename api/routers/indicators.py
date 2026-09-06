@@ -174,9 +174,17 @@ def _fetch_kline_yf(symbol: str, timeframe: str, limit: int = 200) -> list:
 
     df = None
     for provider_symbol in provider_symbol_candidates(symbol):
-        candidate = yf.Ticker(provider_symbol).history(
-            period=period, interval=interval, auto_adjust=True
-        )
+        try:
+            candidate = yf.Ticker(provider_symbol).history(
+                period=period, interval=interval, auto_adjust=True
+            )
+        except Exception as e:
+            # A provider error on one board is not evidence the symbol has no
+            # data. Letting it escape would skip the remaining candidate, so a
+            # KOSDAQ symbol charts empty whenever the .KS lookup happens to
+            # error — the same empty-chart bug, by another route.
+            logger.warning("kline candidate %s failed: %s", provider_symbol, e)
+            continue
         if not candidate.empty:
             df = candidate
             break

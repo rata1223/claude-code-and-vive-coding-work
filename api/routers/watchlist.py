@@ -191,7 +191,14 @@ def search_symbols(
     # six-digit KR code means nothing to yfinance, and searching for one used
     # to return no result at all. A query that is not a tradable equity yields
     # no candidates and is not looked up.
-    if not matched and q:
+    resolved_market = resolve_exchange(q)
+    if not matched and q and not (market and resolved_market != market.upper()):
+        # The market filter has to bind here too, not just on the catalogue
+        # branch. Ask for market=NYSE&q=AAPL and the catalogue rightly drops
+        # AAPL (it is NASD) — without this guard the fallback finds it anyway
+        # and the NYSE tab offers a NASD symbol. The row a search returns is
+        # what the client hands to order entry, so a wrong market here is not
+        # a cosmetic mislabel.
         for provider_symbol in provider_symbol_candidates(q):
             try:
                 info = yf.Ticker(provider_symbol).info
@@ -204,7 +211,7 @@ def search_symbols(
                         # this row is what the client sends back to order entry.
                         "symbol": to_backend_symbol(q),
                         "name": info.get("shortName") or info.get("longName") or q.upper(),
-                        "market": resolve_exchange(q) or market or "NASD",
+                        "market": resolved_market or market or "NASD",
                     }
                 )
                 break

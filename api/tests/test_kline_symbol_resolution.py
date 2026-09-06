@@ -125,3 +125,59 @@ def test_an_unsupported_symbol_is_not_sent_to_the_provider(yf_spy, raw):
 
     assert indicators._fetch_kline_yf(raw, "1d", 200) == []
     assert asked == []
+
+
+# ── a raising candidate must not kill the fallback (CodeRabbit #1) ────────────
+
+class _RaisingTicker:
+    """Raises on history() — a provider error for one board, not for the symbol."""
+
+    def __init__(self, symbol, frames, raising):
+        self.symbol = symbol
+        self._frames = frames
+        self._raising = raising
+
+    def history(self, **_kwargs):
+        if self.symbol in self._raising:
+            raise RuntimeError(f"provider blew up on {self.symbol}")
+        return self._frames.get(self.symbol, pd.DataFrame())
+
+
+@pytest.fixture
+def yf_flaky(monkeypatch):
+    """Patch yfinance so named symbols raise instead of returning a frame."""
+    asked = []
+    frames = {}
+    raising = set()
+
+    def factory(symbol):
+        asked.append(symbol)
+        return _RaisingTicker(symbol, frames, raising)
+
+    monkeypatch.setattr(indicators.yf, "Ticker", factory)
+    return asked, frames, raising
+
+
+def test_a_raising_ks_still_falls_back_to_kq(yf_flaky):
+    """An exception on the KOSPI candidate is a *provider* failure for that
+    board, not evidence the symbol has no data. Letting it escape the loop
+    means every KOSDAQ symbol charts empty whenever the .KS lookup errors —
+    the same empty-chart bug this file exists to prevent, by another route."""
+    asked, frames, raising = yf_flaky
+    raising.add("247540.KS")
+    frames["247540.KQ"] = _bars()
+
+    bars = indicators._fetch_kline_yf("247540", "1d", 200)
+
+    assert asked == ["247540.KS", "247540.KQ"], "the .KQ candidate must still be tried"
+    assert len(bars) == 3
+
+
+def test_every_candidate_raising_returns_no_bars(yf_flaky):
+    """Still no exception out of the helper — the caller gets an empty chart,
+    not a 500."""
+    asked, _frames, raising = yf_flaky
+    raising.update({"005930.KS", "005930.KQ"})
+
+    assert indicators._fetch_kline_yf("005930", "1d", 200) == []
+    assert asked == ["005930.KS", "005930.KQ"]
