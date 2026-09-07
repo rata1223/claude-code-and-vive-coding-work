@@ -68,36 +68,6 @@ const routes = [
     meta: { titleKey: 'quick_trade.title', showTabbar: true }
   },
   {
-    path: '/ai-analysis',
-    name: 'AiAnalysis',
-    component: () => import('@/views/ai-analysis/index.vue'),
-    meta: { titleKey: 'ai_analysis.title', showTabbar: false }
-  },
-  {
-    path: '/ai-analysis/history',
-    name: 'AiAnalysisHistory',
-    component: () => import('@/views/ai-analysis/History.vue'),
-    meta: { titleKey: 'ai_analysis.history_title', showTabbar: false }
-  },
-  {
-    path: '/market',
-    name: 'Market',
-    component: () => import('@/views/market/index.vue'),
-    meta: { titleKey: 'market.title', showTabbar: false }
-  },
-  {
-    path: '/market/indicator/:id',
-    name: 'MarketIndicatorDetail',
-    component: () => import('@/views/market/Detail.vue'),
-    meta: { titleKey: 'market.title', showTabbar: false }
-  },
-  {
-    path: '/market/my-purchases',
-    name: 'MyPurchases',
-    component: () => import('@/views/market/MyPurchases.vue'),
-    meta: { titleKey: 'market.my_purchases', showTabbar: false }
-  },
-  {
     path: '/profile',
     name: 'Profile',
     component: () => import('@/views/profile/index.vue'),
@@ -134,18 +104,6 @@ const routes = [
     meta: { titleKey: 'profile.change_password', showTabbar: false }
   },
   {
-    path: '/profile/referral',
-    name: 'ProfileReferral',
-    component: () => import('@/views/profile/Referral.vue'),
-    meta: { titleKey: 'profile.referral', showTabbar: false }
-  },
-  {
-    path: '/profile/credits',
-    name: 'ProfileCredits',
-    component: () => import('@/views/profile/Credits.vue'),
-    meta: { titleKey: 'profile.credits_recharge', showTabbar: false }
-  },
-  {
     path: '/profile/notification-settings',
     name: 'ProfileNotificationSettings',
     component: () => import('@/views/profile/NotificationSettings.vue'),
@@ -162,10 +120,6 @@ const routes = [
     name: 'CredentialCreate',
     component: () => import('@/views/profile/CredentialForm.vue'),
     meta: { title: '添加 API Key', showTabbar: false }
-  },
-  {
-    path: '/assets',
-    redirect: '/home'
   }
 ]
 

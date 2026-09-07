@@ -37,11 +37,6 @@
       <template v-else>
         <div v-if="filteredIndicators.length === 0" class="empty-block">
           <van-empty :description="$t('indicator_bot.no_indicators')" />
-          <div class="empty-actions">
-            <van-button round type="primary" size="small" @click="$router.push('/market')">
-              {{ $t('indicator_bot.browse_market') }}
-            </van-button>
-          </div>
         </div>
 
         <div v-else class="indicator-list">
@@ -61,26 +56,12 @@
             </div>
             <p v-if="ind.description" class="ind-desc">{{ ind.description }}</p>
             <div class="ind-meta">
-              <span v-if="ind.pricing_type === 'paid'" class="meta-price">
-                <van-icon name="gold-coin-o" />
-                {{ Number(ind.price || 0) }}
-              </span>
-              <span v-else class="meta-free">
-                <van-icon name="checked" />
-                {{ $t('market.price_free') }}
-              </span>
               <span class="meta-time" v-if="ind.updatetime || ind.createtime">
                 <van-icon name="clock-o" />
                 {{ formatTime(ind.updatetime || ind.createtime) }}
               </span>
               <van-icon class="meta-arrow" name="arrow" />
             </div>
-          </div>
-
-          <div class="market-cta" @click="$router.push('/market')">
-            <van-icon name="shop-o" />
-            <span>{{ $t('indicator_bot.browse_market') }}</span>
-            <van-icon class="cta-arrow" name="arrow" />
           </div>
         </div>
       </template>
@@ -697,7 +678,6 @@ function pct(v) {
 .loading { padding: 32px; text-align: center; }
 .empty-block { padding: 8px 16px 24px; }
 .empty-block.soft { padding: 4px 16px 8px; }
-.empty-actions { text-align: center; margin-top: 4px; }
 
 .indicator-list {
   padding: 0 16px;
@@ -750,26 +730,9 @@ function pct(v) {
   font-size: 11px;
   color: var(--text-3);
 }
-.meta-price { color: var(--c-amber); font-weight: 700; display: inline-flex; gap: 4px; align-items: center; }
-.meta-free { color: var(--up); font-weight: 600; display: inline-flex; gap: 4px; align-items: center; }
 .meta-time { display: inline-flex; gap: 4px; align-items: center; }
 .meta-arrow { margin-left: auto; color: var(--text-4); }
 
-.market-cta {
-  margin-top: 4px;
-  padding: 14px 18px;
-  border-radius: 14px;
-  border: 1px dashed var(--border-strong);
-  background: var(--surface-raised);
-  color: var(--accent);
-  font-size: 13px;
-  font-weight: 600;
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  cursor: pointer;
-}
-.market-cta .cta-arrow { margin-left: auto; }
 
 .selected-card {
   margin: 0 16px 14px;

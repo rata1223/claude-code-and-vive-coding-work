@@ -68,18 +68,6 @@ const routes = [
     meta: { titleKey: 'quick_trade.title', showTabbar: true }
   },
   {
-    path: '/ai-analysis',
-    name: 'AiAnalysis',
-    component: () => import('@/views/ai-analysis/index.vue'),
-    meta: { titleKey: 'ai_analysis.title', showTabbar: false }
-  },
-  {
-    path: '/ai-analysis/history',
-    name: 'AiAnalysisHistory',
-    component: () => import('@/views/ai-analysis/History.vue'),
-    meta: { titleKey: 'ai_analysis.history_title', showTabbar: false }
-  },
-  {
     path: '/profile',
     name: 'Profile',
     component: () => import('@/views/profile/index.vue'),
@@ -132,10 +120,6 @@ const routes = [
     name: 'CredentialCreate',
     component: () => import('@/views/profile/CredentialForm.vue'),
     meta: { title: '브로커 자격증명 등록', showTabbar: false }
-  },
-  {
-    path: '/assets',
-    redirect: '/home'
   }
 ]
 
