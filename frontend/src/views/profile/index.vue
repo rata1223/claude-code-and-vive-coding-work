@@ -110,7 +110,9 @@ export default {
     return {
       logoUrl,
       billing: {
-        credits: 0,
+        // Only the VIP fields are read now — the crown beside the avatar. The
+        // credit balance had no reader left once the wallet card went, and a
+        // number nothing renders is a number nothing keeps honest.
         is_vip: false,
         vip_expires_at: null,
         billing_enabled: false
@@ -352,118 +354,6 @@ export default {
   display: inline-flex;
   align-items: center;
   gap: 4px;
-}
-
-/* ===== Double card ===== */
-.double-card {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 10px;
-  margin-bottom: 22px;
-}
-
-.wallet-card,
-.invite-card {
-  position: relative;
-  padding: 16px 14px;
-  border-radius: var(--radius);
-  background: var(--bg-elevated);
-  border: 1px solid var(--border);
-  color: var(--text);
-  overflow: hidden;
-  transition: transform 0.15s;
-}
-.wallet-card:active,
-.invite-card:active { transform: scale(0.98); }
-
-.wallet-card::before {
-  content: '';
-  position: absolute;
-  inset: 0;
-  pointer-events: none;
-  background: radial-gradient(220px 160px at 100% 0%, var(--accent-gold-soft), transparent 62%);
-}
-.invite-card::before {
-  content: '';
-  position: absolute;
-  inset: 0;
-  pointer-events: none;
-  background: radial-gradient(220px 160px at 100% 0%, var(--c-green-soft), transparent 62%);
-}
-
-.wallet-shine { display: none; }
-
-.wallet-head,
-.invite-head {
-  position: relative;
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 10px;
-  color: var(--text-3);
-  font-weight: 700;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-}
-
-.wallet-head .van-icon { font-size: 15px; color: var(--c-amber); }
-.invite-head .van-icon { font-size: 15px; color: var(--c-green); }
-
-.wallet-value {
-  position: relative;
-  margin-top: 6px;
-  font-size: 30px;
-  font-weight: 800;
-  color: var(--c-amber);
-  letter-spacing: -0.025em;
-  font-variant-numeric: tabular-nums;
-}
-
-.wallet-sub {
-  position: relative;
-  margin-top: 2px;
-  font-size: 11px;
-  color: var(--text-3);
-}
-
-.wallet-cta {
-  position: relative;
-  margin-top: 10px;
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  padding: 5px 10px;
-  border-radius: 999px;
-  background: var(--c-amber-soft);
-  color: var(--c-amber);
-  font-size: 11px;
-  font-weight: 700;
-}
-
-.invite-stats {
-  position: relative;
-  margin-top: 8px;
-  display: flex;
-  gap: 14px;
-}
-.invite-stats .stat { display: flex; flex-direction: column; }
-.invite-stats .val {
-  font-size: 22px;
-  font-weight: 800;
-  color: var(--text);
-  font-variant-numeric: tabular-nums;
-  letter-spacing: -0.01em;
-}
-.invite-stats .lab {
-  font-size: 11px;
-  color: var(--text-3);
-}
-.invite-sub {
-  position: relative;
-  margin-top: 10px;
-  font-size: 11px;
-  line-height: 1.4;
-  color: var(--text-3);
 }
 
 /* ===== Menu sections ===== */
