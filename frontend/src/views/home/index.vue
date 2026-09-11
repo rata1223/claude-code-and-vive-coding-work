@@ -347,7 +347,7 @@ export default {
       return this.credentialsStore.hasCredentials
     },
     credentialCount() {
-      return this.credentialsStore.cryptoItems.length
+      return this.credentialsStore.items.length
     },
     unreadCount() {
       return this.notificationStore.unreadCount

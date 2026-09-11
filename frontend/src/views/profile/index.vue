@@ -137,7 +137,14 @@ export default {
       return this.userStore.userInfo
     },
     credentialCount() {
-      return this.credentialsStore.cryptoItems.length
+      // `cryptoItems` is not a getter on this store in the mobile client — it
+      // has `kisItems`/`kiwoomItems` only — so this threw on `undefined.length`
+      // and took the whole Profile page down there. It survived in the web
+      // client only because its own `cryptoItems` is defined as "not ibkr, not
+      // mt5", which happens to count the KIS and Kiwoom rows. Neither spelling
+      // means anything now that crypto is gone: the count is simply how many
+      // broker credentials are registered.
+      return this.credentialsStore.items.length
     },
     unreadCount() {
       return this.notificationStore.unreadCount

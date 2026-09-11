@@ -268,7 +268,7 @@ export default {
       )
     },
     credentials() {
-      return this.credentialsStore.cryptoItems
+      return this.credentialsStore.items
     },
     selectedCredentialId() {
       return this.quickTradeStore.selectedCredentialId

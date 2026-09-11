@@ -64,7 +64,7 @@ export default {
     cta_generate: '开始生成',
     recent_analyses: '最近分析',
     tips_title: 'AI 使用小贴士',
-    tip_1: '先做 AI 标的分析，锁定方向后再生成机器人',
+    tip_1: '用一句话描述想要的策略，AI 会连机器人参数一并配置',
     tip_2: '机器人参数可在生成后手动微调',
     tip_3: '实盘前建议先跑信号模式观察一两天',
     macro_title: '宏观速览',

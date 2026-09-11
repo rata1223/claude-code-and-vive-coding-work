@@ -64,7 +64,7 @@ export default {
     cta_generate: 'Start generating',
     recent_analyses: 'Recent Analyses',
     tips_title: 'AI Tips',
-    tip_1: 'Run AI analysis first, then generate a bot aligned with the direction',
+    tip_1: 'Describe the strategy you want in plain words — AI fills in the bot parameters',
     tip_2: 'You can tweak bot parameters after AI generates them',
     tip_3: 'Run signal-only mode for a day or two before going live',
     macro_title: 'Macro Snapshot',

@@ -218,7 +218,6 @@ export const useWatchlistStore = defineStore('watchlist', {
   }),
 
   getters: {
-    cryptoItems: (state) => state.items.filter((i) => (i.market || '').toLowerCase() === 'crypto'),
     activeItem: (state) => state.items.find((i) => i.symbol === state.activeSymbol) || null
   },
 

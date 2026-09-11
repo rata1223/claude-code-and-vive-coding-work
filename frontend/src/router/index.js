@@ -120,6 +120,16 @@ const routes = [
     name: 'CredentialCreate',
     component: () => import('@/views/profile/CredentialForm.vue'),
     meta: { title: '添加 API Key', showTabbar: false }
+  },
+  {
+    // Nine routes were removed with the crypto-era screens, and a bookmark or
+    // a browser-history entry for one of them still resolves through the SPA
+    // fallback: the guard below stashes it as `redirect`, login honours it,
+    // and the app lands on an unmatched route — a blank page under a tabbar.
+    // The `/assets` redirect used to be the only fallback of this shape; this
+    // generalises it so no deleted path can dead-end.
+    path: '/:pathMatch(.*)*',
+    redirect: '/home'
   }
 ]
 

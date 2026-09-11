@@ -64,7 +64,7 @@ export default {
     cta_generate: '생성 시작',
     recent_analyses: '최근 분석',
     tips_title: 'AI 팁',
-    tip_1: '먼저 AI 분석을 실행한 뒤 방향에 맞춰 봇을 생성하세요',
+    tip_1: '원하는 전략을 문장으로 설명하면 AI가 봇 파라미터까지 구성합니다',
     tip_2: 'AI 생성 후 파라미터를 수동으로 조정할 수 있습니다',
     tip_3: '실거래 전에 시그널 전용 모드로 며칠 운용하는 것을 권장합니다',
     macro_title: '매크로 스냅샷',
