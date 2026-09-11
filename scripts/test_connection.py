@@ -33,9 +33,17 @@ def test_token():
 
 def test_price_us():
     from kis_adapter.market_data import KISMarketData
+    from backend.market.symbols import to_quote_excd
+    from backend.quant.data.universe import EXCD_MAP
+
     md = KISMarketData()
     try:
-        price = md.get_price_us("SPY", "NYSE")
+        # "NYS", not "NYSE": the quote endpoint (HHDFS00000300) takes
+        # NAS/NYS/AMS while orders take NASD/NYSE/AMEX. This check was asking
+        # for an exchange the endpoint does not name — so the one script whose
+        # job is to prove the KIS connection works could report a failure that
+        # says nothing about the connection.
+        price = md.get_price_us("SPY", to_quote_excd(EXCD_MAP["SPY"]))
         print(f"✅ 미국 시세 조회 성공: SPY = ${price:.2f}")
     except Exception as e:
         print(f"❌ 미국 시세 조회 실패: {e}")

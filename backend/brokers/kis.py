@@ -163,8 +163,8 @@ class KISBroker(BrokerAdapter):
                     sym = p["ovrs_pdno"]
                     avg = float(p.get("pchs_avg_pric", 0))
                     try:
-                        excd = _quote_excd(sym)
-                        cur = self._market.get_price_us(sym, excd)
+                        quote_excd = _quote_excd(sym)
+                        cur = self._market.get_price_us(sym, quote_excd)
                     except Exception:
                         cur = avg
                     positions.append(Position(symbol=sym, qty=qty, avg_price=avg,
@@ -388,8 +388,8 @@ class KISBroker(BrokerAdapter):
             if self._is_kr(symbol):
                 result = float(self._market.get_price_kr(symbol))
             else:
-                excd = _quote_excd(symbol)
-                result = self._market.get_price_us(symbol, excd)
+                quote_excd = _quote_excd(symbol)
+                result = self._market.get_price_us(symbol, quote_excd)
             self._breaker.record_success()
             return result
         except Exception:

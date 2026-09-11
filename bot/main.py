@@ -14,6 +14,7 @@ import yfinance as yf
 
 from kis_adapter import KISClient, KISOrders, KISMarketData, KISPortfolio
 from strategy.signals import MultiTimeframeSignals, KR_ETF, EXCD_MAP
+from backend.market.symbols import to_quote_excd
 from strategy.optimizer import PortfolioOptimizer
 from strategy.risk import RiskManager
 from bot.notifier import (
@@ -74,7 +75,7 @@ class TradingEngine:
             if symbol in KR_ETF:
                 return float(self._market.get_price_kr(symbol))
             excd = EXCD_MAP.get(symbol, "NASD")
-            return self._market.get_price_us(symbol, excd)
+            return self._market.get_price_us(symbol, to_quote_excd(excd))
 
         # positions_map → [{"symbol": ..., "entry_price": ..., "qty": ...}] 형태로 변환
         pos_list = []
@@ -131,7 +132,7 @@ class TradingEngine:
                     continue
                 try:
                     excd = EXCD_MAP.get(symbol, "NASD")
-                    price = self._market.get_price_us(symbol, excd)
+                    price = self._market.get_price_us(symbol, to_quote_excd(excd))
                     us = self._portfolio.get_us_balance()
                     qty = next(
                         (int(p.get("ovrs_cblc_qty", 0)) for p in us["positions"] if p["ovrs_pdno"] == symbol), 0
@@ -151,7 +152,7 @@ class TradingEngine:
                 weights = self._optimizer.compute_atr_weights(buy_list, total_krw, self._signals)
                 for symbol, amount_krw in weights.items():
                     excd = EXCD_MAP.get(symbol, "NASD")
-                    price = self._market.get_price_us(symbol, excd)
+                    price = self._market.get_price_us(symbol, to_quote_excd(excd))
                     qty = max(1, int(amount_krw / (price * fx)))
                     try:
                         self._orders.buy_us(symbol, excd, qty, price)
@@ -236,7 +237,7 @@ class TradingEngine:
                 if qty > 0:
                     symbol = pos["ovrs_pdno"]
                     excd = EXCD_MAP.get(symbol, "NASD")
-                    price = self._market.get_price_us(symbol, excd)
+                    price = self._market.get_price_us(symbol, to_quote_excd(excd))
                     self._orders.sell_us(symbol, excd, qty, price)
                     alert_sell(symbol, qty, price, reason="월간 리밸런싱")
         except Exception as e:
