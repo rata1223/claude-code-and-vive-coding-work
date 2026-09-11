@@ -143,7 +143,10 @@ def _allow():
 
 
 def _body(**kw):
-    payload = {"credential_id": 1, "symbol": "AAPL", "market": "us", "exchange": "NASD"}
+    # No ``exchange``: the real client sends none and the handler derives it
+    # from the symbol. A hardcoded "NASD" made the KR case assert a
+    # contradiction (069500 does not trade on NASD).
+    payload = {"credential_id": 1, "symbol": "AAPL", "market": "us"}
     payload.update(kw)
     return ClosePositionRequest(**payload)
 

@@ -11,9 +11,40 @@ from .validator import BrokerCapabilityValidator, OrderRequest
 from kis_adapter import KISClient, KISMarketData, KISOrders, KISPortfolio
 from kis_adapter.dates import inquiry_date_range
 from backend.execution.circuit_breaker import ConsecutiveFailureBreaker
-from backend.quant.data.universe import EXCD_MAP, KR_ETF
+from backend.market.symbols import resolve_exchange, to_quote_excd
+from backend.quant.data.universe import KR_ETF
 
 logger = logging.getLogger(__name__)
+
+
+def _order_excd(symbol: str) -> str:
+    """``OVRS_EXCG_CD`` for a US order or order inquiry.
+
+    Resolution moved out of this module so the bot path and the app path
+    (``api/routers/quick_trade``) cannot drift: they used to agree only by
+    coincidence, one reading ``EXCD_MAP`` and the other trusting the client.
+
+    Falls back to the historical ``NASD`` when the symbol resolves to nothing,
+    which here means a symbol that came from our own universe or from a broker
+    position row and should always resolve — hence the warning. The hard
+    refusal belongs at the API boundary, where symbols arrive untrusted.
+    """
+    exchange = resolve_exchange(symbol)
+    if exchange is None:
+        logger.warning("거래소 미확인 심볼 %s — NASD로 폴백", symbol)
+        return "NASD"
+    return exchange
+
+
+def _quote_excd(symbol: str) -> str:
+    """``EXCD`` for a US quote — a different code set from the order one.
+
+    KIS's own examples: ``order(ovrs_excg_cd="NASD")`` but
+    ``price(excd="NAS")``. Passing the order code to the quote endpoint names
+    an exchange it does not know.
+    """
+    return to_quote_excd(_order_excd(symbol)) or "NAS"
+
 
 _FX_CACHE_LOCK = threading.Lock()
 _FX_CACHE: dict = {"rate": 1350.0, "ts": time.monotonic()}
@@ -132,7 +163,7 @@ class KISBroker(BrokerAdapter):
                     sym = p["ovrs_pdno"]
                     avg = float(p.get("pchs_avg_pric", 0))
                     try:
-                        excd = EXCD_MAP.get(sym, "NASD")
+                        excd = _quote_excd(sym)
                         cur = self._market.get_price_us(sym, excd)
                     except Exception:
                         cur = avg
@@ -171,7 +202,7 @@ class KISBroker(BrokerAdapter):
             if is_kr:
                 raw = (self._orders.buy_kr if side == "buy" else self._orders.sell_kr)(symbol, qty, int(price))
             else:
-                excd = EXCD_MAP.get(symbol, "NASD")
+                excd = _order_excd(symbol)
                 raw = (self._orders.buy_us if side == "buy" else self._orders.sell_us)(symbol, excd, qty, price)
             mapper = KIS_DOMESTIC_MAPPER if is_kr else KIS_OVERSEAS_MAPPER
             order_id = mapper.extract_broker_order_id(raw)
@@ -207,7 +238,7 @@ class KISBroker(BrokerAdapter):
         """주문 취소. US 종목은 cancel_us() 라우팅. KR: TTTC0803U/VTTC0803U."""
         is_us = bool(symbol) and not self._is_kr(symbol)
         if is_us:
-            excd = EXCD_MAP.get(symbol, "NASD")
+            excd = _order_excd(symbol)
             try:
                 resp = self._orders.cancel_us(order_id, symbol, excd, qty, price)
                 rt_cd = resp.get("rt_cd", "1")
@@ -310,7 +341,7 @@ class KISBroker(BrokerAdapter):
         """KIS 해외주식 주문 조회. TR: TTTS3035R (실전) / VTTS3035R (모의)."""
         try:
             tr_id = "VTTS3035R" if self._paper else "TTTS3035R"
-            excd = EXCD_MAP.get(symbol, "NASD")
+            excd = _order_excd(symbol)
             strt_dt, end_dt = inquiry_date_range()
             params = {
                 "CANO": self._account[:8],
@@ -357,7 +388,7 @@ class KISBroker(BrokerAdapter):
             if self._is_kr(symbol):
                 result = float(self._market.get_price_kr(symbol))
             else:
-                excd = EXCD_MAP.get(symbol, "NASD")
+                excd = _quote_excd(symbol)
                 result = self._market.get_price_us(symbol, excd)
             self._breaker.record_success()
             return result

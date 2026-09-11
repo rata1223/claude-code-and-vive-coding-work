@@ -11,6 +11,7 @@ from api.deps import get_current_user
 from api.models import User, WatchlistItem
 from api.schemas import Resp, WatchlistAdd, WatchlistRemove
 from backend.market.symbols import (
+    CANONICAL_EXCHANGES,
     provider_symbol_candidates,
     resolve_exchange,
     to_backend_symbol,
@@ -22,35 +23,55 @@ router = APIRouter(prefix="/api/market", tags=["market"])
 
 # ── Popular symbols by market ─────────────────────────────────────────────
 
-HOT_SYMBOLS = {
-    "NASD": [
-        {"symbol": "AAPL", "name": "Apple Inc.", "market": "NASD"},
-        {"symbol": "MSFT", "name": "Microsoft Corp.", "market": "NASD"},
-        {"symbol": "NVDA", "name": "NVIDIA Corp.", "market": "NASD"},
-        {"symbol": "GOOGL", "name": "Alphabet Inc.", "market": "NASD"},
-        {"symbol": "AMZN", "name": "Amazon.com Inc.", "market": "NASD"},
-        {"symbol": "META", "name": "Meta Platforms", "market": "NASD"},
-        {"symbol": "TSLA", "name": "Tesla Inc.", "market": "NASD"},
-        {"symbol": "QQQ", "name": "Invesco QQQ Trust", "market": "NASD"},
-    ],
-    "NYSE": [
-        {"symbol": "SPY", "name": "SPDR S&P 500 ETF", "market": "NYSE"},
-        {"symbol": "BRK.B", "name": "Berkshire Hathaway B", "market": "NYSE"},
-        {"symbol": "JPM", "name": "JPMorgan Chase", "market": "NYSE"},
-        {"symbol": "V", "name": "Visa Inc.", "market": "NYSE"},
-        {"symbol": "XOM", "name": "Exxon Mobil Corp.", "market": "NYSE"},
-        {"symbol": "WMT", "name": "Walmart Inc.", "market": "NYSE"},
-    ],
-    "KRX": [
-        {"symbol": "005930", "name": "삼성전자", "market": "KRX"},
-        {"symbol": "000660", "name": "SK하이닉스", "market": "KRX"},
-        {"symbol": "035420", "name": "NAVER", "market": "KRX"},
-        {"symbol": "051910", "name": "LG화학", "market": "KRX"},
-        {"symbol": "373220", "name": "LG에너지솔루션", "market": "KRX"},
-        {"symbol": "000270", "name": "기아", "market": "KRX"},
-        {"symbol": "005380", "name": "현대차", "market": "KRX"},
-    ],
+#: Symbol → display name. The **exchange is not written here**: it is resolved
+#: from the symbol by ``backend.market.symbols``, the same call the order path
+#: makes. Writing it twice is what let SPY sit under NASD in this catalogue
+#: while ``EXCD_MAP`` said NYSE — a row that named one venue to the picker and
+#: routed to another. A name is the only thing this file knows better.
+_HOT_NAMES = {
+    "AAPL": "Apple Inc.",
+    "MSFT": "Microsoft Corp.",
+    "NVDA": "NVIDIA Corp.",
+    "GOOGL": "Alphabet Inc.",
+    "AMZN": "Amazon.com Inc.",
+    "META": "Meta Platforms",
+    "TSLA": "Tesla Inc.",
+    "QQQ": "Invesco QQQ Trust",
+    "SPY": "SPDR S&P 500 ETF",
+    "BRK.B": "Berkshire Hathaway B",
+    "JPM": "JPMorgan Chase",
+    "V": "Visa Inc.",
+    "XOM": "Exxon Mobil Corp.",
+    "WMT": "Walmart Inc.",
+    "005930": "삼성전자",
+    "000660": "SK하이닉스",
+    "035420": "NAVER",
+    "051910": "LG화학",
+    "373220": "LG에너지솔루션",
+    "000270": "기아",
+    "005380": "현대차",
 }
+
+
+def _build_hot_symbols() -> dict:
+    """Group the catalogue by the exchange each symbol actually routes to.
+
+    A symbol that resolves to no exchange is dropped rather than filed under a
+    default — it could not be ordered, so offering it is offering a rejection.
+    """
+    grouped: dict = {exchange: [] for exchange in CANONICAL_EXCHANGES}
+    for symbol, name in _HOT_NAMES.items():
+        exchange = resolve_exchange(symbol)
+        if exchange is None:
+            logger.warning("hot symbol %s resolves to no exchange; dropped", symbol)
+            continue
+        grouped[exchange].append(
+            {"symbol": symbol, "name": name, "market": exchange}
+        )
+    return grouped
+
+
+HOT_SYMBOLS = _build_hot_symbols()
 
 
 # ── Watchlist ─────────────────────────────────────────────────────────────

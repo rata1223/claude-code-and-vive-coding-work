@@ -137,3 +137,51 @@ def test_is_kr_agrees_with_the_broker_adapter():
 
     for raw in ["005930", "069500", "AAPL", "SPY", "BRK.B"]:
         assert S.is_kr(raw) == KISBroker._is_kr(raw), raw
+
+
+# ── order codes vs quote codes ────────────────────────────────────────────────
+
+def test_the_quote_code_differs_from_the_order_code():
+    """KIS names the same venue two ways. From its own examples
+    (``koreainvestment/open-trading-api``)::
+
+        order(ovrs_excg_cd="NASD", pdno="AAPL")     # trading
+        price(auth="", excd="NAS", symb="AAPL")     # quotes
+
+    Passing the order code to a quote endpoint asks for an exchange it does
+    not name, and the caller reads the empty answer as "no price".
+    """
+    assert S.to_quote_excd("NASD") == "NAS"
+    assert S.to_quote_excd("NYSE") == "NYS"
+    assert S.to_quote_excd("AMEX") == "AMS"
+
+
+def test_krx_has_no_quote_exchange_code():
+    """Domestic quotes go to a different endpoint that takes no exchange code.
+    Returning some string would let a caller send it anyway."""
+    assert S.to_quote_excd("KRX") is None
+
+
+def test_an_unknown_exchange_has_no_quote_code():
+    assert S.to_quote_excd("SEHK") is None
+    assert S.to_quote_excd(None) is None
+    assert S.to_quote_excd("") is None
+
+
+def test_every_us_exchange_we_can_route_to_has_a_quote_code():
+    """A venue we can place an order on but cannot price is a venue whose
+    close-position path is broken — ``_live_close_price`` returns ``None`` and
+    the close is refused for "no live price"."""
+    for exchange in S.CANONICAL_EXCHANGES:
+        if exchange == S.KR_EXCHANGE:
+            continue
+        assert S.to_quote_excd(exchange), f"{exchange} has no quote code"
+
+
+# ── the symbols the app offers must all be routable ──────────────────────────
+
+def test_the_nyse_names_in_the_catalogue_resolve_to_nyse():
+    """These are offered by the picker's NYSE tab. Before this mapping existed
+    they resolved to the US default and KIS rejected the order."""
+    for symbol in ["SPY", "JPM", "V", "BRK.B", "XOM", "WMT"]:
+        assert S.resolve_exchange(symbol) == "NYSE", symbol

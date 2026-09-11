@@ -194,7 +194,13 @@ class PlaceOrderRequest(BaseModel):
     # silently routed every KR order to the US path. Resolved by
     # api.routers.quick_trade._resolve_market.
     market: Optional[str] = None      # us / kr / None = derive from symbol
-    exchange: str = "NASD"  # NASD / NYSE / KRX
+    # Same story as ``market``, one field later. ``"NASD"`` as a default made
+    # "not supplied" indistinguishable from "the caller chose NASD", so the
+    # handler's ``body.exchange or "NASD"`` could never fire and every NYSE
+    # symbol was ordered as NASD — which KIS rejects. The exchange is now
+    # derived from the symbol; supplying one is optional and, when supplied,
+    # must agree.
+    exchange: Optional[str] = None    # NASD / NYSE / KRX / None = derive
 
 
 class EmergencyFlattenRequest(BaseModel):
@@ -230,7 +236,7 @@ class ClosePositionRequest(BaseModel):
     symbol: str
     qty: Optional[float] = None  # None = close the entire live position
     market: Optional[str] = None   # None = derive from symbol (see _resolve_market)
-    exchange: str = "NASD"
+    exchange: Optional[str] = None  # None = derive from symbol (see _resolve_exchange)
 
 
 # ─────────────────────────────────────────────

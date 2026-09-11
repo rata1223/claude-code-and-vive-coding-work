@@ -16,3 +16,8 @@ EXCD_MAP: dict[str, str] = {s: "NASD" for s in ["AAPL", "NVDA", "MSFT", "GOOGL",
                                                    "META", "TSLA", "AVGO", "QQQ", "XLK", "XLRE"]}
 EXCD_MAP.update({s: "NYSE" for s in ["SPY", "XLF", "XLE", "XLV", "XLI", "XLY", "XLP", "XLU",
                                        "JPM", "V"]})
+
+# UNIVERSE 밖이지만 앱 종목 피커(api/routers/watchlist.py HOT_SYMBOLS)가 파는 종목.
+# EXCD_MAP은 유니버스 목록이 아니라 심볼→거래소 매핑이므로, 주문 가능한 종목은
+# 전부 여기 있어야 한다. 빠지면 미국 기본값(NASD)으로 떨어져 KIS가 주문을 거부한다.
+EXCD_MAP.update({s: "NYSE" for s in ["BRK.B", "XOM", "WMT"]})
