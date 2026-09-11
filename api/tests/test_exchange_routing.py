@@ -13,8 +13,8 @@ indistinguishable from "the caller chose NASD". And the client supplies nothing:
 ``frontend/src/views/quick-trade/index.vue`` posts
 ``{credential_id, symbol, side, qty, price, market_type, source}``.
 
-So every NYSE name the picker offers — SPY, JPM, V, XOM, WMT, BRK.B and the
-sector ETFs — went to KIS tagged NASD. The sibling handler ``_resolve_market``
+So every non-NASDAQ name the picker offers — JPM, V, XOM, WMT, BRK.B, SPY and
+the sector ETFs — went to KIS tagged NASD. The sibling handler ``_resolve_market``
 already derives the *market* from the symbol; these tests pin the *exchange* to
 the same treatment, through ``backend.market.symbols.resolve_exchange``.
 
@@ -97,11 +97,14 @@ def _us_pos(symbol, held="10"):
 # ── the exchange comes from the symbol ────────────────────────────────────────
 
 @pytest.mark.parametrize("symbol,expected", [
-    ("SPY", "NYSE"),      # NYSE Arca — in EXCD_MAP, and the NYSE tab's first row
+    # Listed on NYSE proper, so the expected code is not in doubt. The NYSE
+    # Arca names (SPY, XL*) are deliberately absent — see
+    # ``test_an_arca_etf_is_routed_by_the_map_whatever_the_map_says``.
     ("JPM", "NYSE"),
     ("V", "NYSE"),
-    ("XLF", "NYSE"),
+    ("XOM", "NYSE"),
     ("AAPL", "NASD"),     # unchanged — the case that worked by accident
+    ("MSFT", "NASD"),
     ("QQQ", "NASD"),
 ])
 def test_a_us_order_carries_the_symbols_own_exchange(monkeypatch, db, user, symbol, expected):
@@ -124,6 +127,27 @@ def test_the_nyse_names_the_picker_offers_are_mapped(monkeypatch, db, user, symb
 
     assert resp.code == 1, resp.msg
     assert orders.calls == [("buy_us", symbol, "NYSE", 1, 100.0)]
+
+
+def test_an_arca_etf_is_routed_by_the_map_whatever_the_map_says(monkeypatch, db, user):
+    """SPY is NYSE Arca. KIS's order codes are NASD/NYSE/AMEX with no ARCA, and
+    which of NYSE or AMEX it files Arca under is **not verified here** — the
+    symbol master that would settle it is unreachable from this environment
+    (see the note in ``backend/quant/data/universe.py``).
+
+    So this asserts only what this change is responsible for: the order carries
+    whatever ``EXCD_MAP`` says, instead of a hardcoded NASD. If the mapping is
+    later corrected to AMEX, this test follows it rather than contradicting it.
+    """
+    from backend.quant.data.universe import EXCD_MAP
+
+    orders, _, _ = _wire(monkeypatch, orders=RecordingOrders())
+
+    resp = quick_trade.place_order(_order(symbol="SPY"), None, user, db, _allow())
+
+    assert resp.code == 1, resp.msg
+    assert orders.calls == [("buy_us", "SPY", EXCD_MAP["SPY"], 1, 100.0)]
+    assert orders.calls[0][2] != "NASD", "the pre-fix misroute must not return"
 
 
 def test_a_kr_order_takes_the_domestic_path_with_no_exchange(monkeypatch, db, user):
@@ -155,11 +179,11 @@ def test_a_non_equity_symbol_is_refused_before_the_broker(monkeypatch, db, user,
 
 def test_a_client_exchange_that_contradicts_the_symbol_is_refused(monkeypatch, db, user):
     """Ignoring it silently would leave the client believing something false.
-    SPY is NYSE; a caller asserting NASD is wrong and should hear so."""
+    JPM is NYSE-listed; a caller asserting NASD is wrong and should hear so."""
     orders, _, _ = _wire(monkeypatch, orders=RecordingOrders())
 
     resp = quick_trade.place_order(
-        _order(symbol="SPY", exchange="NASD"), None, user, db, _allow())
+        _order(symbol="JPM", exchange="NASD"), None, user, db, _allow())
 
     assert resp.code == -1
     assert orders.calls == []
@@ -169,10 +193,10 @@ def test_a_client_exchange_that_agrees_is_accepted(monkeypatch, db, user):
     orders, _, _ = _wire(monkeypatch, orders=RecordingOrders())
 
     resp = quick_trade.place_order(
-        _order(symbol="SPY", exchange="NYSE"), None, user, db, _allow())
+        _order(symbol="JPM", exchange="NYSE"), None, user, db, _allow())
 
     assert resp.code == 1, resp.msg
-    assert orders.calls == [("buy_us", "SPY", "NYSE", 1, 100.0)]
+    assert orders.calls == [("buy_us", "JPM", "NYSE", 1, 100.0)]
 
 
 # ── close-position routes the same way ───────────────────────────────────────
@@ -180,20 +204,20 @@ def test_a_client_exchange_that_agrees_is_accepted(monkeypatch, db, user):
 def test_close_position_uses_the_symbols_exchange(monkeypatch, db, user):
     orders, _, _ = _wire(monkeypatch,
                          orders=RecordingOrders(),
-                         portfolio=FakePortfolio(us=_us_pos("SPY")),
+                         portfolio=FakePortfolio(us=_us_pos("JPM")),
                          market_data=RecordingMarketData())
 
     resp = quick_trade.close_position(
-        ClosePositionRequest(credential_id=1, symbol="SPY"), None, user, db, _allow())
+        ClosePositionRequest(credential_id=1, symbol="JPM"), None, user, db, _allow())
 
     assert resp.code == 1, resp.msg
-    assert orders.calls == [("sell_us", "SPY", "NYSE", 10, 175.5)]
+    assert orders.calls == [("sell_us", "JPM", "NYSE", 10, 175.5)]
 
 
 # ── the quote endpoints take the other code set ──────────────────────────────
 
 @pytest.mark.parametrize("symbol,quote_excd", [
-    ("SPY", "NYS"),
+    ("JPM", "NYS"),
     ("AAPL", "NAS"),
 ])
 def test_a_quote_is_asked_for_with_the_quote_exchange_code(
@@ -224,7 +248,7 @@ def test_a_cancel_uses_the_exchange_the_order_was_placed_with(monkeypatch, db, u
     orders, _, _ = _wire(monkeypatch, orders=RecordingOrders())
     db.add(QuickTradeOrder(
         user_id=user.id, credential_id=1, idempotency_key="cancel-me",
-        request_hash="h1", symbol="SPY", side="buy", market="us",
+        request_hash="h1", symbol="JPM", side="buy", market="us",
         exchange="NYSE", order_type="limit", qty=1, price=100.0,
         status=QT_SUBMITTED, broker_order_id="ODNO-1",
     ))
@@ -236,7 +260,7 @@ def test_a_cancel_uses_the_exchange_the_order_was_placed_with(monkeypatch, db, u
         CancelOrderRequest(credential_id=1, order_id=order_id), user, db)
 
     assert resp.code == 1, resp.msg
-    assert orders.calls == [("cancel_us", "ODNO-1", "SPY", "NYSE", 1, 100.0)]
+    assert orders.calls == [("cancel_us", "ODNO-1", "JPM", "NYSE", 1, 100.0)]
 
 
 def test_a_cancel_on_a_row_with_no_exchange_is_refused(monkeypatch, db, user):
@@ -245,7 +269,7 @@ def test_a_cancel_on_a_row_with_no_exchange_is_refused(monkeypatch, db, user):
     orders, _, _ = _wire(monkeypatch, orders=RecordingOrders())
     db.add(QuickTradeOrder(
         user_id=user.id, credential_id=1, idempotency_key="no-exch",
-        request_hash="h2", symbol="SPY", side="buy", market="us",
+        request_hash="h2", symbol="JPM", side="buy", market="us",
         exchange="", order_type="limit", qty=1, price=100.0,
         status=QT_SUBMITTED, broker_order_id="ODNO-2",
     ))
@@ -258,3 +282,47 @@ def test_a_cancel_on_a_row_with_no_exchange_is_refused(monkeypatch, db, user):
 
     assert resp.code == -1
     assert orders.calls == []
+
+
+# ── review findings: market/exchange coherence, and a boot-safe catalogue ─────
+
+@pytest.mark.parametrize("symbol,market", [
+    ("069500", "us"),   # domestic code declared as US
+    ("AAPL", "kr"),     # US ticker declared as domestic
+])
+def test_a_market_that_contradicts_the_symbol_is_refused(monkeypatch, db, user, symbol, market):
+    """``market`` and ``exchange`` are resolved by different functions, and
+    ``_resolve_market`` honours an explicit value. Without a cross-check,
+    ``{symbol: "069500", market: "us"}`` reaches ``buy_us("069500", "KRX", …)``
+    — a domestic code on the overseas endpoint — and persists a row whose
+    recovery inquiry can never match, leaving the order RESERVED for good."""
+    orders, _, _ = _wire(monkeypatch, orders=RecordingOrders())
+
+    resp = quick_trade.place_order(
+        _order(symbol=symbol, market=market, price=9000.0), None, user, db, _allow())
+
+    assert resp.code == -1
+    assert orders.calls == []
+
+
+def test_an_unroutable_catalogue_entry_is_dropped_not_fatal(monkeypatch):
+    """``_build_hot_symbols`` runs at import. ``resolve_exchange`` reads
+    ``EXCD_MAP``, which can name a venue outside ``CANONICAL_EXCHANGES`` — add
+    "AMEX" to it and indexing the group dict directly raises ``KeyError`` at
+    module scope, taking the whole API down at startup instead of dropping one
+    row from a hot list."""
+    import importlib
+
+    from api.routers import watchlist
+    from backend.quant.data import universe
+
+    monkeypatch.setitem(universe.EXCD_MAP, "SPY", "AMEX")
+    reloaded = importlib.reload(watchlist)
+    try:
+        assert set(reloaded.HOT_SYMBOLS) == {"KRX", "NASD", "NYSE"}
+        offered = {r["symbol"] for rows in reloaded.HOT_SYMBOLS.values() for r in rows}
+        assert "SPY" not in offered, "an unroutable symbol must not be offered"
+        assert "AAPL" in offered, "the rest of the catalogue must survive"
+    finally:
+        monkeypatch.undo()
+        importlib.reload(watchlist)

@@ -26,7 +26,7 @@ from api.services.quick_trade_service import (
 from backend.brokers.semantic_mapper import KIS_DOMESTIC_MAPPER, KIS_OVERSEAS_MAPPER
 from strategy.risk import RiskManager
 from backend.risk.halt_policy import HaltCause, OperationClass, is_allowed
-from backend.market.symbols import resolve_exchange, to_quote_excd
+from backend.market.symbols import KR_EXCHANGE, resolve_exchange, to_quote_excd
 from backend.risk.sellable_qty import resolve_sellable, validate_sell_qty
 
 logger = logging.getLogger(__name__)
@@ -193,8 +193,19 @@ class ExchangeMismatch(Exception):
     """The caller named an exchange the symbol does not trade on."""
 
 
-def _resolve_exchange(symbol: str, requested: Optional[str]) -> str:
-    """The KIS ``OVRS_EXCG_CD`` for ``symbol``, derived — never defaulted.
+def _resolve_exchange(symbol: str, requested: Optional[str],
+                      market: Optional[str] = None) -> str:
+    """The KIS ``OVRS_EXCG_CD`` for ``symbol``, derived from the symbol.
+
+    KNOWN LIMIT — read before trusting this. ``resolve_exchange`` looks the
+    symbol up in ``EXCD_MAP`` and falls back to NASD for a US ticker it does
+    not know. That map holds the trading universe plus the app's catalogue, and
+    ``/api/market/symbols/search`` hands the picker arbitrary tickers through
+    its yfinance fallback — so a symbol like ``KO`` (NYSE) still routes as NASD
+    and is still rejected by KIS. Closing that needs a real symbol master
+    (KIS publishes ``nasmst``/``nysmst``/``amsmst``), which is its own task.
+    What this function fixes is the far larger hole underneath it: that the
+    exchange was not derived *at all*.
 
     The old rule was ``body.exchange or "NASD"``, which is two bugs wearing one
     line. ``exchange`` defaulted to ``"NASD"`` in the schema, so the ``or``
@@ -218,6 +229,13 @@ def _resolve_exchange(symbol: str, requested: Optional[str]) -> str:
     ``ExchangeMismatch`` — the caller named one and it disagrees. Ignoring it
     would place the right order while leaving the client's wrong belief
     intact; the next thing it does with that belief is unlikely to be right.
+
+    ``market`` is checked against the same resolution when the caller states
+    one. The two are resolved by different functions, so nothing otherwise
+    stops ``{symbol: "069500", market: "us"}`` from reaching
+    ``buy_us("069500", "KRX", …)`` — a domestic code on the overseas endpoint,
+    persisted as a row whose recovery inquiry can never match, leaving the
+    order RESERVED forever.
     """
     resolved = resolve_exchange(symbol)
     if resolved is None:
@@ -227,6 +245,11 @@ def _resolve_exchange(symbol: str, requested: Optional[str]) -> str:
     if requested and requested.strip().upper() != resolved:
         raise ExchangeMismatch(
             f"{symbol} trades on {resolved}, not {requested.strip().upper()}"
+        )
+    if market and market != ("kr" if resolved == KR_EXCHANGE else "us"):
+        raise ExchangeMismatch(
+            f"{symbol} trades on {resolved}, which is not the "
+            f"{market.upper()} market"
         )
     return resolved
 
@@ -467,7 +490,7 @@ def place_order(
         market = _resolve_market(body.symbol, body.market)
         order_type = "limit"  # KIS quick-trade submits ORD_DVSN "00" — always limit
         try:
-            exchange = _resolve_exchange(body.symbol, body.exchange)
+            exchange = _resolve_exchange(body.symbol, body.exchange, market)
         except (ExchangeUnresolved, ExchangeMismatch) as e:
             return Resp.err(str(e))
 
@@ -619,7 +642,7 @@ def close_position(
     # must not be weaker than the conflict check it bypasses. Also pure: the
     # exchange is derived from the symbol, so hoisting it contacts nothing.
     try:
-        exchange = _resolve_exchange(body.symbol, body.exchange)
+        exchange = _resolve_exchange(body.symbol, body.exchange, market)
     except (ExchangeUnresolved, ExchangeMismatch) as e:
         return Resp.err(str(e))
 

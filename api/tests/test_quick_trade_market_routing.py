@@ -124,14 +124,39 @@ def test_us_close_position_is_unaffected(monkeypatch, db, user):
     assert orders.calls == [("sell_us", "AAPL", "NASD", 10, 175.5)]
 
 
-def test_an_explicit_market_still_wins_on_close(monkeypatch, db, user):
-    """A caller that does know the market keeps control of it.
+def test_an_explicit_market_is_honoured_when_it_agrees_with_the_symbol(monkeypatch, db, user):
+    """A caller that states the market keeps control of it — within coherence.
 
-    The symbol is deliberately one that *derives* to US, and the balance holds
-    it on the KR side only: the KR path can be reached here solely by honouring
-    ``body.market``. Passing a KR-deriving symbol would prove nothing, since
-    derivation alone would produce the same call.
+    This test used to pass ``symbol="AAPL", market="kr"`` precisely *because*
+    the two disagree: that was the only way to observe the override, since a
+    KR-deriving symbol would produce the same call by derivation alone. The P0
+    exchange fix removed that scenario deliberately. ``market`` and
+    ``exchange`` are now cross-checked, and "AAPL on the KR market" is a
+    contradiction, not an override: honouring it sent a US ticker to
+    ``sell_kr`` and persisted a row whose recovery inquiry could never match,
+    leaving the order RESERVED for good.
+
+    The override therefore no longer has an effect that *differs* from
+    derivation — a differing value is refused. What remains true, and is what
+    this asserts, is that stating it is still accepted and still routes.
     """
+    orders, _, _ = _wire(monkeypatch,
+                         portfolio=FakePortfolio(
+                             kr=[{"pdno": "069500", "hldg_qty": "7",
+                                  "ord_psbl_qty": "7",
+                                  "pchs_avg_pric": "9000"}]),
+                         market_data=FakeMarketData(price=9500))
+
+    body = ClosePositionRequest(credential_id=1, symbol="069500", market="kr")
+    resp = quick_trade.close_position(body, None, user, db, _allow())
+
+    assert resp.code == 1, resp.msg
+    assert orders.calls == [("sell_kr", "069500", 7, 9500)]
+
+
+def test_an_explicit_market_that_contradicts_the_symbol_is_refused(monkeypatch, db, user):
+    """The other half of the rule above, stated outright so the removal of the
+    contradicting override is visible rather than implied."""
     orders, _, _ = _wire(monkeypatch,
                          portfolio=FakePortfolio(
                              kr=[{"pdno": "AAPL", "hldg_qty": "7",
@@ -142,8 +167,8 @@ def test_an_explicit_market_still_wins_on_close(monkeypatch, db, user):
     body = ClosePositionRequest(credential_id=1, symbol="AAPL", market="kr")
     resp = quick_trade.close_position(body, None, user, db, _allow())
 
-    assert resp.code == 1, resp.msg
-    assert orders.calls == [("sell_kr", "AAPL", 7, 9500)]
+    assert resp.code == -1
+    assert orders.calls == []
 
 
 def test_a_close_replay_matches_when_the_body_carries_no_market(monkeypatch, db, user):

@@ -181,7 +181,14 @@ def test_every_us_exchange_we_can_route_to_has_a_quote_code():
 # ── the symbols the app offers must all be routable ──────────────────────────
 
 def test_the_nyse_names_in_the_catalogue_resolve_to_nyse():
-    """These are offered by the picker's NYSE tab. Before this mapping existed
-    they resolved to the US default and KIS rejected the order."""
-    for symbol in ["SPY", "JPM", "V", "BRK.B", "XOM", "WMT"]:
+    """These are offered by the picker's NYSE tab and are listed on NYSE
+    proper, so the expected code is not in doubt. Before this mapping existed
+    they resolved to the US default and KIS rejected the order.
+
+    SPY and the XL* sector ETFs are excluded on purpose: they are NYSE Arca,
+    and whether KIS files Arca under NYSE or AMEX is unverified — see the note
+    in ``backend/quant/data/universe.py``. Asserting it here would turn an
+    assumption into a fact by writing it down twice.
+    """
+    for symbol in ["JPM", "V", "BRK.B", "XOM", "WMT"]:
         assert S.resolve_exchange(symbol) == "NYSE", symbol

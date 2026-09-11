@@ -62,8 +62,16 @@ def _build_hot_symbols() -> dict:
     grouped: dict = {exchange: [] for exchange in CANONICAL_EXCHANGES}
     for symbol, name in _HOT_NAMES.items():
         exchange = resolve_exchange(symbol)
-        if exchange is None:
-            logger.warning("hot symbol %s resolves to no exchange; dropped", symbol)
+        # Two ways a symbol earns no tab, and neither may raise: this runs at
+        # import, so a KeyError here takes the whole API down at startup rather
+        # than dropping one row. ``resolve_exchange`` reads ``EXCD_MAP``, which
+        # can name a venue outside CANONICAL_EXCHANGES — add "AMEX" to it and
+        # indexing ``grouped`` directly is an instant boot failure.
+        if exchange not in grouped:
+            logger.warning(
+                "hot symbol %s resolves to %r, which is not a routable "
+                "exchange; dropped from the catalogue", symbol, exchange,
+            )
             continue
         grouped[exchange].append(
             {"symbol": symbol, "name": name, "market": exchange}
