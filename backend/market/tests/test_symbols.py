@@ -11,6 +11,8 @@ distinction has to be named. Collapsing them is what made every Korean symbol
 render an empty chart: ``_fetch_kline_yf`` handed a raw symbol to yfinance,
 which has never heard of a bare ``005930``.
 """
+import pathlib
+
 import pytest
 
 from backend.market import symbols as S
@@ -137,3 +139,107 @@ def test_is_kr_agrees_with_the_broker_adapter():
 
     for raw in ["005930", "069500", "AAPL", "SPY", "BRK.B"]:
         assert S.is_kr(raw) == KISBroker._is_kr(raw), raw
+
+
+# ── order codes vs quote codes ────────────────────────────────────────────────
+
+def test_the_quote_code_differs_from_the_order_code():
+    """KIS names the same venue two ways. From its own examples
+    (``koreainvestment/open-trading-api``)::
+
+        order(ovrs_excg_cd="NASD", pdno="AAPL")     # trading
+        price(auth="", excd="NAS", symb="AAPL")     # quotes
+
+    Passing the order code to a quote endpoint asks for an exchange it does
+    not name, and the caller reads the empty answer as "no price".
+    """
+    assert S.to_quote_excd("NASD") == "NAS"
+    assert S.to_quote_excd("NYSE") == "NYS"
+    assert S.to_quote_excd("AMEX") == "AMS"
+
+
+def test_krx_has_no_quote_exchange_code():
+    """Domestic quotes go to a different endpoint that takes no exchange code.
+    Returning some string would let a caller send it anyway."""
+    assert S.to_quote_excd("KRX") is None
+
+
+def test_an_unknown_exchange_has_no_quote_code():
+    assert S.to_quote_excd("SEHK") is None
+    assert S.to_quote_excd(None) is None
+    assert S.to_quote_excd("") is None
+
+
+def test_every_us_exchange_we_can_route_to_has_a_quote_code():
+    """A venue we can place an order on but cannot price is a venue whose
+    close-position path is broken — ``_live_close_price`` returns ``None`` and
+    the close is refused for "no live price"."""
+    for exchange in S.CANONICAL_EXCHANGES:
+        if exchange == S.KR_EXCHANGE:
+            continue
+        assert S.to_quote_excd(exchange), f"{exchange} has no quote code"
+
+
+# ── the symbols the app offers must all be routable ──────────────────────────
+
+def test_the_nyse_names_in_the_catalogue_resolve_to_nyse():
+    """These are offered by the picker's NYSE tab and are listed on NYSE
+    proper, so the expected code is not in doubt. Before this mapping existed
+    they resolved to the US default and KIS rejected the order.
+
+    SPY and the XL* sector ETFs are excluded on purpose: they are NYSE Arca,
+    and whether KIS files Arca under NYSE or AMEX is unverified — see the note
+    in ``backend/quant/data/universe.py``. Asserting it here would turn an
+    assumption into a fact by writing it down twice.
+    """
+    for symbol in ["JPM", "V", "BRK.B", "XOM", "WMT"]:
+        assert S.resolve_exchange(symbol) == "NYSE", symbol
+
+
+# ── no caller may hand an order code to the quote endpoint ────────────────────
+
+def test_no_production_caller_passes_an_order_code_to_a_quote():
+    """The order/quote code split is only worth anything if every call site
+    honours it, and the first pass missed four in ``bot/main.py`` plus two
+    scripts — found in review, not by a test. ``EXCD_MAP`` holds *order* codes,
+    so any ``get_price_us`` argument that reaches it unconverted is the bug.
+
+    Source-level because the alternative is mocking KIS in four modules to
+    observe one argument; the mistake is textual and this catches it textually.
+    """
+    import re
+
+    repo = pathlib.Path(__file__).resolve().parents[3]
+    offenders = []
+    for path in repo.rglob("*.py"):
+        rel = path.relative_to(repo).as_posix()
+        if "/tests/" in f"/{rel}" or rel.startswith("tests/") or "test_" in path.name:
+            continue
+        if any(part in rel for part in (".git/", "node_modules/", "site-packages/")):
+            continue
+        for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            call = re.search(r"get_price_us\(([^)]*)\)", line)
+            if not call:
+                continue
+            args = call.group(1)
+            # The definition itself, and any call already routed through the
+            # translation, are fine.
+            if "to_quote_excd" in args or "_quote_excd" in args or "def " in line:
+                continue
+            if re.search(r'"(NASD|NYSE|AMEX)"', args) or re.search(r"\bexcd\b", args):
+                offenders.append(f"{rel}:{lineno}: {line.strip()}")
+    assert offenders == [], (
+        "these hand an order code to the quote endpoint:\n  " + "\n  ".join(offenders)
+    )
+
+
+def test_the_universe_map_has_exactly_one_definition():
+    """``backend/quant/data/universe`` documents itself as canonical and says
+    ``strategy/signals`` imports from it. That was not true — ``signals`` kept
+    its own copy, and the two had already drifted: the canonical one gained
+    BRK.B, XOM and WMT while the copy that actually routed bot orders did not.
+    """
+    from backend.quant.data.universe import EXCD_MAP as canonical
+    from strategy.signals import EXCD_MAP as reexported
+
+    assert reexported is canonical, "strategy.signals must re-export, not redefine"

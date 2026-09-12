@@ -59,6 +59,7 @@ def main():
     from kis_adapter.market_data import KISMarketData
     from kis_adapter.orders import KISOrders
     from strategy.signals import EXCD_MAP
+    from backend.market.symbols import to_quote_excd
 
     md = KISMarketData()
     orders = KISOrders()
@@ -71,7 +72,10 @@ def main():
             print(f"주문 완료: {symbol} {qty}주 @ {price:,}원")
         else:
             excd = EXCD_MAP.get(symbol, "NASD")
-            price = md.get_price_us(symbol, excd)
+            # Order code for the order, quote code for the quote — KIS uses
+            # different sets (NASD/NYSE vs NAS/NYS). This path submits real
+            # orders when DRY_RUN=false, so a failed quote here is a failed buy.
+            price = md.get_price_us(symbol, to_quote_excd(excd))
             qty = max(1, int(amount_krw / (price * 1350)))
             orders.buy_us(symbol, excd, qty, price)
             print(f"주문 완료: {symbol} {qty}주 @ ${price:.2f}")
