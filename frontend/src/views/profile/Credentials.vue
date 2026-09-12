@@ -142,7 +142,7 @@ export default {
       return useCredentialsStore()
     },
     credentials() {
-      return this.credentialsStore.cryptoItems
+      return this.credentialsStore.items
     },
     egressIpText() {
       const data = this.credentialsStore.egressIp

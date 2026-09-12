@@ -68,18 +68,6 @@ const routes = [
     meta: { titleKey: 'quick_trade.title', showTabbar: true }
   },
   {
-    path: '/ai-analysis',
-    name: 'AiAnalysis',
-    component: () => import('@/views/ai-analysis/index.vue'),
-    meta: { titleKey: 'ai_analysis.title', showTabbar: false }
-  },
-  {
-    path: '/ai-analysis/history',
-    name: 'AiAnalysisHistory',
-    component: () => import('@/views/ai-analysis/History.vue'),
-    meta: { titleKey: 'ai_analysis.history_title', showTabbar: false }
-  },
-  {
     path: '/profile',
     name: 'Profile',
     component: () => import('@/views/profile/index.vue'),
@@ -134,7 +122,13 @@ const routes = [
     meta: { title: '브로커 자격증명 등록', showTabbar: false }
   },
   {
-    path: '/assets',
+    // Routes were removed with the crypto-era screens, and a bookmark or a
+    // browser-history entry for one of them still resolves through the SPA
+    // fallback: the guard below stashes it as `redirect`, login honours it,
+    // and the app lands on an unmatched route — a blank page under a tabbar.
+    // The `/assets` redirect used to be the only fallback of this shape; this
+    // generalises it so no deleted path can dead-end.
+    path: '/:pathMatch(.*)*',
     redirect: '/home'
   }
 ]
