@@ -268,7 +268,12 @@ export default {
       )
     },
     credentials() {
-      return this.credentialsStore.cryptoItems
+      // KIS only. Every Quick Trade endpoint hands its credential to the
+      // backend's `_load_kis`, which builds a KIS client unconditionally, so a
+      // Kiwoom credential offered here would fail every balance, position and
+      // order request with a broker auth error. The backend refuses one too —
+      // this keeps it from being selectable in the first place.
+      return this.credentialsStore.kisItems
     },
     selectedCredentialId() {
       return this.quickTradeStore.selectedCredentialId

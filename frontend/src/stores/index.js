@@ -83,7 +83,11 @@ export const useCredentialsStore = defineStore('credentials', {
 
   getters: {
     hasCredentials: (state) => state.items.length > 0,
-    cryptoItems: (state) => state.items.filter((item) => !['ibkr', 'mt5'].includes(item.exchange_id))
+    // Quick Trade routes every request through the KIS client, so a Kiwoom
+    // credential cannot be used there. Same definition the mobile store
+    // already carries — the two had diverged, which is how the web picker
+    // came to offer a credential the backend cannot use.
+    kisItems: (state) => state.items.filter((item) => item.exchange_id === 'kis')
   },
 
   actions: {
@@ -173,50 +177,6 @@ export const useSettingsStore = defineStore('settings', {
   }
 })
 
-export const useAiAnalysisStore = defineStore('aiAnalysis', {
-  state: () => ({
-    history: [],
-    total: 0,
-    loading: false,
-    lastResult: null
-  }),
-
-  actions: {
-    setHistory(payload) {
-      this.history = Array.isArray(payload?.list) ? payload.list : []
-      this.total = Number(payload?.total || 0)
-    },
-    setLastResult(result) {
-      this.lastResult = result || null
-    },
-    setLoading(val) {
-      this.loading = val
-    }
-  }
-})
-
-export const useMarketStore = defineStore('market', {
-  state: () => ({
-    items: [],
-    total: 0,
-    loading: false,
-    purchases: []
-  }),
-
-  actions: {
-    setItems(list, total = 0) {
-      this.items = Array.isArray(list) ? list : []
-      this.total = Number(total || this.items.length)
-    },
-    setPurchases(list) {
-      this.purchases = Array.isArray(list) ? list : []
-    },
-    setLoading(val) {
-      this.loading = val
-    }
-  }
-})
-
 export const useNotificationStore = defineStore('notification', {
   state: () => ({
     notifications: [],
@@ -261,7 +221,6 @@ export const useWatchlistStore = defineStore('watchlist', {
   }),
 
   getters: {
-    cryptoItems: (state) => state.items.filter((i) => (i.market || '').toLowerCase() === 'crypto'),
     activeItem: (state) => state.items.find((i) => i.symbol === state.activeSymbol) || null
   },
 
