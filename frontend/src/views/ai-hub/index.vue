@@ -9,10 +9,6 @@
             {{ $t('ai_hub.title') }}
           </span>
         </div>
-        <button type="button" class="history-tab" @click="openHistoryDrawer">
-          <van-icon name="clock-o" />
-          <span>{{ $t('ai_hub.open_history') }}</span>
-        </button>
       </div>
       <h1 class="nav-title">{{ $t('ai_hub.hero_title') }}</h1>
       <p class="nav-desc">{{ $t('ai_hub.hero_desc') }}</p>
@@ -103,25 +99,6 @@
       </div>
     </div>
 
-    <!-- AI analysis entry cards -->
-    <div class="feature-cards">
-      <div class="feat-card analysis" @click="$router.push('/ai-analysis')">
-        <div class="feat-body">
-          <div class="feat-icon">
-            <van-icon name="fire-o" />
-          </div>
-          <div class="feat-copy">
-            <span class="feat-title">{{ $t('ai_hub.card_analysis_title') }}</span>
-            <p class="feat-desc">{{ $t('ai_hub.card_analysis_desc') }}</p>
-          </div>
-        </div>
-        <div class="feat-cta">
-          <span>{{ $t('ai_hub.go_analysis') }}</span>
-          <van-icon name="arrow" />
-        </div>
-      </div>
-    </div>
-
     <!-- Chat-style bot generator -->
     <div class="chat-card qd-card">
       <div class="chat-head">
@@ -176,53 +153,6 @@
         <div class="tip-row"><div class="bulb">3</div><span>{{ $t('ai_hub.tip_3') }}</span></div>
       </div>
     </div>
-
-    <!-- History: right drawer -->
-    <van-popup
-      v-model:show="showHistoryDrawer"
-      position="right"
-      class="history-popup"
-      :style="{ width: 'min(360px, 88vw)', height: '100%' }"
-      teleport="body"
-      round
-    >
-      <div class="drawer-page">
-        <div class="drawer-head">
-          <span class="drawer-title">{{ $t('ai_hub.drawer_history') }}</span>
-          <van-icon name="cross" class="drawer-close" @click="showHistoryDrawer = false" />
-        </div>
-        <div v-if="loadingHistory" class="drawer-loading">
-          <van-loading vertical>{{ $t('common.loading') }}</van-loading>
-        </div>
-        <div v-else class="drawer-body">
-          <div v-if="!drawerHistory.length" class="drawer-empty">
-            <van-icon name="records" />
-            <span>{{ $t('ai_hub.no_recent') }}</span>
-          </div>
-          <div v-else class="drawer-list">
-            <div
-              v-for="item in drawerHistory"
-              :key="item.memory_id || item.id || item.created_at"
-              class="drawer-row"
-              @click="openHistoryRecord(item)"
-            >
-              <div :class="['dr-icon', decisionClass(item.decision)]">
-                <van-icon :name="decisionIcon(item.decision)" />
-              </div>
-              <div class="dr-main">
-                <span class="dr-title">{{ item.symbol || item.input_data?.symbol || '--' }}</span>
-                <span class="dr-sub">{{ formatTime(item.created_at) }}</span>
-              </div>
-              <span :class="['dr-badge', decisionClass(item.decision)]">{{ decisionLabel(item.decision) }}</span>
-            </div>
-          </div>
-          <van-button block round plain class="drawer-more" @click="goFullHistory">
-            {{ $t('ai_hub.history') }}
-            <van-icon name="arrow" />
-          </van-button>
-        </div>
-      </div>
-    </van-popup>
 
     <!-- AI 推荐参数预览弹窗 -->
     <van-popup
@@ -293,9 +223,8 @@
 </template>
 
 <script>
+import { globalMarketApi, strategyApi } from '@/api'
 import { showToast } from 'vant'
-import { aiAnalysisApi, globalMarketApi, strategyApi } from '@/api'
-import { useAiAnalysisStore } from '@/stores'
 import { normalizeAiBotRecommendation } from '@/views/trading/botScriptTemplates'
 
 /** 后端返回的中文事件名 → 英文兜底映射（字段 name_en 缺失时使用） */
@@ -323,13 +252,10 @@ export default {
   name: 'AiHub',
   data() {
     return {
-      drawerHistory: [],
-      loadingHistory: false,
       loadingMacro: false,
       indices: [],
       sentiment: null,
       calendarEvents: [],
-      showHistoryDrawer: false,
       chatPrompt: '',
       calendarExpanded: true,
       creating: false,
@@ -343,24 +269,7 @@ export default {
   activated() {
     this.loadMacro()
   },
-  watch: {
-    showHistoryDrawer(val) {
-      if (val) this.loadDrawerHistory()
-    }
-  },
   methods: {
-    async loadDrawerHistory() {
-      this.loadingHistory = true
-      try {
-        const res = await aiAnalysisApi.getAllHistory({ page: 1, pagesize: 30 })
-        const list = res?.data?.list || res?.data?.items || []
-        this.drawerHistory = Array.isArray(list) ? list : []
-      } catch {
-        this.drawerHistory = []
-      } finally {
-        this.loadingHistory = false
-      }
-    },
     async loadMacro() {
       this.loadingMacro = true
       try {
@@ -432,32 +341,6 @@ export default {
       if (k === 'medium') return this.$t('ai_hub.calendar_impact_medium')
       if (k === 'low') return this.$t('ai_hub.calendar_impact_low')
       return impact || ''
-    },
-    openHistoryDrawer() {
-      this.showHistoryDrawer = true
-    },
-    goFullHistory() {
-      this.showHistoryDrawer = false
-      this.$router.push('/ai-analysis/history')
-    },
-    openHistoryRecord(item) {
-      const store = useAiAnalysisStore()
-      const payload = {
-        decision: item.decision,
-        confidence: item.confidence,
-        summary: item.summary,
-        market_data: item.market_data || { current_price: item.current_price },
-        trading_plan: {
-          entry_price: item.entry_price,
-          stop_loss: item.stop_loss,
-          take_profit: item.take_profit
-        },
-        indicators: item.indicators,
-        risks: item.risks
-      }
-      store.setLastResult(payload)
-      this.showHistoryDrawer = false
-      this.$router.push('/ai-analysis')
     },
     hasCalendarMetrics(ev) {
       return !!(ev && (ev.actual || ev.forecast || ev.previous))
@@ -566,31 +449,6 @@ export default {
       if (type === 'script') return 'Script Strategy'
       return String(type || '--')
     },
-    decisionLabel(decision) {
-      const d = String(decision || '').toUpperCase()
-      if (d === 'BUY' || d === 'LONG') return 'BUY'
-      if (d === 'SELL' || d === 'SHORT') return 'SELL'
-      if (d === 'HOLD') return 'HOLD'
-      return d || '-'
-    },
-    decisionClass(decision) {
-      const d = String(decision || '').toUpperCase()
-      if (['BUY', 'LONG'].includes(d)) return 'up'
-      if (['SELL', 'SHORT'].includes(d)) return 'down'
-      return 'neutral'
-    },
-    decisionIcon(decision) {
-      const d = String(decision || '').toUpperCase()
-      if (['BUY', 'LONG'].includes(d)) return 'arrow-up'
-      if (['SELL', 'SHORT'].includes(d)) return 'arrow-down'
-      return 'pause-circle-o'
-    },
-    formatTime(val) {
-      if (!val) return ''
-      const d = typeof val === 'number' ? new Date(val > 1e12 ? val : val * 1000) : new Date(val)
-      if (Number.isNaN(d.getTime())) return ''
-      return `${d.getMonth() + 1}/${d.getDate()} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
-    }
   }
 }
 </script>
@@ -614,22 +472,6 @@ export default {
   margin-bottom: 8px;
 }
 .nav-top-left { min-width: 0; }
-.history-tab {
-  flex-shrink: 0;
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 8px 12px;
-  border-radius: 999px;
-  border: 1px solid var(--border-strong);
-  background: var(--surface-raised);
-  color: var(--text-2);
-  font-size: 12px;
-  font-weight: 600;
-  cursor: pointer;
-}
-.history-tab .van-icon { font-size: 16px; color: var(--accent); }
-
 .nav-eyebrow {
   display: inline-flex;
   align-items: center;
@@ -881,76 +723,6 @@ export default {
 .cal-impact.medium { background: var(--warn-soft); color: var(--warn); }
 .cal-impact.low { background: var(--c-slate-soft); color: var(--c-slate); }
 
-/* Feature card */
-.feature-cards {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-  margin-bottom: 14px;
-}
-.feat-card {
-  position: relative;
-  padding: 18px 16px;
-  border-radius: var(--radius-lg);
-  overflow: hidden;
-  background: var(--bg-elevated);
-  border: 1px solid var(--border);
-  box-shadow: var(--shadow-card);
-  transition: transform 0.15s;
-}
-.feat-card:active { transform: scale(0.98); }
-.feat-card.analysis::before {
-  content: '';
-  position: absolute;
-  inset: 0;
-  pointer-events: none;
-  background: radial-gradient(280px 200px at 0% 0%, var(--accent-crimson-soft), transparent 62%);
-}
-.feat-body {
-  position: relative;
-  display: flex;
-  align-items: flex-start;
-  gap: 14px;
-  margin-bottom: 12px;
-}
-.feat-icon {
-  width: 48px; height: 48px;
-  flex-shrink: 0;
-  border-radius: 14px;
-  display: flex; align-items: center; justify-content: center;
-  font-size: 24px;
-  background: var(--c-red);
-  color: #ffffff;
-  border: 1px solid transparent;
-}
-.feat-copy { flex: 1; min-width: 0; }
-.feat-title {
-  display: block;
-  font-size: 17px;
-  font-weight: 800;
-  color: var(--text);
-  letter-spacing: -0.01em;
-  margin-bottom: 5px;
-}
-.feat-desc {
-  margin: 0;
-  font-size: 12px;
-  color: var(--text-2);
-  line-height: 1.5;
-}
-.feat-cta {
-  position: relative;
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 8px 14px;
-  border-radius: 999px;
-  background: var(--c-red);
-  color: #ffffff;
-  font-size: 12px;
-  font-weight: 700;
-}
-
 /* Chat card */
 .chat-card {
   padding: 16px 14px 14px;
@@ -1075,86 +847,6 @@ export default {
   font-size: 11px;
   font-weight: 800;
 }
-
-/* History drawer */
-.history-popup :deep(.van-popup) {
-  display: flex;
-  flex-direction: column;
-}
-.drawer-page {
-  height: 100%;
-  display: flex;
-  flex-direction: column;
-  background: var(--bg-elevated);
-  padding-top: var(--safe-area-top, 0px);
-}
-.drawer-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 14px 16px;
-  border-bottom: 1px solid var(--hairline);
-}
-.drawer-title { font-size: 17px; font-weight: 800; color: var(--text); }
-.drawer-close { font-size: 20px; color: var(--text-2); padding: 4px; }
-.drawer-loading { flex: 1; display: flex; align-items: center; justify-content: center; padding: 40px; }
-.drawer-body {
-  flex: 1;
-  overflow-y: auto;
-  padding: 12px 14px calc(16px + var(--safe-area-bottom, 0px));
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-}
-.drawer-empty {
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 10px;
-  color: var(--text-3);
-  font-size: 13px;
-  padding: 40px 16px;
-}
-.drawer-empty .van-icon { font-size: 36px; color: var(--text-4); }
-.drawer-list { display: flex; flex-direction: column; gap: 8px; }
-.drawer-row {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 12px 12px;
-  border-radius: 14px;
-  background: var(--surface-raised);
-  border: 1px solid var(--border);
-  transition: background 0.15s;
-}
-.drawer-row:active { background: var(--accent-soft); }
-.dr-icon {
-  width: 32px; height: 32px;
-  border-radius: 10px;
-  display: flex; align-items: center; justify-content: center;
-  font-size: 15px;
-  background: var(--surface-deep);
-  color: var(--text-2);
-}
-.dr-icon.up { background: var(--up-soft); color: var(--up); }
-.dr-icon.down { background: var(--down-soft); color: var(--down); }
-.dr-icon.neutral { background: var(--surface-raised); color: var(--text-2); }
-.dr-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
-.dr-title { font-size: 14px; font-weight: 700; color: var(--text); }
-.dr-sub { font-size: 11px; color: var(--text-3); }
-.dr-badge {
-  flex-shrink: 0;
-  padding: 3px 8px;
-  border-radius: 6px;
-  font-size: 10px;
-  font-weight: 800;
-}
-.dr-badge.up { background: var(--up-soft); color: var(--up); }
-.dr-badge.down { background: var(--down-soft); color: var(--down); }
-.dr-badge.neutral { background: var(--surface-deep); color: var(--text-2); }
-.drawer-more { margin-top: 4px; font-weight: 600; }
 
 /* Recommend popup */
 .recommend-popup :deep(.van-popup) {

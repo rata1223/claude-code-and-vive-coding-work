@@ -370,7 +370,6 @@ http.interceptors.response.use(
 
 export const authApi = {
   login: (data) => http.post('/api/auth/login', data),
-  loginWithCode: (data) => http.post('/api/auth/login-code', data),
   register: (data) => http.post('/api/auth/register', data),
   sendCode: (data) => http.post('/api/auth/send-code', data),
   resetPassword: (data) => http.post('/api/auth/reset-password', data),
@@ -582,96 +581,6 @@ export const quickTradeApi = {
   }
 }
 
-export const aiAnalysisApi = {
-  analyze: (payload) => http.post('/api/fast-analysis/analyze', payload, { timeout: 300000 }),
-  getHistory: async (params = {}) => {
-    const res = await http.get('/api/fast-analysis/history', { params })
-    return {
-      ...res,
-      data: unwrapItems(res.data)
-    }
-  },
-  getAllHistory: async (params = {}) => {
-    const res = await http.get('/api/fast-analysis/history/all', { params })
-    return {
-      ...res,
-      data: {
-        list: ensureArray(res.data?.list),
-        total: Number(res.data?.total || 0),
-        page: Number(res.data?.page || 1),
-        pagesize: Number(res.data?.pagesize || 20)
-      }
-    }
-  },
-  deleteHistory: (memoryId) => http.delete(`/api/fast-analysis/history/${memoryId}`),
-  getPerformance: async (params = {}) => {
-    const res = await http.get('/api/fast-analysis/performance', { params })
-    return {
-      ...res,
-      data: res.data || {}
-    }
-  },
-  submitFeedback: (payload) => http.post('/api/fast-analysis/feedback', payload),
-  getSimilarPatterns: async (params = {}) => {
-    const res = await http.get('/api/fast-analysis/similar-patterns', { params })
-    return {
-      ...res,
-      data: res.data || {}
-    }
-  }
-}
-
-export const marketApi = {
-  getIndicators: async (params = {}) => {
-    const res = await http.get('/api/community/indicators', { params })
-    return {
-      ...res,
-      data: {
-        items: ensureArray(res.data?.items),
-        total: Number(res.data?.total || 0),
-        page: Number(res.data?.page || 1),
-        page_size: Number(res.data?.page_size || 12)
-      }
-    }
-  },
-  getIndicator: async (id) => {
-    const res = await http.get(`/api/community/indicators/${id}`)
-    return {
-      ...res,
-      data: res.data || null
-    }
-  },
-  purchase: (id) => http.post(`/api/community/indicators/${id}/purchase`),
-  syncIndicator: (id) => http.post(`/api/community/indicators/${id}/sync`),
-  getMyPurchases: async (params = {}) => {
-    const res = await http.get('/api/community/my-purchases', { params })
-    return {
-      ...res,
-      data: {
-        items: ensureArray(res.data?.items),
-        total: Number(res.data?.total || 0)
-      }
-    }
-  },
-  getComments: async (id, params = {}) => {
-    const res = await http.get(`/api/community/indicators/${id}/comments`, { params })
-    return {
-      ...res,
-      data: {
-        items: ensureArray(res.data?.items),
-        total: Number(res.data?.total || 0)
-      }
-    }
-  },
-  getIndicatorPerformance: async (id) => {
-    const res = await http.get(`/api/community/indicators/${id}/performance`)
-    return {
-      ...res,
-      data: res.data || {}
-    }
-  }
-}
-
 export const watchlistApi = {
   getList: async () => {
     const res = await http.get('/api/market/watchlist/get')
@@ -761,35 +670,7 @@ export const userApi = {
   getNotificationSettings: () => http.get('/api/users/notification-settings'),
   updateNotificationSettings: (data) => http.put('/api/users/notification-settings', data),
   testNotificationSettings: () => http.post('/api/users/notification-settings/test'),
-  changePassword: (data) => http.post('/api/users/change-password', data),
-  getMyCreditsLog: async (params = {}) => {
-    const res = await http.get('/api/users/my-credits-log', { params })
-    const items = ensureArray(res.data?.items || res.data?.list)
-    return {
-      ...res,
-      data: {
-        list: items,
-        items,
-        total: Number(res.data?.total || 0),
-        page: Number(res.data?.page || 1),
-        page_size: Number(res.data?.page_size || 20),
-        total_pages: Number(res.data?.total_pages || 0)
-      }
-    }
-  },
-  getMyReferrals: async (params = {}) => {
-    const res = await http.get('/api/users/my-referrals', { params })
-    return {
-      ...res,
-      data: {
-        list: ensureArray(res.data?.list),
-        total: Number(res.data?.total || 0),
-        referral_code: res.data?.referral_code || '',
-        referral_bonus: Number(res.data?.referral_bonus || 0),
-        register_bonus: Number(res.data?.register_bonus || 0)
-      }
-    }
-  }
+  changePassword: (data) => http.post('/api/users/change-password', data)
 }
 
 export const globalMarketApi = {
@@ -818,38 +699,6 @@ export const globalMarketApi = {
       data: normalized
     }
   }
-}
-
-export const billingApi = {
-  /**
-   * v3.0.6+ — list enabled USDT chains so the chain picker can render
-   * before the order is created. Chains without a configured receiving
-   * address are filtered out by the backend, so the response can be
-   * rendered verbatim.
-   */
-  listUsdtChains: async () => {
-    const res = await http.get('/api/billing/usdt/chains')
-    return {
-      ...res,
-      data: res.data || { chains: [] }
-    }
-  },
-  getPlans: async () => {
-    const res = await http.get('/api/billing/plans')
-    return {
-      ...res,
-      data: res.data || {}
-    }
-  },
-  purchase: (plan) => http.post('/api/billing/purchase', { plan }),
-  createUsdtOrder: (plan, chain) => {
-    const payload = { plan }
-    if (chain) payload.chain = chain
-    return http.post('/api/billing/usdt/create', payload)
-  },
-  getUsdtOrder: (orderId, refresh = true) => http.get(`/api/billing/usdt/order/${orderId}`, {
-    params: { refresh: refresh ? 1 : 0 }
-  })
 }
 
 export default http

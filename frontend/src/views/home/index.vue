@@ -58,14 +58,6 @@
           <div class="app-icon primary"><van-icon name="plus" /></div>
           <span>{{ $t('home.create_bot') }}</span>
         </div>
-        <div class="app-tile" @click="$router.push('/ai-analysis')">
-          <div class="app-icon crimson"><van-icon name="fire-o" /></div>
-          <span>{{ $t('home.ai_analysis') }}</span>
-        </div>
-        <div class="app-tile" @click="$router.push('/market')">
-          <div class="app-icon indigo"><van-icon name="bar-chart-o" /></div>
-          <span>{{ $t('home.indicator_market') }}</span>
-        </div>
         <div class="app-tile" @click="$router.push('/quick-trade')">
           <div class="app-icon green"><van-icon name="exchange" /></div>
           <span>{{ $t('home.quick_trade') }}</span>
@@ -73,18 +65,6 @@
         <div class="app-tile" @click="$router.push('/profile/credentials')">
           <div class="app-icon blue"><van-icon name="shield-o" /></div>
           <span>{{ $t('home.credential_manage') }}</span>
-        </div>
-        <div class="app-tile" @click="$router.push('/market/my-purchases')">
-          <div class="app-icon teal"><van-icon name="bag-o" /></div>
-          <span>{{ $t('market.my_purchases') }}</span>
-        </div>
-        <div class="app-tile" @click="$router.push('/profile/referral')">
-          <div class="app-icon pink"><van-icon name="friends-o" /></div>
-          <span>{{ $t('profile.referral') }}</span>
-        </div>
-        <div class="app-tile" @click="$router.push('/profile/credits')">
-          <div class="app-icon gold"><van-icon name="gold-coin-o" /></div>
-          <span>{{ $t('profile.credits') }}</span>
         </div>
       </div>
     </div>
@@ -367,7 +347,7 @@ export default {
       return this.credentialsStore.hasCredentials
     },
     credentialCount() {
-      return this.credentialsStore.cryptoItems.length
+      return this.credentialsStore.items.length
     },
     unreadCount() {
       return this.notificationStore.unreadCount

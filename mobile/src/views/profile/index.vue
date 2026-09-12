@@ -27,47 +27,6 @@
       </div>
     </div>
 
-    <!-- Dual glass cards: Credits + Invite -->
-    <div class="double-card">
-      <div class="wallet-card" @click="$router.push('/profile/credits')">
-        <div class="wallet-shine"></div>
-        <div class="wallet-head">
-          <van-icon name="gold-coin-o" />
-          <span>{{ $t('profile.credits') }}</span>
-        </div>
-        <div class="wallet-value">{{ formatCredits(billing.credits) }}</div>
-        <div class="wallet-sub">
-          <span v-if="billing.is_vip && billing.vip_expires_at">
-            {{ $t('profile.vip_active', { date: formatDate(billing.vip_expires_at) }) }}
-          </span>
-          <span v-else>{{ $t('profile.vip_none') }}</span>
-        </div>
-        <div class="wallet-cta">
-          <span>{{ $t('profile.credits_recharge') }}</span>
-          <van-icon name="arrow" />
-        </div>
-      </div>
-
-      <div class="invite-card" @click="$router.push('/profile/referral')">
-        <div class="wallet-shine invite"></div>
-        <div class="invite-head">
-          <van-icon name="friends-o" />
-          <span>{{ $t('profile.referral') }}</span>
-        </div>
-        <div class="invite-stats">
-          <div class="stat">
-            <span class="val">{{ referralData.total || 0 }}</span>
-            <span class="lab">{{ $t('profile.referral_total') }}</span>
-          </div>
-          <div class="stat" v-if="referralData.referral_bonus > 0">
-            <span class="val">+{{ referralData.referral_bonus }}</span>
-            <span class="lab">{{ $t('profile.referral_bonus') }}</span>
-          </div>
-        </div>
-        <div class="invite-sub">{{ $t('profile.referral_desc') }}</div>
-      </div>
-    </div>
-
     <!-- Trading -->
     <div class="menu-section">
       <span class="menu-section-title">{{ $t('profile.section_trading') }}</span>
@@ -78,16 +37,6 @@
           <span class="value">{{ credentialCount }}</span>
           <van-icon name="arrow" class="arrow" />
         </div>
-        <div class="menu-item" @click="$router.push('/market/my-purchases')">
-          <div class="menu-icon c-teal"><van-icon name="bag-o" /></div>
-          <span class="label">{{ $t('market.my_purchases') }}</span>
-          <van-icon name="arrow" class="arrow" />
-        </div>
-        <div class="menu-item" @click="$router.push('/ai-analysis/history')">
-          <div class="menu-icon c-red"><van-icon name="fire-o" /></div>
-          <span class="label">{{ $t('ai_analysis.history_title') }}</span>
-          <van-icon name="arrow" class="arrow" />
-        </div>
       </div>
     </div>
 
@@ -95,17 +44,6 @@
     <div class="menu-section">
       <span class="menu-section-title">{{ $t('profile.section_account') }}</span>
       <div class="menu-group">
-        <div class="menu-item" @click="$router.push('/profile/credits')">
-          <div class="menu-icon c-amber"><van-icon name="gold-coin-o" /></div>
-          <span class="label">{{ $t('profile.credits_recharge') }}</span>
-          <span class="value">{{ formatCredits(billing.credits) }}</span>
-          <van-icon name="arrow" class="arrow" />
-        </div>
-        <div class="menu-item" @click="$router.push('/profile/referral')">
-          <div class="menu-icon c-green"><van-icon name="friends-o" /></div>
-          <span class="label">{{ $t('profile.referral') }}</span>
-          <van-icon name="arrow" class="arrow" />
-        </div>
         <div class="menu-item" @click="$router.push('/profile/security')">
           <div class="menu-icon c-indigo"><van-icon name="lock" /></div>
           <span class="label">{{ $t('profile.change_password') }}</span>
@@ -172,16 +110,12 @@ export default {
     return {
       logoUrl,
       billing: {
-        credits: 0,
+        // Only the VIP fields are read now — the crown beside the avatar. The
+        // credit balance had no reader left once the wallet card went, and a
+        // number nothing renders is a number nothing keeps honest.
         is_vip: false,
         vip_expires_at: null,
         billing_enabled: false
-      },
-      referralData: {
-        total: 0,
-        referral_bonus: 0,
-        register_bonus: 0,
-        referral_code: ''
       }
     }
   },
@@ -203,7 +137,14 @@ export default {
       return this.userStore.userInfo
     },
     credentialCount() {
-      return this.credentialsStore.cryptoItems.length
+      // `cryptoItems` is not a getter on this store in the mobile client — it
+      // has `kisItems`/`kiwoomItems` only — so this threw on `undefined.length`
+      // and took the whole Profile page down there. It survived in the web
+      // client only because its own `cryptoItems` is defined as "not ibkr, not
+      // mt5", which happens to count the KIS and Kiwoom rows. Neither spelling
+      // means anything now that crypto is gone: the count is simply how many
+      // broker credentials are registered.
+      return this.credentialsStore.items.length
     },
     unreadCount() {
       return this.notificationStore.unreadCount
@@ -249,11 +190,10 @@ export default {
   methods: {
     async loadData() {
       try {
-        const [profileRes, credentialsRes, unreadRes, referralRes] = await Promise.allSettled([
+        const [profileRes, credentialsRes, unreadRes] = await Promise.allSettled([
           userApi.getProfile(),
           credentialsApi.list(),
-          strategyApi.getUnreadNotificationCount(),
-          userApi.getMyReferrals({ page: 1, page_size: 1 })
+          strategyApi.getUnreadNotificationCount()
         ])
         if (profileRes.status === 'fulfilled' && profileRes.value?.data) {
           const profile = profileRes.value.data
@@ -264,22 +204,9 @@ export default {
         }
         this.credentialsStore.setItems(credentialsRes.status === 'fulfilled' ? (credentialsRes.value.data || []) : [])
         this.notificationStore.setUnreadCount(unreadRes.status === 'fulfilled' ? (unreadRes.value.data || 0) : 0)
-        if (referralRes.status === 'fulfilled' && referralRes.value?.data) {
-          this.referralData = {
-            total: referralRes.value.data.total || 0,
-            referral_bonus: referralRes.value.data.referral_bonus || 0,
-            register_bonus: referralRes.value.data.register_bonus || 0,
-            referral_code: referralRes.value.data.referral_code || ''
-          }
-        }
       } catch (error) {
         console.error('Load profile data failed:', error)
       }
-    },
-
-    formatCredits(value) {
-      const num = Number(value || 0)
-      return new Intl.NumberFormat('en-US').format(num)
     },
 
     onAvatarError(event) {
@@ -287,13 +214,6 @@ export default {
       if (img && img.src !== this.logoUrl) {
         img.src = this.logoUrl
       }
-    },
-
-    formatDate(value) {
-      if (!value) return '-'
-      const d = new Date(value)
-      if (Number.isNaN(d.getTime())) return '-'
-      return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
     },
 
     toggleTheme() {
@@ -441,118 +361,6 @@ export default {
   display: inline-flex;
   align-items: center;
   gap: 4px;
-}
-
-/* ===== Double card ===== */
-.double-card {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 10px;
-  margin-bottom: 22px;
-}
-
-.wallet-card,
-.invite-card {
-  position: relative;
-  padding: 16px 14px;
-  border-radius: var(--radius);
-  background: var(--bg-elevated);
-  border: 1px solid var(--border);
-  color: var(--text);
-  overflow: hidden;
-  transition: transform 0.15s;
-}
-.wallet-card:active,
-.invite-card:active { transform: scale(0.98); }
-
-.wallet-card::before {
-  content: '';
-  position: absolute;
-  inset: 0;
-  pointer-events: none;
-  background: radial-gradient(220px 160px at 100% 0%, var(--accent-gold-soft), transparent 62%);
-}
-.invite-card::before {
-  content: '';
-  position: absolute;
-  inset: 0;
-  pointer-events: none;
-  background: radial-gradient(220px 160px at 100% 0%, var(--c-green-soft), transparent 62%);
-}
-
-.wallet-shine { display: none; }
-
-.wallet-head,
-.invite-head {
-  position: relative;
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 10px;
-  color: var(--text-3);
-  font-weight: 700;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-}
-
-.wallet-head .van-icon { font-size: 15px; color: var(--c-amber); }
-.invite-head .van-icon { font-size: 15px; color: var(--c-green); }
-
-.wallet-value {
-  position: relative;
-  margin-top: 6px;
-  font-size: 30px;
-  font-weight: 800;
-  color: var(--c-amber);
-  letter-spacing: -0.025em;
-  font-variant-numeric: tabular-nums;
-}
-
-.wallet-sub {
-  position: relative;
-  margin-top: 2px;
-  font-size: 11px;
-  color: var(--text-3);
-}
-
-.wallet-cta {
-  position: relative;
-  margin-top: 10px;
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  padding: 5px 10px;
-  border-radius: 999px;
-  background: var(--c-amber-soft);
-  color: var(--c-amber);
-  font-size: 11px;
-  font-weight: 700;
-}
-
-.invite-stats {
-  position: relative;
-  margin-top: 8px;
-  display: flex;
-  gap: 14px;
-}
-.invite-stats .stat { display: flex; flex-direction: column; }
-.invite-stats .val {
-  font-size: 22px;
-  font-weight: 800;
-  color: var(--text);
-  font-variant-numeric: tabular-nums;
-  letter-spacing: -0.01em;
-}
-.invite-stats .lab {
-  font-size: 11px;
-  color: var(--text-3);
-}
-.invite-sub {
-  position: relative;
-  margin-top: 10px;
-  font-size: 11px;
-  line-height: 1.4;
-  color: var(--text-3);
 }
 
 /* ===== Menu sections ===== */

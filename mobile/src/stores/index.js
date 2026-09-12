@@ -174,50 +174,6 @@ export const useSettingsStore = defineStore('settings', {
   }
 })
 
-export const useAiAnalysisStore = defineStore('aiAnalysis', {
-  state: () => ({
-    history: [],
-    total: 0,
-    loading: false,
-    lastResult: null
-  }),
-
-  actions: {
-    setHistory(payload) {
-      this.history = Array.isArray(payload?.list) ? payload.list : []
-      this.total = Number(payload?.total || 0)
-    },
-    setLastResult(result) {
-      this.lastResult = result || null
-    },
-    setLoading(val) {
-      this.loading = val
-    }
-  }
-})
-
-export const useMarketStore = defineStore('market', {
-  state: () => ({
-    items: [],
-    total: 0,
-    loading: false,
-    purchases: []
-  }),
-
-  actions: {
-    setItems(list, total = 0) {
-      this.items = Array.isArray(list) ? list : []
-      this.total = Number(total || this.items.length)
-    },
-    setPurchases(list) {
-      this.purchases = Array.isArray(list) ? list : []
-    },
-    setLoading(val) {
-      this.loading = val
-    }
-  }
-})
-
 export const useNotificationStore = defineStore('notification', {
   state: () => ({
     notifications: [],
@@ -262,7 +218,6 @@ export const useWatchlistStore = defineStore('watchlist', {
   }),
 
   getters: {
-    cryptoItems: (state) => state.items.filter((i) => (i.market || '').toLowerCase() === 'crypto'),
     activeItem: (state) => state.items.find((i) => i.symbol === state.activeSymbol) || null
   },
 

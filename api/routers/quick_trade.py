@@ -379,10 +379,31 @@ def _live_close_price(market_data, symbol: str, market: str, exchange: str):
     return price if price > 0 else None
 
 
+#: The only brokerage Quick Trade can route to. ``_load_kis`` builds a
+#: ``KISClient`` unconditionally, so a credential for anything else is not a
+#: credential this router can use.
+_QT_PROVIDER = "kis"
+
+
 def _get_cred(credential_id: int, user_id: int, db: Session) -> Optional[Credential]:
+    """The caller's Quick-Trade-usable credential, or ``None``.
+
+    Ownership was the only check here, but ``Credential.exchange_id`` is
+    ``'kis'`` or ``'kiwoom'`` and every handler hands whatever comes back to
+    ``_load_kis``. A Kiwoom credential therefore went out as Kiwoom keys on a
+    KIS client, and the user saw a broker authentication error rather than
+    "that credential is for the other brokerage".
+
+    Filtering here rather than at the seven call sites means no handler can
+    forget: the provider check and the ownership check are the same lookup.
+    """
     return (
         db.query(Credential)
-        .filter(Credential.id == credential_id, Credential.user_id == user_id)
+        .filter(
+            Credential.id == credential_id,
+            Credential.user_id == user_id,
+            Credential.exchange_id == _QT_PROVIDER,
+        )
         .first()
     )
 
@@ -398,7 +419,7 @@ def get_balance(
 ):
     cred = _get_cred(credential_id, current_user.id, db)
     if not cred:
-        return Resp.err("Credential not found")
+        return Resp.err("No KIS credential found for that id — Quick Trade routes to KIS only")
 
     # No symbol to derive from — a balance request is inherently per-market, so
     # an unusable value (the UI's "spot"/"swap") can only fall back to US.
@@ -450,7 +471,7 @@ def get_position(
 ):
     cred = _get_cred(credential_id, current_user.id, db)
     if not cred:
-        return Resp.err("Credential not found")
+        return Resp.err("No KIS credential found for that id — Quick Trade routes to KIS only")
 
     try:
         _, _, portfolio = _load_kis(cred)
@@ -483,7 +504,7 @@ def place_order(
 ):
     cred = _get_cred(body.credential_id, current_user.id, db)
     if not cred:
-        return Resp.err("Credential not found")
+        return Resp.err("No KIS credential found for that id — Quick Trade routes to KIS only")
 
     try:
         qty = int(body.qty)
@@ -628,7 +649,7 @@ def close_position(
     """
     cred = _get_cred(body.credential_id, current_user.id, db)
     if not cred:
-        return Resp.err("Credential not found")
+        return Resp.err("No KIS credential found for that id — Quick Trade routes to KIS only")
 
     # Resolved before the replay short-circuit because the persisted row stores
     # the *resolved* market (``req["market"]`` below), so that is what a replay
@@ -907,7 +928,7 @@ def get_open_orders(
 
     cred = _get_cred(credential_id, current_user.id, db)
     if not cred:
-        return Resp.err("Credential not found")
+        return Resp.err("No KIS credential found for that id — Quick Trade routes to KIS only")
 
     rows = (
         db.query(QuickTradeOrder)
@@ -968,7 +989,7 @@ def cancel_order(
 
     cred = _get_cred(body.credential_id, current_user.id, db)
     if not cred:
-        return Resp.err("Credential not found")
+        return Resp.err("No KIS credential found for that id — Quick Trade routes to KIS only")
 
     order = (
         db.query(QuickTradeOrder)

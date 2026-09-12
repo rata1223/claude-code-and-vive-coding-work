@@ -1,7 +1,7 @@
 """User profile management."""
 import logging
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
 from api.auth import hash_password, verify_password
@@ -94,21 +94,3 @@ def change_password(
     current_user.password_hash = hash_password(new_pw)
     db.commit()
     return Resp.ok(None, "Password changed")
-
-
-@router.get("/my-credits-log")
-def my_credits_log(
-    page: int = Query(1, ge=1),
-    page_size: int = Query(20, ge=1, le=100),
-    current_user: User = Depends(get_current_user),
-):
-    return Resp.ok({"total": 0, "items": []})
-
-
-@router.get("/my-referrals")
-def my_referrals(
-    page: int = Query(1, ge=1),
-    page_size: int = Query(20, ge=1, le=100),
-    current_user: User = Depends(get_current_user),
-):
-    return Resp.ok({"total": 0, "items": [], "referral_code": None})
