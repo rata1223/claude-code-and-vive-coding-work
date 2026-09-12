@@ -76,11 +76,17 @@ def test_close_position_refuses_a_kiwoom_credential(monkeypatch, db, user, kiwoo
 
 
 def test_balance_refuses_a_kiwoom_credential(monkeypatch, db, user, kiwoom_cred):
-    _wire(monkeypatch)
+    """The error code alone would pass even if balance loaded the portfolio
+    first and only then refused, so the portfolio is spied on directly."""
+    _orders, portfolio, _md = _wire(monkeypatch)
+    reached = []
+    portfolio.get_us_balance = lambda: reached.append("us")
+    portfolio.get_kr_balance = lambda: reached.append("kr")
 
     resp = quick_trade.get_balance(KIWOOM_ID, "us", user, db)
 
     assert resp.code == -1
+    assert reached == [], "the broker must not be queried for a refused credential"
 
 
 def test_cancel_refuses_a_kiwoom_credential(monkeypatch, db, user, kiwoom_cred):
