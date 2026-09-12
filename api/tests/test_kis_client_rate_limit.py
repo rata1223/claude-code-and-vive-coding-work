@@ -24,6 +24,7 @@ the discipline.
 No network: ``requests`` and ``time.sleep`` are patched throughout.
 """
 import pytest
+import requests
 
 from kis_adapter import client as client_mod
 from kis_adapter.auth import KISCredentials
@@ -96,20 +97,40 @@ def test_the_registry_never_holds_a_raw_app_key():
 # ── GET: retry failures, never decisions ─────────────────────────────────────
 
 class _Resp:
-    def __init__(self, payload):
+    """A ``requests`` response double that fails the way the real one does.
+
+    ``raise_for_status`` really raises ``requests.HTTPError`` on a 4xx/5xx, so
+    a test can distinguish "the client retried the status" from "the client
+    retried the exception raise_for_status threw" — the two were the same code
+    path before, which is the defect these tests pin.
+    """
+
+    def __init__(self, payload, status_code=200):
         self._payload = payload
+        self.status_code = status_code
 
     def raise_for_status(self):
-        return None
+        if self.status_code >= 400:
+            raise requests.HTTPError(f"{self.status_code} for url", response=self)
 
     def json(self):
+        if self._payload is _MALFORMED:
+            raise ValueError("Expecting value: line 1 column 1 (char 0)")
         return self._payload
 
 
+#: Sentinel payload for "the body was not JSON at all" (a gateway error page).
+_MALFORMED = object()
+
+
 def test_get_does_not_retry_a_broker_rejection(monkeypatch):
-    """``rt_cd != "0"`` is an answer. Asking again spends rate budget to hear
-    it twice more — and for ``EGW00133`` (token issuance, 1/min) or
-    ``EGW00201`` (rate exceeded) the retry is actively harmful."""
+    """``rt_cd != "0"`` is normally the broker's final answer — asking again
+    spends rate budget to hear it twice more.
+
+    ``EGW00201`` (rate exceeded) is the one exception, and is retried; see
+    ``test_get_retries_a_rate_exceeded_rejection`` below. ``EGW00133`` (token
+    issuance, 1/min) is not: a one-second retry cannot satisfy a one-minute
+    cap, and that path belongs to the auth module."""
     calls = []
 
     def fake_get(url, **kwargs):
@@ -303,3 +324,112 @@ def test_the_limiter_does_not_sleep_holding_its_lock(monkeypatch):
     limiter.wait()
 
     assert held and all(held), "the lock must be released before sleeping"
+
+
+# ── review findings: an HTTP status is a decision too ────────────────────────
+#
+# ``requests.get()``, ``raise_for_status()`` and ``json()`` shared one ``try``,
+# so a 403 retried three times exactly like a dropped connection — the same
+# waste this file's ``rt_cd`` tests exist to prevent, one layer down.
+#
+# The rule is not "only transport failures": it is the same question the
+# ``EGW00201`` branch asks — *can asking again produce a different answer?* A
+# 503 or a 429 can; a 403 or a 404 cannot.
+
+def _get_returning(monkeypatch, responses):
+    """Patch ``requests.get`` to return ``responses`` in order, recording calls.
+
+    The last entry repeats once exhausted, so "always 503" is expressed as a
+    one-element list."""
+    calls = []
+
+    def fake_get(url, **kwargs):
+        calls.append(url)
+        return responses[min(len(calls) - 1, len(responses) - 1)]
+
+    monkeypatch.setattr(client_mod.requests, "get", fake_get)
+    return calls
+
+
+def _client(monkeypatch):
+    """A paper client with the token fetch stubbed out."""
+    c = client_mod.KISClient(PAPER)
+    monkeypatch.setattr(c.auth, "get_headers", lambda tr_id: {})
+    return c
+
+
+def test_get_does_not_retry_a_client_error(monkeypatch):
+    """A 403 is an answer about the credential, not a failed delivery. Retrying
+    burns two more of the app key's rate-limit slots to be told the same."""
+    calls = _get_returning(monkeypatch, [_Resp({}, status_code=403)])
+    c = _client(monkeypatch)
+
+    with pytest.raises(requests.HTTPError):
+        c.get("/uapi/whatever", "TR", {})
+
+    assert len(calls) == 1, f"a 4xx must not be retried (got {len(calls)} calls)"
+
+
+def test_get_does_not_retry_a_404(monkeypatch):
+    """The same holds for a wrong path — nothing about waiting fixes it."""
+    calls = _get_returning(monkeypatch, [_Resp({}, status_code=404)])
+    c = _client(monkeypatch)
+
+    with pytest.raises(requests.HTTPError):
+        c.get("/uapi/whatever", "TR", {})
+
+    assert len(calls) == 1
+
+
+def test_get_retries_a_server_error(monkeypatch):
+    """A 503 says the gateway could not answer *this time*. Making it final
+    would turn a blip into a failed balance lookup — the same user-visible
+    failure the ``EGW00201`` branch exists to avoid."""
+    calls = _get_returning(monkeypatch, [
+        _Resp({}, status_code=503),
+        _Resp({"rt_cd": "0", "output": {"ok": True}}),
+    ])
+    c = _client(monkeypatch)
+
+    data = c.get("/uapi/whatever", "TR", {})
+
+    assert len(calls) == 2
+    assert data["output"] == {"ok": True}
+
+
+def test_get_retries_a_429(monkeypatch):
+    """KIS answers a throttle as ``EGW00201`` in the body, but an intermediary
+    can answer 429 at the HTTP layer. Both mean "too fast"."""
+    calls = _get_returning(monkeypatch, [
+        _Resp({}, status_code=429),
+        _Resp({"rt_cd": "0", "output": {"ok": True}}),
+    ])
+    c = _client(monkeypatch)
+
+    assert c.get("/uapi/whatever", "TR", {})["output"] == {"ok": True}
+    assert len(calls) == 2
+
+
+def test_get_gives_up_on_a_persistent_server_error(monkeypatch):
+    """Retrying a 5xx is bounded like every other transient failure, and the
+    HTTPError is what finally surfaces."""
+    calls = _get_returning(monkeypatch, [_Resp({}, status_code=503)])
+    c = _client(monkeypatch)
+
+    with pytest.raises(requests.HTTPError):
+        c.get("/uapi/whatever", "TR", {})
+
+    assert len(calls) == client_mod.KISClient.MAX_RETRIES
+
+
+def test_get_retries_a_malformed_body(monkeypatch):
+    """A 200 whose body is not JSON is a gateway anomaly, not an answer from
+    the broker — the request was never really served."""
+    calls = _get_returning(monkeypatch, [
+        _Resp(_MALFORMED),
+        _Resp({"rt_cd": "0", "output": {"ok": True}}),
+    ])
+    c = _client(monkeypatch)
+
+    assert c.get("/uapi/whatever", "TR", {})["output"] == {"ok": True}
+    assert len(calls) == 2

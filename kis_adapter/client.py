@@ -59,6 +59,18 @@ class RateLimiter:
 #: one's.
 _TRANSIENT_MSG_CODES = frozenset({"EGW00201"})
 
+#: HTTP statuses where asking again can produce a different answer — the same
+#: question ``_TRANSIENT_MSG_CODES`` asks, one layer down. A 4xx that is not
+#: 429 is an answer about the request itself (wrong path, wrong credential):
+#: retrying it spends the app key's rate-limit slots to be told the same thing.
+_RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
+
+#: Keyed by credential fingerprint and never evicted — the same shape as
+#: ``auth._MEM_TOKENS`` and ``auth._ISSUE_LOCKS``, which key on the same ``_fp``
+#: and hold strictly more per entry. Eviction would have to prove no waiter is
+#: scheduled on a limiter before dropping it; dropping a live one resets
+#: ``_last_call`` to 0, which is precisely the bug this registry exists to fix.
+#: If it is ever worth bounding, all three belong in one change.
 _LIMITERS: dict = {}
 _LIMITERS_LOCK = Lock()
 
@@ -75,6 +87,8 @@ def _limiter_for(auth: KISAuth) -> RateLimiter:
     interval to one of them.
     """
     rate = 5 if auth.env == "paper" else 15
+    # ``env`` is already inside ``_fp``; carrying it in the key too costs
+    # nothing and keeps paper and real separate even if ``_fp``'s recipe changes.
     key = (auth._fp, auth.env)
     with _LIMITERS_LOCK:
         limiter = _LIMITERS.get(key)
@@ -111,15 +125,42 @@ class KISClient:
         # would turn a momentary throttle into a failed balance lookup, and
         # ``_live_position_row`` rejects the user's close order on the strength
         # of that.
+        #
+        # The same question decides the HTTP layer below — *can asking again
+        # produce a different answer?* — which is why the three stages are
+        # separated rather than sharing one ``except``.
         for attempt in range(self.MAX_RETRIES):
+            last = attempt == self.MAX_RETRIES - 1
             self._limiter.wait()
+
+            # 1. Transport: nothing was answered at all.
             try:
                 resp = requests.get(url, headers=headers, params=params, timeout=_http_timeout())
-                resp.raise_for_status()
-                data = resp.json()
             except Exception as e:
                 logger.warning("GET %s attempt %d failed: %s", path, attempt + 1, e)
-                if attempt == self.MAX_RETRIES - 1:
+                if last:
+                    raise
+                time.sleep(1)
+                continue
+
+            # 2. HTTP status. A 5xx or 429 is worth asking again; every other
+            #    4xx is an answer, and ``raise_for_status`` surfaces it now
+            #    rather than three rate-limit slots later.
+            if resp.status_code >= 400:
+                if not (resp.status_code in _RETRYABLE_STATUS and not last):
+                    resp.raise_for_status()
+                logger.warning("GET %s attempt %d failed: HTTP %d",
+                               path, attempt + 1, resp.status_code)
+                time.sleep(1)
+                continue
+
+            # 3. A 200 whose body is not JSON is a gateway page, not a reply.
+            try:
+                data = resp.json()
+            except ValueError as e:
+                logger.warning("GET %s attempt %d returned a non-JSON body: %s",
+                               path, attempt + 1, e)
+                if last:
                     raise
                 time.sleep(1)
                 continue
@@ -135,8 +176,15 @@ class KISClient:
             return data
 
     def post(self, path: str, tr_id: str, body: dict) -> dict:
-        # Retries only on network-level errors (no response received).
-        # rt_cd rejections break out immediately — never retry a confirmed API decision.
+        # rt_cd rejections break out immediately — never retry a confirmed API
+        # decision. Everything else is retried: transport failures *and* any
+        # HTTP error status, which is not the same discipline ``get`` now
+        # applies. Left alone deliberately — this is the order-submission path,
+        # and narrowing it is a change to how orders are sent, not a cleanup.
+        #
+        # Worth knowing while it stands: a 5xx here re-sends the order up to
+        # three times. If KIS accepted an order and only the response was lost,
+        # that is a duplicate order. Pre-existing; tracked separately.
         hashkey = self.auth.get_hashkey(body)
         headers = self.auth.get_headers(tr_id)
         headers["hashkey"] = hashkey
