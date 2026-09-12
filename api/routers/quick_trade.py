@@ -26,6 +26,7 @@ from api.services.quick_trade_service import (
 from backend.brokers.semantic_mapper import KIS_DOMESTIC_MAPPER, KIS_OVERSEAS_MAPPER
 from strategy.risk import RiskManager
 from backend.risk.halt_policy import HaltCause, OperationClass, is_allowed
+from backend.market.symbols import KR_EXCHANGE, resolve_exchange, to_quote_excd
 from backend.risk.sellable_qty import resolve_sellable, validate_sell_qty
 
 logger = logging.getLogger(__name__)
@@ -184,6 +185,75 @@ def _resolve_market(symbol: str, requested: Optional[str]) -> str:
     return "kr" if KISBroker._is_kr(symbol or "") else "us"
 
 
+class ExchangeUnresolved(Exception):
+    """The symbol names no exchange this platform can route an order to."""
+
+
+class ExchangeMismatch(Exception):
+    """The caller named an exchange the symbol does not trade on."""
+
+
+def _resolve_exchange(symbol: str, requested: Optional[str],
+                      market: Optional[str] = None) -> str:
+    """The KIS ``OVRS_EXCG_CD`` for ``symbol``, derived from the symbol.
+
+    KNOWN LIMIT — read before trusting this. ``resolve_exchange`` looks the
+    symbol up in ``EXCD_MAP`` and falls back to NASD for a US ticker it does
+    not know. That map holds the trading universe plus the app's catalogue, and
+    ``/api/market/symbols/search`` hands the picker arbitrary tickers through
+    its yfinance fallback — so a symbol like ``KO`` (NYSE) still routes as NASD
+    and is still rejected by KIS. Closing that needs a real symbol master
+    (KIS publishes ``nasmst``/``nysmst``/``amsmst``), which is its own task.
+    What this function fixes is the far larger hole underneath it: that the
+    exchange was not derived *at all*.
+
+    The old rule was ``body.exchange or "NASD"``, which is two bugs wearing one
+    line. ``exchange`` defaulted to ``"NASD"`` in the schema, so the ``or``
+    never fired and an omitted exchange was indistinguishable from a chosen
+    one; and the client omits it always — the view posts no ``exchange`` at
+    all. Every NYSE name the picker offers went to KIS tagged NASD, and KIS
+    rejects an order whose exchange is wrong for the symbol
+    (``BROKER_SEMANTICS.md``).
+
+    Deriving is the same treatment ``_resolve_market`` already gives the
+    market, through the same source of truth: ``backend.market.symbols``, which
+    reads ``EXCD_MAP``.
+
+    Two refusals, both deliberate:
+
+    ``ExchangeUnresolved`` — the symbol is not a tradable equity (a crypto pair
+    left over in a watchlist, say). There is no correct exchange, so there is
+    no order to place. Falling back to the US default is how such a symbol
+    would reach a KIS equities account.
+
+    ``ExchangeMismatch`` — the caller named one and it disagrees. Ignoring it
+    would place the right order while leaving the client's wrong belief
+    intact; the next thing it does with that belief is unlikely to be right.
+
+    ``market`` is checked against the same resolution when the caller states
+    one. The two are resolved by different functions, so nothing otherwise
+    stops ``{symbol: "069500", market: "us"}`` from reaching
+    ``buy_us("069500", "KRX", …)`` — a domestic code on the overseas endpoint,
+    persisted as a row whose recovery inquiry can never match, leaving the
+    order RESERVED forever.
+    """
+    resolved = resolve_exchange(symbol)
+    if resolved is None:
+        raise ExchangeUnresolved(
+            f"{symbol!r} is not a tradable equity — no exchange to route to"
+        )
+    if requested and requested.strip().upper() != resolved:
+        raise ExchangeMismatch(
+            f"{symbol} trades on {resolved}, not {requested.strip().upper()}"
+        )
+    if market and market != ("kr" if resolved == KR_EXCHANGE else "us"):
+        raise ExchangeMismatch(
+            f"{symbol} trades on {resolved}, which is not the "
+            f"{market.upper()} market"
+        )
+    return resolved
+
+
 def _live_held_qty(portfolio, symbol: str, market: str) -> int:
     """Held quantity for ``symbol`` straight from the broker, or 0 if not held.
 
@@ -285,10 +355,20 @@ def _live_close_price(market_data, symbol: str, market: str, exchange: str):
     Never falls back to the position's average purchase price: pricing a
     liquidation off cost basis can post a deeply off-market limit (the defect
     recorded as G2 in docs/P0_07_CLOSE_POSITION_AUDIT.md).
+
+    ``exchange`` arrives as the *order* code and is translated before use: KIS
+    quotes take ``NAS``/``NYS``/``AMS`` where orders take ``NASD``/``NYSE``/
+    ``AMEX``. Passing the order code through asks the quote endpoint for an
+    exchange it does not name — and this function returning ``None`` is what
+    blocks the close, so a bad code here reads as "no live price".
     """
+    quote_excd = to_quote_excd(exchange)
+    if market != "kr" and quote_excd is None:
+        logger.warning("no quote exchange code for %s (%s)", symbol, exchange)
+        return None
     try:
         price = (market_data.get_price_kr(symbol) if market == "kr"
-                 else market_data.get_price_us(symbol, exchange))
+                 else market_data.get_price_us(symbol, quote_excd))
     except Exception as e:
         logger.warning("close price lookup failed %s: %s", symbol, e)
         return None
@@ -430,7 +510,10 @@ def place_order(
         qty = int(body.qty)
         market = _resolve_market(body.symbol, body.market)
         order_type = "limit"  # KIS quick-trade submits ORD_DVSN "00" — always limit
-        exchange = body.exchange or "NASD"
+        try:
+            exchange = _resolve_exchange(body.symbol, body.exchange, market)
+        except (ExchangeUnresolved, ExchangeMismatch) as e:
+            return Resp.err(str(e))
 
         # Reject before reserving: a non-positive qty/price must never reach the
         # broker, and KR orders are cast with int() below, so a sub-1 KRW price
@@ -577,8 +660,12 @@ def close_position(
     # Hoisted for the same reason, and because ``exchange`` is part of the order
     # identity: ``request_fingerprint`` includes it precisely because the same
     # symbol on NASD and on NYSE is a distinct order. The replay short-circuit
-    # must not be weaker than the conflict check it bypasses.
-    exchange = body.exchange or "NASD"
+    # must not be weaker than the conflict check it bypasses. Also pure: the
+    # exchange is derived from the symbol, so hoisting it contacts nothing.
+    try:
+        exchange = _resolve_exchange(body.symbol, body.exchange, market)
+    except (ExchangeUnresolved, ExchangeMismatch) as e:
+        return Resp.err(str(e))
 
     # An explicit replay short-circuits before any broker lookup. This handler
     # derives its quantity from the live figure, so re-running the resolution
@@ -927,7 +1014,15 @@ def cancel_order(
         return Resp.err("Order has no broker order id — nothing to cancel")
 
     market = _resolve_market(order.symbol, order.market)
-    exchange = order.exchange or "NASD"
+    # Read off the row, never re-derived: the cancel has to name the venue the
+    # resting order actually sits on. Re-deriving would agree today and diverge
+    # the moment the mapping is corrected — or a symbol changes listing —
+    # underneath a live order, cancelling against the wrong exchange.
+    # Nor is there a safe default: ``or "NASD"`` sent every unlabelled cancel to
+    # NASD, which is the same misroute this change removes from the order path.
+    exchange = (order.exchange or "").strip()
+    if market != "kr" and not exchange:
+        return Resp.err("Order has no exchange recorded — cannot cancel safely")
     qty = int(order.qty or 0)
     price = float(order.price or 0.0)
 

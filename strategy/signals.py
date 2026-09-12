@@ -12,14 +12,19 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-US_ETF = ["SPY", "QQQ", "XLK", "XLF", "XLE", "XLV", "XLI", "XLY", "XLP", "XLU", "XLRE"]
-US_LARGE = ["AAPL", "NVDA", "MSFT", "GOOGL", "AMZN", "META", "TSLA", "AVGO", "JPM", "V"]
-KR_ETF = ["069500", "360750", "091160"]
-
-UNIVERSE = US_ETF + US_LARGE + KR_ETF
-
-EXCD_MAP = {s: "NASD" for s in ["AAPL", "NVDA", "MSFT", "GOOGL", "AMZN", "META", "TSLA", "AVGO", "QQQ", "XLK", "XLRE"]}
-EXCD_MAP.update({s: "NYSE" for s in ["SPY", "XLF", "XLE", "XLV", "XLI", "XLY", "XLP", "XLU", "JPM", "V"]})
+# Re-exported, not redefined. ``backend/quant/data/universe`` documents itself
+# as the canonical source and says this module imports from it — which was not
+# true: this file kept its own copy of all five constants, and the two
+# ``EXCD_MAP``s had already drifted (the canonical one gained BRK.B, XOM and
+# WMT; this one did not). ``bot/main.py`` and ``scripts/`` read the map through
+# here, so the stale copy is the one that routed real orders.
+from backend.quant.data.universe import (  # noqa: F401 - re-exported for callers
+    EXCD_MAP,
+    KR_ETF,
+    UNIVERSE,
+    US_ETF,
+    US_LARGE,
+)
 
 SECTOR_MAP = {
     "SPY": "broad", "QQQ": "tech", "XLK": "tech", "XLF": "finance",

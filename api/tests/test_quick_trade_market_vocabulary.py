@@ -213,3 +213,30 @@ def test_the_initial_market_is_one_the_caller_allows(app):
         f"{app}: searchMarketInner still defaults to Crypto regardless of the "
         "caller's market list"
     )
+
+
+# ── the catalogue cannot drift from the routing rule ──────────────────────────
+
+def test_the_catalogue_market_is_derived_not_written():
+    """The SPY conflict above was possible because the exchange was spelled out
+    per row *and* held in ``EXCD_MAP``. Two writable copies of one fact drift;
+    this asserts the catalogue keeps none of its own."""
+    from backend.market.symbols import resolve_exchange
+
+    for exchange, rows in HOT_SYMBOLS.items():
+        for row in rows:
+            resolved = resolve_exchange(row["symbol"])
+            assert resolved == exchange == row["market"], (
+                f"{row['symbol']}: catalogue says {row['market']}/{exchange}, "
+                f"routing says {resolved}"
+            )
+
+
+def test_every_offered_symbol_can_be_routed():
+    """A row the picker shows but the order path cannot classify is a
+    guaranteed rejection presented as a normal choice."""
+    from backend.market.symbols import resolve_exchange
+
+    for rows in HOT_SYMBOLS.values():
+        for row in rows:
+            assert resolve_exchange(row["symbol"]) is not None, row["symbol"]

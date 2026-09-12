@@ -48,6 +48,12 @@ _US_DEFAULT = "NASD"
 #: Pair separators (``/``) are caught separately.
 _CRYPTO_QUOTES = ("USDT", "USDC", "BUSD")
 
+#: Order exchange code → quote exchange code. KIS names the same venue two
+#: ways depending on which endpoint you are calling; see ``to_quote_excd``.
+#: AMEX is listed for completeness — nothing routes there yet, but leaving it
+#: out would make the one venue that is missing look deliberate.
+_QUOTE_EXCD = {"NASD": "NAS", "NYSE": "NYS", "AMEX": "AMS"}
+
 #: Yahoo Finance board suffixes for KIS domestic codes. A six-digit code does
 #: not say which board it trades on — KOSPI is ``.KS``, KOSDAQ is ``.KQ`` — so
 #: both are offered, in the order to try them. Picking one and hoping is how
@@ -130,6 +136,24 @@ def provider_symbol_candidates(raw_symbol) -> List[str]:
         return [f"{symbol}{suffix}" for suffix in _KR_PROVIDER_SUFFIXES]
     # Yahoo spells class shares with a hyphen: BRK.B is BRK-B.
     return [symbol.replace(".", "-")]
+
+
+def to_quote_excd(exchange) -> Optional[str]:
+    """The quote-endpoint spelling of an order exchange code, or ``None``.
+
+    KIS uses two different code sets for the same venue, and passing one where
+    the other belongs asks for an exchange the endpoint does not name. From
+    KIS's own examples (``koreainvestment/open-trading-api``):
+
+        order(ovrs_excg_cd="NASD", pdno="AAPL")     # trading  → NASD/NYSE/AMEX
+        price(auth="", excd="NAS", symb="AAPL")     # quotes   → NAS/NYS/AMS
+
+    ``None`` for KRX: domestic quotes go to a different endpoint entirely
+    (``inquire-price`` with ``FID_INPUT_ISCD``), which takes no exchange code,
+    so there is nothing to translate and a caller asking is confused about
+    which path it is on.
+    """
+    return _QUOTE_EXCD.get(exchange)
 
 
 def to_backend_symbol(raw_symbol) -> Optional[str]:

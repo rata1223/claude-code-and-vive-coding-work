@@ -127,9 +127,13 @@ def _allow():
 
 
 def _order(**kw):
+    # No ``exchange``: the real client sends none and the handler derives it
+    # from the symbol. Hardcoding "NASD" here made the KR cases below assert a
+    # contradiction (069500 does not trade on NASD) rather than the behaviour
+    # they are about.
     payload = {
         "credential_id": 1, "symbol": "AAPL", "side": "buy",
-        "qty": 10, "price": 100.0, "market": "us", "exchange": "NASD",
+        "qty": 10, "price": 100.0, "market": "us",
     }
     payload.update(kw)
     return PlaceOrderRequest(**payload)
