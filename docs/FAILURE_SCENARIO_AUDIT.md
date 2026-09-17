@@ -343,14 +343,16 @@ genuinely down and needs investigation" with "Redis blipped for 10 seconds."
 
 Three distinct network-timeout surfaces:
 
-1. **GET/POST body retries (existing, cross-ref DO-01).** `KISClient.get()`/`post()`
-   (`client.py:37-96`) retry the HTTP request itself up to 3x with a 1s sleep and 10s
-   per-attempt timeout. For GET this is safe (idempotent). For POST
-   (`client.py:56-96`), a network timeout *after* the broker has already accepted and
-   processed the order, but *before* the response reaches the client, causes a retry that
-   submits a **second** order — the original `IDEMPOTENT_EXECUTION.md` DO-01 "ghost order"
-   finding. This audit confirms the retry loop in current `client.py` is unchanged and DO-01
-   remains present.
+1. **GET/POST body retries (cross-ref DO-01 — ✅ now RESOLVED).** `KISClient.get()`
+   retries the HTTP request itself up to 3x with a 1s sleep and 10s per-attempt timeout;
+   for GET this is safe (idempotent). For POST it **used to** do the same, so a network
+   timeout *after* the broker had already accepted and processed the order, but *before*
+   the response reached the client, caused a retry that submitted a **second** order — the
+   original `IDEMPOTENT_EXECUTION.md` DO-01 "ghost order" finding.
+   **That is fixed**: a new order is now sent once and never re-sent. The timeout
+   propagates, the `QT_RESERVED` reservation stays open, and `KISOrders.inquire_orders()`
+   resolves what actually landed. Only replayable requests — the cancels, keyed to
+   `ORGN_ODNO` — still retry, via `post(..., idempotent=True)`.
 2. **`_get_fx()` fallback chain — SD-04, confirmed present, not re-derived here.**
    `backend/brokers/kis.py:300-317` fetches USD/KRW via `yfinance` with a 1-hour TTL cache;
    if the live fetch fails (including on network timeout) it falls back to the cached value,
@@ -597,6 +599,9 @@ results in live trading being halted until manual operator intervention, with an
 points at the wrong subsystem.
 
 ### Chain 2 — DO-01/FS-05: Network timeout → ghost order → in-memory double-apply
+> ✅ **This chain is BROKEN AT STEP 2 as of the DO-01 fix** — a new order is sent once, so
+> there is no second order to double-apply. Retained because FS-05 (no fill-id-level
+> idempotency in `PositionTracker.on_fill()`) is still reachable by other means.
 
 ```
 1. POST /uapi/.../order succeeds at the broker; response is lost to a network
@@ -801,8 +806,8 @@ the gaps `TASK 4-1B`'s failure-injection harness (§8) should target first.
 | SD-05 | Stale data, Redis down | MEDIUM | **CONFIRMED PRESENT** | `heartbeat.py` (whole file) | Heartbeat is a process-liveness signal only; a worker that is alive but trading on stale data produces zero alerts |
 | SD-09 | Stale data | MEDIUM | **CONFIRMED PRESENT** | `indicator/strategy.py:103-118` | `.days`-truncated staleness gate + bare `except: pass` can silently disable the staleness check entirely |
 
-Summary of this table: **8 cross-referenced existing IDs confirmed present**
-(DO-01, DO-05, EX-02, EX-04, EX-10, EX-11, CA-03, CA-04), **3 stale-data IDs confirmed
+Summary of this table (as audited): **8 cross-referenced existing IDs confirmed present**
+(DO-01 — ✅ since RESOLVED, DO-05, EX-02, EX-04, EX-10, EX-11, CA-03, CA-04), **3 stale-data IDs confirmed
 present** (SD-04, SD-05, SD-09 — full detail remains in `STALE_DATA_AUDIT.md`'s own
 SD-01..SD-13 scope), **3 RESOLVED** since their source audits (F1, F5, EX-06), and
 **7 new `FS-01`..`FS-07`** findings raised by this audit.
@@ -1010,7 +1015,7 @@ or corrupt runtime behavior without any startup-time signal.
 | Redis down | **HIGH** | FS-01: self-healing at every layer that detects it directly, but the cross-process watchdog interaction converts a transient blip into a manually-resolved trading halt with a misleading alert. No test coverage. |
 | Worker restart | MEDIUM | StartupRecovery is strong (F1/EX-06 resolved, well-tested); FS-02 (breaker reset) and the FS-01 heartbeat-gap interaction are the residual risk. |
 | Process kill | MEDIUM | Correctly detected (heartbeat/watchdog); CA-03 repairs qty but loses the `Fill` audit row (CA-04) — financially self-correcting but audit-trail-incomplete. No test coverage. |
-| Network timeout | MEDIUM | DO-01 (ghost orders) is the headline risk and is unchanged/confirmed; FS-07 (auth-endpoint timeout bypasses retry) is a narrower, lower-probability window. SD-04 is already tracked. |
+| Network timeout | MEDIUM | DO-01 (ghost orders) **was** the headline risk and is now ✅ resolved — a new order is sent once, with `QT_RESERVED` carrying the indeterminate outcome. FS-07 (auth-endpoint timeout bypasses retry) is a narrower, lower-probability window and remains open. SD-04 is already tracked. |
 | Broker API failure | MEDIUM | Breaker provides real protection but is silent (no alert on trip) and resets on restart (FS-02); DO-05 remains the deeper structural gap. |
 | Polling failure | **HIGH** | EX-02 (confirmed, now also covering PARTIAL_FILLED) and EX-10 (confirmed, no thread supervisor) combine for up to ~1.5h of *total* silent fill-loss across *all* strategies with zero test coverage — among the largest single blast radii in this audit. |
 | Reconciliation failure | MEDIUM | Core repair logic is well-tested; CA-03/CA-04 masking and EX-11's TOCTOU are known, tracked gaps; lock-contention-skip has no alerting. |

@@ -1,5 +1,17 @@
 # Failure Scenario Test Suite — Design Specification
 
+> ### ⚠️ DO-01 is RESOLVED — read before implementing any `[CURRENT]` DO-01 test
+> This spec was written while `KISClient.post()` retried a new order up to 3x. **It no
+> longer does**: a new order is sent once and never re-sent, an indeterminate outcome is
+> carried by the `QT_RESERVED` reservation and resolved by `KISOrders.inquire_orders()`,
+> and only replayable requests (cancels, keyed to `ORGN_ODNO`) retry via
+> `post(..., idempotent=True)`.
+>
+> So **do not write the `[CURRENT]` DO-01 characterisation tests below** — they would pin
+> a bug that is fixed. The behaviour is already covered by
+> `api/tests/test_kis_client_order_retry.py`. Every other `DO-01` cross-reference in this
+> file is historical context; `AUDIT.md` R-01 is the authority.
+
 > **Design-only deliverable (TASK 4-1B).** This document defines, for each of the 10
 > failure scenarios named in TASK 4-1A's audit (`docs/FAILURE_SCENARIO_AUDIT.md`, ~1,216
 > lines, merged via PR #76), the expected behavior, recovery expectations, validation
@@ -561,7 +573,8 @@ in this case) — audit §3.3, §6, §8.3.
 
 ### §4.4 Network Timeout
 
-**Audit Cross-Refs**: `DO-01` (CRITICAL, CONFIRMED PRESENT); `SD-04` (MEDIUM, CONFIRMED
+**Audit Cross-Refs**: ~~`DO-01` (CRITICAL, CONFIRMED PRESENT)~~ → ✅ **RESOLVED**, see the
+banner at the top of this file; `SD-04` (MEDIUM, CONFIRMED
 PRESENT — cross-ref `STALE_DATA_AUDIT.md`, not re-derived); `FS-07` (MEDIUM-HIGH, NEW) —
 audit §3.4, §6, §8.4.
 
@@ -612,8 +625,9 @@ audit §3.4, §6, §8.4.
 
 **Fail-Closed Rules**:
 - `[CURRENT]` GET retries are safe (idempotent) — correct, no change needed.
-- `[CURRENT]` POST retries can create ghost orders (DO-01). `[TARGET]`: cross-ref audit §11
-  for the broker-side idempotency-token fix (out of scope here, cited only).
+- ~~`[CURRENT]` POST retries can create ghost orders (DO-01).~~ ✅ **RESOLVED** — a new order
+  is sent once. `[TARGET]` remains: cross-ref audit §11 for the broker-side
+  idempotency-token fix (DO-05, still open — KIS accepts no client-supplied key).
 - `[CURRENT]` FX fallback never blocks/raises even when stale. `[TARGET]`: cross-ref SD-04's
   own fix recommendation in `STALE_DATA_AUDIT.md` (not re-derived here).
 - `[CURRENT]` auth/hashkey timeout fails the whole call with zero retries (FS-07). `[TARGET]`:
@@ -629,7 +643,8 @@ audit §3.4, §6, §8.4.
   `event_type="auth_endpoint_timeout"` (proposed, not implemented).
 
 **Skeleton Mapping**: → `TestNetworkTimeoutScenario` —
-`test_post_retry_after_timeout_may_duplicate_order` (DO-01, `[CURRENT]`),
+~~`test_post_retry_after_timeout_may_duplicate_order`~~ (DO-01 ✅ resolved; covered instead by
+`api/tests/test_kis_client_order_retry.py`),
 `test_auth_hashkey_timeout_fails_without_retry` (FS-07, `[CURRENT]`),
 `test_fx_fallback_on_timeout_uses_stale_cache` (SD-04, regression guard).
 
@@ -1267,7 +1282,7 @@ true today; `[TARGET]` = proposed future behavior, not implemented by this task.
 | 4.3 | Emit `reconcile_fix_qty_no_fill_record` when a qty repair has no matching `Fill` | `[TARGET]` | CA-03/CA-04 |
 | 4.3 | `WorkerWatchdog` response is identical for genuine death vs. Redis blip | `[CURRENT]` gap | cross-ref §4.1 |
 | 4.4 | GET retries are safe/idempotent | `[CURRENT]` correct | — |
-| 4.4 | POST retries after timeout can create ghost orders | `[CURRENT]` gap | DO-01 |
+| 4.4 | ~~POST retries after timeout can create ghost orders~~ — a new order is sent once | ✅ RESOLVED | DO-01 |
 | 4.4 | Broker-side idempotency-token fix (cited, not designed here) | `[TARGET]` | audit §11 item, DO-01 |
 | 4.4 | FX fallback never blocks/raises even when stale | `[CURRENT]` gap | SD-04 |
 | 4.4 | `_get_fx()`'s own fix per `STALE_DATA_AUDIT.md` (cited, not re-derived) | `[TARGET]` | SD-04 |
@@ -1347,7 +1362,7 @@ assert.
 | `TestRedisDownScenario.test_recovery_alert_does_not_clear_kill_switch` | `kill_switch` stays `True` indefinitely after Redis recovers; `_alert_recovery()` only emits a WS info message | `_alert_recovery()` annotates `kill_reason` with a resolution marker; `kill_switch` still requires manual clear (fail-closed preserved) | FS-01 |
 | `TestWorkerRestartScenario.test_breaker_resets_on_restart` | A fresh `ConsecutiveFailureBreaker()` after restart has `is_open() is False`, even if the pre-restart instance was mid-cooldown | Breaker state persisted (Redis) and restored at `StartupRecovery`, or broker-timeout gates (`_step_balance`/`_step_positions`) substitute | FS-02 |
 | `TestProcessKillScenario.test_missing_fill_row_after_repair_undetected` | `db.query(DBFill).filter(DBFill.order_id == order_id).count() == 0` even after `reconcile_fix_qty` repairs the qty | `reconcile_fix_qty_no_fill_record` `AuditLog` event emitted alongside the qty repair when no matching `Fill` exists | CA-03/CA-04 |
-| `TestNetworkTimeoutScenario.test_post_retry_after_timeout_may_duplicate_order` | Retry submits a second `idempotency_key`-bearing `Order`; DB can hold two rows for one logical intent | Broker-side idempotency token (cross-ref audit §11, out of scope for this suite) | DO-01 |
+| ~~`TestNetworkTimeoutScenario.test_post_retry_after_timeout_may_duplicate_order`~~ ✅ do not write — DO-01 resolved | Retry **used to** submit a second `idempotency_key`-bearing `Order`; a new order is now sent once, so the DB cannot gain a second row this way. Covered by `api/tests/test_kis_client_order_retry.py` | Broker-side idempotency token (DO-05, still open — KIS accepts no client-supplied key) | DO-01 |
 | `TestNetworkTimeoutScenario.test_auth_hashkey_timeout_fails_without_retry` | `requests.post` to `/oauth2/tokenP`/`/uapi/hashkey` called exactly once; `Timeout` propagates immediately | `get_hashkey()`/`_issue_token()` get their own retry, or are moved inside `KISClient`'s existing retry loop | FS-07 |
 | `TestBrokerApiFailureScenario.test_breaker_trip_logs_but_does_not_alert` | `logger.error` fires once at the threshold-crossing; no `alert_emergency`/`publish_alert` call | Breaker trip additionally calls `alert_emergency`/`publish_alert`, mirroring `WorkerWatchdog._alert_dead_worker()` | DO-05 cross-ref |
 | `TestPollingFailureScenario.test_filled_callback_exception_loses_fill` | Order removed from `OrderFillPoller._entries` even though `on_filled` raised; fill permanently lost | Entry popped only after `on_filled` succeeds; bounded retry then alert on persistent failure | EX-02 |
