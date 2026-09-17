@@ -567,9 +567,11 @@ audit §3.4, §6, §8.4.
 
 **Expected Behavior** (current code) — three independent surfaces, all using `requests` with
 `timeout=10`:
-1. **GET/POST body retries** (`client.py:41-54` GET, `56-96` POST) — 3x retry, 1s sleep, 10s
-   per-attempt timeout. GET is idempotent (safe). POST (`place_order`) retried after a timeout
-   that occurred AFTER the broker accepted but BEFORE the response arrived → DO-01 "ghost
+1. **GET/POST body retries** (`kis_adapter/client.py`) — GET: 3x retry, 1s sleep, 10s
+   per-attempt timeout; GET is idempotent (safe). POST: ✅ **a new order is now sent once and
+   never re-sent** (only `idempotent=True` requests — the cancels — retry). It **used to** be
+   retried after a timeout that occurred AFTER the broker accepted but BEFORE the response
+   arrived → DO-01 "ghost
    order": a second order submitted for the same logical intent.
 2. **`_get_fx()`** (`backend/brokers/kis.py:300-317`) — `yfinance` fetch with a 1h TTL cache;
    on failure (incl. timeout) falls back to the cached rate, logging a warning only if the
@@ -1169,8 +1171,10 @@ scope — see §2's closing note and §8's env-var open question).
   `kill_switch=True` on genuine process death (regression guard).
 
 **`TestNetworkTimeoutScenario`** (§4.4, DO-01, SD-04, FS-07):
-- `test_post_retry_after_timeout_may_duplicate_order` — `[CURRENT]` POST retry after
-  timeout can submit a second `idempotency_key`-bearing order (DO-01).
+- ~~`test_post_retry_after_timeout_may_duplicate_order`~~ — ✅ **RESOLVED (DO-01)**, so do not
+  write this as a `[CURRENT]` characterisation test: a new order is sent once and a timeout
+  now propagates without a second send. The behaviour is pinned instead by
+  `api/tests/test_kis_client_order_retry.py::test_post_does_not_resend_after_a_timeout`.
 - `test_auth_hashkey_timeout_fails_without_retry` — `[CURRENT]` `_issue_token`/`get_hashkey`
   raise immediately, zero retries (FS-07).
 - `test_fx_fallback_on_timeout_uses_stale_cache` — `_get_fx()` returns cached rate on

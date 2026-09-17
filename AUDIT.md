@@ -52,7 +52,7 @@ Defects found:
 
 **D-2**: `KISBroker.place_order()` catches all exceptions and returns `Order(status=REJECTED)`. A network timeout (order may have landed at broker) is indistinguishable from a true rejection. The caller has no way to distinguish between "broker rejected" and "we don't know."
 
-**D-3**: `KISClient.post()` retries 3 times on any exception, including timeout. For order submission this creates duplicate orders. `get()` retries are safe; `post()` retries for order endpoints are not.
+**D-3** — ✅ RESOLVED (see R-01): `KISClient.post()` **retried** 3 times on any exception, including timeout. For order submission this **created** duplicate orders. `get()` retries are safe; `post()` retries for order endpoints were not. A new order is now sent once and never re-sent; only replayable requests (cancels) retry.
 
 **D-4**: KR/US symbol detection heuristic `len(symbol) == 6 and symbol.isdigit()` appears in 4 separate locations: `KISBroker.place_order()`, `KISBroker.get_order_status()`, `KISBroker.get_price()`, and `runner.py:on_filled()`. This heuristic would misclassify a 6-digit US OTC symbol (edge case but possible).
 
@@ -145,7 +145,7 @@ Both define identical cron schedules (09:05 KST Korean, 22:35 KST US, 00:01 risk
 ### CRITICAL
 
 **R-01: POST retry creates duplicate orders** — ✅ RESOLVED
-`KISClient.post()` retries 3 times on any exception. A timeout after the broker processed the order results in a second identical order with no deduplication mechanism (no client_order_id field in KIS order body). Probability: occurs on network flaps or broker API slowness. Impact: doubled position, excess capital deployed.
+**Original finding**: `KISClient.post()` **retried** 3 times on any exception. A timeout after the broker processed the order **resulted in** a second identical order with no deduplication mechanism (no client_order_id field in KIS order body). Probability: **occurred** on network flaps or broker API slowness. Impact: doubled position, excess capital deployed.
 
 > **Resolution**: new orders are now sent exactly once and never re-sent; only
 > replayable requests (cancels, keyed to `ORGN_ODNO`) opt in to retry via
@@ -276,8 +276,9 @@ recovery = StartupRecovery(..., poller=worker._poller)
 
 ## 4. Failure-Mode Analysis
 
-### FM-01: Network timeout on order POST → duplicate order
-**Sequence**: KISClient.post() → broker receives order → network times out before response → KISClient retries (attempt 2) → second order submitted → broker now has two identical orders.
+### FM-01: Network timeout on order POST → duplicate order — ✅ RESOLVED (see R-01)
+**Sequence (as it was)**: KISClient.post() → broker receives order → network times out before response → KISClient **retried** (attempt 2) → second order submitted → broker now has two identical orders.
+**Now**: a new order is sent once. The timeout propagates, the `QT_RESERVED` row stays open, and `KISOrders.inquire_orders()` resolves what actually landed.
 **No deduplication**: KIS order body has no client-controlled idempotency field.
 **Detection**: Reconciliation at next market open discovers position 2x expected size.
 **Recovery**: Manual cancel of one order.

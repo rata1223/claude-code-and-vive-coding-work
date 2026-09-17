@@ -413,13 +413,25 @@ strategy._run_id = run_id
 
 ---
 
-## 10. HTTP Client Fix — Disable POST Retry
+## 10. HTTP Client Fix — Disable POST Retry — ✅ SHIPPED (differently)
+
+> **Implemented, but not as the `post_safe()` design below.** Rather than a second
+> method, `KISClient.post()` took a keyword-only `idempotent: bool = False`
+> parameter: a new order (the default) is sent once and never re-sent, while a
+> replayable request — the cancels, keyed to `ORGN_ODNO` — passes
+> `idempotent=True` and keeps retrying transport failures, 429 and 5xx.
+>
+> One method with a default that is safe beats two methods where the unsafe one
+> keeps the shorter name: a new call site cannot get re-sending by accident, and
+> there is no way to reach the old behaviour for an order at all.
+> **Do not add `post_safe()`** — see `kis_adapter/client.py` and
+> `api/tests/test_kis_client_order_retry.py`.
 
 ### 10.1 Root Cause (DO-01)
 
-`KISClient.post()` retries on ANY exception, including `requests.Timeout`. Order placement (buy/sell) POSTs are non-idempotent — retrying after a timeout can create a second broker order if the first was accepted before the connection dropped.
+`KISClient.post()` **retried** on ANY exception, including `requests.Timeout`. Order placement (buy/sell) POSTs are non-idempotent — retrying after a timeout **could** create a second broker order if the first was accepted before the connection dropped.
 
-### 10.2 Fix: `post_safe()`
+### 10.2 Original proposal: `post_safe()` (superseded — see note above)
 
 Add a non-retrying variant to `KISClient`:
 
@@ -698,8 +710,8 @@ Background (30s delay): PositionReconciler.reconcile("post_recovery")
 |---|---|
 | `backend/execution/idempotency.py` | **NEW FILE** — `ExecutionFingerprint`, `IdempotencyStore`, `DuplicateDetector`, `DistributedLock`, `RecoveryLogic`, `BrokerVerification`, `IdempotencyBrokerAdapter` |
 | `backend/database/models.py` | Add `execution_fingerprints` table; add `last_session_key` to `strategy_runs`; make `idempotency_key` NOT NULL with fallback default; add UNIQUE on `orders.broker_order_id` |
-| `kis_adapter/client.py` | Add `post_safe()` (single-attempt, no retry) |
-| `kis_adapter/orders.py` | `buy_kr/sell_kr/buy_us/sell_us` call `post_safe()` |
+| `kis_adapter/client.py` | ✅ SHIPPED, as `post(..., idempotent=False)` (the default) rather than a separate `post_safe()` — see §10 |
+| `kis_adapter/orders.py` | ✅ SHIPPED — `buy_kr/sell_kr/buy_us/sell_us` keep the safe default; `cancel_kr/cancel_us` pass `idempotent=True` |
 | `backend/strategy/base.py` | Add `_run_id: int = 0` to `__init__` |
 | `backend/worker/runner.py` | Set `strategy._run_id = run_id`; wrap broker in `IdempotencyBrokerAdapter`; DB session-key check in `_handle_market_open()` |
 | `backend/worker/recovery.py` | Call `RecoveryLogic.run_startup_scan()` in Phase 6 |
@@ -712,7 +724,7 @@ Background (30s delay): PositionReconciler.reconcile("post_recovery")
 
 | Finding | Severity | This Design Addresses It Via |
 |---|---|---|
-| DO-01 HTTP retry creates ghost orders | CRITICAL | `post_safe()` — no retry on POST; `IdempotencyBrokerAdapter` handles retry at application level |
+| DO-01 HTTP retry creates ghost orders | CRITICAL | ✅ SHIPPED as `post(..., idempotent=False)` — a new order is sent once; the `QT_RESERVED` reservation carries the indeterminate outcome and `inquire_orders()` resolves it |
 | DO-02 Post-restart market_open replay | CRITICAL | DB `last_session_key` on `strategy_runs` — authoritative cross-restart dedup |
 | DO-03 Nullable idempotency_key | HIGH | `execution_fingerprints` PRIMARY KEY is always non-null (fingerprint is always computable) |
 | DO-04 SELECT-then-INSERT TOCTOU | HIGH | `execution_fingerprints` PK → INSERT race → IntegrityError → wait-and-poll |

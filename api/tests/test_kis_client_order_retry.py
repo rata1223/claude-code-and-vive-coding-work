@@ -128,6 +128,27 @@ def test_post_does_not_resend_on_a_server_error(monkeypatch):
     assert len(calls) == 1
 
 
+def test_post_does_not_resend_on_a_429(monkeypatch):
+    """A 429 is the one status where re-sending would arguably be safe — the
+    gateway refused the request, so it cannot have reached the order book. It
+    is still sent once.
+
+    The invariant is worth more than the recovered attempt: "a new order is
+    sent once" holds without exceptions a later reader can widen, and a dropped
+    order is recorded and recoverable where a duplicate is not. `_RETRYABLE_STATUS`
+    lists 429 for the sake of `get` and of cancels; this pins that a refactor
+    touching that set cannot quietly hand it to new orders.
+    """
+    calls = _posts_recording(monkeypatch, lambda _n: _Resp({}, status_code=429))
+    c = _client(monkeypatch)
+
+    with pytest.raises(requests.HTTPError):
+        c.post("/uapi/order", "TR", ORDER_BODY)
+
+    assert len(calls) == 1, (
+        f"a new order must not be re-sent on a throttle (got {len(calls)} sends)")
+
+
 def test_post_does_not_resend_on_a_connection_error(monkeypatch):
     """Even a refused connection — where the order almost certainly never
     landed — is sent once. "Almost certainly" is not a basis for re-sending an
@@ -269,6 +290,21 @@ def test_a_cancel_is_retried_on_a_server_error(monkeypatch):
         monkeypatch,
         lambda n: _Resp({}, status_code=503) if n == 1
         else _Resp({"rt_cd": "0"}))
+    c = _client(monkeypatch)
+
+    c.post("/uapi/cancel", "TR", ORDER_BODY, idempotent=True)
+
+    assert len(calls) == 2
+
+
+def test_a_cancel_is_retried_on_a_429(monkeypatch):
+    """The other side of ``test_post_does_not_resend_on_a_429``: the same
+    status, the opposite outcome, because the request is replayable. The two
+    sit next to each other so the boundary reads as a pair rather than as two
+    unrelated rules."""
+    calls = _posts_recording(
+        monkeypatch,
+        lambda n: _Resp({}, status_code=429) if n == 1 else _Resp({"rt_cd": "0"}))
     c = _client(monkeypatch)
 
     c.post("/uapi/cancel", "TR", ORDER_BODY, idempotent=True)

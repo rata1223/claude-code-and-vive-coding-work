@@ -74,8 +74,9 @@ Cross-references `AUDIT.md`:
 - **D-2** — `KISBroker.place_order()` catches all exceptions and returns
   `Order(status=REJECTED)`; a network timeout (order may have landed at the broker) is
   indistinguishable from a true rejection.
-- **D-3** — `KISClient.post()` retries 3× on any exception, including order POSTs → potential
-  duplicate live orders.
+- **D-3** — ✅ RESOLVED. `KISClient.post()` **retried** 3× on any exception, including order
+  POSTs → potential duplicate live orders. A new order is now sent once and never re-sent;
+  only replayable requests (cancels, keyed to `ORGN_ODNO`) retry via `post(..., idempotent=True)`.
 
 Idempotency (`backend/execution/idempotency.py`) mitigates this **only when Redis is up**;
 under Redis unavailability it degrades to single-worker / fail-open.

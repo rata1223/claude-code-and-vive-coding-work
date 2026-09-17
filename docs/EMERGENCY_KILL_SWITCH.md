@@ -53,7 +53,8 @@ KISBroker.place_order()                                           brokers/kis.py
     ▼
 KISOrders.buy_kr / sell_kr / buy_us / sell_us                      kis_adapter/orders.py
     ▼
-KISClient.post()  (rate-limited: 5/s paper, 15/s real; 3 retries)  kis_adapter/client.py:56-75
+KISClient.post()  (rate-limited: 5/s paper, 15/s real; sent ONCE,  kis_adapter/client.py
+                   never re-sent — cancels retry, new orders do not)
     ▼
 KIS REST API
 ```
