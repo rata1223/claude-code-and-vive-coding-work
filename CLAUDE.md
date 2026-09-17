@@ -59,7 +59,7 @@
 | 파일 | 내용 |
 |---|---|
 | `kis_adapter/auth.py` | KIS 토큰 발급·갱신(24h), Redis 캐시, Hashkey 발급 |
-| `kis_adapter/client.py` | Rate limit(모의 5/s, 실전 15/s), 재시도 3회 |
+| `kis_adapter/client.py` | Rate limit(앱키 단위, 모의 5/s·실전 15/s). **GET만 재시도 3회**(전송 실패·429·5xx·`EGW00201`) — **주문 POST는 1회 전송, 절대 재전송 안 함**(중복 주문 방지, 불확정은 `QT_RESERVED`로 복구) |
 | `kis_adapter/orders.py` | 미국/한국 매수·매도·취소 (TR_ID 모의/실전 자동 전환) |
 | `kis_adapter/market_data.py` | 미국/한국 현재가 조회 |
 | `kis_adapter/portfolio.py` | 미국/한국 잔고·포지션 조회 |

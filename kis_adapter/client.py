@@ -175,16 +175,33 @@ class KISClient:
                 raise RuntimeError(f"KIS API error: {msg}")
             return data
 
-    def post(self, path: str, tr_id: str, body: dict) -> dict:
-        # rt_cd rejections break out immediately — never retry a confirmed API
-        # decision. Everything else is retried: transport failures *and* any
-        # HTTP error status, which is not the same discipline ``get`` now
-        # applies. Left alone deliberately — this is the order-submission path,
-        # and narrowing it is a change to how orders are sent, not a cleanup.
+    def post(self, path: str, tr_id: str, body: dict, *, idempotent: bool = False) -> dict:
+        # **A new order is sent once and never re-sent.** A failure here does
+        # not mean the order failed — a lost response can mean KIS booked it and
+        # only the answer went missing. Re-sending then doubles a real position.
         #
-        # Worth knowing while it stands: a 5xx here re-sends the order up to
-        # three times. If KIS accepted an order and only the response was lost,
-        # that is a duplicate order. Pre-existing; tracked separately.
+        # ``get`` retries a 503 because a read can be repeated. A *new order*
+        # cannot. A *cancel* can: it is keyed to an existing ``ORGN_ODNO``, so
+        # sending it twice cancels the same order twice — the second attempt is
+        # answered with an ``rt_cd`` error, never a second effect. Callers that
+        # know their request is replayable pass ``idempotent=True``; the default
+        # is the unsafe-to-replay case, so a new call site cannot opt into
+        # re-sending by accident.
+        #
+        # Giving up after one attempt is safe for a new order because the layer
+        # above already models "submitted, outcome unknown": ``reserve_and_submit``
+        # (api/services/quick_trade_service.py) commits a ``QT_RESERVED`` row
+        # *before* calling the broker and, on any non-``RuntimeError``, leaves
+        # it RESERVED — "the broker may or may not have received the order...
+        # Never blindly retry the broker here." ``KISOrders.inquire_orders()``
+        # then resolves what actually landed. Retrying here overrode all of it.
+        #
+        # A cancel has no such reservation: ``Reconciler._mark_order_lost`` and
+        # ``OrderFillPoller._handle_timeout_locked`` both record the order as
+        # canceled whether or not the cancel actually succeeded, so dropping a
+        # cancel on one transient blip would leave a live resting order recorded
+        # as dead. Keeping the retry is what stops this change from making that
+        # (pre-existing, backend/execution) gap easier to hit.
         hashkey = self.auth.get_hashkey(body)
         headers = self.auth.get_headers(tr_id)
         headers["hashkey"] = hashkey
@@ -193,35 +210,63 @@ class KISClient:
         _CLOSED_CODES = {"-90", "-91", "-100"}
         _CLOSED_TEXTS = ("거래가능시간", "시간외거래", "매매시간이 아님")
 
-        for attempt in range(self.MAX_RETRIES):
+        attempts = self.MAX_RETRIES if idempotent else 1
+        for attempt in range(attempts):
+            last = attempt == attempts - 1
             self._limiter.wait()
             try:
                 resp = requests.post(url, headers=headers, json=body, timeout=_http_timeout())
-                resp.raise_for_status()
-                data = resp.json()
             except Exception as e:
-                logger.warning("POST %s attempt %d failed: %s", path, attempt + 1, e)
-                if attempt == self.MAX_RETRIES - 1:
+                if last:
+                    logger.warning("POST %s failed, not re-sent (outcome unknown): %s", path, e)
                     raise
+                logger.warning("POST %s attempt %d failed: %s", path, attempt + 1, e)
                 time.sleep(1)
                 continue
 
-            if data.get("rt_cd") != "0":
-                code = data.get("rt_cd", "")
-                msg = data.get("msg1", "")
-                if code in _CLOSED_CODES or any(t in msg for t in _CLOSED_TEXTS):
-                    try:
-                        from backend.data.calendar import (
-                            MarketClosedError, Market, SessionType, BlockReason,
-                        )
-                        raise MarketClosedError(
-                            market=Market.KRX,
-                            session=SessionType.CLOSED,
-                            reason=BlockReason.WRONG_SESSION,
-                            detail=f"KIS rt_cd={code}: {msg}",
-                        )
-                    except ImportError:
-                        raise RuntimeError(f"KIS 시장 미개장 ({code}): {msg}")
-                raise RuntimeError(f"KIS API error: {msg}")
+            if resp.status_code >= 400:
+                if not (resp.status_code in _RETRYABLE_STATUS and not last):
+                    resp.raise_for_status()
+                logger.warning("POST %s attempt %d failed: HTTP %d",
+                               path, attempt + 1, resp.status_code)
+                time.sleep(1)
+                continue
 
-            return data
+            try:
+                data = resp.json()
+            except ValueError as e:
+                if last:
+                    logger.warning("POST %s returned a non-JSON body, not re-sent: %s", path, e)
+                    raise
+                logger.warning("POST %s attempt %d returned a non-JSON body: %s",
+                               path, attempt + 1, e)
+                time.sleep(1)
+                continue
+            break
+
+        # An ``rt_cd`` rejection is the broker's answer and is never re-sent,
+        # whichever branch it takes below. Note the two are not equally final to
+        # the caller: ``MarketClosedError`` is deliberately **not** a
+        # ``RuntimeError`` (backend/data/calendar.py — so the circuit breaker
+        # does not count a closed market as a broker failure), which means
+        # ``reserve_and_submit`` sees it as indeterminate and leaves the row
+        # RESERVED rather than REJECTED. Pre-existing, and unchanged here.
+        if data.get("rt_cd") != "0":
+            code = data.get("rt_cd", "")
+            msg = data.get("msg1", "")
+            if code in _CLOSED_CODES or any(t in msg for t in _CLOSED_TEXTS):
+                try:
+                    from backend.data.calendar import (
+                        MarketClosedError, Market, SessionType, BlockReason,
+                    )
+                    raise MarketClosedError(
+                        market=Market.KRX,
+                        session=SessionType.CLOSED,
+                        reason=BlockReason.WRONG_SESSION,
+                        detail=f"KIS rt_cd={code}: {msg}",
+                    )
+                except ImportError:
+                    raise RuntimeError(f"KIS 시장 미개장 ({code}): {msg}")
+            raise RuntimeError(f"KIS API error: {msg}")
+
+        return data

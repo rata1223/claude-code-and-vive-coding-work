@@ -144,8 +144,17 @@ Both define identical cron schedules (09:05 KST Korean, 22:35 KST US, 00:01 risk
 
 ### CRITICAL
 
-**R-01: POST retry creates duplicate orders**
+**R-01: POST retry creates duplicate orders** — ✅ RESOLVED
 `KISClient.post()` retries 3 times on any exception. A timeout after the broker processed the order results in a second identical order with no deduplication mechanism (no client_order_id field in KIS order body). Probability: occurs on network flaps or broker API slowness. Impact: doubled position, excess capital deployed.
+
+> **Resolution**: new orders are now sent exactly once and never re-sent; only
+> replayable requests (cancels, keyed to `ORGN_ODNO`) opt in to retry via
+> `post(..., idempotent=True)`. Note this **diverges from ROADMAP P0-01's
+> prescription** of `except (requests.ConnectionError, requests.Timeout)`: a
+> `Timeout` is precisely the case where the order may already be live, so it is
+> the one thing that must *not* be retried. An indeterminate send is instead
+> left recoverable by the existing `QT_RESERVED` reservation and resolved by
+> `KISOrders.inquire_orders()`.
 
 **R-02: Pre-submission fence not enforced**
 `StrategyBase.buy()` calls `broker.place_order()` without first writing a PENDING record to the DB. Per PHILOSOPHY.md §3.1, the intent ledger must precede submission. A crash between `place_order()` succeeding at the broker and any DB write creates an untracked position discoverable only via reconciliation — which only runs on restart and at market open.
@@ -393,7 +402,7 @@ The check passes if any `StrategyRun` was created more than 28 days ago, regardl
 
 | ID | Severity | Category | Description |
 |---|---|---|---|
-| D-3 / R-01 | CRITICAL | Execution | POST retry creates duplicate orders |
+| D-3 / R-01 | ~~CRITICAL~~ ✅ RESOLVED | Execution | POST retry creates duplicate orders |
 | R-02 | CRITICAL | Execution | No pre-submission DB write (PHILOSOPHY §3.1 violated) |
 | D-13 | CRITICAL | Schema | Position table has no unique constraint → duplicate rows |
 | R-03 | HIGH | Risk | EmergencyFlattenManager is dry_run=True in production |

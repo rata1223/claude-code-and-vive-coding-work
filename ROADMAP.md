@@ -20,7 +20,18 @@ Any single incomplete P0 item is sufficient to block the paper→real transition
 
 ---
 
-#### P0-01 — Fix `KISClient.post()` retry logic on order endpoints
+#### P0-01 — Fix `KISClient.post()` retry logic on order endpoints — ✅ DONE
+
+> **Implemented differently from the prescription below, deliberately.** The
+> plan said `except (requests.ConnectionError, requests.Timeout)` — i.e. keep
+> retrying those. But a `Timeout` is exactly the case where KIS may already have
+> booked the order and only the answer was lost, so retrying it is the duplicate
+> this item exists to prevent. What shipped: a **new order is sent once and
+> never re-sent**; an indeterminate outcome stays recoverable through the
+> existing `QT_RESERVED` reservation (`reserve_and_submit`) and is resolved by
+> `KISOrders.inquire_orders()`. Only replayable requests — the cancels, keyed to
+> `ORGN_ODNO` — retry, via `post(..., idempotent=True)`.
+
 
 | Field | Value |
 |---|---|

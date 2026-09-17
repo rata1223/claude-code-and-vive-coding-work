@@ -173,7 +173,10 @@ class KISOrders:
             "QTY_ALL_ORD_YN": "Y",
         }
         logger.info("CANCEL_KR %s order=%s qty=%s", symbol, org_order_no, qty)
-        return self._client.post(CANCEL_KR_PATH, self._tr("cancel_kr"), body)
+        # Replayable: keyed to ORGN_ODNO, so a re-send cancels the same order
+        # again rather than having a second effect. See KISClient.post.
+        return self._client.post(CANCEL_KR_PATH, self._tr("cancel_kr"), body,
+                                 idempotent=True)
 
     def cancel_us(self, org_order_no: str, symbol: str, excd: str, qty: int, price: float) -> dict:
         body = {
@@ -188,4 +191,6 @@ class KISOrders:
             "ORD_SVR_DVSN_CD": "0",
         }
         logger.info("CANCEL_US %s order=%s", symbol, org_order_no)
-        return self._client.post(CANCEL_PATH, self._tr("cancel_us"), body)
+        # Replayable — see cancel_kr.
+        return self._client.post(CANCEL_PATH, self._tr("cancel_us"), body,
+                                 idempotent=True)

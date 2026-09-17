@@ -887,8 +887,13 @@ written in this task.**
 - **Mock**: patch `requests.get`/`requests.post` (or the `requests.Session` used by
   `KISClient`/`KISAuth`) to raise `requests.exceptions.Timeout` on the Nth call.
 - **Assert**:
-  - `KISClient.get()`/`post()` retry exactly `MAX_RETRIES=3` times with the documented 1s
-    backoff when the **data/order** call times out.
+  - `KISClient.get()` retries exactly `MAX_RETRIES=3` times with the documented 1s backoff
+    when the **data** call times out.
+  - `KISClient.post()` for a **new order** sends exactly **once** and re-raises — a timeout
+    may mean KIS booked the order, so re-sending would duplicate it. The order row stays
+    `QT_RESERVED` and is resolved by `KISOrders.inquire_orders()`. A **cancel**
+    (`idempotent=True`, keyed to `ORGN_ODNO`) still retries `MAX_RETRIES=3`.
+    Covered by `api/tests/test_kis_client_order_retry.py`.
   - When `KISAuth.get_hashkey()` or `KISAuth._issue_token()` (via `get_headers()`) times out
     — patch `requests.post` to raise only for URLs containing `/uapi/hashkey` or
     `/oauth2/tokenP` — assert that `KISClient.post()` raises **immediately, with zero
