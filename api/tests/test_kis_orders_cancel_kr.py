@@ -36,8 +36,9 @@ class _FakeClient:
         self.posts = []
         self._response = response if response is not None else {"rt_cd": "0"}
 
-    def post(self, path, tr_id, body):
-        self.posts.append({"path": path, "tr_id": tr_id, "body": body})
+    def post(self, path, tr_id, body, *, idempotent=False):
+        self.posts.append({"path": path, "tr_id": tr_id, "body": body,
+                           "idempotent": idempotent})
         return self._response
 
 
@@ -107,13 +108,25 @@ def test_cancel_kr_does_not_swallow_transport_errors():
     """A raised transport error must reach the caller. Returning False here is
     what makes the broker version unable to distinguish failure modes."""
     class _Boom(_FakeClient):
-        def post(self, path, tr_id, body):
+        def post(self, path, tr_id, body, *, idempotent=False):
             raise RuntimeError("connection reset")
 
     orders = KISOrders(client=_Boom())
 
     with pytest.raises(RuntimeError):
         orders.cancel_kr("ODNO-1", "069500", 7, 9000.0)
+
+
+def test_cancel_kr_is_marked_replayable():
+    """A cancel is keyed to ORGN_ODNO, so it is safe to re-send — and it must
+    be, because the callers above it (``Reconciler._mark_order_lost``,
+    ``OrderFillPoller._handle_timeout_locked``) record the order as canceled
+    whether or not the cancel actually landed. See ``KISClient.post``."""
+    orders = _orders()
+
+    orders.cancel_kr("ODNO-1", "069500", 7, 9000.0)
+
+    assert orders._client.posts[0]["idempotent"] is True
 
 
 def test_cancel_kr_reads_no_process_environment(monkeypatch):

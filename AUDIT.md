@@ -52,7 +52,7 @@ Defects found:
 
 **D-2**: `KISBroker.place_order()` catches all exceptions and returns `Order(status=REJECTED)`. A network timeout (order may have landed at broker) is indistinguishable from a true rejection. The caller has no way to distinguish between "broker rejected" and "we don't know."
 
-**D-3**: `KISClient.post()` retries 3 times on any exception, including timeout. For order submission this creates duplicate orders. `get()` retries are safe; `post()` retries for order endpoints are not.
+**D-3** — ✅ RESOLVED (see R-01): `KISClient.post()` **retried** 3 times on any exception, including timeout. For order submission this **created** duplicate orders. `get()` retries are safe; `post()` retries for order endpoints were not. A new order is now sent once and never re-sent; only replayable requests (cancels) retry.
 
 **D-4**: KR/US symbol detection heuristic `len(symbol) == 6 and symbol.isdigit()` appears in 4 separate locations: `KISBroker.place_order()`, `KISBroker.get_order_status()`, `KISBroker.get_price()`, and `runner.py:on_filled()`. This heuristic would misclassify a 6-digit US OTC symbol (edge case but possible).
 
@@ -144,8 +144,17 @@ Both define identical cron schedules (09:05 KST Korean, 22:35 KST US, 00:01 risk
 
 ### CRITICAL
 
-**R-01: POST retry creates duplicate orders**
-`KISClient.post()` retries 3 times on any exception. A timeout after the broker processed the order results in a second identical order with no deduplication mechanism (no client_order_id field in KIS order body). Probability: occurs on network flaps or broker API slowness. Impact: doubled position, excess capital deployed.
+**R-01: POST retry creates duplicate orders** — ✅ RESOLVED
+**Original finding**: `KISClient.post()` **retried** 3 times on any exception. A timeout after the broker processed the order **resulted in** a second identical order with no deduplication mechanism (no client_order_id field in KIS order body). Probability: **occurred** on network flaps or broker API slowness. Impact: doubled position, excess capital deployed.
+
+> **Resolution**: new orders are now sent exactly once and never re-sent; only
+> replayable requests (cancels, keyed to `ORGN_ODNO`) opt in to retry via
+> `post(..., idempotent=True)`. Note this **diverges from ROADMAP P0-01's
+> prescription** of `except (requests.ConnectionError, requests.Timeout)`: a
+> `Timeout` is precisely the case where the order may already be live, so it is
+> the one thing that must *not* be retried. An indeterminate send is instead
+> left recoverable by the existing `QT_RESERVED` reservation and resolved by
+> `KISOrders.inquire_orders()`.
 
 **R-02: Pre-submission fence not enforced**
 `StrategyBase.buy()` calls `broker.place_order()` without first writing a PENDING record to the DB. Per PHILOSOPHY.md §3.1, the intent ledger must precede submission. A crash between `place_order()` succeeding at the broker and any DB write creates an untracked position discoverable only via reconciliation — which only runs on restart and at market open.
@@ -267,8 +276,9 @@ recovery = StartupRecovery(..., poller=worker._poller)
 
 ## 4. Failure-Mode Analysis
 
-### FM-01: Network timeout on order POST → duplicate order
-**Sequence**: KISClient.post() → broker receives order → network times out before response → KISClient retries (attempt 2) → second order submitted → broker now has two identical orders.
+### FM-01: Network timeout on order POST → duplicate order — ✅ RESOLVED (see R-01)
+**Sequence (as it was)**: KISClient.post() → broker receives order → network times out before response → KISClient **retried** (attempt 2) → second order submitted → broker now has two identical orders.
+**Now**: a new order is sent once. The timeout propagates, the `QT_RESERVED` row stays open, and `KISOrders.inquire_orders()` resolves what actually landed.
 **No deduplication**: KIS order body has no client-controlled idempotency field.
 **Detection**: Reconciliation at next market open discovers position 2x expected size.
 **Recovery**: Manual cancel of one order.
@@ -393,7 +403,7 @@ The check passes if any `StrategyRun` was created more than 28 days ago, regardl
 
 | ID | Severity | Category | Description |
 |---|---|---|---|
-| D-3 / R-01 | CRITICAL | Execution | POST retry creates duplicate orders |
+| D-3 / R-01 | ~~CRITICAL~~ ✅ RESOLVED | Execution | POST retry creates duplicate orders |
 | R-02 | CRITICAL | Execution | No pre-submission DB write (PHILOSOPHY §3.1 violated) |
 | D-13 | CRITICAL | Schema | Position table has no unique constraint → duplicate rows |
 | R-03 | HIGH | Risk | EmergencyFlattenManager is dry_run=True in production |

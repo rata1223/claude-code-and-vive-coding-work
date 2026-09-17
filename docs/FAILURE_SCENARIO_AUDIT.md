@@ -127,8 +127,8 @@ live pipeline (e.g., `bot/notifier.py`'s `alert_emergency`/`alert_daily_summary`
 │             │                    → backend/brokers/kis.py KISBroker.place_order()    │
 │             │                         → kis_adapter/client.py KISClient.post()       │
 │             │                              (auth.get_hashkey + auth.get_headers       │
-│             │                               BEFORE the 3x retry loop; 3x retry,       │
-│             │                               1s backoff, 10s timeout, inside loop)     │
+│             │                               BEFORE the send; a new order is sent      │
+│             │                               ONCE, 10s timeout, never re-sent)         │
 │             │                    → self._poller.register(order, on_filled=...)       │
 │             ├─ on redis.ConnectionError → _enter_db_polling_mode()                    │
 │             │     (30s loop: self._redis.ping() to detect recovery; else poll        │
@@ -339,18 +339,20 @@ genuinely down and needs investigation" with "Redis blipped for 10 seconds."
 
 | Detection | Handling (file:line) | Blast Radius | Silent Propagation? | Recovery Status | Test Coverage | Cross-Refs |
 |---|---|---|---|---|---|---|
-| `requests` `timeout=10` on every HTTP call (`client.py:44,68`, `auth.py:72,87,97`) | `client.py:41-54` (GET, 3x retry/1s), `client.py:56-96` (POST, 3x retry/1s) | GET: bounded ~33s worst case, no side effect. POST: retry of a non-idempotent call → possible duplicate order (**DO-01**). Token/hashkey refresh: **no retry at all** | FX fallback (**SD-04**) is silent (log warning only); token-refresh timeout (**FS-07**) is silent until the *next* strategy cycle | GET/POST body retries: automatic. FX fallback: automatic but possibly stale/wrong. Token/hashkey refresh: **not retried within the call** | None — no test for `client.py` retry/timeout or `_get_fx` fallback | DO-01 (**CONFIRMED PRESENT**), SD-04 (**CONFIRMED PRESENT**), **FS-07 (NEW)** |
+| `requests` `timeout=10` on every HTTP call (`client.py:44,68`, `auth.py:72,87,97`) | `client.py` GET: 3x retry/1s. POST: single send for a new order, 3x only when `idempotent=True` (cancels) | GET: bounded ~33s worst case, no side effect. POST: ✅ a new order is no longer retried, so the duplicate-order path (**DO-01**) is closed. Token/hashkey refresh: **no retry at all** | FX fallback (**SD-04**) is silent (log warning only); token-refresh timeout (**FS-07**) is silent until the *next* strategy cycle | GET/POST body retries: automatic. FX fallback: automatic but possibly stale/wrong. Token/hashkey refresh: **not retried within the call** | `api/tests/test_kis_client_order_retry.py` covers the order/cancel POST split; no test for `_get_fx` fallback | ~~DO-01~~ ✅ RESOLVED, SD-04 (**CONFIRMED PRESENT**), **FS-07 (NEW)** |
 
 Three distinct network-timeout surfaces:
 
-1. **GET/POST body retries (existing, cross-ref DO-01).** `KISClient.get()`/`post()`
-   (`client.py:37-96`) retry the HTTP request itself up to 3x with a 1s sleep and 10s
-   per-attempt timeout. For GET this is safe (idempotent). For POST
-   (`client.py:56-96`), a network timeout *after* the broker has already accepted and
-   processed the order, but *before* the response reaches the client, causes a retry that
-   submits a **second** order — the original `IDEMPOTENT_EXECUTION.md` DO-01 "ghost order"
-   finding. This audit confirms the retry loop in current `client.py` is unchanged and DO-01
-   remains present.
+1. **GET/POST body retries (cross-ref DO-01 — ✅ now RESOLVED).** `KISClient.get()`
+   retries the HTTP request itself up to 3x with a 1s sleep and 10s per-attempt timeout;
+   for GET this is safe (idempotent). For POST it **used to** do the same, so a network
+   timeout *after* the broker had already accepted and processed the order, but *before*
+   the response reached the client, caused a retry that submitted a **second** order — the
+   original `IDEMPOTENT_EXECUTION.md` DO-01 "ghost order" finding.
+   **That is fixed**: a new order is now sent once and never re-sent. The timeout
+   propagates, the `QT_RESERVED` reservation stays open, and `KISOrders.inquire_orders()`
+   resolves what actually landed. Only replayable requests — the cancels, keyed to
+   `ORGN_ODNO` — still retry, via `post(..., idempotent=True)`.
 2. **`_get_fx()` fallback chain — SD-04, confirmed present, not re-derived here.**
    `backend/brokers/kis.py:300-317` fetches USD/KRW via `yfinance` with a 1-hour TTL cache;
    if the live fetch fails (including on network timeout) it falls back to the cached value,
@@ -597,15 +599,21 @@ results in live trading being halted until manual operator intervention, with an
 points at the wrong subsystem.
 
 ### Chain 2 — DO-01/FS-05: Network timeout → ghost order → in-memory double-apply
+> ✅ **This chain is BROKEN AT STEP 2 as of the DO-01 fix** — a new order is sent once, so
+> there is no second order to double-apply. Retained because FS-05 (no fill-id-level
+> idempotency in `PositionTracker.on_fill()`) is still reachable by other means.
 
 ```
 1. POST /uapi/.../order succeeds at the broker; response is lost to a network
    timeout before reaching the client (10s timeout).
      kis_adapter/client.py:68 (resp = requests.post(..., timeout=10))       [infra]
 
-2. KISClient.post()'s retry loop (3x, 1s backoff) resubmits the SAME order body —
-   broker accepts it as a NEW order (no idempotency token sent — DO-05).
-     kis_adapter/client.py:65-96                                            [DO-01, DO-05]
+2. ✅ **NO LONGER HAPPENS.** KISClient.post()'s retry loop **used to** resubmit the
+   SAME order body (3x, 1s backoff) and the broker accepted it as a NEW order (no
+   idempotency token sent — DO-05). A new order is now sent once and never re-sent,
+   so the sequence stops here: the timeout propagates, the `QT_RESERVED` row stays
+   open, and `KISOrders.inquire_orders()` resolves what actually landed.
+     kis_adapter/client.py                                                  [DO-01 resolved, DO-05 open]
 
 3. Both orders eventually fill. OrderFillPoller registers both broker_order_ids
    (different IDs from the broker's perspective) under self._entries, each with its
@@ -782,8 +790,8 @@ the gaps `TASK 4-1B`'s failure-injection harness (§8) should target first.
 | **FS-04** | Server restart | **CRITICAL** | NEW | `database/models.py:145-149` | `Base.metadata.create_all()` is a no-op for existing tables; an ORM model change that adds a column surfaces as a runtime `ProgrammingError` on first access post-restart, not at the DB-health check. Matches `ROADMAP.md` P0-14 / `AUDIT.md DB-01` |
 | **FS-05** | Duplicate event, Polling failure | MEDIUM-HIGH | NEW | `position_tracker.py:80-116`; `runner.py:429-511` | `PositionTracker.on_fill()` has no fill-id-level idempotency; a duplicate `on_filled` invocation (via EX-02/EX-10/EX-11 mechanisms) double-applies to in-memory position state before DB-level dedup runs, and the divergence is not corrected until the next reconciliation (up to 30 min) |
 | **FS-06** | Process kill, Redis down (cross-cutting) | LOW | NEW | `gunicorn_conf.py:15,24-34`; `heartbeat.py:86-177` | `GUNICORN_WORKERS` default `"2"` → 2 independent `WorkerWatchdog` instances, each polling the same heartbeat key every 60s and racing to write `kill_switch`/send alerts. Idempotent (`if not row.kill_switch`) but doubles DB writes and can send duplicate Telegram/WS alerts |
-| **FS-07** | Network timeout | MEDIUM-HIGH | NEW | `client.py:38,56-58,65`; `auth.py:65-75,90-99` | `get_hashkey()`/`get_headers()`→`_issue_token()` are computed before `KISClient`'s 3x retry loop and have no retry of their own; a single network timeout on KIS's auth/hashkey endpoints fails the entire `get()`/`post()` call with zero retries, unlike the data/order endpoint itself |
-| DO-01 | Network timeout, Broker API failure | CRITICAL | **CONFIRMED PRESENT** | `kis_adapter/client.py:56-96` | POST retry (3x) on a non-idempotent order-placement call can submit duplicate orders ("ghost orders") if the first response is lost to a timeout |
+| **FS-07** | Network timeout | MEDIUM-HIGH | NEW | `client.py`; `auth.py:65-75,90-99` | `get_hashkey()`/`get_headers()`→`_issue_token()` are computed before `KISClient`'s retry loop and have no retry of their own; a single network timeout on KIS's auth/hashkey endpoints fails the entire `get()`/`post()` call with zero retries, unlike the data endpoint itself. (Still open. Note `get()` retries 3x but an order `post()` is now single-send by design, so for a new order the asymmetry no longer applies.) |
+| DO-01 | Network timeout, Broker API failure | CRITICAL | ✅ **RESOLVED** | `kis_adapter/client.py` | POST retry (3x) on a non-idempotent order-placement call **could** submit duplicate orders ("ghost orders") if the first response was lost to a timeout. A new order is now sent once and never re-sent; the indeterminate outcome is carried by the `QT_RESERVED` reservation and resolved by `KISOrders.inquire_orders()`. Only replayable requests (cancels) retry. |
 | DO-05 | Broker API failure, Network timeout | HIGH | **CONFIRMED PRESENT** | `backend/brokers/kis.py:106-150` | `place_order()` sends no broker-side idempotency token; only app-level fingerprinting guards against duplicate submission |
 | EX-02 | Polling failure, Process kill | CRITICAL | **CONFIRMED PRESENT** (extended to PARTIAL_FILLED) | `order_poller.py:130-149,151-165,170-178` | Entry popped / `last_reported_qty` advanced BEFORE `on_filled`/`on_timeout` callback; an exception in the callback permanently loses that fill/timeout |
 | EX-04 | Duplicate event, Reconciliation failure | HIGH | **CONFIRMED PRESENT** | `database/models.py:48-55`; `reconciler.py:392-393` | No UNIQUE constraint on `Fill` table; dedup is app-level query only |
@@ -798,8 +806,8 @@ the gaps `TASK 4-1B`'s failure-injection harness (§8) should target first.
 | SD-05 | Stale data, Redis down | MEDIUM | **CONFIRMED PRESENT** | `heartbeat.py` (whole file) | Heartbeat is a process-liveness signal only; a worker that is alive but trading on stale data produces zero alerts |
 | SD-09 | Stale data | MEDIUM | **CONFIRMED PRESENT** | `indicator/strategy.py:103-118` | `.days`-truncated staleness gate + bare `except: pass` can silently disable the staleness check entirely |
 
-Summary of this table: **8 cross-referenced existing IDs confirmed present**
-(DO-01, DO-05, EX-02, EX-04, EX-10, EX-11, CA-03, CA-04), **3 stale-data IDs confirmed
+Summary of this table (as audited): **8 cross-referenced existing IDs confirmed present**
+(DO-01 — ✅ since RESOLVED, DO-05, EX-02, EX-04, EX-10, EX-11, CA-03, CA-04), **3 stale-data IDs confirmed
 present** (SD-04, SD-05, SD-09 — full detail remains in `STALE_DATA_AUDIT.md`'s own
 SD-01..SD-13 scope), **3 RESOLVED** since their source audits (F1, F5, EX-06), and
 **7 new `FS-01`..`FS-07`** findings raised by this audit.
@@ -823,7 +831,7 @@ SD-01..SD-13 scope), **3 RESOLVED** since their source audits (F1, F5, EX-06), a
 | `backend/execution/order_poller.py` | `OrderFillPoller` — 5s-tick polling, fill/timeout callbacks | Polling failure, Process kill, Duplicate event | Dict keyed by `order.id` with overwrite semantics (63, 91, supports EX-06 fix); per-callback try/except (142, 163-164, 176-178) | Pop-before-callback for FILLED/PARTIAL_FILLED/timeout (EX-02); no thread-crash supervisor (EX-10); no `is_registered()` (EX-11) |
 | `backend/execution/reconciler.py` | `PositionReconciler` — periodic + on-demand position/order reconciliation | Reconciliation failure, Process kill, Stale data | Non-blocking lock (112-122); per-order try/except continue (323-332); broker-scoped (317); `lost_order` aging check (334-340) | CA-03 unconditional overwrite masks root cause; lock-skip is silent (no alert); EX-11 TOCTOU |
 | `backend/brokers/kis.py` | `KISBroker` — `BrokerAdapter` implementation, FX cache | Broker API failure, Network timeout, Stale data | `ConsecutiveFailureBreaker(threshold=5, cooldown=10min)` (48); `MarketClosedError` excluded from breaker (138-144); FX 1h-TTL cache + >30min stale warning (300-317, SD-04) | FS-02 (breaker reset on restart); SD-04 hardcoded `1350.0` fallback |
-| `kis_adapter/client.py` | `KISClient` — HTTP GET/POST, rate limiting, retry | Network timeout, Broker API failure | 3x retry/1s backoff/10s timeout on GET and POST body (37-96); `MarketClosedError` special-cased (81-93); `RateLimiter` (11-22) | DO-01 (POST retry → ghost orders); FS-07 (`get_headers`/`get_hashkey` outside retry loop) |
+| `kis_adapter/client.py` | `KISClient` — HTTP GET/POST, rate limiting, retry | Network timeout, Broker API failure | GET: 3x retry/1s backoff (transport, 429, 5xx, `EGW00201`). POST: **single send** for a new order, 3x only when `idempotent=True` (cancels). `MarketClosedError` special-cased; `RateLimiter` per app key | ~~DO-01~~ ✅ resolved; FS-07 (`get_headers`/`get_hashkey` outside retry loop) still open |
 | `kis_adapter/auth.py` | `KISAuth` — token cache (Redis + in-memory), hashkey | Network timeout, Redis down | 3-tier token cache (Redis → in-memory → fresh issue, 32-63); lazy Redis client (no eager connect) | FS-07 (`_issue_token`/`get_hashkey` no retry, single 10s timeout, `auth.py:65-75,90-99`) |
 | `backend/database/models.py` | SQLAlchemy ORM models + `init_db_factory` | Server restart, Duplicate event | `Order.idempotency_key` UniqueConstraint (28); `Position` UniqueConstraint on symbol+broker (80-82); `pool_pre_ping=True` (147) | FS-04 (`create_all()` no-op on drift, 148); `Fill` no UNIQUE constraint (EX-04); `Command` no TTL/purge field (103-111, FS-03) |
 | `bot/scheduler.py`, `bot/main.py` | Legacy `BlockingScheduler` engine | — (LOW, disabled) | `docker-compose.yml:80-110` — service commented out, explicit duplicate-order warning | None actionable — informational only per audit scope |
@@ -887,8 +895,13 @@ written in this task.**
 - **Mock**: patch `requests.get`/`requests.post` (or the `requests.Session` used by
   `KISClient`/`KISAuth`) to raise `requests.exceptions.Timeout` on the Nth call.
 - **Assert**:
-  - `KISClient.get()`/`post()` retry exactly `MAX_RETRIES=3` times with the documented 1s
-    backoff when the **data/order** call times out.
+  - `KISClient.get()` retries exactly `MAX_RETRIES=3` times with the documented 1s backoff
+    when the **data** call times out.
+  - `KISClient.post()` for a **new order** sends exactly **once** and re-raises — a timeout
+    may mean KIS booked the order, so re-sending would duplicate it. The order row stays
+    `QT_RESERVED` and is resolved by `KISOrders.inquire_orders()`. A **cancel**
+    (`idempotent=True`, keyed to `ORGN_ODNO`) still retries `MAX_RETRIES=3`.
+    Covered by `api/tests/test_kis_client_order_retry.py`.
   - When `KISAuth.get_hashkey()` or `KISAuth._issue_token()` (via `get_headers()`) times out
     — patch `requests.post` to raise only for URLs containing `/uapi/hashkey` or
     `/oauth2/tokenP` — assert that `KISClient.post()` raises **immediately, with zero
@@ -1002,7 +1015,7 @@ or corrupt runtime behavior without any startup-time signal.
 | Redis down | **HIGH** | FS-01: self-healing at every layer that detects it directly, but the cross-process watchdog interaction converts a transient blip into a manually-resolved trading halt with a misleading alert. No test coverage. |
 | Worker restart | MEDIUM | StartupRecovery is strong (F1/EX-06 resolved, well-tested); FS-02 (breaker reset) and the FS-01 heartbeat-gap interaction are the residual risk. |
 | Process kill | MEDIUM | Correctly detected (heartbeat/watchdog); CA-03 repairs qty but loses the `Fill` audit row (CA-04) — financially self-correcting but audit-trail-incomplete. No test coverage. |
-| Network timeout | MEDIUM | DO-01 (ghost orders) is the headline risk and is unchanged/confirmed; FS-07 (auth-endpoint timeout bypasses retry) is a narrower, lower-probability window. SD-04 is already tracked. |
+| Network timeout | MEDIUM | DO-01 (ghost orders) **was** the headline risk and is now ✅ resolved — a new order is sent once, with `QT_RESERVED` carrying the indeterminate outcome. FS-07 (auth-endpoint timeout bypasses retry) is a narrower, lower-probability window and remains open. SD-04 is already tracked. |
 | Broker API failure | MEDIUM | Breaker provides real protection but is silent (no alert on trip) and resets on restart (FS-02); DO-05 remains the deeper structural gap. |
 | Polling failure | **HIGH** | EX-02 (confirmed, now also covering PARTIAL_FILLED) and EX-10 (confirmed, no thread supervisor) combine for up to ~1.5h of *total* silent fill-loss across *all* strategies with zero test coverage — among the largest single blast radii in this audit. |
 | Reconciliation failure | MEDIUM | Core repair logic is well-tested; CA-03/CA-04 masking and EX-11's TOCTOU are known, tracked gaps; lock-contention-skip has no alerting. |
@@ -1038,7 +1051,7 @@ TASK 4-1B's broader harness.
 |---|---|---|
 | F1 | `RECONCILIATION_ENGINE.md` | **RESOLVED** — `_apply_fill_to_position_db()` defined at `recovery.py:324-348`, called correctly at 266 |
 | F5 | `RECONCILIATION_ENGINE.md` | **RESOLVED** — dedup + sessions-snapshot share one lock acquisition, `runner.py:316-345` |
-| DO-01 | `IDEMPOTENT_EXECUTION.md` | confirmed present — `kis_adapter/client.py:56-96` POST retry |
+| DO-01 | `IDEMPOTENT_EXECUTION.md` | **RESOLVED** — a new order is sent once in `KISClient.post()`; only `idempotent=True` requests (cancels) retry |
 | DO-05 | `IDEMPOTENT_EXECUTION.md` | confirmed present — `backend/brokers/kis.py:106-150`, no broker-side idempotency token |
 | EX-02 | `ORDER_POLLING_RELIABILITY.md` | confirmed present, **extended** to PARTIAL_FILLED — `order_poller.py:130-165` |
 | EX-04 | `ORDER_POLLING_RELIABILITY.md` | confirmed present — `database/models.py:48-55`, no UNIQUE on `Fill` |

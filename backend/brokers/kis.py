@@ -264,7 +264,9 @@ class KISBroker(BrokerAdapter):
                 "ORD_UNPR": "0",
                 "QTY_ALL_ORD_YN": "Y",
             }
-            resp = self._client.post("/uapi/domestic-stock/v1/trading/order-rvsecncl", tr_id, body)
+            # Replayable: RVSE_CNCL_DVSN_CD=02 keyed to ORGN_ODNO. See KISClient.post.
+            resp = self._client.post("/uapi/domestic-stock/v1/trading/order-rvsecncl",
+                                     tr_id, body, idempotent=True)
             rt_cd = resp.get("rt_cd", "1")
             if rt_cd == "0":
                 logger.info("주문 취소 성공: %s", order_id)
