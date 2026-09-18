@@ -21,6 +21,7 @@ from api.routers import (
     global_market,
     indicators,
     quick_trade,
+    risk,
     strategies,
     templates,
     users,
@@ -190,3 +191,4 @@ app.include_router(watchlist.router)
 app.include_router(global_market.router)
 app.include_router(users.router)
 app.include_router(quick_trade.router)
+app.include_router(risk.router)

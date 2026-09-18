@@ -12,7 +12,7 @@
 
 ---
 
-## 프로젝트 진행 현황 (2026-07-04 기준, PR #79 이후)
+## 프로젝트 진행 현황 (2026-09-18 기준, main `7c75add` = PR #156)
 
 > **이 섹션이 최신 상태의 단일 진실 공급원(SoT).** 아래 "다음 작업 목록(Stage 1~9)"은 초기 설계 로드맵으로,
 > 대부분 이미 구현 완료됐다. 실제 진행은 `AUDIT.md` → `ROADMAP.md` 기반 하드닝 트랙으로 이어지고 있다.
@@ -29,10 +29,19 @@
 | 보안 하드닝 | #110, #114 | CodeQL 알림 다수 수정, 커밋된 안드로이드 서명키 제거, RestrictedPython 업그레이드 |
 | CI 품질 | #100, #101, #115 | Codacy SARIF/이진자산 예외 처리, `_reset_last_run()` 리팩터 |
 
-**진행 중 (이번 세션):**
-- **PR #116 — P3-02C-B 런타임 재조정 동기화**: `PositionReconciler`가 발견한 체결을 단일 `OrderFillPoller` 파이프라인(`resync()`)으로 라우팅해, 워커 재시작 없이 런타임(포지션 트래커·상태머신·펜딩락)을 복구한다. 브랜치 `claude/p3-02c-runtime-recon`.
-  - ⚠️ 이미 머지된 P3-02B(#109)가 워커/전략의 터미널 콜백·복구 `filled_qty` 부분을 더 완전하게 선구현 → 3개 파일 충돌. 신규 가치는 **poller self-heal + reconciler→resync 라우팅 + 통합테스트/문서**로 재범위 조정 필요.
-  - CodeRabbit 유효 지적 4건 대기: `_apply_update` 동시성 락(resync↔폴링 경쟁), 워터마크 명시화(라이브 주문 0 시드), `dry_run` 존중, 라우팅된 `PARTIAL_FILLED` 중복 방지.
+**#119~#156에서 머지된 작업 (위 표 이후):**
+
+| 영역 | PR | 내용 |
+|---|---|---|
+| 런타임 재조정 | #119 | P3-02C-B poller self-heal + `reconciler→resync()` 라우팅. **(#116은 미머지 종료, #119가 대체)** |
+| 리스크 게이트 | #145, #146, #148 | EmergencyFlatten 가격 없으면 fail-closed / halt는 신규 위험만 차단(청산은 허용) / 보유≠매도가능 — 브로커 주문가능수량 강제 |
+| 거래 UI 안전 | #149, #150 | KR을 UI에서 도달 가능하게 + 브로커 장애를 0으로 보고하지 않기 / 금액 아닌 주수·지정가 전용·취소·청산 도달성 |
+| 종목 선택 | #151 | 심볼 추상화 계층(`raw`→`provider`→`backend`) + 정규 거래소 어휘 |
+| 크립토 잔재 정리 | #152, #155 | 백엔드 없는 화면 9개 제거(32→23), 죽은 API 호출 13→0 / 자격증명 화면 KIS 문구 10개 로케일 |
+| 주문 정확성 | #153 | **NYSE 종목 주문 불가 수정** — 거래소 코드를 심볼에서 유도. 주문(`NASD`)과 시세(`NAS`) 코드 체계 분리 |
+| KIS 클라이언트 | #154, #156 | 레이트 리밋을 앱키 단위로(요청마다 새 리미터라 무효였음) / **주문은 1회 전송·재전송 금지**(중복 주문 차단, AUDIT R-01) |
+
+**열린 PR 0건.** 다음 작업은 `origin/main`에서 새로 분기하면 된다.
 
 **아키텍처 실제 현황 (초기 로드맵 대비 완료분):**
 - `backend/brokers/`: `base`·`models`·`kis`·`kiwoom`·`capabilities`·`router`·`paper_broker`·`semantic_mapper`·`validator` 모두 존재 (Stage 1 완료)
@@ -85,6 +94,20 @@
 1. **QuantDinger 백엔드 빌드**: `docker-compose.yml`에서 `./quantdinger/backend_api_python`을 빌드하므로 서버에 먼저 `git clone https://github.com/brokermr810/QuantDinger.git ./quantdinger` 필요
 2. **키움증권**: `kiwoom_adapter/`(client·market_data·orders·portfolio) + `backend/brokers/kiwoom.py` 존재하나 완성도·실거래 검증 미완. 세부 이슈는 `docs/KIWOOM_AUDIT_REPORT.md`·`ROADMAP.md`(P1-01 등) 참고
 3. **모의→실전**: `.env`에서 `KIS_ENV=paper` → `KIS_ENV=real`만 변경. **4주 모의 전 절대 금지**
+   — 강제 장치는 `backend/worker/promotion_guard.py`의 `LivePromotionGuard`다. 6개 관문 중
+   **"4주 모의투자 완료"**는 `strategy_runs`에 `started_at <= now-28d`인 행이 있는지로 판정한다.
+   **코드로 줄일 수 없는 유일한 항목이고, 실전 전환일 = 모의투자를 켜는 날 + 28일로 고정된다.**
+4. ⚠️ **SPY·XL\* 섹터 ETF의 거래소 코드 미검증**: 이들은 NYSE Arca 상장인데 KIS 주문 코드에
+   ARCA가 없다. KIS가 Arca를 NYSE로 두는지 AMEX로 두는지 **확인하지 못했다**(종목 마스터
+   다운로드가 개발 환경 egress 정책에 막힘). 현재 매핑은 NYSE. **모의투자에서 이 종목들이
+   거부되면 여기부터 의심할 것.** `backend/quant/data/universe.py` 주석 참고
+5. **`EXCD_MAP`에 없는 미국 티커는 `NASD`로 폴백**한다. 검색 폴백이 임의 티커를 피커에 넘기므로
+   #153이 고친 오라우팅이 그 경로로 재현된다. 제대로 닫으려면 종목 마스터가 필요
+6. **`tr_cont` 페이지네이션 미구현 (7곳)**: `CTX_AREA_NK100/NK200`을 전부 `""`로 보내고 응답의
+   연속 키를 읽지 않아, 2페이지 이상이면 **조용히 1페이지만** 돌아온다
+7. **미구현 P0 (ROADMAP 참고)**: `P0-10` SIGTERM 핸들러 없음 · `P0-03` `EmergencyFlattenManager`
+   `dry_run` 기본값이 아직 `True`(`backend/worker/emergency.py:57`) · `P0-11`은 기동 시점이 아니라
+   `crypto.py:_get_fernet()` 최초 호출 시점에만 키를 검증
 
 ---
 
@@ -407,14 +430,35 @@ KR_ETF   = ["069500", "360750", "091160"]  # KODEX200, TIGER S&P500, KODEX반도
 - **메인**: `rata1223/claude-code-and-vive-coding-work` (기본 브랜치 `main`)
 - 초기 구축: PR #1 (`claude/vibrant-davinci-skmpx`), PR #2 (`claude/vibrant-davinci-skmpx-fixes`)
 - **PR #79** (`claude/update-MW7LQ`): 실패 시나리오 통합테스트 (TASK 4-1C) — **머지됨** (2026-06-16)
-- 하드닝 트랙 PR #85~#115: 위 "프로젝트 진행 현황" 표 참조 — **모두 머지됨**
-- **PR #116** (`claude/p3-02c-runtime-recon`): P3-02C-B 런타임 재조정 동기화 — **진행 중** (P3-02B와 충돌, 재범위 조정 필요)
+- 하드닝 트랙 PR #85~#156: 위 "프로젝트 진행 현황" 표 참조 — **모두 머지됨**
+- **PR #116**은 미머지 종료(2026-07-05). 같은 작업을 **#119**가 대체 구현해 머지했다
+- **현재 열린 PR 0건.** main = `7c75add`
 
 > 작업 방식: 기능별 새 브랜치에서 작업 → `main`으로 드래프트 PR → CodeRabbit/CodeQL 리뷰 → 머지.
 > 브랜치 보호 룰셋(PR 필수 + 코드 스캐닝)이 적용돼 `main` 직접 푸시 불가.
+> CodeRabbit은 드래프트 PR을 자동 리뷰하지 않는다 — `@coderabbitai review` 코멘트로 수동 요청할 것.
+> Codacy 스캔은 비필수(required 아님)이고 10분 넘게 걸릴 때가 있다. 나머지 8개가 그린이면 머지 가능.
 
 ```bash
 # 새 세션에서 최신 상태 받기
 git fetch origin main
 git checkout -B <새-작업-브랜치> origin/main
 ```
+
+### 다음 작업 (우선순위)
+
+현재 방침: **배포·모의투자 시계는 나중, 하드닝을 계속한다.**
+
+1. `P0-12` — ⚠️ **부분 완료**. 영속 DB 플래그 해제 API는 있다(`api/routers/risk.py`,
+   `KILL_SWITCH_ADMINS` 허용목록). 남은 것 둘: (a) 로드맵 원래 범위인 **인메모리
+   `SAFE_MODE` 무재시작 해제**(P0-04 의존), (b) **`PersistentLossTracker._write_db`가
+   메모리 값으로 `kill_switch`를 덮어써** 실행 중 해제가 되돌려지는 문제 — 그래서 지금은
+   "워커 정지 → 해제 → 기동" 순서를 강제 안내한다
+2. `P0-10` SIGTERM 핸들러 — 코드베이스에 `signal` 핸들러가 전혀 없다. 컨테이너 재시작이
+   항상 비정상 종료로 처리된다
+3. `P0-03` `EmergencyFlattenManager(dry_run=True)` 기본값 → 로드맵은 `False`를 요구
+4. `P2-01` `order_events` append-only 테이블 (큰 변경)
+5. `P3-04` Pinia 스토어 분리 — `frontend/src/stores/`가 아직 `index.js` 하나 (큰 변경)
+
+> `ROADMAP.md`의 각 항목에 `✅ DONE` / `❌ OPEN` 표기와 **근거 파일:행**을 달아두는 작업이
+> 진행 중이다(P6-05). 표기가 없는 항목은 아직 검증되지 않은 것이지 미완이라는 뜻이 아니다.

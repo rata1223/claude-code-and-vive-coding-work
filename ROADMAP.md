@@ -196,7 +196,28 @@ Any single incomplete P0 item is sufficient to block the paper→real transition
 
 ---
 
-#### P0-12 — Kill-switch reset API endpoint
+#### P0-12 — Kill-switch reset API endpoint — ⚠️ PARTIAL
+
+> **Durable half done; in-process half still open.** This item was written about
+> the in-memory `SAFE_MODE` ("no programmatic way to clear it without restarting
+> the process"). Investigating it surfaced a **worse, different gap** that was
+> closed first:
+>
+> `DailyRiskState.kill_switch` (Postgres) is set on an MDD breach and **a restart
+> does not clear it** — `StartupRecovery._step_risk` re-reads it and
+> `_step_enable_trading` re-halts, logging *"수동 해제 후 재시작 필요."* The only
+> writer of `False` was `KillSwitch._clear_halt_in_db`, inside a class **never
+> constructed in production**. So the documented "manual release" meant editing
+> the row by hand in SQL.
+>
+> ✅ **Shipped**: `api/routers/risk.py` — `GET /api/risk/kill-switch` (status) and
+> `POST /api/risk/kill-switch/reset` (clear, mandatory written reason, `AuditLog`
+> row naming the operator). Tests: `api/tests/test_risk_killswitch_reset.py`.
+>
+> ❌ **Still open**: clearing in-process `SAFE_MODE` *without* a restart, as
+> originally specified. The reset endpoint deliberately tells the operator a
+> worker restart is required, because the worker caches the flag at boot. That
+> half still depends on **P0-04** (per-broker SAFE_MODE map).
 
 | Field | Value |
 |---|---|
