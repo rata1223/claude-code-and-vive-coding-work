@@ -126,10 +126,12 @@ class WorkerSession:
 
         The default stays ``True`` because an operator's ``strategy:stop`` *does*
         mean "leave it off".
+
+        **This returns immediately.** ``strategy.stop()`` runs in ``_run``'s
+        cleanup, on the session's own thread, not here — see there for why.
         """
         self._deactivate_on_exit = deactivate
         self._stop_event.set()
-        self.strategy.stop()
         logger.info("Worker 세션 중단 요청: run_id=%d (deactivate=%s)",
                     self.run_id, deactivate)
 
@@ -159,8 +161,23 @@ class WorkerSession:
         except Exception as e:
             logger.exception("전략 실행 오류 run_id=%d: %s", self.run_id, e)
         finally:
+            # Order matters. ``_mark_stopped()`` is the durable record that the
+            # operator switched this strategy off, and ``_restore_active()``
+            # reads it on the next boot — it must not be held hostage by user
+            # cleanup that may never return.
             if self._deactivate_on_exit:
                 self._mark_stopped()
+
+            # ``StrategyBase.stop()`` calls the overridable ``on_stop()``;
+            # ``ScriptStrategy`` runs a sandboxed *user script* there. Running it
+            # here rather than in ``stop()`` puts it on this thread, inside the
+            # deadline ``StrategyWorker._shutdown_strategies()`` applies with
+            # ``join()`` — and keeps it off the pub/sub loop thread, which is
+            # what ``_handle_stop()`` calls ``stop()`` from.
+            try:
+                self.strategy.stop()
+            except Exception as e:
+                logger.exception("전략 on_stop 오류 run_id=%d: %s", self.run_id, e)
 
     def _mark_stopped(self):
         try:
@@ -296,6 +313,7 @@ class StrategyWorker:
 
     @property
     def shutdown_requested(self) -> bool:
+        """Whether a stop has been asked for. Read by the loops and by ``main()``."""
         return self._shutdown.is_set()
 
     def request_shutdown(self) -> None:
@@ -336,12 +354,14 @@ class StrategyWorker:
         t0 = self._shutdown_at if self._shutdown_at is not None else time.monotonic()
 
         def _left(reserve: float = 0.0) -> float:
+            """Budget still unspent, minus what later steps are reserved."""
             return max(0.0, _SHUTDOWN_BUDGET_SEC - (time.monotonic() - t0) - reserve)
 
         done: list[str] = []
         failed: list[str] = []
 
         def _step(name: str, fn) -> None:
+            """Run one teardown step; record it and carry on if it raises."""
             try:
                 fn()
                 done.append(name)
@@ -386,6 +406,7 @@ class StrategyWorker:
         })
 
     def _shutdown_scheduler(self) -> None:
+        """Stop dispatching scheduled jobs. First, so nothing new starts."""
         if self._scheduler is None:
             return
         # wait=False: a job already running keeps its thread, but no new ones are
@@ -394,6 +415,14 @@ class StrategyWorker:
         self._scheduler.shutdown(wait=False)
 
     def _shutdown_strategies(self, budget: float) -> None:
+        """Ask every session to end, then wait for them within one deadline.
+
+        The deadline is taken **before** the stop loop. ``stop()`` only sets an
+        event now, so the loop is cheap — but taking the deadline first means a
+        change that makes it expensive again cannot silently spend the budget
+        the later teardown steps need.
+        """
+        deadline = time.monotonic() + budget
         with self._lock:
             sessions = [s for s in self._sessions.values() if s is not None]
         for session in sessions:
@@ -401,7 +430,6 @@ class StrategyWorker:
                 session.stop(deactivate=False)
             except Exception as e:
                 logger.warning("전략 중단 실패 run_id=%s: %s", session.run_id, e)
-        deadline = time.monotonic() + budget
         stuck = [s.run_id for s in sessions
                  if not s.join(max(0.0, deadline - time.monotonic()))]
         if stuck:
@@ -409,6 +437,7 @@ class StrategyWorker:
                            stuck)
 
     def _join_aux_threads(self, budget: float) -> None:
+        """Wait, briefly, for tracked one-shot threads to finish their I/O."""
         with self._lock:
             threads = [t for t in self._aux_threads if t.is_alive()]
         deadline = time.monotonic() + budget
@@ -419,6 +448,7 @@ class StrategyWorker:
             logger.warning("보조 스레드 미종료: %s", stuck)
 
     def _shutdown_poller(self, budget: float) -> None:
+        """Stop the fill poller and wait for its current cycle — the drain."""
         if self._poller is None:
             return
         self._poller.stop()
@@ -475,6 +505,7 @@ class StrategyWorker:
             db.commit()
 
     def _shutdown_heartbeat(self) -> None:
+        """Stop publishing the liveness beat. Last, and the key is left alone."""
         self._heartbeat.stop()
         # Deliberately NOT deleting `worker:heartbeat`. WorkerWatchdog runs in the
         # API process and sets DailyRiskState.kill_switch the moment the key is
@@ -1122,6 +1153,7 @@ def install_signal_handlers(worker: "StrategyWorker") -> None:
     seen = {"count": 0}
 
     def _handler(signum, _frame):
+        """Raise the flag on the first signal; give up and exit on the second."""
         name = signal.Signals(signum).name
         seen["count"] += 1
         if seen["count"] > 1:
@@ -1161,8 +1193,9 @@ def main():
     # (prevents dual-poller situation where recovery creates its own poller)
     worker = StrategyWorker()
 
-    # Installed before the recovery sequence: a SIGTERM arriving during recovery
-    # then raises the flag, and worker.run() tears down instead of starting up.
+    # Installed before the recovery sequence, and the sequence is handed the flag
+    # below — otherwise a SIGTERM during startup is only noticed once the whole
+    # boot has finished, which is well past the 10s SIGKILL deadline.
     install_signal_handlers(worker)
 
     # ── 시작 복구 시퀀스 ───────────────────────────────────────────────────
@@ -1181,8 +1214,19 @@ def main():
         broker=broker,
         poller=worker._poller,
         ca_runtime=worker._ca_runtime,  # P2-02C: same gate the worker uses
+        should_abort=lambda: worker.shutdown_requested,
     )
-    if not recovery.run():
+    recovered = recovery.run()
+
+    if worker.shutdown_requested:
+        # Stopped during boot. Starting the scheduler here would mean starting a
+        # component only to tear it down, and firing jobs into a process that is
+        # already on its way out.
+        logger.info("기동 중 종료 요청 — 스케줄러를 시작하지 않고 종료 절차로 넘어간다")
+        worker.shutdown()
+        return
+
+    if not recovered:
         logger.critical("복구 실패 — Worker SafeMode로 계속 실행")
 
     from backend.worker.scheduler import build_scheduler

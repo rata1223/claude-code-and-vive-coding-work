@@ -26,6 +26,7 @@ Three things in here are easy to get backwards, so each has its own test:
 
 No Redis, no broker, no network: SQLite in memory and fakes.
 """
+import itertools
 import signal
 import threading
 import time
@@ -142,6 +143,7 @@ def _worker(calls=None, *, poller=None, heartbeat=None, scheduler=None,
     w._loss_tracker = loss_tracker
     w._reconciler = MagicMock()
     w._last_known_equity = None
+    w._ca_runtime = MagicMock()
     return w
 
 
@@ -159,10 +161,21 @@ class FakeStrategy:
         pass
 
 
+#: Process-wide, so no two tests ever share a run_id.
+#:
+#: They otherwise all get id 1 (a fresh in-memory engine per test restarts the
+#: sequence), and a strategy thread left over from an earlier test runs
+#: ``_mark_stopped()`` against whatever ``runner._SessionFactory`` points at
+#: *when it finally wakes* — which is the next test's database. That leak
+#: silently flipped the next test's row and made an ordering test pass for the
+#: wrong reason. Distinct ids make the stale write a no-op (``db.get`` misses).
+_next_run_id = itertools.count(1000)
+
+
 def _run_row(factory, is_active=True):
     sess = factory()
-    row = StrategyRun(strategy_type="indicator", name="t", config="{}",
-                      broker="kis", is_active=is_active)
+    row = StrategyRun(id=next(_next_run_id), strategy_type="indicator", name="t",
+                      config="{}", broker="kis", is_active=is_active)
     sess.add(row)
     sess.commit()
     rid = row.id
@@ -686,3 +699,335 @@ class TestSecondSignalCounting:
         handlers[signal.SIGINT](signal.SIGINT, None)
 
         assert exits == [], "the first signal must never hard-exit"
+
+
+# ── Review findings (#159): user cleanup code must run inside the budget ─────
+
+@pytest.fixture()
+def tiny_budget(monkeypatch):
+    """Shrink the teardown budget so these tests are fast but still meaningful.
+
+    `shutdown()` reads both constants from the module at call time, so patching
+    them here changes the behaviour under test rather than just the assertion.
+    """
+    monkeypatch.setattr(runner, "_SHUTDOWN_BUDGET_SEC", 1.0)
+    monkeypatch.setattr(runner, "_AUX_JOIN_CAP_SEC", 0.5)
+
+
+class TestStrategyCleanupIsBounded:
+    """`StrategyBase.stop()` is `self._running = False; self.on_stop()`, and
+    `on_stop()` is overridable — `ScriptStrategy.on_stop()`
+    (`backend/strategy/script/strategy.py:79`) runs a **sandboxed user script**.
+
+    Calling it synchronously from `WorkerSession.stop()` put it ahead of, and
+    outside, the join deadline: one user script that never returns cost the
+    poller drain, the equity checkpoint, the heartbeat stop and the audit row.
+    The budget bounded `join()`, never `stop()`.
+    """
+
+    @pytest.fixture()
+    def wedged(self):
+        """A strategy whose stop() hangs until the test releases it.
+
+        The release also fires on a timer, so a regression fails the assertion
+        instead of hanging the suite.
+        """
+        release = threading.Event()
+        entered = threading.Event()
+        strategy = FakeStrategy()
+
+        def _never_returns():
+            entered.set()
+            release.wait(8)          # safety net: far above the 1s test budget
+
+        strategy.stop = _never_returns
+        timer = threading.Timer(6.0, release.set)
+        timer.daemon = True
+        timer.start()
+        try:
+            yield strategy, entered
+        finally:
+            # Release first, then wait the strategy threads out, so none of them
+            # survives into the next test still holding a reference to
+            # ``runner._SessionFactory``.
+            release.set()
+            timer.cancel()
+            for t in threading.enumerate():
+                if t.name.startswith("strategy-") and t is not threading.current_thread():
+                    t.join(3)
+
+    def test_a_wedged_on_stop_cannot_outlast_the_budget(
+            self, patched_factory, tiny_budget, wedged):
+        strategy, _ = wedged
+        run_id = _run_row(patched_factory)
+        poller = MagicMock()
+        poller._thread = FakeThread(name="order-poller")
+        w = _worker(poller=poller)
+        session = runner.WorkerSession(run_id, strategy)
+        w._sessions[run_id] = session
+        session.start()
+
+        t0 = time.monotonic()
+        w.shutdown()
+        elapsed = time.monotonic() - t0
+
+        assert elapsed < runner._SHUTDOWN_BUDGET_SEC + 1.0, (
+            f"a user on_stop() held the teardown for {elapsed:.1f}s against a "
+            f"{runner._SHUTDOWN_BUDGET_SEC}s budget")
+
+    def test_the_steps_after_the_strategies_still_run(
+            self, patched_factory, tiny_budget, wedged):
+        """The whole point of bounding it."""
+        strategy, _ = wedged
+        run_id = _run_row(patched_factory)
+        poller = MagicMock()
+        poller._thread = FakeThread(name="order-poller")
+        heartbeat = MagicMock()
+        w = _worker(poller=poller, heartbeat=heartbeat)
+        session = runner.WorkerSession(run_id, strategy)
+        w._sessions[run_id] = session
+        session.start()
+
+        w.shutdown()
+
+        poller.stop.assert_called_once()
+        heartbeat.stop.assert_called_once()
+        assert len(_audit_rows(patched_factory, "worker_shutdown")) == 1
+
+    def test_stop_returns_without_waiting_for_user_cleanup(
+            self, patched_factory, wedged):
+        """`WorkerSession.stop()` itself must not block. `_handle_stop()` runs on
+        the pub/sub loop thread, so a wedged user script froze the worker's whole
+        command loop — it could no longer start or stop anything."""
+        strategy, entered = wedged
+        run_id = _run_row(patched_factory)
+        session = runner.WorkerSession(run_id, strategy)
+        session.start()
+
+        t0 = time.monotonic()
+        session.stop()
+        elapsed = time.monotonic() - t0
+
+        assert elapsed < 1.0, (
+            f"stop() blocked {elapsed:.1f}s on user cleanup — the caller is the "
+            f"pub/sub command loop")
+
+    def test_an_operator_stop_does_not_block_the_command_loop(
+            self, patched_factory, wedged):
+        strategy, _ = wedged
+        run_id = _run_row(patched_factory)
+        w = _worker()
+        session = runner.WorkerSession(run_id, strategy)
+        w._sessions[run_id] = session
+        session.start()
+
+        returned = threading.Event()
+        threading.Thread(
+            target=lambda: (w._handle_stop({"run_id": run_id}), returned.set()),
+            daemon=True).start()
+
+        assert returned.wait(2), (
+            "_handle_stop blocked on a wedged on_stop() — the pub/sub command "
+            "loop is frozen")
+
+    def test_the_stop_intent_is_recorded_before_user_cleanup(
+            self, patched_factory, wedged):
+        """`_mark_stopped()` is the durable record that the operator switched the
+        strategy off. Running user cleanup ahead of it would let a script that
+        never returns leave the row `is_active = True`, and the next boot would
+        restore a strategy the operator had switched off."""
+        strategy, _ = wedged
+        run_id = _run_row(patched_factory)
+        w = _worker()
+        session = runner.WorkerSession(run_id, strategy)
+        w._sessions[run_id] = session
+        session.start()
+
+        w._handle_stop({"run_id": run_id})
+
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and _is_active(patched_factory, run_id):
+            time.sleep(0.05)
+
+        assert _is_active(patched_factory, run_id) is False, (
+            "a wedged on_stop() kept _mark_stopped() from ever running")
+
+    def test_a_raising_on_stop_does_not_lose_the_record(self, patched_factory):
+        strategy = FakeStrategy()
+        strategy.stop = MagicMock(side_effect=RuntimeError("user script blew up"))
+        run_id = _run_row(patched_factory)
+        w = _worker()
+        session = runner.WorkerSession(run_id, strategy)
+        w._sessions[run_id] = session
+        session.start()
+
+        w._handle_stop({"run_id": run_id})
+        session.join(3)
+
+        assert _is_active(patched_factory, run_id) is False
+
+
+# ── Review findings (#159): startup must observe the shutdown request ────────
+
+class TestStartupRecoveryIsCancellable:
+    """`StartupRecovery.run()` walks nine steps and checked for cancellation at
+    none of them. `_step_balance` and `_step_positions` each wait up to
+    `_BROKER_STARTUP_TIMEOUT` (30s by default, `recovery.py:28`), so a SIGTERM
+    during startup was only noticed after recovery finished and the scheduler had
+    already started — long past the 10s SIGKILL deadline.
+    """
+
+    def _recovery(self, calls, should_abort=None, abort_after=None):
+        """A StartupRecovery whose nine steps are replaced with recorders.
+
+        The real `run()` loop drives them, so the cancellation check is tested
+        where it actually lives rather than through a test-only parameter.
+        """
+        from backend.worker.recovery import StartupRecovery
+
+        rec = StartupRecovery(db_session_factory=MagicMock(),
+                              should_abort=should_abort)
+        state = {"abort": False}
+
+        def _make(name):
+            def _fn():
+                calls.append(name)
+                if name == abort_after:
+                    state["abort"] = True
+                return True
+            return _fn
+
+        for name in ("_step_db", "_step_redis", "_step_risk", "_step_balance",
+                     "_step_positions", "_step_reconcile", "_step_pending_orders",
+                     "_step_validate_state", "_step_enable_trading"):
+            setattr(rec, name, _make(name))
+        return rec, state
+
+    def test_recovery_stops_at_the_next_step_boundary(self):
+        calls = []
+        state_holder = {}
+
+        def _abort():
+            return state_holder.get("state", {}).get("abort", False)
+
+        rec, state = self._recovery(calls, should_abort=_abort,
+                                    abort_after="_step_risk")
+        state_holder["state"] = state
+
+        ok = rec.run()
+
+        assert calls == ["_step_db", "_step_redis", "_step_risk"], (
+            f"recovery kept going after the abort was requested: {calls}")
+        assert ok is False
+
+    def test_recovery_runs_every_step_when_not_asked_to_stop(self):
+        calls = []
+        rec, _ = self._recovery(calls, should_abort=lambda: False)
+
+        assert rec.run() is True
+        assert len(calls) == 9
+
+    def test_the_callback_is_optional(self):
+        """Existing constructions pass no callback and must keep working."""
+        calls = []
+        rec, _ = self._recovery(calls)
+
+        assert rec.run() is True
+        assert len(calls) == 9
+
+    def test_an_aborted_recovery_is_not_reported_as_a_recovery_failure(self):
+        """A shutdown is not a broken recovery. The log/SAFE_MODE reason has to
+        say which one it was, or the next operator reads a clean stop as a
+        failed boot."""
+        from backend.worker.recovery import SAFE_MODE
+
+        calls = []
+        state_holder = {}
+        rec, state = self._recovery(
+            calls, should_abort=lambda: state_holder.get("s", {}).get("abort", False),
+            abort_after="_step_db")
+        state_holder["s"] = state
+
+        rec.run()
+
+        # SafeModeState exposes no public reason accessor (only can_trade /
+        # halt_cause), so the recorded string is read directly.
+        reason = SAFE_MODE._reason or ""
+        assert "종료" in reason, (
+            f"an aborted startup was recorded as {reason!r} — a shutdown is not "
+            f"a failed recovery, and the next operator reads this string")
+
+
+class TestMainSkipsStartupWhenStopping:
+    """The finding's concrete claim: `main()` reached `BackgroundScheduler.start()`
+    before anything looked at the shutdown flag. Starting the scheduler there
+    means standing a component up only to tear it down, and firing jobs into a
+    process already on its way out.
+    """
+
+    @pytest.fixture()
+    def stub_main(self, monkeypatch):
+        """Replace everything `main()` reaches for except the flow under test."""
+        import backend.worker.recovery as recovery_mod
+        import backend.worker.scheduler as scheduler_mod
+
+        worker = _worker()
+        worker.shutdown = MagicMock(wraps=worker.shutdown)
+        worker.run = MagicMock()
+
+        built = {"scheduler": 0}
+        monkeypatch.setattr(runner, "StrategyWorker", lambda: worker)
+        monkeypatch.setattr(runner, "_get_session_factory", lambda: MagicMock())
+        monkeypatch.setattr(runner, "get_kis_broker", lambda: MagicMock())
+        monkeypatch.setattr(runner.redis, "from_url", lambda *a, **k: MagicMock())
+
+        recovery = MagicMock()
+        recovery.run.return_value = True
+        monkeypatch.setattr(recovery_mod, "StartupRecovery",
+                            lambda **kw: recovery)
+
+        def _build():
+            built["scheduler"] += 1
+            return MagicMock()
+
+        monkeypatch.setattr(scheduler_mod, "build_scheduler", _build)
+        return worker, recovery, built
+
+    def test_the_scheduler_is_not_started(self, stub_main):
+        worker, recovery, built = stub_main
+        worker.request_shutdown()          # as the signal handler does
+
+        runner.main()
+
+        assert built["scheduler"] == 0, (
+            "the scheduler was started for a process that is shutting down")
+        worker.run.assert_not_called()
+        worker.shutdown.assert_called_once()
+
+    def test_recovery_is_handed_the_flag(self, stub_main, monkeypatch):
+        """Passing it is what lets recovery stop at a step boundary instead of
+        running all nine steps out past the SIGKILL deadline."""
+        import backend.worker.recovery as recovery_mod
+
+        captured = {}
+        recovery = MagicMock()
+        recovery.run.return_value = True
+        monkeypatch.setattr(recovery_mod, "StartupRecovery",
+                            lambda **kw: (captured.update(kw), recovery)[1])
+        worker, _, _ = stub_main
+
+        runner.main()
+
+        assert callable(captured.get("should_abort")), (
+            "StartupRecovery was built without a cancellation callback")
+        assert captured["should_abort"]() is False
+        worker.request_shutdown()
+        assert captured["should_abort"]() is True
+
+    def test_a_normal_boot_still_starts_everything(self, stub_main):
+        worker, _, built = stub_main
+
+        runner.main()
+
+        assert built["scheduler"] == 1
+        worker.run.assert_called_once()
