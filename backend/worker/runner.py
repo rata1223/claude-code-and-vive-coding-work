@@ -12,10 +12,11 @@ Redis Pub/Sub:
 import json
 import logging
 import os
+import signal
 import threading
 import time
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import date, datetime
 
 import redis
 from sqlalchemy.exc import IntegrityError
@@ -41,6 +42,17 @@ _REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:6379")
 _DB_URL = os.environ.get("DB_URL", "postgresql://quantdinger:quantdinger@postgres:5432/quantdinger")
 
 _SUBSCRIBE_CHANNELS = ["strategy:start", "strategy:stop", "session:kr_open", "session:us_open"]
+
+#: Total wall-clock the teardown may spend. ``docker stop`` sends SIGTERM and
+#: then SIGKILL 10 seconds later (docker-compose sets no ``stop_grace_period``
+#: for kis-worker, so that default applies). Every join below draws from this one
+#: budget instead of owning an independent timeout, because independent timeouts
+#: add up past the grace period and the last steps never run.
+_SHUTDOWN_BUDGET_SEC = 8.0
+
+#: Ceiling on step 3 of the teardown. See the call site for why it is capped
+#: rather than given whatever the budget has left.
+_AUX_JOIN_CAP_SEC = 3.0
 
 _SessionFactory = None
 
@@ -93,16 +105,40 @@ class WorkerSession:
         self.strategy = strategy
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
+        #: Whether ``_run``'s exit should mark ``strategy_runs.is_active = False``.
+        #: See ``stop()``.
+        self._deactivate_on_exit = True
 
     def start(self):
         self._thread = threading.Thread(target=self._run, daemon=True, name=f"strategy-{self.run_id}")
         self._thread.start()
         logger.info("Worker 세션 시작: run_id=%d", self.run_id)
 
-    def stop(self):
+    def stop(self, *, deactivate: bool = True):
+        """Ask the strategy thread to end.
+
+        ``deactivate=False`` is the **process shutdown** path. ``_run``'s
+        ``finally`` normally flips ``strategy_runs.is_active`` to ``False``, and
+        ``StrategyWorker._restore_active()`` only restores rows where that is
+        ``True`` — so tearing sessions down the ordinary way on the way out would
+        silently switch every running strategy off on every deploy, and nobody
+        would find out until a bar that never traded.
+
+        The default stays ``True`` because an operator's ``strategy:stop`` *does*
+        mean "leave it off".
+        """
+        self._deactivate_on_exit = deactivate
         self._stop_event.set()
         self.strategy.stop()
-        logger.info("Worker 세션 중단 요청: run_id=%d", self.run_id)
+        logger.info("Worker 세션 중단 요청: run_id=%d (deactivate=%s)",
+                    self.run_id, deactivate)
+
+    def join(self, timeout: float) -> bool:
+        """Wait for the strategy thread. ``True`` if it ended within ``timeout``."""
+        if self._thread is None:
+            return True
+        self._thread.join(timeout)
+        return not self._thread.is_alive()
 
     def trigger_market_open(self, market: str):
         """Scheduler calls this when a market session opens."""
@@ -123,7 +159,8 @@ class WorkerSession:
         except Exception as e:
             logger.exception("전략 실행 오류 run_id=%d: %s", self.run_id, e)
         finally:
-            self._mark_stopped()
+            if self._deactivate_on_exit:
+                self._mark_stopped()
 
     def _mark_stopped(self):
         try:
@@ -145,6 +182,18 @@ class StrategyWorker:
         self._sessions: dict[int, WorkerSession] = {}
         self._lock = threading.Lock()
         self._last_market_open: dict[str, float] = {}  # market → monotonic ts; dedup gate
+
+        # ── graceful shutdown (P0-10) ────────────────────────────────────────
+        self._shutdown = threading.Event()
+        self._shutdown_done = False
+        #: monotonic timestamp of the signal, not of shutdown() being entered.
+        #: The 10s SIGKILL clock starts at the signal, so the budget must too.
+        self._shutdown_at: float | None = None
+        self._scheduler = None          # set by main() via attach_scheduler()
+        #: One-shot threads spawned per market open / periodic reconcile. They do
+        #: broker I/O and DB writes, so they are tracked in order to be joined on
+        #: the way out rather than SIGKILLed mid-flight.
+        self._aux_threads: list[threading.Thread] = []
 
         # Process-level OrderFillPoller — shared across all strategy sessions
         try:
@@ -215,27 +264,255 @@ class StrategyWorker:
         )
 
     def run(self):
-        self._restore_active()
-        # Startup reconciliation: broker is ground truth on boot
         try:
-            self._reconciler.reconcile("startup")
-        except Exception as e:
-            logger.warning("시작 조정 실패 (계속 진행): %s", e)
-        self._run_with_pubsub()
+            # A SIGTERM during startup used to be deferred until the whole boot
+            # sequence finished — restore + a broker-backed reconcile, which can
+            # run for seconds — and the teardown then began against a clock that
+            # was already most of the way to SIGKILL. Each step is a checkpoint.
+            if self._shutdown.is_set():
+                logger.info("기동 중 shutdown 요청 — 전략 복원 생략")
+                return
+            self._restore_active()
+
+            if self._shutdown.is_set():
+                logger.info("기동 중 shutdown 요청 — 시작 조정 생략")
+                return
+            # Startup reconciliation: broker is ground truth on boot
+            try:
+                self._reconciler.reconcile("startup")
+            except Exception as e:
+                logger.warning("시작 조정 실패 (계속 진행): %s", e)
+
+            if self._shutdown.is_set():
+                return
+            self._run_with_pubsub()
+        finally:
+            # Reached on a SIGTERM, on a clean loop exit, and on the way out of an
+            # exception. It is the only place that guarantees the checkpoint and
+            # the shutdown record happen at all.
+            self.shutdown()
+
+    # ── graceful shutdown (P0-10) ────────────────────────────────────────────
+
+    @property
+    def shutdown_requested(self) -> bool:
+        return self._shutdown.is_set()
+
+    def request_shutdown(self) -> None:
+        """Raise the shutdown flag. Safe to call from a signal handler.
+
+        A handler runs in the main thread between two bytecodes, which may be
+        anywhere — inside ``self._lock``, inside a SQLAlchemy commit, inside the
+        poller's registration path. Running the teardown from there would try to
+        take locks the interrupted frame already holds. So the handler sets this
+        and returns; the loops poll it and call ``shutdown()`` on their way out.
+        """
+        if self._shutdown_at is None:
+            self._shutdown_at = time.monotonic()
+        self._shutdown.set()
+
+    def attach_scheduler(self, scheduler) -> None:
+        """Hand the APScheduler instance over so the teardown can stop it first."""
+        self._scheduler = scheduler
+
+    def shutdown(self) -> None:
+        """Stop everything this process owns, in order, inside the grace period.
+
+        Every step is best-effort and isolated: one wedged component must not
+        cost the others their cleanup, and the audit record is written whatever
+        happened, because "was this a clean stop or a crash?" is the question the
+        next boot needs answered.
+        """
+        if self._shutdown_done:
+            return
+        self._shutdown_done = True
+        self._shutdown.set()
+
+        # From the signal, not from here: SIGKILL is 10s after the signal, and
+        # anything the boot sequence spent before reaching this point is time the
+        # teardown no longer has. When the flag was raised long ago every step
+        # gets a zero timeout, which is the correct answer — do what can be done
+        # without blocking, and still write the record.
+        t0 = self._shutdown_at if self._shutdown_at is not None else time.monotonic()
+
+        def _left(reserve: float = 0.0) -> float:
+            return max(0.0, _SHUTDOWN_BUDGET_SEC - (time.monotonic() - t0) - reserve)
+
+        done: list[str] = []
+        failed: list[str] = []
+
+        def _step(name: str, fn) -> None:
+            try:
+                fn()
+                done.append(name)
+            except Exception as e:
+                logger.warning("종료 단계 실패 (%s): %s", name, e)
+                failed.append(name)
+
+        logger.info("graceful shutdown 시작 (예산 %.0fs)", _SHUTDOWN_BUDGET_SEC)
+
+        # 1. Scheduler first — a job that fires mid-teardown starts work on the
+        #    components the steps below are about to take away.
+        _step("scheduler", self._shutdown_scheduler)
+        # 2. Strategies. deactivate=False: see WorkerSession.stop().
+        _step("strategies", lambda: self._shutdown_strategies(_left(reserve=3.0)))
+        # 3. The one-shot threads — market-open broadcasts and periodic
+        #    reconciles, which do broker I/O and DB writes. Capped separately:
+        #    ``IndicatorStrategy._scan_and_trade`` never checks ``is_running()``,
+        #    so a scan already in flight keeps submitting orders and stopping its
+        #    strategy in step 2 does not end it. Waiting it out would spend the
+        #    poller's budget too. Orders it did submit are persisted and
+        #    re-registered with the poller by ``StartupRecovery`` on the next boot
+        #    (backend/worker/recovery.py:333), so abandoning the thread costs
+        #    tracking until restart, not the order.
+        _step("aux-threads",
+              lambda: self._join_aux_threads(min(_AUX_JOIN_CAP_SEC, _left(reserve=2.0))))
+        # 4. Poller — the "drain active polls" half of P0-10.
+        _step("poller", lambda: self._shutdown_poller(_left(reserve=1.0)))
+        # 5. Checkpoint equity to the DB.
+        _step("equity-checkpoint", self._checkpoint_equity)
+        # 6. Heartbeat LAST, so the API-side watchdog does not see a dead worker
+        #    while the teardown is still running.
+        _step("heartbeat", self._shutdown_heartbeat)
+
+        elapsed = time.monotonic() - t0
+        logger.info("graceful shutdown 완료 (%.1fs) — 완료=%s 실패=%s",
+                    elapsed, done, failed or "없음")
+        _audit("worker_shutdown", actor="worker", detail={
+            "steps_ok": done,
+            "steps_failed": failed,
+            "elapsed_sec": round(elapsed, 2),
+            "within_budget": elapsed <= _SHUTDOWN_BUDGET_SEC,
+        })
+
+    def _shutdown_scheduler(self) -> None:
+        if self._scheduler is None:
+            return
+        # wait=False: a job already running keeps its thread, but no new ones are
+        # dispatched. Waiting could spend the whole grace period inside a job that
+        # is polling a market.
+        self._scheduler.shutdown(wait=False)
+
+    def _shutdown_strategies(self, budget: float) -> None:
+        with self._lock:
+            sessions = [s for s in self._sessions.values() if s is not None]
+        for session in sessions:
+            try:
+                session.stop(deactivate=False)
+            except Exception as e:
+                logger.warning("전략 중단 실패 run_id=%s: %s", session.run_id, e)
+        deadline = time.monotonic() + budget
+        stuck = [s.run_id for s in sessions
+                 if not s.join(max(0.0, deadline - time.monotonic()))]
+        if stuck:
+            logger.warning("전략 스레드 미종료 run_id=%s — 데몬이라 프로세스와 함께 끝난다",
+                           stuck)
+
+    def _join_aux_threads(self, budget: float) -> None:
+        with self._lock:
+            threads = [t for t in self._aux_threads if t.is_alive()]
+        deadline = time.monotonic() + budget
+        for t in threads:
+            t.join(max(0.0, deadline - time.monotonic()))
+        stuck = [t.name for t in threads if t.is_alive()]
+        if stuck:
+            logger.warning("보조 스레드 미종료: %s", stuck)
+
+    def _shutdown_poller(self, budget: float) -> None:
+        if self._poller is None:
+            return
+        self._poller.stop()
+        # stop() only sets the poller's event, and its thread is a daemon — so
+        # without this join the interpreter can tear it down between reading a
+        # fill from the broker and writing it. Reaching for the private handle is
+        # deliberate: widening backend/execution's API is not this change's job.
+        thread = getattr(self._poller, "_thread", None)
+        if thread is None:
+            return
+        thread.join(budget)
+        if thread.is_alive():
+            logger.warning("OrderFillPoller 스레드가 %.1fs 안에 끝나지 않음", budget)
+
+    def _checkpoint_equity(self) -> None:
+        """Write daily/weekly PnL and peak equity. **Never** the halt flag.
+
+        Deliberately not ``PersistentLossTracker._persist()``, which would also
+        write ``kill_switch`` from the tracker's in-memory value (issue #158).
+        That direction of the stale write is fail-**open** and this step would be
+        the one to trigger it:
+
+            Redis goes down → the heartbeat key cannot be refreshed → it expires
+            → the API-side ``WorkerWatchdog`` sets ``kill_switch=True`` in the DB
+            while this worker is still alive holding an in-memory ``False`` → a
+            SIGTERM here writes ``False`` and ``kill_reason=None`` back over it →
+            the restarted worker resumes trading with the halt erased.
+
+        So the checkpoint touches only the three equity columns and leaves
+        ``kill_switch``/``kill_reason`` exactly as they are on disk, whoever set
+        them. ``record_pnl()`` persists these same columns on every call, so this
+        is a retry for a write that failed earlier rather than the only copy.
+        """
+        tracker = self._loss_tracker
+        if tracker is None:
+            return
+        from backend.database.models import DailyRiskState
+
+        # The tracker's own mutex (P0-05) — read the three values consistently.
+        with tracker._lock:
+            daily_pnl = tracker.daily_pnl
+            weekly_pnl = tracker.weekly_pnl
+            peak_equity = tracker.peak_equity
+
+        with _session() as db:
+            today = date.today()
+            row = db.get(DailyRiskState, today)
+            if row is None:
+                row = DailyRiskState(trade_date=today)
+                db.add(row)
+            row.daily_pnl = daily_pnl
+            row.weekly_pnl = weekly_pnl
+            row.peak_equity = peak_equity
+            db.commit()
+
+    def _shutdown_heartbeat(self) -> None:
+        self._heartbeat.stop()
+        # Deliberately NOT deleting `worker:heartbeat`. WorkerWatchdog runs in the
+        # API process and sets DailyRiskState.kill_switch the moment the key is
+        # missing (backend/worker/heartbeat.py:_alert_dead_worker). Tidying it up
+        # here would halt trading on every deploy; letting the 90s TTL lapse is
+        # what gives a restart room to come back unnoticed.
+
+    def _spawn_aux(self, target, args=(), name=None) -> threading.Thread:
+        """Start a tracked one-shot thread so ``shutdown()`` can wait for it."""
+        t = threading.Thread(target=target, args=args, daemon=True, name=name)
+        with self._lock:
+            self._aux_threads = [x for x in self._aux_threads if x.is_alive()]
+            self._aux_threads.append(t)
+        t.start()
+        return t
 
     def _run_with_pubsub(self):
         backoff = 2.0
-        while True:
+        while not self._shutdown.is_set():
+            pubsub = None
             try:
                 pubsub = self._redis.pubsub()
                 pubsub.subscribe(*_SUBSCRIBE_CHANNELS)
                 logger.info("Worker 대기 중 (Redis Pub/Sub: %s)...", _SUBSCRIBE_CHANNELS)
                 backoff = 2.0
 
-                for message in pubsub.listen():
-                    if message["type"] != "message":
+                # get_message(timeout=) rather than listen(). listen() blocks in a
+                # socket read, and PEP 475 resumes that read once a signal handler
+                # returns — so a flag raised by SIGTERM would never be looked at
+                # and the process would sit there until SIGKILL. A 1s poll bounds
+                # how long shutdown waits for this loop to notice.
+                while not self._shutdown.is_set():
+                    message = pubsub.get_message(timeout=1.0)
+                    if message is None or message["type"] != "message":
                         continue
-                    channel = message["channel"].decode()
+                    channel = message["channel"]
+                    if isinstance(channel, bytes):
+                        channel = channel.decode()
                     try:
                         data = json.loads(message["data"])
                     except Exception:
@@ -250,21 +527,35 @@ class StrategyWorker:
                         self._handle_market_open(market)
 
             except redis.ConnectionError as e:
+                if self._shutdown.is_set():
+                    break
                 logger.error("Redis 연결 끊김: %s — %.1fs 후 재연결", e, backoff)
-                time.sleep(backoff)
+                self._shutdown.wait(backoff)
                 backoff = min(backoff * 2, 64.0)
                 self._enter_db_polling_mode()
             except Exception as e:
+                if self._shutdown.is_set():
+                    break
                 logger.exception("Worker 예외: %s — %.1fs 후 재시작", e, backoff)
-                time.sleep(backoff)
+                self._shutdown.wait(backoff)
                 backoff = min(backoff * 2, 64.0)
+            finally:
+                if pubsub is not None:
+                    try:
+                        pubsub.close()
+                    except Exception:
+                        pass
+
+        logger.info("Pub/Sub 루프 종료 (shutdown 요청)")
 
     def _enter_db_polling_mode(self):
         """Redis 불가 시 DB commands 테이블을 30초마다 폴링."""
         from backend.database.models import Command
         logger.warning("DB 폴링 모드 전환 (Redis 불가)")
         _audit("redis_failover", actor="worker", detail={"mode": "db_polling"})
-        while True:
+        # Same shutdown check as the pub/sub loop: if only that one learned to
+        # exit, a SIGTERM during a Redis outage still hangs until SIGKILL.
+        while not self._shutdown.is_set():
             try:
                 self._redis.ping()
                 logger.info("Redis 재연결 성공 — 폴링 모드 종료")
@@ -298,7 +589,7 @@ class StrategyWorker:
             except Exception as e:
                 logger.warning("DB 폴링 오류: %s", e)
 
-            time.sleep(30)
+            self._shutdown.wait(30)
 
     # ── 이벤트 핸들러 ─────────────────────────────────────────────────────
     def _handle_start(self, data: dict):
@@ -345,23 +636,15 @@ class StrategyWorker:
             self._last_market_open[market] = now
             sessions = [s for s in self._sessions.values() if s is not None]
 
-        # Periodic reconciliation on each market open (catches overnight drift)
-        threading.Thread(
-            target=self._reconciler.reconcile,
-            args=("periodic",),
-            daemon=True,
-            name=f"reconcile-{market}",
-        ).start()
+        # Periodic reconciliation on each market open (catches overnight drift).
+        # Tracked so a shutdown waits for it — it does broker I/O and DB writes.
+        self._spawn_aux(self._reconciler.reconcile, ("periodic",),
+                        name=f"reconcile-{market}")
 
         logger.info("장 시작 브로드캐스트: market=%s sessions=%d", market, len(sessions))
         for session in sessions:
-            t = threading.Thread(
-                target=session.trigger_market_open,
-                args=(market,),
-                daemon=True,
-                name=f"market-open-{session.run_id}",
-            )
-            t.start()
+            self._spawn_aux(session.trigger_market_open, (market,),
+                            name=f"market-open-{session.run_id}")
 
     # ── 재시작 복원 ───────────────────────────────────────────────────────
     def _restore_active(self):
@@ -818,6 +1101,40 @@ class StrategyWorker:
             logger.debug("WebSocket 주문 발행 실패: %s", e)
 
 
+def install_signal_handlers(worker: "StrategyWorker") -> None:
+    """Route SIGTERM/SIGINT into the worker's shutdown flag.
+
+    SIGTERM is what ``docker stop`` sends; SIGINT is Ctrl-C in a foreground
+    container. Python installs no handler for SIGTERM by default, so until this
+    ran the process simply vanished — the poller could die between reading a fill
+    and writing it, and nothing recorded that the stop was deliberate.
+
+    The handler does one thing. Signal handlers run in the main thread between
+    two bytecodes, i.e. possibly inside a lock or a commit; doing the teardown
+    here would deadlock on locks the interrupted frame holds. A second signal is
+    read as "stop waiting" and exits without unwinding, since the graceful path
+    is evidently not finishing.
+    """
+    # Counts signals, not ``worker.shutdown_requested``. ``shutdown()`` raises
+    # that flag itself, so keying off it would turn the operator's *first* Ctrl-C
+    # during a teardown reached from ``run()``'s ``finally`` into an immediate
+    # ``_exit`` — losing the equity checkpoint and the shutdown record.
+    seen = {"count": 0}
+
+    def _handler(signum, _frame):
+        name = signal.Signals(signum).name
+        seen["count"] += 1
+        if seen["count"] > 1:
+            logger.warning("%s 재수신 — graceful shutdown 포기, 즉시 종료", name)
+            os._exit(1)
+        logger.info("%s 수신 — graceful shutdown 시작", name)
+        worker.request_shutdown()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, _handler)
+    logger.info("SIGTERM/SIGINT 핸들러 등록 (종료 예산 %.0fs)", _SHUTDOWN_BUDGET_SEC)
+
+
 def main():
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -844,6 +1161,10 @@ def main():
     # (prevents dual-poller situation where recovery creates its own poller)
     worker = StrategyWorker()
 
+    # Installed before the recovery sequence: a SIGTERM arriving during recovery
+    # then raises the flag, and worker.run() tears down instead of starting up.
+    install_signal_handlers(worker)
+
     # ── 시작 복구 시퀀스 ───────────────────────────────────────────────────
     from backend.worker.recovery import StartupRecovery
     factory = _get_session_factory()
@@ -868,8 +1189,9 @@ def main():
     scheduler = build_scheduler()
     scheduler.start()
     logger.info("스케줄러 시작")
+    worker.attach_scheduler(scheduler)  # so shutdown() can stop it first
 
-    worker.run()  # blocking
+    worker.run()  # blocking until SIGTERM/SIGINT; tears down on the way out
 
 
 if __name__ == "__main__":

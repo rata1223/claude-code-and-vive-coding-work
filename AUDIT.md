@@ -391,8 +391,10 @@ A 1-share tolerance means a position in AVGO ($150+), MSFT ($400+), or SPY ($500
 ### IC-08: `Position` table `qty` column is `Integer`, not `Decimal`
 Fractional share support (if ever needed) is impossible without a schema change. US ETFs at KIS currently require whole shares, so this is acceptable today but constrains future flexibility.
 
-### IC-09: Worker shutdown is not graceful
-There is no signal handler for SIGTERM in `backend/worker/runner.py`. Docker sends SIGTERM before SIGKILL. Without a handler, `StrategyWorker` has 10 seconds (Docker default) before hard kill, with no opportunity to cancel open orders, flush state, or mark strategy_runs as inactive.
+### IC-09: Worker shutdown is not graceful — ✅ RESOLVED (P0-10)
+~~There is no signal handler for SIGTERM in `backend/worker/runner.py`.~~ `install_signal_handlers()` now registers SIGTERM and SIGINT, and `StrategyWorker.shutdown()` runs an ordered teardown (scheduler → strategies → auxiliary threads → poller drain → equity checkpoint → heartbeat) inside an 8s budget, then writes a `worker_shutdown` audit row. See ROADMAP P0-10 for the evidence and the two counter-intuitive parts.
+
+One prescription in the original finding was **wrong and was not implemented**: marking `strategy_runs` inactive on shutdown. `_restore_active()` only restores rows where `is_active` is `True`, so doing that would silently switch every running strategy off on every deploy. Sessions are stopped with `deactivate=False` instead, and a test pins it.
 
 ### IC-10: `LivePromotionGuard._check_paper_run()` checks `started_at <= cutoff` not `stopped_at` or continuous run
 The check passes if any `StrategyRun` was created more than 28 days ago, regardless of whether it actually ran for 28 consecutive days. A strategy started 29 days ago and immediately stopped satisfies the check. This is a regulatory/process constraint, not a system bug, but it means the 4-week paper run gate is not enforced meaningfully.
@@ -413,7 +415,7 @@ The check passes if any `StrategyRun` was created more than 28 days ago, regardl
 | D-1 | HIGH | Architecture | place_order() bypasses state machine PENDING→SUBMITTED |
 | DB-02 | HIGH | Security | Credential encryption key defaults to empty |
 | R-09 | HIGH | Alerting | asyncio.run() fails inside async contexts |
-| IC-09 | HIGH | Ops | No SIGTERM handler → unclean shutdown |
+| IC-09 | ~~HIGH~~ ✅ RESOLVED | Ops | No SIGTERM handler → unclean shutdown |
 | C-01 | MEDIUM | Coupling | quant engine → worker SAFE_MODE circular coupling |
 | C-02/C-03 | MEDIUM | Coupling | backend imports legacy bot notifier |
 | D-11/D-12 | MEDIUM | Schema | Missing FK constraints on fills, trades |
