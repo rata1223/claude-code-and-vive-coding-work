@@ -22,19 +22,28 @@ is the gap: a control that can only be set, never released, is not a safety
 control — it is an outage. This router is the release path, with the thing a
 hand-edited row never leaves behind: a named operator and a written reason.
 
-**What this does not do.** It does not resume a running worker. The worker
-caches ``_kill_switch_active`` during `StartupRecovery` and gates ``SAFE_MODE``
-from that snapshot, so clearing the flag takes effect on its next start — which
-is exactly what the existing log message already tells the operator. Saying so
-in the response matters: an operator who believes trading resumed when it has
-not is worse off than one who is told to restart.
+**What this does not do, and the order that matters.** It does not resume a
+running worker: the worker caches ``_kill_switch_active`` during
+`StartupRecovery`, so the clear takes effect on its next start.
+
+Worse, resetting *while a worker is running* can be silently undone.
+``PersistentLossTracker._write_db`` (backend/quant/risk/engine.py) writes
+``row.kill_switch = ks`` from its **in-memory** value on every PnL write, so a
+live worker that still believes the switch is set will put it back on its next
+write. The safe order is therefore **stop the worker → reset → start**, which
+the response states.
+
+The durable fix is to make the tracker honour an external clear rather than
+overwrite it — that belongs in the worker's risk engine, not here, and is
+tracked as follow-up on P0-12.
 """
 import json
 import logging
+import os
 from datetime import date, datetime
 
 from fastapi import APIRouter, Depends
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.orm import Session
 
 from api.database import get_db
@@ -48,7 +57,11 @@ router = APIRouter(prefix="/api/risk", tags=["risk"])
 
 #: Told to the operator on a successful reset. The worker re-reads the flag at
 #: startup, so the reset alone does not resume trading.
-RESTART_NOTICE = "워커 재시작 후 매매가 재개됩니다 (기동 시 플래그를 다시 읽습니다)."
+RESTART_NOTICE = (
+    "워커를 **정지한 뒤** 해제하고 다시 기동하세요. 실행 중인 워커는 "
+    "PersistentLossTracker의 메모리 값으로 DailyRiskState를 덮어쓰므로, "
+    "다음 PnL 기록 시 kill_switch가 True로 되돌아갑니다."
+)
 
 
 class KillSwitchResetRequest(BaseModel):
@@ -63,6 +76,40 @@ class KillSwitchResetRequest(BaseModel):
     """
 
     reason: str = Field(..., min_length=1, max_length=200)
+
+    @field_validator("reason")
+    @classmethod
+    def _non_blank(cls, v: str) -> str:
+        """``min_length=1`` alone accepts ``"   "``, which is a blank reason
+        wearing a character. Trim, then require something left."""
+        trimmed = v.strip()
+        if not trimmed:
+            raise ValueError("사유는 공백일 수 없습니다")
+        return trimmed
+
+
+def _is_risk_admin(user: User) -> bool:
+    """Fail-closed break-glass allowlist, mirroring ``EMERGENCY_FLATTEN_ADMINS``
+    in ``api/routers/quick_trade.py``.
+
+    Clearing a kill switch re-enables trading for the **whole deployment**, not
+    for the caller's own book, and this app has no role or admin column
+    (``api/models.py:User``). So the same shape is used here: while
+    ``KILL_SWITCH_ADMINS`` is unset — the default — **nobody** is authorized and
+    the control is dormant. A dormant control is recoverable by setting one env
+    var; a control every registered user can fire is not.
+
+    A separate list from the flatten one on purpose: liquidating a book and
+    releasing a risk halt are different powers and should be grantable apart.
+    """
+    allowed = {
+        e.strip().lower()
+        for e in os.environ.get("KILL_SWITCH_ADMINS", "").split(",")
+        if e.strip()
+    }
+    if not allowed:
+        return False
+    return (getattr(user, "email", "") or "").lower() in allowed
 
 
 def _today_row(db: Session):
@@ -94,6 +141,10 @@ def reset_kill_switch(
 ):
     """Clear today's persistent kill switch, recording who did it and why."""
     from backend.database.models import AuditLog
+
+    if not _is_risk_admin(current_user):
+        # Fail closed, and say nothing about who is on the list.
+        return Resp.err("권한이 없습니다 — KILL_SWITCH_ADMINS에 등록된 운영자만 해제할 수 있습니다.")
 
     row = _today_row(db)
     if row is None or not row.kill_switch:

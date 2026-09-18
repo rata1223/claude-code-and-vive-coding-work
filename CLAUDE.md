@@ -449,7 +449,11 @@ git checkout -B <새-작업-브랜치> origin/main
 
 현재 방침: **배포·모의투자 시계는 나중, 하드닝을 계속한다.**
 
-1. ~~`P0-12` 킬스위치 해제 API~~ — 이번 작업에서 완료 (`api/routers/risk.py`)
+1. `P0-12` — ⚠️ **부분 완료**. 영속 DB 플래그 해제 API는 있다(`api/routers/risk.py`,
+   `KILL_SWITCH_ADMINS` 허용목록). 남은 것 둘: (a) 로드맵 원래 범위인 **인메모리
+   `SAFE_MODE` 무재시작 해제**(P0-04 의존), (b) **`PersistentLossTracker._write_db`가
+   메모리 값으로 `kill_switch`를 덮어써** 실행 중 해제가 되돌려지는 문제 — 그래서 지금은
+   "워커 정지 → 해제 → 기동" 순서를 강제 안내한다
 2. `P0-10` SIGTERM 핸들러 — 코드베이스에 `signal` 핸들러가 전혀 없다. 컨테이너 재시작이
    항상 비정상 종료로 처리된다
 3. `P0-03` `EmergencyFlattenManager(dry_run=True)` 기본값 → 로드맵은 `False`를 요구

@@ -65,6 +65,16 @@ def engine():
     eng.dispose()
 
 
+@pytest.fixture(autouse=True)
+def _authorized(monkeypatch):
+    """Most tests exercise the happy path, so put the caller on the allowlist.
+
+    The gate itself is covered by the authorization tests below, which clear
+    this. ``a@example.com`` is the ``user`` fixture's address.
+    """
+    monkeypatch.setenv("KILL_SWITCH_ADMINS", "a@example.com")
+
+
 def _risk_row(db, *, kill_switch: bool, reason: str | None = None):
     from datetime import date
     from backend.database.models import DailyRiskState
@@ -199,7 +209,8 @@ def test_status_tells_the_operator_a_restart_is_needed(db, user):
         risk.KillSwitchResetRequest(reason="정리 완료"), user, db)
 
     assert resp.code == 1
-    assert "재시작" in (resp.msg + str(resp.data))
+    note = resp.msg + str(resp.data)
+    assert "기동" in note, "the operator must be told the worker has to come back up"
 
 
 # ── the reset actually reaches the thing that halts trading ──────────────────
@@ -238,3 +249,91 @@ def test_the_boot_time_reader_sees_the_cleared_flag(db, user):
     assert after.kill_switch is False, (
         "the boot path still reports a kill switch — the reset cleared "
         "something StartupRecovery does not read")
+
+
+# ── authorization: clearing a halt is a deployment-wide power ────────────────
+
+def test_reset_is_refused_when_the_allowlist_is_unset(db, user, monkeypatch):
+    """Fail closed by default. Clearing the switch re-enables trading for the
+    whole deployment, not for the caller's own book, and this app has no admin
+    column — so the control stays dormant until an operator is named."""
+    from api.routers import risk
+
+    monkeypatch.delenv("KILL_SWITCH_ADMINS", raising=False)
+    _risk_row(db, kill_switch=True, reason="MDD")
+
+    resp = risk.reset_kill_switch(
+        risk.KillSwitchResetRequest(reason="해제 시도"), user, db)
+
+    assert resp.code == -1
+    assert "권한" in resp.msg
+
+
+def test_reset_is_refused_for_a_user_not_on_the_allowlist(db, user, monkeypatch):
+    from api.routers import risk
+
+    monkeypatch.setenv("KILL_SWITCH_ADMINS", "someone-else@example.com")
+    _risk_row(db, kill_switch=True, reason="MDD")
+
+    resp = risk.reset_kill_switch(
+        risk.KillSwitchResetRequest(reason="해제 시도"), user, db)
+
+    assert resp.code == -1
+
+
+def test_an_unauthorized_reset_does_not_clear_the_flag(db, user, monkeypatch):
+    """The refusal must be a refusal, not a message in front of a mutation."""
+    from datetime import date
+    from backend.database.models import DailyRiskState
+    from api.routers import risk
+
+    monkeypatch.delenv("KILL_SWITCH_ADMINS", raising=False)
+    _risk_row(db, kill_switch=True, reason="MDD")
+
+    risk.reset_kill_switch(risk.KillSwitchResetRequest(reason="시도"), user, db)
+
+    assert db.get(DailyRiskState, date.today()).kill_switch is True
+
+
+# ── a blank reason is not a reason ───────────────────────────────────────────
+
+def test_a_whitespace_only_reason_is_rejected():
+    """``min_length=1`` alone accepts "   ", which defeats the point of
+    requiring a reason at all."""
+    import pydantic
+    from api.routers import risk
+
+    with pytest.raises(pydantic.ValidationError):
+        risk.KillSwitchResetRequest(reason="   ")
+
+
+def test_the_reason_is_stored_trimmed(db, user):
+    from backend.database.models import AuditLog
+    from api.routers import risk
+
+    _risk_row(db, kill_switch=True, reason="MDD")
+    risk.reset_kill_switch(
+        risk.KillSwitchResetRequest(reason="  포지션 정리 완료  "), user, db)
+
+    row = db.query(AuditLog).filter(
+        AuditLog.event_type == "kill_switch_reset").one()
+    assert '"reason": "포지션 정리 완료"' in row.detail
+
+
+# ── the live-worker hazard is stated, not glossed ────────────────────────────
+
+def test_the_response_warns_about_resetting_under_a_live_worker(db, user):
+    """``PersistentLossTracker._write_db`` writes ``row.kill_switch`` from its
+    in-memory value on every PnL write, so a running worker puts the flag back.
+    The operator has to be told to stop the worker first — a reset that gets
+    silently undone is worse than one that is refused.
+    """
+    from api.routers import risk
+
+    _risk_row(db, kill_switch=True, reason="MDD")
+    resp = risk.reset_kill_switch(
+        risk.KillSwitchResetRequest(reason="정리 완료"), user, db)
+
+    note = resp.msg + str(resp.data)
+    assert "정지" in note, "the response must say to stop the worker first"
+    assert "PersistentLossTracker" in note or "되돌아" in note
