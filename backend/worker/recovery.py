@@ -96,13 +96,18 @@ class StartupRecovery:
     """
 
     def __init__(self, db_session_factory, redis_client=None, broker=None, poller=None,
-                 ca_runtime=None):
+                 ca_runtime=None, should_abort=None):
         self._factory = db_session_factory
         self._redis = redis_client
         self._broker = broker
         self._shared_poller = poller  # Worker's poller — avoid creating a second one
         self._ca_runtime = ca_runtime  # P2-02C: CorporateActionRuntime (optional)
         self._actions: list[ReconcileAction] = []
+        #: Optional ``() -> bool``. Checked before each step; True stops the
+        #: sequence. The worker passes its SIGTERM flag, so a stop signal during
+        #: startup is noticed at the next step boundary instead of after the
+        #: whole boot. Optional so existing constructions are unaffected.
+        self._should_abort = should_abort
 
     def run(self) -> bool:
         """복구 실행. 성공 시 True, 치명적 오류 시 False."""
@@ -118,6 +123,19 @@ class StartupRecovery:
             ("정상 모드 진입", self._step_enable_trading),
         ]
         for i, (name, fn) in enumerate(steps, 1):
+            # Checked per step, not per instruction: the broker probes below wait
+            # up to _BROKER_STARTUP_TIMEOUT each, and Docker's SIGKILL lands 10s
+            # after SIGTERM. Stopping at the next boundary is what keeps a stop
+            # signal during startup from running the whole sequence out.
+            #
+            # NOTE: a step *already in flight* is still not interruptible —
+            # _step_balance's ThreadPoolExecutor waits for its task on __exit__
+            # even after .result(timeout=...) has raised. Tracked separately.
+            if self._should_abort is not None and self._should_abort():
+                logger.warning("[복구 %d/%d] 종료 요청 — %s 이전에 복구 중단",
+                               i, len(steps), name)
+                SAFE_MODE.disable("기동 중 종료 요청 — 복구 중단")
+                return False
             logger.info("[복구 %d/%d] %s", i, len(steps), name)
             try:
                 ok = fn()

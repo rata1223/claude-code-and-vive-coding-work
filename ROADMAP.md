@@ -166,7 +166,73 @@ Any single incomplete P0 item is sufficient to block the paper→real transition
 
 ---
 
-#### P0-10 — SIGTERM handler for graceful shutdown
+#### P0-10 — SIGTERM handler for graceful shutdown — ✅ DONE
+
+> **Evidence**: `backend/worker/runner.py` — `install_signal_handlers()` registers
+> SIGTERM **and** SIGINT; the handler only raises a flag (it runs in the main
+> thread at an arbitrary bytecode, so a teardown there would take locks the
+> interrupted frame holds), and a second signal exits immediately.
+> `StrategyWorker.shutdown()` runs the ordered teardown inside one
+> `_SHUTDOWN_BUDGET_SEC = 8.0` budget: scheduler → strategies → auxiliary threads
+> → poller drain → equity checkpoint → heartbeat, then a `worker_shutdown`
+> `AuditLog` row (the "recovery record" this item asks for). `run()` calls it from
+> a `finally`, so it happens on a crash out of the loop too.
+> Tests: `backend/worker/tests/test_graceful_shutdown.py` (41).
+>
+> **Three things here are counter-intuitive and are pinned by their own tests:**
+>
+> * The teardown stops sessions with `deactivate=False`. `WorkerSession._run`'s
+>   `finally` normally flips `strategy_runs.is_active` to `False`, and
+>   `_restore_active()` only restores rows where it is `True` — so the obvious
+>   implementation would switch every strategy off on every deploy.
+> * The teardown does **not** delete `worker:heartbeat`. `WorkerWatchdog` runs in
+>   the API process (`backend/api/gunicorn_conf.py:31`) and sets
+>   `DailyRiskState.kill_switch` the moment that key is missing. Letting the 90s
+>   TTL lapse is what lets a restart come back unnoticed.
+> * The equity checkpoint writes the three equity columns **directly** rather than
+>   calling `PersistentLossTracker._persist()`, which would also write
+>   `kill_switch` from the tracker's in-memory value (issue #158). At shutdown
+>   that direction is fail-**open**: Redis down → heartbeat expires → the API
+>   watchdog sets `kill_switch=True` while this worker is alive holding an
+>   in-memory `False` → the teardown writes `False` back and the restart trades
+>   with the halt erased.
+>
+> Also required: the pub/sub loop moved from `pubsub.listen()` to
+> `get_message(timeout=1.0)`. PEP 475 resumes a blocking socket read once the
+> handler returns, so a flag raised by SIGTERM would otherwise never be read and
+> the process would still sit there until SIGKILL.
+>
+> **Two more things the budget has to actually cover** (both from review):
+>
+> * `WorkerSession.stop()` sets the stop event and returns. `strategy.stop()` —
+>   which calls the overridable `on_stop()`, and `ScriptStrategy` runs a sandboxed
+>   *user script* there — happens in `_run`'s cleanup on the session's own thread,
+>   so the bounded `join()` limits it. Calling it from `stop()` put user code
+>   ahead of and outside the deadline, and worse, ran it on the pub/sub loop
+>   thread (`_handle_stop`), where a wedged script froze the whole command loop.
+>   In that cleanup `_mark_stopped()` runs **first**: the durable record of an
+>   operator's stop must not be held hostage by code that may never return.
+> * `StartupRecovery` takes a `should_abort` callback and checks it before each of
+>   its nine steps; `main()` passes the worker's flag and, if a stop was requested
+>   during boot, skips `scheduler.start()` and tears down directly. Without it a
+>   SIGTERM during startup was only seen after the whole boot — the two broker
+>   probes wait `_BROKER_STARTUP_TIMEOUT` (30s default) each.
+>
+> **Not covered**: in-flight *order submissions* are not individually drained.
+> `IndicatorStrategy._scan_and_trade()` never checks `is_running()`, so a scan
+> already in flight keeps submitting after its strategy is stopped; the teardown
+> caps its wait at `_AUX_JOIN_CAP_SEC = 3.0` rather than spending the poller's
+> budget on it. Orders it did submit are persisted and re-registered with the
+> poller by `StartupRecovery` on the next boot
+> (`backend/worker/recovery.py:333`), so abandoning that thread costs tracking
+> until restart, not the order. The existing `QT_RESERVED` reservation and the
+> boot-time `PositionReconciler` remain what resolves an indeterminate submit.
+>
+> A recovery step **already in flight** is also still not interruptible:
+> `_step_balance`/`_step_positions` use `with ThreadPoolExecutor(...) as ex:`, and
+> `__exit__` waits for the submitted task even after `.result(timeout=...)` has
+> raised. The cancellation check above is per step boundary only. Tracked
+> separately.
 
 | Field | Value |
 |---|---|

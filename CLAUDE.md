@@ -105,9 +105,15 @@
    #153이 고친 오라우팅이 그 경로로 재현된다. 제대로 닫으려면 종목 마스터가 필요
 6. **`tr_cont` 페이지네이션 미구현 (7곳)**: `CTX_AREA_NK100/NK200`을 전부 `""`로 보내고 응답의
    연속 키를 읽지 않아, 2페이지 이상이면 **조용히 1페이지만** 돌아온다
-7. **미구현 P0 (ROADMAP 참고)**: `P0-10` SIGTERM 핸들러 없음 · `P0-03` `EmergencyFlattenManager`
+7. **미구현 P0 (ROADMAP 참고)**: `P0-03` `EmergencyFlattenManager`
    `dry_run` 기본값이 아직 `True`(`backend/worker/emergency.py:57`) · `P0-11`은 기동 시점이 아니라
    `crypto.py:_get_fernet()` 최초 호출 시점에만 키를 검증
+8. **`PersistentLossTracker._write_db()`가 외부 킬스위치 해제를 덮어쓴다** (이슈 #158).
+   워커가 도는 동안 해제하면 다음 PnL 기록에서 `True`로 되돌아간다. 그래서 해제 절차는
+   반드시 **워커 정지 → 해제 → 기동** 순서다 — `api/routers/risk.py`가 응답에 안내한다
+9. **워커 종료 예산은 8초**(`_SHUTDOWN_BUDGET_SEC`). `docker-compose.yml`은 `kis-worker`에
+   `stop_grace_period`를 지정하지 않아 도커 기본값 10초가 적용된다. 종료 단계를 늘리려면
+   예산과 grace period를 함께 봐야 한다
 
 ---
 
@@ -454,8 +460,8 @@ git checkout -B <새-작업-브랜치> origin/main
    `SAFE_MODE` 무재시작 해제**(P0-04 의존), (b) **`PersistentLossTracker._write_db`가
    메모리 값으로 `kill_switch`를 덮어써** 실행 중 해제가 되돌려지는 문제 — 그래서 지금은
    "워커 정지 → 해제 → 기동" 순서를 강제 안내한다
-2. `P0-10` SIGTERM 핸들러 — 코드베이스에 `signal` 핸들러가 전혀 없다. 컨테이너 재시작이
-   항상 비정상 종료로 처리된다
+2. ~~`P0-10` SIGTERM 핸들러~~ — 완료(`backend/worker/runner.py`
+   `install_signal_handlers` + `StrategyWorker.shutdown`)
 3. `P0-03` `EmergencyFlattenManager(dry_run=True)` 기본값 → 로드맵은 `False`를 요구
 4. `P2-01` `order_events` append-only 테이블 (큰 변경)
 5. `P3-04` Pinia 스토어 분리 — `frontend/src/stores/`가 아직 `index.js` 하나 (큰 변경)
