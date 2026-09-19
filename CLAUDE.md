@@ -108,9 +108,13 @@
 7. **미구현 P0 (ROADMAP 참고)**: `P0-03` `EmergencyFlattenManager`
    `dry_run` 기본값이 아직 `True`(`backend/worker/emergency.py:57`) · `P0-11`은 기동 시점이 아니라
    `crypto.py:_get_fernet()` 최초 호출 시점에만 키를 검증
-8. **`PersistentLossTracker._write_db()`가 외부 킬스위치 해제를 덮어쓴다** (이슈 #158).
-   워커가 도는 동안 해제하면 다음 PnL 기록에서 `True`로 되돌아간다. 그래서 해제 절차는
-   반드시 **워커 정지 → 해제 → 기동** 순서다 — `api/routers/risk.py`가 응답에 안내한다
+8. **킬스위치 해제는 유지되지만, 그것만으로 매매가 재개되지는 않는다.**
+   이슈 #158(`_write_db`가 메모리 값으로 덮어쓰던 문제)은 해결됐다 — 트래커가 행을 다시
+   읽고 **자기 판단이 있을 때만** 플래그를 주장한다. "워커 정지 → 해제 → 기동" 절차는
+   더 이상 필요 없다. 다만 **두 가지가 남는다**: (a) 워커가 기동 시 킬스위치를 캐시해
+   `SAFE_MODE`를 잠그므로 **재시작이 필요**하다(P0-12 남은 절반, P0-04 의존),
+   (b) **위반 조건 자체가 유효하면** 다음 PnL 기록에서 `_evaluate()`가 다시 정지시킨다 —
+   일손실·MDD 정지는 보통 그날 내내 조건이 유효하므로 **장중 재개는 이 API만으로는 안 된다**
 9. **워커 종료 예산은 8초**(`_SHUTDOWN_BUDGET_SEC`). `docker-compose.yml`은 `kis-worker`에
    `stop_grace_period`를 지정하지 않아 도커 기본값 10초가 적용된다. 종료 단계를 늘리려면
    예산과 grace period를 함께 봐야 한다
@@ -455,16 +459,25 @@ git checkout -B <새-작업-브랜치> origin/main
 
 현재 방침: **배포·모의투자 시계는 나중, 하드닝을 계속한다.**
 
-1. `P0-12` — ⚠️ **부분 완료**. 영속 DB 플래그 해제 API는 있다(`api/routers/risk.py`,
-   `KILL_SWITCH_ADMINS` 허용목록). 남은 것 둘: (a) 로드맵 원래 범위인 **인메모리
-   `SAFE_MODE` 무재시작 해제**(P0-04 의존), (b) **`PersistentLossTracker._write_db`가
-   메모리 값으로 `kill_switch`를 덮어써** 실행 중 해제가 되돌려지는 문제 — 그래서 지금은
-   "워커 정지 → 해제 → 기동" 순서를 강제 안내한다
-2. ~~`P0-10` SIGTERM 핸들러~~ — 완료(`backend/worker/runner.py`
-   `install_signal_handlers` + `StrategyWorker.shutdown`)
-3. `P0-03` `EmergencyFlattenManager(dry_run=True)` 기본값 → 로드맵은 `False`를 요구
-4. `P2-01` `order_events` append-only 테이블 (큰 변경)
-5. `P3-04` Pinia 스토어 분리 — `frontend/src/stores/`가 아직 `index.js` 하나 (큰 변경)
+1. **`P0-03`은 로드맵 설명이 틀렸다 — 착수 전에 읽을 것.** 로드맵은
+   "`dry_run` 기본값이 `True`이고 한 번도 오버라이드되지 않는다"고 하지만 **기본값을
+   뒤집는 것은 무동작이다**: 프로덕션 유일 생성 지점 `backend/api/server.py:340-345`가 이미
+   `ENABLE_LIVE_TRADING`에서 `dry_run`을 명시로 넘기고, 테스트 생성 지점도 전부 명시한다.
+   **진짜 공백은 MDD 킬스위치가 flatten을 아예 호출하지 않는다는 것**이다 —
+   `_fire_kill_switch_alert`(`backend/quant/risk/engine.py`)는 SAFE_MODE 차단·텔레그램·
+   WebSocket 세 가지만 하고 `EmergencyFlattenManager`를 import조차 하지 않는다.
+   그 배선은 **P0-04 의존**이다. `backend/worker/emergency.py`의 docstring이 MDD를
+   트리거로 광고하는 것도 사실과 다르니 함께 고칠 것
+2. `P0-12` — ⚠️ **부분 완료**. 위 알려진 이슈 8번 참고. 남은 건 (a) 인메모리 `SAFE_MODE`
+   무재시작 해제(P0-04 의존), (b) 위반 조건이 유효할 때의 재개 의미 정의(리스크 정책 판단)
+3. `P2-01` `order_events` append-only 테이블 (큰 변경)
+4. `P3-04` Pinia 스토어 분리 — `frontend/src/stores/`가 아직 `index.js` 하나 (큰 변경)
+5. 열린 이슈: **#160**(`PersistentLossTracker` 날짜 키 불일치 — KST 00~09시에 부팅 복원이
+   빈 행을 읽는 fail-open) · **#161**(`StartupRecovery`의 브로커 조회가 타임아웃 뒤에도
+   블록 — 기동 중 SIGTERM이 SIGKILL까지 가는 주원인)
+
+> ~~`P0-10` SIGTERM 핸들러~~ — 완료(PR #159, `install_signal_handlers` +
+> `StrategyWorker.shutdown`, 종료 예산 8초).
 
 > `ROADMAP.md`의 각 항목에 `✅ DONE` / `❌ OPEN` 표기와 **근거 파일:행**을 달아두는 작업이
 > 진행 중이다(P6-05). 표기가 없는 항목은 아직 검증되지 않은 것이지 미완이라는 뜻이 아니다.
