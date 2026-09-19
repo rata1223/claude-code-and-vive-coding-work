@@ -466,21 +466,19 @@ class StrategyWorker:
     def _checkpoint_equity(self) -> None:
         """Write daily/weekly PnL and peak equity. **Never** the halt flag.
 
-        Deliberately not ``PersistentLossTracker._persist()``, which would also
-        write ``kill_switch`` from the tracker's in-memory value (issue #158).
-        That direction of the stale write is fail-**open** and this step would be
-        the one to trigger it:
+        Deliberately narrow: only the three equity columns, never the halt flag.
+        ``_persist()`` would do more than this step needs — a Redis write, and a
+        pass over ``kill_switch`` — and a shutdown checkpoint has no business
+        deciding a halt either way.
 
-            Redis goes down → the heartbeat key cannot be refreshed → it expires
-            → the API-side ``WorkerWatchdog`` sets ``kill_switch=True`` in the DB
-            while this worker is still alive holding an in-memory ``False`` → a
-            SIGTERM here writes ``False`` and ``kill_reason=None`` back over it →
-            the restarted worker resumes trading with the halt erased.
+        (This used to be load-bearing: ``_write_db`` overwrote the flag from
+        memory, so calling ``_persist()`` here could erase a halt the API-side
+        watchdog had set while this worker was alive believing nothing was wrong.
+        Issue #158 fixed that at the source — the tracker now re-reads the row —
+        so this is a matter of scope rather than safety.)
 
-        So the checkpoint touches only the three equity columns and leaves
-        ``kill_switch``/``kill_reason`` exactly as they are on disk, whoever set
-        them. ``record_pnl()`` persists these same columns on every call, so this
-        is a retry for a write that failed earlier rather than the only copy.
+        ``record_pnl()`` persists these same columns on every call, so this is a
+        retry for a write that failed earlier rather than the only copy.
         """
         tracker = self._loss_tracker
         if tracker is None:
@@ -837,6 +835,11 @@ class StrategyWorker:
                            detail={"fill_price": fill.price, "qty": fill.qty})
                 try:
                     ks_before = self._loss_tracker.kill_switch
+                    # Distinguishes "this fill breached a limit" from "this write
+                    # picked up a halt set elsewhere" — both flip kill_switch
+                    # False -> True, but only the first belongs to this symbol.
+                    decisions_before = getattr(
+                        self._loss_tracker, "kill_switch_decisions", None)
                     # Never fall back to peak_equity: MDD = (peak - peak)/peak = 0% masks drawdown.
                     # Use last-known-good equity; skip MDD evaluation if none available.
                     try:
@@ -858,9 +861,22 @@ class StrategyWorker:
                                     f"{entry_price:.4f}" if entry_price is not None else "n/a",
                                     fill.price, fill.qty)
                         if not ks_before and self._loss_tracker.kill_switch:
-                            _audit("kill_switch_triggered", symbol=fill.symbol,
-                                   detail={"reason": self._loss_tracker.kill_reason,
-                                           "realized_pnl": realized_pnl})
+                            decisions_after = getattr(
+                                self._loss_tracker, "kill_switch_decisions", None)
+                            ours = (decisions_before is None
+                                    or decisions_after != decisions_before)
+                            if ours:
+                                _audit("kill_switch_triggered", symbol=fill.symbol,
+                                       detail={"reason": self._loss_tracker.kill_reason,
+                                               "realized_pnl": realized_pnl})
+                            else:
+                                # Set outside this process (typically the API-side
+                                # WorkerWatchdog) and only noticed here. Recording
+                                # it against this symbol and P&L would invent a
+                                # cause for the next person reading the trail.
+                                _audit("kill_switch_adopted",
+                                       detail={"reason": self._loss_tracker.kill_reason,
+                                               "noticed_on_fill": fill.symbol})
                 except Exception as e:
                     logger.warning("P&L 기록 실패: %s", e)
 
