@@ -22,20 +22,34 @@ is the gap: a control that can only be set, never released, is not a safety
 control — it is an outage. This router is the release path, with the thing a
 hand-edited row never leaves behind: a named operator and a written reason.
 
-**What this does not do, and the order that matters.** It does not resume a
-running worker: the worker caches ``_kill_switch_active`` during
-`StartupRecovery`, so the clear takes effect on its next start.
+**What clearing the flag does and does not achieve.** Two things still stand
+between a cleared row and a trading worker, and the response says both.
 
-Worse, resetting *while a worker is running* can be silently undone.
-``PersistentLossTracker._write_db`` (backend/quant/risk/engine.py) writes
-``row.kill_switch = ks`` from its **in-memory** value on every PnL write, so a
-live worker that still believes the switch is set will put it back on its next
-write. The safe order is therefore **stop the worker → reset → start**, which
-the response states.
+1. **A running worker does not resume.** It caches ``_kill_switch_active``
+   during `StartupRecovery` and `_step_enable_trading` acts on that, so lifting
+   ``SAFE_MODE`` needs a restart. That is the half of ROADMAP P0-12 still open
+   (it depends on P0-04).
 
-The durable fix is to make the tracker honour an external clear rather than
-overwrite it — that belongs in the worker's risk engine, not here, and is
-tracked as follow-up on P0-12.
+2. **A halt whose cause still holds comes straight back.** Clearing the row does
+   not clear the *breach*. On the next PnL write ``LossTracker._evaluate()``
+   re-checks the daily, weekly and MDD limits and halts again if any is still
+   exceeded — a fresh decision, logged and alerted, not a stale overwrite. For a
+   daily-loss or MDD halt the condition normally holds for the rest of the
+   session, so **this endpoint alone does not resume intraday trading.**
+
+What is no longer true: the reset used to be *silently* undone.
+``PersistentLossTracker._write_db`` overwrote the column from its in-memory
+value on every write, so a clear vanished with no log and no reason. That is
+fixed (issue #158) — the tracker now re-reads the row and only asserts the flag
+when it has a decision of its own to record, so an external clear survives and
+the tracker converges to it. The old workaround ("stop the worker, then clear,
+then start") is no longer required.
+
+One residue, stated so it is not a surprise: if the worker breached a limit and
+the write of *that* halt failed, the intent stays pending and is re-asserted on
+its next successful write — including over a clear made in between. That
+direction is fail-closed (a real breach wins), and the reverse — a failed clear
+replaying over somebody else's halt — is explicitly dropped instead.
 """
 import json
 import logging
@@ -55,12 +69,14 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/risk", tags=["risk"])
 
-#: Told to the operator on a successful reset. The worker re-reads the flag at
-#: startup, so the reset alone does not resume trading.
+#: Told to the operator on a successful reset. Clearing the row is necessary but
+#: not sufficient — see the module docstring for both remaining gates.
 RESTART_NOTICE = (
-    "워커를 **정지한 뒤** 해제하고 다시 기동하세요. 실행 중인 워커는 "
-    "PersistentLossTracker의 메모리 값으로 DailyRiskState를 덮어쓰므로, "
-    "다음 PnL 기록 시 kill_switch가 True로 되돌아갑니다."
+    "해제는 즉시 반영되며 실행 중인 워커가 덮어쓰지 않습니다. 다만 "
+    "**매매 재개에는 워커 재시작이 필요합니다** — 워커가 기동 시 킬스위치를 "
+    "캐시해 SAFE_MODE를 잠그기 때문입니다. 또한 **위반 조건 자체가 아직 "
+    "유효하면**(일손실·주간손실·MDD 한도) 다음 PnL 기록에서 다시 정지됩니다. "
+    "그건 덮어쓰기가 아니라 새 판단이며 로그와 알림이 남습니다."
 )
 
 

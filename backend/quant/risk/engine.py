@@ -230,7 +230,16 @@ class LossTracker:
         self.weekly_pnl = 0.0
         self.week_start = _seoul_today()
 
-    def record_pnl(self, pnl: float, current_equity: float) -> None:
+    def record_pnl(self, pnl: float, current_equity: float) -> str:
+        """Record realized P&L and re-evaluate the limits.
+
+        Returns what **this call** did to the kill switch — ``"triggered"`` if it
+        halted, otherwise ``"unchanged"``. Callers need a per-call answer:
+        inspecting ``self.kill_switch`` before and after cannot distinguish this
+        call's decision from a concurrent one's, and fills arrive on several
+        poller threads at once. ``PersistentLossTracker`` extends the vocabulary
+        with ``"adopted"``.
+        """
         today = _seoul_today()
         if today != self.trade_date:
             self.reset_daily()
@@ -243,7 +252,20 @@ class LossTracker:
         if current_equity > self.peak_equity:
             self.peak_equity = current_equity
 
+        was_halted = self.kill_switch
         self._evaluate()
+        return "triggered" if (self.kill_switch and not was_halted) else "unchanged"
+
+    def _mark_kill_switch_changed(self) -> None:
+        """Called wherever **this process** decides the kill switch's value.
+
+        A no-op here; ``PersistentLossTracker`` overrides it to record that it
+        has something to assert the next time it writes the row. Deliberately
+        an explicit call at each site rather than a property setter on
+        ``kill_switch``: a setter would also fire for ``_restore_state()``, which
+        is reading the DB's value back, not forming an opinion — and that
+        distinction is the entire fix (issue #158).
+        """
 
     def _evaluate(self) -> None:
         capital = max(self.peak_equity, 1.0)
@@ -251,6 +273,7 @@ class LossTracker:
         # 일일 손실 한도
         if self.daily_pnl / capital < -self.config.daily_loss_limit_pct:
             self.kill_switch = True
+            self._mark_kill_switch_changed()
             self.kill_reason = f"일일 손실 한도 초과 ({self.daily_pnl/capital:.2%})"
             logger.error("킬스위치 [일일] %s", self.kill_reason)
             self._fire_kill_switch_alert(self.kill_reason)
@@ -259,6 +282,7 @@ class LossTracker:
         # 주간 손실 한도
         if self.weekly_pnl / capital < -self.config.weekly_loss_limit_pct:
             self.kill_switch = True
+            self._mark_kill_switch_changed()
             self.kill_reason = f"주간 손실 한도 초과 ({self.weekly_pnl/capital:.2%})"
             logger.error("킬스위치 [주간] %s", self.kill_reason)
             self._fire_kill_switch_alert(self.kill_reason)
@@ -269,6 +293,7 @@ class LossTracker:
             mdd = (self.current_equity - self.peak_equity) / self.peak_equity
             if mdd < -self.config.mdd_limit_pct:
                 self.kill_switch = True
+                self._mark_kill_switch_changed()
                 self.kill_reason = f"MDD 한도 초과 ({mdd:.2%})"
                 logger.error("킬스위치 [MDD] %s", self.kill_reason)
                 self._fire_kill_switch_alert(self.kill_reason)
@@ -307,6 +332,7 @@ class LossTracker:
 
     def manual_reset(self) -> None:
         self.kill_switch = False
+        self._mark_kill_switch_changed()
         self.kill_reason = ""
         logger.info("킬스위치 수동 해제")
 
@@ -367,7 +393,25 @@ class PersistentLossTracker(LossTracker):
     def __init__(self, config: RiskConfig, redis_client=None,
                  db_session=None, db_factory=None):
         super().__init__(config=config)
-        self._lock = threading.Lock()  # serialises concurrent record_pnl() calls
+        # RLock, not Lock: LossTracker.record_pnl() calls reset_daily() when the
+        # Seoul date rolls over, and this class overrides reset_daily() to take
+        # this same lock. With a plain Lock that is a permanent hang on the first
+        # fill after Seoul midnight — inside the US session this system trades.
+        # (Pre-existing; found while reviewing issue #158.)
+        self._lock = threading.RLock()  # serialises concurrent record_pnl() calls
+        # ── kill-switch ownership (issue #158) ───────────────────────────────
+        # State alone cannot distinguish "a fresh breach" from "a stale True
+        # sitting on top of somebody else's clear", so intent is recorded
+        # instead. Bumped by _mark_kill_switch_changed() whenever *this process*
+        # decides the value; _write_db() asserts the flag only while these two
+        # differ, and otherwise lets the row on disk win.
+        #
+        # A counter rather than a bool: a breach can land between a write's
+        # snapshot and its commit, and clearing a bool afterwards would discard
+        # it. Comparing epochs means only an *unchanged* epoch is marked caught
+        # up. Set before _restore_state() below, which must not count as intent.
+        self._ks_epoch = 0
+        self._ks_written = 0
         self._redis = redis_client
         # Prefer db_factory (creates per-op sessions) over a long-lived db_session.
         # Long-lived sessions cause stale connections and pool exhaustion on 24h+ processes.
@@ -378,6 +422,17 @@ class PersistentLossTracker(LossTracker):
             self._db_factory = None
             self._db = db_session  # legacy: long-lived session, kept for compat
         self._restore_state()
+
+    def _mark_kill_switch_changed(self) -> None:
+        """This process has formed an opinion; the next write asserts it."""
+        self._ks_epoch += 1
+
+    # Deliberately no public accessor for ``_ks_epoch``. An earlier revision
+    # exposed one so the fill pipeline could tell "we just halted" from "we
+    # adopted somebody else's halt" by diffing it across a call — but a
+    # process-global counter read outside the lock cannot attribute a decision
+    # to one call when fills arrive concurrently. ``record_pnl()`` returns that
+    # answer per call instead; re-adding the accessor would invite the bug back.
 
     def _redis_key(self) -> str:
         return self._REDIS_KEY_TEMPLATE.format(date=_seoul_today().isoformat())
@@ -404,10 +459,22 @@ class PersistentLossTracker(LossTracker):
                 self.kill_reason = db_state.kill_reason or ""
                 logger.warning("킬스위치 복원: %s", self.kill_reason)
 
-    def record_pnl(self, pnl: float, current_equity: float) -> None:
+    def record_pnl(self, pnl: float, current_equity: float) -> str:
+        """As the base, plus ``"adopted"`` when the write picked up a halt that
+        was set outside this process.
+
+        The base call runs **inside ``self._lock``**, so its ``"triggered"``
+        answer describes this call and no other — which is the whole point.
+        Comparing ``kill_switch`` or the decision counter across the call from
+        outside cannot do that: fills arrive concurrently on poller threads, and
+        another fill's breach lands between the two reads.
+        """
         with self._lock:
-            super().record_pnl(pnl, current_equity)
-        self._persist()
+            outcome = super().record_pnl(pnl, current_equity)
+        adopted = self._persist()
+        if outcome == "unchanged" and adopted:
+            return "adopted"
+        return outcome
 
     def reset_daily(self) -> None:
         with self._lock:
@@ -457,9 +524,10 @@ class PersistentLossTracker(LossTracker):
         except Exception as e:
             logger.warning("킬스위치 감사 로그 예외: %s", e)
 
-    def _persist(self) -> None:
+    def _persist(self) -> bool:
+        """Returns True when the write adopted a halt set outside this process."""
         self._write_redis()
-        self._write_db()
+        return self._write_db()
 
     def _write_redis(self) -> None:
         if self._redis is None:
@@ -470,7 +538,20 @@ class PersistentLossTracker(LossTracker):
         except Exception as e:
             logger.warning("Redis PnL 기록 실패: %s", e)
 
-    def _write_db(self) -> None:
+    def _write_db(self) -> bool:
+        """Persist the day's numbers, and settle who owns the kill switch.
+
+        The equity columns are always this process's to write. The halt flag is
+        not: ``api/routers/risk.py`` clears it and ``WorkerWatchdog`` sets it,
+        both from outside this process. This used to overwrite whatever they had
+        written with the in-memory value, which broke in both directions —
+        an operator's clear was undone, and a watchdog halt was *erased* (issue
+        #158). So the row is re-read, and the flag is asserted only while this
+        process has an opinion it has not yet written; otherwise the row wins and
+        memory converges to it.
+
+        Returns True when this write adopted a halt from the row.
+        """
         from backend.database.models import DailyRiskState
         today = date.today()
         with self._lock:
@@ -479,6 +560,95 @@ class PersistentLossTracker(LossTracker):
             peak_eq = self.peak_equity
             ks = self.kill_switch
             kr = self.kill_reason or None
+            epoch = self._ks_epoch
+            asserting = epoch != self._ks_written
+
+        def _apply(row, is_new: bool) -> tuple[bool, str | None] | None:
+            """Write into ``row``; return the flag to adopt, or None if asserted.
+
+            ``is_new`` matters: a row that did not exist holds nobody's decision.
+            Its ``kill_switch`` is still ``None`` before flush, so adopting
+            ``bool(None)`` would **clear a live halt** — every day at the first
+            write against a new date key. There is nothing external to defer to,
+            so this process's value is simply carried forward.
+            """
+            row.daily_pnl = daily_pnl
+            row.weekly_pnl = weekly_pnl
+            row.peak_equity = peak_eq
+            if asserting or is_new:
+                row.kill_switch = ks
+                row.kill_reason = kr
+                return None
+            return bool(row.kill_switch), row.kill_reason
+
+        def _settle(adopted) -> bool:
+            """Record the outcome against the epoch the write was based on.
+
+            Returns True when this write adopted a halt set outside this process,
+            so ``record_pnl()`` can report ``"adopted"`` for **this call** rather
+            than leaving the caller to infer it from shared state.
+
+            If the epoch moved while the write was in flight, a breach landed
+            after the snapshot: leave the marker alone so the next write asserts
+            it, and do not adopt a row that is now out of date.
+            """
+            adopt_halt = None
+            with self._lock:
+                if self._ks_epoch != epoch:
+                    return False
+                if asserting or is_new_row[0]:
+                    self._ks_written = epoch
+                elif adopted is not None:
+                    was = self.kill_switch
+                    self.kill_switch, self.kill_reason = adopted[0], adopted[1] or ""
+                    if adopted[0] and not was:
+                        adopt_halt = adopted[1] or "외부 킬스위치"
+
+            if adopt_halt is not None:
+                # Converging the attribute is not enough to stop anything:
+                # can_buy() has no production callers and the real order gate is
+                # SAFE_MODE (backend/strategy/base.py). A halt somebody else set
+                # — the API-side WorkerWatchdog, typically — has to close that
+                # gate here or this process keeps trading through it.
+                #
+                # No Telegram/WebSocket alert: whoever set the flag already
+                # raised one, and this runs on every subsequent write.
+                logger.warning("외부 킬스위치 감지 — 매매 차단: %s", adopt_halt)
+                try:
+                    from backend.risk.halt_policy import HaltCause
+                    from backend.worker.recovery import SAFE_MODE
+                    SAFE_MODE.disable(f"킬스위치(외부): {adopt_halt}",
+                                      cause=HaltCause.RISK_BREACH)
+                except Exception as e:
+                    logger.warning("SAFE_MODE 비활성화 실패: %s", e)
+            # Adopting a *clear* deliberately does NOT re-enable SAFE_MODE:
+            # resuming has to go through StartupRecovery's checks, which is the
+            # half of P0-12 that is still open.
+            return adopt_halt is not None
+
+        # One helper, applied on both paths — these two branches were copy-pasted
+        # and are exactly where a fix lands on one side only.
+        def _abandon_failed_clear() -> None:
+            """A failed write leaves this process's intent unwritten, so the next
+            write re-asserts it. That is right for a halt — fail-closed — and
+            wrong for a clear: by then somebody else may have halted the
+            deployment, and replaying our stale ``False`` would erase it, which
+            is the #158 overwrite wearing a different hat.
+
+            So a clear that never reached the DB is dropped. The operator retries
+            if they still want it, and memory converges to whatever the row
+            actually says on the next write.
+            """
+            if ks:
+                return
+            with self._lock:
+                if self._ks_epoch == epoch:
+                    self._ks_written = epoch
+                    logger.warning(
+                        "킬스위치 해제 기록 실패 — 해제 의사를 폐기한다. "
+                        "DB 값이 우선이며, 필요하면 다시 해제할 것")
+
+        is_new_row = [False]
 
         if self._db_factory is not None:
             sess = self._db_factory()
@@ -487,15 +657,14 @@ class PersistentLossTracker(LossTracker):
                 if row is None:
                     row = DailyRiskState(trade_date=today)
                     sess.add(row)
-                row.daily_pnl = daily_pnl
-                row.weekly_pnl = weekly_pnl
-                row.peak_equity = peak_eq
-                row.kill_switch = ks
-                row.kill_reason = kr
+                    is_new_row[0] = True
+                adopted = _apply(row, is_new_row[0])
                 sess.commit()
+                return _settle(adopted)
             except Exception as e:
                 logger.warning("DB PnL 기록 실패: %s", e)
                 sess.rollback()
+                _abandon_failed_clear()
             finally:
                 sess.close()
         elif self._db is not None:
@@ -505,18 +674,19 @@ class PersistentLossTracker(LossTracker):
                 if row is None:
                     row = DailyRiskState(trade_date=today)
                     self._db.add(row)
-                row.daily_pnl = daily_pnl
-                row.weekly_pnl = weekly_pnl
-                row.peak_equity = peak_eq
-                row.kill_switch = ks
-                row.kill_reason = kr
+                    is_new_row[0] = True
+                adopted = _apply(row, is_new_row[0])
                 self._db.commit()
+                return _settle(adopted)
             except Exception as e:
                 logger.warning("DB PnL 기록 실패 (legacy): %s", e)
                 try:
                     self._db.rollback()
                 except Exception:
                     pass
+                _abandon_failed_clear()
+
+        return False
 
     def _load_redis(self, today: date) -> Optional[float]:
         if self._redis is None:

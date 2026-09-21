@@ -280,6 +280,42 @@ Any single incomplete P0 item is sufficient to block the paper→real transition
 > `POST /api/risk/kill-switch/reset` (clear, mandatory written reason, `AuditLog`
 > row naming the operator). Tests: `api/tests/test_risk_killswitch_reset.py`.
 >
+> ✅ **Also closed (issue #158)**: the reset used to be *silently* undone —
+> `PersistentLossTracker._write_db` overwrote the column from its in-memory value
+> on every PnL write. It now re-reads the row and asserts the flag only when it
+> has a decision of its own to record, so an external clear survives and the
+> tracker converges to it. The old "stop the worker → reset → start" procedure is
+> no longer needed. Tests:
+> `backend/worker/tests/test_kill_switch_convergence.py` (24).
+>
+> Four things review turned up while closing it, all fixed in the same change:
+>
+> * A row that does not exist yet is **not** an external opinion — its
+>   `kill_switch` is `None` before flush, and adopting `bool(None)` cleared a live
+>   halt at the first write against each new date key, i.e. every day boundary.
+> * A **failed** write leaves the intent pending. Re-asserting a stale *halt* is
+>   fail-closed and kept; re-asserting a stale *clear* over a halt set meanwhile
+>   is fail-open and is now dropped.
+> * Adopting a halt into memory changed nothing on its own — `can_buy()` has no
+>   production callers and the real order gate is `SAFE_MODE`. Adoption now closes
+>   that gate (adopting a *clear* deliberately does not re-open it).
+> * Pre-existing, found here: `self._lock` was a plain `Lock`, and
+>   `record_pnl()` → `reset_daily()` re-enters it at the Seoul date rollover — a
+>   permanent hang on the first fill after KST midnight, inside the US session.
+>   Now an `RLock`.
+>
+> ❌ **Still open, and it is what keeps this PARTIAL**:
+>
+> 1. The in-memory `SAFE_MODE` half this item was written about — a restart is
+>    still required to resume trading (depends on P0-04).
+> 2. Clearing the row does not clear the **breach**. While a limit is still
+>    exceeded, `LossTracker._evaluate()` halts again on the next PnL write — a
+>    fresh, logged decision, not a stale overwrite. For a daily-loss or MDD halt
+>    the condition normally holds for the rest of the session, so the endpoint
+>    alone does not resume intraday trading. Deciding what "resume" should mean
+>    (reset the baseline? only re-halt on a worse reading?) is risk-policy work,
+>    not a mechanical fix.
+>
 > ❌ **Still open**: clearing in-process `SAFE_MODE` *without* a restart, as
 > originally specified. The reset endpoint deliberately tells the operator a
 > worker restart is required, because the worker caches the flag at boot. That

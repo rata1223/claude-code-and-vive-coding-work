@@ -320,13 +320,17 @@ def test_the_reason_is_stored_trimmed(db, user):
     assert '"reason": "포지션 정리 완료"' in row.detail
 
 
-# ── the live-worker hazard is stated, not glossed ────────────────────────────
+# ── what the operator is told, now that the overwrite is gone ────────────────
 
-def test_the_response_warns_about_resetting_under_a_live_worker(db, user):
-    """``PersistentLossTracker._write_db`` writes ``row.kill_switch`` from its
-    in-memory value on every PnL write, so a running worker puts the flag back.
-    The operator has to be told to stop the worker first — a reset that gets
-    silently undone is worse than one that is refused.
+def test_the_response_states_both_remaining_gates(db, user):
+    """Clearing the row is necessary but not sufficient, for two separate
+    reasons, and an operator who is told neither will think trading resumed.
+
+    1. ``StartupRecovery`` caches the flag at boot and ``_step_enable_trading``
+       locks ``SAFE_MODE`` from it — lifting that needs a restart (the half of
+       P0-12 still open).
+    2. Clearing the row does not clear the *breach*. If a limit is still
+       exceeded, ``LossTracker._evaluate()`` halts again on the next PnL write.
     """
     from api.routers import risk
 
@@ -334,6 +338,67 @@ def test_the_response_warns_about_resetting_under_a_live_worker(db, user):
     resp = risk.reset_kill_switch(
         risk.KillSwitchResetRequest(reason="정리 완료"), user, db)
 
+    assert resp.code == 1
     note = resp.msg + str(resp.data)
-    assert "정지" in note, "the response must say to stop the worker first"
-    assert "PersistentLossTracker" in note or "되돌아" in note
+    assert "재시작" in note, "the operator must be told a restart is needed"
+    assert "위반 조건" in note or "다시 정지" in note, (
+        "the operator must be told a live breach re-halts")
+
+
+def test_the_response_no_longer_tells_them_to_stop_the_worker_first(db, user):
+    """That instruction existed only because ``_write_db`` silently overwrote
+    the cleared flag (issue #158). That is fixed, so repeating the advice would
+    send operators through a needless outage."""
+    from api.routers import risk
+
+    _risk_row(db, kill_switch=True, reason="MDD")
+    resp = risk.reset_kill_switch(
+        risk.KillSwitchResetRequest(reason="정리 완료"), user, db)
+
+    note = resp.msg + str(resp.data)
+    assert "정지한 뒤" not in note
+    assert "되돌아갑니다" not in note
+
+
+def test_a_live_tracker_does_not_undo_the_reset(db, user):
+    """The claim the response now makes, driven end to end against the real
+    risk engine rather than trusted from the wording."""
+    from sqlalchemy.orm import sessionmaker
+
+    from backend.quant.risk.engine import PersistentLossTracker, RiskConfig
+    from api.routers import risk
+
+    Session = sessionmaker(bind=db.get_bind(), autocommit=False, autoflush=False)
+
+    def _factory():
+        return Session()
+
+    # A worker that halted earlier in the session and is still running.
+    tracker = PersistentLossTracker(config=RiskConfig(), redis_client=None,
+                                    db_factory=_factory)
+    tracker.peak_equity = 1_000_000.0
+    tracker.record_pnl(-500_000.0, 500_000.0)
+    assert tracker.kill_switch is True
+
+    db.expire_all()
+    resp = risk.reset_kill_switch(
+        risk.KillSwitchResetRequest(reason="포지션 수동 정리 완료"), user, db)
+    assert resp.code == 1, resp.msg
+
+    # The day rolls over, so no limit is breached any more; the only thing that
+    # could put the flag back now is the stale in-memory value.
+    tracker.reset_daily()
+    tracker.reset_weekly()
+    tracker.record_pnl(0.0, 1_000_000.0)
+
+    from datetime import date
+
+    from backend.database.models import DailyRiskState
+    sess = Session()
+    try:
+        row = sess.get(DailyRiskState, date.today())
+        assert row.kill_switch is False, (
+            "a live worker put the halt back — #158 is not actually fixed")
+    finally:
+        sess.close()
+    assert tracker.kill_switch is False, "the tracker did not converge to the row"
