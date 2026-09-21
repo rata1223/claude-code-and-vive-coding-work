@@ -834,12 +834,6 @@ class StrategyWorker:
                     _audit("sell_without_entry_price", symbol=fill.symbol,
                            detail={"fill_price": fill.price, "qty": fill.qty})
                 try:
-                    ks_before = self._loss_tracker.kill_switch
-                    # Distinguishes "this fill breached a limit" from "this write
-                    # picked up a halt set elsewhere" — both flip kill_switch
-                    # False -> True, but only the first belongs to this symbol.
-                    decisions_before = getattr(
-                        self._loss_tracker, "kill_switch_decisions", None)
                     # Never fall back to peak_equity: MDD = (peak - peak)/peak = 0% masks drawdown.
                     # Use last-known-good equity; skip MDD evaluation if none available.
                     try:
@@ -855,28 +849,30 @@ class StrategyWorker:
                             logger.warning("잔고 조회 실패 — 마지막 확인 잔고(%.0f원) 사용: %s",
                                            current_equity, _be)
                     if current_equity is not None:
-                        self._loss_tracker.record_pnl(realized_pnl, current_equity)
+                        # record_pnl() reports what *this call* did, decided under
+                        # the tracker's own lock. Fills arrive concurrently on
+                        # poller threads, so reading kill_switch (or a decision
+                        # counter) before and after would let one fill claim
+                        # another's breach and file it against the wrong symbol
+                        # and P&L.
+                        outcome = self._loss_tracker.record_pnl(
+                            realized_pnl, current_equity)
                         logger.info("손익 기록: %s %.0f원 (entry=%s fill=%.4f qty=%d)",
                                     fill.symbol, realized_pnl,
                                     f"{entry_price:.4f}" if entry_price is not None else "n/a",
                                     fill.price, fill.qty)
-                        if not ks_before and self._loss_tracker.kill_switch:
-                            decisions_after = getattr(
-                                self._loss_tracker, "kill_switch_decisions", None)
-                            ours = (decisions_before is None
-                                    or decisions_after != decisions_before)
-                            if ours:
-                                _audit("kill_switch_triggered", symbol=fill.symbol,
-                                       detail={"reason": self._loss_tracker.kill_reason,
-                                               "realized_pnl": realized_pnl})
-                            else:
-                                # Set outside this process (typically the API-side
-                                # WorkerWatchdog) and only noticed here. Recording
-                                # it against this symbol and P&L would invent a
-                                # cause for the next person reading the trail.
-                                _audit("kill_switch_adopted",
-                                       detail={"reason": self._loss_tracker.kill_reason,
-                                               "noticed_on_fill": fill.symbol})
+                        if outcome == "triggered":
+                            _audit("kill_switch_triggered", symbol=fill.symbol,
+                                   detail={"reason": self._loss_tracker.kill_reason,
+                                           "realized_pnl": realized_pnl})
+                        elif outcome == "adopted":
+                            # Set outside this process (typically the API-side
+                            # WorkerWatchdog) and only noticed here. Recording it
+                            # against this symbol and P&L would invent a cause for
+                            # the next person reading the trail.
+                            _audit("kill_switch_adopted",
+                                   detail={"reason": self._loss_tracker.kill_reason,
+                                           "noticed_on_fill": fill.symbol})
                 except Exception as e:
                     logger.warning("P&L 기록 실패: %s", e)
 

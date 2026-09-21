@@ -28,6 +28,7 @@ These tests drive the real `PersistentLossTracker` against SQLite. Mocks cannot
 show this bug — it only exists in the read/write interleaving.
 """
 import threading
+import time
 from datetime import timedelta as _timedelta
 
 import pytest
@@ -391,8 +392,14 @@ class TestABreachStillReAsserts:
         assert t.kill_switch is True
 
     def test_and_that_is_a_fresh_assertion_not_a_stale_write(self, factory):
-        """The distinction matters: the epoch moved, so the tracker decided
-        again rather than replaying an old value."""
+        """The distinction matters: the tracker *decided* again rather than
+        replaying an old value.
+
+        Reads `_ks_epoch` directly because that is precisely the thing under
+        test — whether `_evaluate()` formed a new opinion. `record_pnl()`'s
+        return value cannot answer it: the tracker was already halted, so there
+        is no transition to report and the call correctly says `"unchanged"`.
+        """
         t = _tracker(factory)
         _breach(t)
         before = t._ks_epoch
@@ -642,3 +649,114 @@ class TestAdoptedHaltIsNotBlamedOnAFill:
         types = self._audit_types(factory)
         assert "kill_switch_triggered" in types, types
         assert "kill_switch_adopted" not in types
+
+
+# ── review round 2: attribution must be per call, not per process ────────────
+
+class TestRecordPnlReportsItsOwnOutcome:
+    """`record_pnl()` returns what **that call** did.
+
+    The previous revision had the fill pipeline diff a process-global decision
+    counter across the call. Fills arrive concurrently on poller threads, so
+    fill #1 could snapshot the counter, fill #2 could breach a limit, and fill #1
+    would then see a changed counter and file `kill_switch_triggered` against its
+    own symbol and P&L — a cause invented for whoever reads the audit trail next.
+    """
+
+    def test_a_breach_reports_triggered(self, factory):
+        t = _tracker(factory)
+        t.peak_equity = 1_000_000.0
+
+        assert t.record_pnl(-500_000.0, 500_000.0) == "triggered"
+
+    def test_an_uneventful_write_reports_unchanged(self, factory):
+        t = _tracker(factory)
+        t.peak_equity = 1_000_000.0
+
+        assert t.record_pnl(0.0, 1_000_000.0) == "unchanged"
+
+    def test_picking_up_an_external_halt_reports_adopted(self, factory):
+        t = _tracker(factory)
+        t.peak_equity = 1_000_000.0
+        _external_write(factory, kill_switch=True, kill_reason="워치독")
+
+        assert t.record_pnl(0.0, 1_000_000.0) == "adopted"
+
+    def test_an_already_halted_tracker_does_not_re_report_adopted(self, factory):
+        """Only the transition is news. Reporting every later write as `adopted`
+        would file a fresh audit row on each fill."""
+        t = _tracker(factory)
+        t.peak_equity = 1_000_000.0
+        _external_write(factory, kill_switch=True, kill_reason="워치독")
+        assert t.record_pnl(0.0, 1_000_000.0) == "adopted"
+
+        assert t.record_pnl(0.0, 1_000_000.0) == "unchanged"
+
+    def test_a_halt_landing_while_this_call_waits_is_not_claimed(self, factory):
+        """*Why* the per-call answer can be trusted: it is decided **inside** the
+        lock, after waiting, not from a read taken before waiting.
+
+        A benign call can sit on the lock while another thread halts. If the
+        "was it halted?" read happens before acquiring the lock, that call wakes
+        up, sees the switch on, and reports `"triggered"` — filing another
+        thread's breach against its own symbol and P&L. Reading it after
+        acquiring gives the honest answer.
+
+        Sequence: hold the lock, let the benign call start and block on it, flip
+        the switch, release.
+        """
+        t = _tracker(factory)
+        t.peak_equity = 1_000_000.0
+
+        lock_held = threading.Event()
+        may_release = threading.Event()
+        result = {}
+
+        def _holder():
+            with t._lock:
+                lock_held.set()
+                may_release.wait(5)
+                # A breach decided by *this* holder, not by the benign caller.
+                t.kill_switch = True
+                t.kill_reason = "다른 스레드의 위반"
+
+        holder = threading.Thread(target=_holder, daemon=True)
+        holder.start()
+        assert lock_held.wait(5), "holder never took the lock"
+
+        benign = threading.Thread(
+            target=lambda: result.update(
+                outcome=t.record_pnl(0.0, 1_000_000.0)),
+            daemon=True)
+        benign.start()
+        # Give the benign call time to reach the lock and block there. Anything
+        # it reads before that point is what this test is about.
+        time.sleep(0.2)
+        may_release.set()
+        holder.join(5)
+        benign.join(5)
+
+        assert result.get("outcome") != "triggered", (
+            f"a benign call reported {result.get('outcome')!r} for a halt "
+            f"another thread decided — it would be audited against the wrong "
+            f"symbol and P&L")
+
+    def test_the_decision_counter_is_not_exposed(self):
+        """Re-adding a public accessor would invite the same wrong approach."""
+        from backend.quant.risk.engine import PersistentLossTracker
+
+        assert not hasattr(PersistentLossTracker, "kill_switch_decisions")
+
+
+class TestFillPipelineUsesTheReturnedOutcome:
+    def test_the_runner_no_longer_diffs_a_global_counter(self):
+        """A grep-style guard: the attribution must come from `record_pnl()`'s
+        return value, not from snapshots taken around it."""
+        import inspect
+
+        import backend.worker.runner as runner
+
+        src = inspect.getsource(runner.StrategyWorker._make_fill_callback)
+        assert "decisions_before" not in src
+        assert "kill_switch_decisions" not in src
+        assert 'outcome == "triggered"' in src
