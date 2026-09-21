@@ -899,24 +899,32 @@ class StrategyWorker:
         # either side of the open produced two keys and two rows (issue #160).
         # Resolved once: two calls could straddle Seoul midnight and put one
         # date in the key and the next in `trade_date` on the same row.
-        from backend.database.models import trading_day
-        day = trading_day()
+        from backend.database.models import trading_days_in_play
+        days = trading_days_in_play()
+        day = days[0]
         idem_key = (
             f"{order.id}:{order.symbol}:{order.side}:{day.isoformat()}"
             if order.id else None
         )
         try:
             with _session() as db:
-                # Scoped to the trading day, because a KIS ODNO is only unique
-                # *within* one — the same comment three lines up says so, and
-                # the idempotency key below is built on it. Matching on the
-                # broker id alone reached back to an earlier day's row with the
-                # recycled number, overwrote its status and fill quantity, and
-                # left today's order with no row at all.
+                # Both days in play, not just today's.
+                #
+                # A KIS ODNO is only unique *within* a trading day, so matching
+                # on the broker id alone reached back to an older row with a
+                # recycled number and overwrote a settled order. But matching on
+                # today alone is worse: the US session runs 22:30–05:00 KST, so
+                # an order submitted at 23:50 has yesterday's `trade_date`, and
+                # its own fill arriving at 00:10 would not find it — inserting a
+                # *second* row for one order, the first stuck at "submitted".
+                # That is a nightly occurrence, not an edge case.
+                #
+                # The overnight window is exactly the two days in play, so a row
+                # outside it carrying the same number is a different order.
                 existing = db.query(DBOrder).filter(
                     DBOrder.broker_order_id == order.id,
-                    DBOrder.trade_date == day,
-                ).first()
+                    DBOrder.trade_date.in_(days),
+                ).order_by(DBOrder.trade_date.desc()).first()
                 if existing:
                     existing.status = order.status.value
                     existing.filled_qty = order.filled_qty

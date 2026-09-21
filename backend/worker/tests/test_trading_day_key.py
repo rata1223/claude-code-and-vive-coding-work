@@ -518,45 +518,32 @@ class TestTheDailyResetLeavesTheLiveCounterAlone:
 
 
 class TestOneTradingDayValuePerOrderRow:
-    def test_the_idempotency_key_and_trade_date_cannot_disagree(self, monkeypatch):
+    def test_the_idempotency_key_and_trade_date_cannot_disagree(
+            self, factory, monkeypatch):
         """Two `trading_day()` calls could straddle midnight and split one row.
 
         Driven by making the helper return a different day on each call: with a
-        single resolved value the row is coherent regardless, and with two calls
-        it is not.
+        single resolved value the row stays coherent regardless, and with two
+        calls it does not.
         """
         import itertools
+        from backend.database.models import Order as DBOrder
         from backend.worker import runner as runner_mod
 
         days = itertools.chain([KST_DAY, KST_DAY + timedelta(days=1)],
                                itertools.repeat(KST_DAY + timedelta(days=9)))
         monkeypatch.setattr("backend.database.models.trading_day",
                             lambda: next(days))
+        _persist_via(monkeypatch, factory, runner_mod, _StubOrder())
 
-        captured = {}
-
-        class _Row:
-            # `_persist_order` builds a query against these before constructing
-            # a row; the values are irrelevant, only their presence.
-            broker_order_id = None
-            idempotency_key = None
-            trade_date = None
-
-            def __init__(self, **kw):
-                captured.update(kw)
-
-        monkeypatch.setattr(runner_mod, "DBOrder", _Row)
-        monkeypatch.setattr(runner_mod, "_session", _null_session)
-
-        order = _StubOrder()
-        runner_mod.StrategyWorker._persist_order(object.__new__(
-            runner_mod.StrategyWorker), order)
-
-        assert captured, "the order row was never constructed"
-        key_day = captured["idempotency_key"].rsplit(":", 1)[1]
-        assert key_day == captured["trade_date"].isoformat(), (
-            f"key says {key_day}, column says {captured['trade_date']}"
-        )
+        sess = factory()
+        try:
+            row = sess.query(DBOrder).one()
+            key_day = row.idempotency_key.rsplit(":", 1)[1]
+            assert key_day == row.trade_date.isoformat(), (
+                f"key says {key_day}, column says {row.trade_date}")
+        finally:
+            sess.close()
 
 
 class TestTheReArmFailsClosed:
@@ -586,6 +573,23 @@ class TestTheReArmFailsClosed:
 
         assert SAFE_MODE.can_trade is False, (
             "trading resumed although the kill-switch lookup never completed")
+
+
+def _persist_via(monkeypatch, factory, runner_mod, order):
+    """Run the real `_persist_order` against `factory`'s database."""
+    from contextlib import contextmanager
+
+    @contextmanager
+    def _sess():
+        db = factory()
+        try:
+            yield db
+        finally:
+            db.close()
+
+    monkeypatch.setattr(runner_mod, "_session", _sess)
+    runner_mod.StrategyWorker._persist_order(
+        object.__new__(runner_mod.StrategyWorker), order)
 
 
 class _StubOrder:
@@ -681,19 +685,7 @@ class TestOrderIdentityIsScopedToTheTradingDay:
 
     def _persist(self, monkeypatch, factory, order):
         from backend.worker import runner as runner_mod
-        from contextlib import contextmanager
-
-        @contextmanager
-        def _sess():
-            db = factory()
-            try:
-                yield db
-            finally:
-                db.close()
-
-        monkeypatch.setattr(runner_mod, "_session", _sess)
-        runner_mod.StrategyWorker._persist_order(
-            object.__new__(runner_mod.StrategyWorker), order)
+        _persist_via(monkeypatch, factory, runner_mod, order)
 
     def test_a_recycled_order_number_does_not_overwrite_an_earlier_day(
             self, in_window, factory, monkeypatch):
@@ -751,6 +743,50 @@ class TestOrderIdentityIsScopedToTheTradingDay:
             assert len(rows) == 1, "the second sighting inserted a second row"
             assert rows[0].status == "filled"
             assert rows[0].filled_qty == 1
+        finally:
+            sess.close()
+
+    def test_an_order_submitted_before_midnight_fills_into_the_same_row(
+            self, in_window, factory, monkeypatch):
+        """The US session crosses Seoul midnight, so one order spans two dates.
+
+        Submitted at 23:50 the row carries yesterday's `trade_date`; its own
+        fill at 00:10 is resolved against today's. Scoping the lookup to today
+        alone missed it and inserted a *second* row, leaving the first stuck at
+        "submitted" — nightly, not an edge case.
+        """
+        from backend.database.models import Order as DBOrder
+
+        yesterday = KST_DAY - timedelta(days=1)
+        sess = factory()
+        sess.add(DBOrder(
+            broker_order_id=_StubOrder.id, symbol="AAPL", side="buy",
+            qty=1, price=100.0, filled_qty=0, status="submitted", market="US",
+            idempotency_key=f"{_StubOrder.id}:AAPL:buy:{yesterday.isoformat()}",
+            trade_date=yesterday,
+        ))
+        sess.commit()
+        sess.close()
+
+        class _Filled(_StubOrder):
+            filled_qty = 1
+            avg_fill_price = 101.5
+
+            class status:
+                value = "filled"
+
+        self._persist(monkeypatch, factory, _Filled())
+
+        sess = factory()
+        try:
+            rows = sess.query(DBOrder).all()
+            assert len(rows) == 1, (
+                f"the overnight fill created a second row: "
+                f"{[(r.trade_date, r.status) for r in rows]}")
+            assert rows[0].status == "filled"
+            assert rows[0].filled_qty == 1
+            assert rows[0].trade_date == yesterday, (
+                "the fill should update the submitting day's row in place")
         finally:
             sess.close()
 
