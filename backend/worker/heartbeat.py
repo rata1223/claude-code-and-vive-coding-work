@@ -131,13 +131,12 @@ class WorkerWatchdog:
         # DB is the only cross-process channel available without additional infrastructure.
         try:
             import os
-            from datetime import date
-            from backend.database.models import init_db_factory, DailyRiskState
+            from backend.database.models import init_db_factory, DailyRiskState, trading_day
             db_url = os.environ.get("DB_URL", "postgresql://quantdinger:quantdinger@postgres:5432/quantdinger")
             factory = init_db_factory(db_url)
             sess = factory()
             try:
-                today = date.today()
+                today = trading_day()
                 row = sess.get(DailyRiskState, today)
                 if row is None:
                     row = DailyRiskState(trade_date=today)

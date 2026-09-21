@@ -106,10 +106,9 @@ def get_status():
     pending_orders = -1
 
     try:
-        from backend.database.models import DailyRiskState
-        from datetime import date
+        from backend.database.models import DailyRiskState, trading_day
         db = get_db()
-        row = db.get(DailyRiskState, date.today())
+        row = db.get(DailyRiskState, trading_day())
         if row:
             kill_switch = row.kill_switch
             kill_reason = row.kill_reason or ""
@@ -379,7 +378,6 @@ def worker_heartbeat_status():
 @app.get("/api/metrics")
 def get_metrics():
     """운영 메트릭 스냅샷 — 모니터링/대시보드용."""
-    from datetime import date as _date
     metrics: dict = {
         "timestamp": datetime.utcnow().isoformat(),
         "worker_alive": False,
@@ -403,8 +401,8 @@ def get_metrics():
             Order.status.in_(["pending", "submitted", "partial_filled"])
         ).count()
         metrics["open_positions"] = db.query(Position).count()
-        from backend.database.models import DailyRiskState
-        row = db.get(DailyRiskState, _date.today())
+        from backend.database.models import DailyRiskState, trading_day
+        row = db.get(DailyRiskState, trading_day())
         if row:
             metrics["kill_switch"] = row.kill_switch
             if row.peak_equity and row.peak_equity > 0:

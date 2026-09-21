@@ -10,7 +10,7 @@
 import logging
 import threading
 from dataclasses import dataclass, field
-from datetime import date, datetime, timezone, timedelta
+from datetime import date
 from typing import Optional
 
 import numpy as np
@@ -18,12 +18,17 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-_SEOUL_TZ = timezone(timedelta(hours=9))
-
 
 def _seoul_today() -> date:
-    """Return today's date in Asia/Seoul timezone (UTC+9)."""
-    return datetime.now(_SEOUL_TZ).date()
+    """Today in Asia/Seoul — delegated to the one definition (issue #160).
+
+    Kept as a name because this module reads it in a dozen places, but the
+    computation now lives beside ``DailyRiskState``, whose primary key it
+    produces. Imported inside the call so patching the one helper reaches every
+    caller, here and elsewhere.
+    """
+    from backend.database.models import trading_day
+    return trading_day()
 
 
 # ── 설정 ──────────────────────────────────────────────────────────────────────
@@ -552,8 +557,8 @@ class PersistentLossTracker(LossTracker):
 
         Returns True when this write adopted a halt from the row.
         """
-        from backend.database.models import DailyRiskState
-        today = date.today()
+        from backend.database.models import DailyRiskState, trading_day
+        today = trading_day()
         with self._lock:
             daily_pnl = self.daily_pnl
             weekly_pnl = self.weekly_pnl

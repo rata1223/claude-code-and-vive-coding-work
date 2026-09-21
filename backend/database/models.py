@@ -1,9 +1,34 @@
-from datetime import datetime
+from datetime import date, datetime, timedelta, timezone
 from sqlalchemy import (
     Boolean, Column, Date, DateTime, Float, Integer, String, Text,
     UniqueConstraint, create_engine,
 )
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
+
+_KST = timezone(timedelta(hours=9))
+
+
+def trading_day() -> date:
+    """This platform's trading day, in Asia/Seoul (UTC+9).
+
+    The one way to produce a ``DailyRiskState.trade_date`` key. It lives beside
+    the model because the primary key's meaning is the table's contract, not any
+    one caller's choice, and every caller already imports ``DailyRiskState``
+    from here.
+
+    Why it is needed: the rest of the platform already runs on KST — the
+    scheduler is ``BackgroundScheduler(timezone="Asia/Seoul")`` and
+    ``LossTracker`` rolls its day over on the Seoul date — but the containers
+    run on UTC (no ``TZ`` in ``docker-compose.yml``), so the writers that keyed
+    rows with ``date.today()`` were a day behind for the nine hours of
+    **KST 00:00–09:00**. Readers and writers then disagreed about which row was
+    "today", which lost a live halt across a worker restart (issue #160).
+
+    Callers import this *inside the function* that needs it, matching how
+    ``DailyRiskState`` is already imported, so that patching this one name
+    covers every site.
+    """
+    return datetime.now(_KST).date()
 
 
 class Base(DeclarativeBase):

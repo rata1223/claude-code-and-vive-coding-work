@@ -502,11 +502,10 @@ class KillSwitch:
         if self._db is None:
             return TradingState.RUNNING, None
         try:
-            from datetime import date
-            from backend.database.models import DailyRiskState
+            from backend.database.models import DailyRiskState, trading_day
             sess = self._db()
             try:
-                row = sess.get(DailyRiskState, date.today())
+                row = sess.get(DailyRiskState, trading_day())
                 if row is not None and row.kill_switch:
                     return TradingState.HALTED, now
             finally:
@@ -602,11 +601,10 @@ class KillSwitch:
         if self._db is None:
             return
         try:
-            from datetime import date
-            from backend.database.models import DailyRiskState
+            from backend.database.models import DailyRiskState, trading_day
             sess = self._db()
             try:
-                today = date.today()
+                today = trading_day()
                 row = sess.get(DailyRiskState, today)
                 if row is None:
                     row = DailyRiskState(trade_date=today)
@@ -632,11 +630,10 @@ class KillSwitch:
         if self._db is None:
             return
         try:
-            from datetime import date
-            from backend.database.models import DailyRiskState
+            from backend.database.models import DailyRiskState, trading_day
             sess = self._db()
             try:
-                today = date.today()
+                today = trading_day()
                 row = sess.get(DailyRiskState, today)
                 if row is not None and row.kill_switch:
                     row.kill_switch = False

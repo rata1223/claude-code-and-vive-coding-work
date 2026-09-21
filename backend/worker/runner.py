@@ -16,7 +16,7 @@ import signal
 import threading
 import time
 from contextlib import contextmanager
-from datetime import date, datetime
+from datetime import datetime
 
 import redis
 from sqlalchemy.exc import IntegrityError
@@ -483,7 +483,7 @@ class StrategyWorker:
         tracker = self._loss_tracker
         if tracker is None:
             return
-        from backend.database.models import DailyRiskState
+        from backend.database.models import DailyRiskState, trading_day
 
         # The tracker's own mutex (P0-05) — read the three values consistently.
         with tracker._lock:
@@ -492,7 +492,7 @@ class StrategyWorker:
             peak_equity = tracker.peak_equity
 
         with _session() as db:
-            today = date.today()
+            today = trading_day()
             row = db.get(DailyRiskState, today)
             if row is None:
                 row = DailyRiskState(trade_date=today)
@@ -894,9 +894,12 @@ class StrategyWorker:
         # Derive a deterministic idempotency key from broker order id + date.
         # KIS ODNO is unique per trading day per account, so this composite key
         # prevents duplicate DB rows when the same order is processed twice.
-        from datetime import date as _date
+        # The trading day must be KIS's, i.e. Seoul's: on the UTC date the key
+        # rolled over at 09:00 KST — the Korean market open — so one order seen
+        # either side of the open produced two keys and two rows (issue #160).
+        from backend.database.models import trading_day
         idem_key = (
-            f"{order.id}:{order.symbol}:{order.side}:{_date.today().isoformat()}"
+            f"{order.id}:{order.symbol}:{order.side}:{trading_day().isoformat()}"
             if order.id else None
         )
         try:
@@ -927,7 +930,12 @@ class StrategyWorker:
                         price=order.price,
                         status=order.status.value,
                         market=market,
-                        trade_date=datetime.utcnow().date(),
+                        # Same day as the idempotency key three lines up — a row
+                        # that says one thing in its key and another in its
+                        # column is how the next person copies the wrong one.
+                        # Nothing reads this column today, so this is a
+                        # coherence fix, not a behaviour change.
+                        trade_date=trading_day(),
                     )
                     db.add(row)
                 db.commit()

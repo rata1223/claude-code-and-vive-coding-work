@@ -54,7 +54,7 @@ replaying over somebody else's halt — is explicitly dropped instead.
 import json
 import logging
 import os
-from datetime import date, datetime
+from datetime import datetime
 
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field, field_validator
@@ -129,8 +129,8 @@ def _is_risk_admin(user: User) -> bool:
 
 
 def _today_row(db: Session):
-    from backend.database.models import DailyRiskState
-    return db.get(DailyRiskState, date.today())
+    from backend.database.models import DailyRiskState, trading_day
+    return db.get(DailyRiskState, trading_day())
 
 
 @router.get("/kill-switch")
