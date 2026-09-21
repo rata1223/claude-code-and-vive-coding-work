@@ -907,8 +907,15 @@ class StrategyWorker:
         )
         try:
             with _session() as db:
+                # Scoped to the trading day, because a KIS ODNO is only unique
+                # *within* one — the same comment three lines up says so, and
+                # the idempotency key below is built on it. Matching on the
+                # broker id alone reached back to an earlier day's row with the
+                # recycled number, overwrote its status and fill quantity, and
+                # left today's order with no row at all.
                 existing = db.query(DBOrder).filter(
-                    DBOrder.broker_order_id == order.id
+                    DBOrder.broker_order_id == order.id,
+                    DBOrder.trade_date == day,
                 ).first()
                 if existing:
                     existing.status = order.status.value

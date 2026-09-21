@@ -540,6 +540,7 @@ class TestOneTradingDayValuePerOrderRow:
             # a row; the values are irrelevant, only their presence.
             broker_order_id = None
             idempotency_key = None
+            trade_date = None
 
             def __init__(self, **kw):
                 captured.update(kw)
@@ -667,3 +668,112 @@ class TestTheFlaskReportersSeeTheSameHalt:
         _seed(factory, KST_DAY, daily_pnl=-10_000.0, peak_equity=1_000_000.0)
 
         assert client.get("/api/metrics").get_json()["daily_pnl_pct"] == -1.0
+
+
+class TestOrderIdentityIsScopedToTheTradingDay:
+    """A KIS ODNO is unique *within* a trading day, not across them.
+
+    The idempotency key has always said so. The existing-row lookup beside it
+    did not, so a recycled order number reached back to an earlier day's row —
+    overwriting a settled order's status and fill quantity, and leaving the new
+    order unrecorded. Pre-existing, but it contradicts the key it sits next to.
+    """
+
+    def _persist(self, monkeypatch, factory, order):
+        from backend.worker import runner as runner_mod
+        from contextlib import contextmanager
+
+        @contextmanager
+        def _sess():
+            db = factory()
+            try:
+                yield db
+            finally:
+                db.close()
+
+        monkeypatch.setattr(runner_mod, "_session", _sess)
+        runner_mod.StrategyWorker._persist_order(
+            object.__new__(runner_mod.StrategyWorker), order)
+
+    def test_a_recycled_order_number_does_not_overwrite_an_earlier_day(
+            self, in_window, factory, monkeypatch):
+        from backend.database.models import Order as DBOrder
+
+        stale = DBOrder(
+            broker_order_id=_StubOrder.id, symbol="TSLA", side="sell",
+            qty=3, price=400.0, filled_qty=3, status="filled", market="US",
+            idempotency_key="old-key",
+            trade_date=KST_DAY - timedelta(days=5),
+        )
+        sess = factory()
+        sess.add(stale)
+        sess.commit()
+        stale_pk = stale.id
+        sess.close()
+
+        self._persist(monkeypatch, factory, _StubOrder())
+
+        sess = factory()
+        try:
+            settled = sess.get(DBOrder, stale_pk)
+            assert settled.status == "filled", (
+                "an earlier trading day's order was overwritten by a recycled "
+                "broker order number")
+            assert settled.filled_qty == 3
+            assert settled.symbol == "TSLA"
+
+            rows = sess.query(DBOrder).filter(
+                DBOrder.trade_date == KST_DAY).all()
+            assert len(rows) == 1, "today's order was never recorded"
+            assert rows[0].symbol == "AAPL"
+        finally:
+            sess.close()
+
+    def test_the_same_order_seen_twice_today_still_updates_in_place(
+            self, in_window, factory, monkeypatch):
+        """The lookup must stay useful — narrowing it must not break the update."""
+        from backend.database.models import Order as DBOrder
+
+        self._persist(monkeypatch, factory, _StubOrder())
+
+        class _Filled(_StubOrder):
+            filled_qty = 1
+            avg_fill_price = 101.5
+
+            class status:
+                value = "filled"
+
+        self._persist(monkeypatch, factory, _Filled())
+
+        sess = factory()
+        try:
+            rows = sess.query(DBOrder).all()
+            assert len(rows) == 1, "the second sighting inserted a second row"
+            assert rows[0].status == "filled"
+            assert rows[0].filled_qty == 1
+        finally:
+            sess.close()
+
+    def test_two_different_orders_on_the_same_day_stay_separate(
+            self, in_window, factory, monkeypatch):
+        """Scoping by day must not become matching by day.
+
+        Dropping the broker-id predicate would make every order of the day
+        collapse onto the first row — the same overwrite, one day wide.
+        """
+        from backend.database.models import Order as DBOrder
+
+        class _Other(_StubOrder):
+            id = "0000118"
+            symbol = "MSFT"
+
+        self._persist(monkeypatch, factory, _StubOrder())
+        self._persist(monkeypatch, factory, _Other())
+
+        sess = factory()
+        try:
+            rows = sess.query(DBOrder).order_by(DBOrder.broker_order_id).all()
+            assert [r.broker_order_id for r in rows] == ["0000117", "0000118"]
+            assert [r.symbol for r in rows] == ["AAPL", "MSFT"]
+        finally:
+            sess.close()
