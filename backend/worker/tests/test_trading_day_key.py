@@ -16,9 +16,13 @@ two of which are not in the issue as filed:
    key, read back under another; a worker restarting inside the window comes up
    with the halt cleared, and `StartupRecovery._step_risk` branches on
    `tracker.kill_switch`. Fail-open.
-2. **The 06:01 KST reset touches the wrong day.** 06:01 KST is 21:01 UTC *the
-   previous day*, so it zeroed **yesterday's** `daily_pnl` — destroying the
-   record — and deleted a Redis key the engine never reads.
+2. **The 06:01 KST reset touched the wrong day.** 06:01 KST is 21:01 UTC *the
+   previous day*, so it zeroed **yesterday's** `daily_pnl` and deleted a Redis
+   key the engine never reads. Aligning the keys turned that dead write into a
+   live one — and 06:01 is six hours *into* the Seoul day, which already holds
+   the overnight US session. So the reset does not reset those counters at all
+   any more: `LossTracker` already rolls the day over at Seoul midnight and owns
+   them. See `TestTheDailyResetLeavesTheLiveCounterAlone`.
 3. **The "did the kill switch fire yesterday?" check looked two days back.**
    `date.today() - 1` at 06:01 KST is the day before KST-yesterday, so a real
    halt went unseen and `SAFE_MODE.enable()` resumed trading — the exact
@@ -30,6 +34,7 @@ of the world between KST 00:00 and 09:00. Patching the single helper covers ever
 call site, because they all import it inside the function that uses it.
 """
 
+from contextlib import contextmanager
 from datetime import date, timedelta
 
 import pytest
@@ -190,51 +195,6 @@ class TestHaltSurvivesRestartInsideTheWindow:
         _breach(t)
         assert _tracker(factory).kill_switch is True
         assert _row(factory, UTC_DAY) is not None
-
-
-class TestDailyResetTouchesToday:
-    """Consequence (2): 06:01 KST is 21:01 UTC *yesterday*."""
-
-    @pytest.fixture(autouse=True)
-    def _wire_scheduler(self, monkeypatch, factory):
-        monkeypatch.setattr("backend.worker.scheduler._get_db", lambda: factory())
-
-    def test_reset_zeroes_todays_row_and_leaves_yesterdays_alone(
-            self, in_window, factory, monkeypatch):
-        """The reset must clear the day it is opening, not the one it is closing.
-
-        Zeroing yesterday's `daily_pnl` is silent record loss: that row is the
-        closed day's result, and nothing rewrites it.
-        """
-        monkeypatch.setattr("redis.from_url", lambda *a, **k: _FakeRedis())
-        _seed(factory, KST_DAY, daily_pnl=-40_000.0)
-        _seed(factory, KST_DAY - timedelta(days=1), daily_pnl=-11_000.0)
-
-        from backend.worker.scheduler import _reset_daily_risk
-        _reset_daily_risk()
-
-        assert _row(factory, KST_DAY).daily_pnl == 0.0
-        assert _row(factory, KST_DAY - timedelta(days=1)).daily_pnl == -11_000.0, (
-            "the reset destroyed the closed day's record"
-        )
-
-    def test_reset_deletes_the_redis_key_the_engine_actually_reads(
-            self, in_window, factory, monkeypatch):
-        """A reset that deletes a key nobody reads is not a reset.
-
-        The engine's `_redis_key()` is built from the Seoul date, so the UTC-keyed
-        delete left the live counter in place for the whole window.
-        """
-        fake = _FakeRedis()
-        monkeypatch.setattr("redis.from_url", lambda *a, **k: fake)
-        engine_key = _tracker(factory)._redis_key()
-
-        from backend.worker.scheduler import _reset_daily_risk
-        _reset_daily_risk()
-
-        assert engine_key in fake.deleted, (
-            f"reset deleted {sorted(fake.deleted)}, but the engine reads {engine_key}"
-        )
 
 
 class TestYesterdaysHaltBlocksResume:
@@ -403,3 +363,307 @@ class _FakeRedis:
         for k in keys:
             self.deleted.add(k.decode() if isinstance(k, bytes) else k)
         return len(keys)
+
+
+class TestTheOvernightSessionStraddlesSeoulMidnight:
+    """Follow-up to #160: moving the key to KST moved the boundary *into* a session.
+
+    The US session runs 22:30–05:00 KST. Under the old UTC key the day rolled at
+    09:00 KST, outside every session, so a halt and everything that later read
+    it always addressed the same row. On the Seoul date the roll happens at
+    midnight, mid-session — so a halt at 23:10 and a read at 00:40 land on
+    different rows unless the reader looks at both.
+
+    `trading_days_in_play()` is that shared definition. These cover the worker
+    side; the operator endpoints are in `api/tests/test_risk_killswitch_reset.py`.
+    """
+
+    def test_the_helper_offers_today_and_the_day_before(self, in_window):
+        from backend.database.models import trading_days_in_play
+        assert trading_days_in_play() == (KST_DAY, KST_DAY - timedelta(days=1))
+
+    def test_kill_switch_restores_a_halt_fired_before_midnight(
+            self, in_window, factory):
+        """`KillSwitch` starts RUNNING unless it finds a halt — and it has no
+        carry-forward to the new day's row, so missing it fails open."""
+        from backend.risk.kill_switch import KillSwitch, TradingState
+        _seed(factory, KST_DAY - timedelta(days=1),
+              kill_switch=True, kill_reason="MDD 한도 초과")
+
+        assert KillSwitch(db_factory=factory).state is TradingState.HALTED
+
+    def test_kill_switch_resume_clears_the_day_the_halt_is_on(
+            self, in_window, factory):
+        """Clearing only today's row left the real halt in place, unreachable."""
+        from datetime import datetime, timezone
+        from backend.risk.kill_switch import KillSwitch
+        yesterday = KST_DAY - timedelta(days=1)
+        _seed(factory, yesterday, kill_switch=True, kill_reason="MDD 한도 초과")
+
+        ks = KillSwitch(db_factory=factory)
+        # Well past the recovery cooldown — that policy is not what is under
+        # test here, only which row the clear addresses.
+        outcome = ks.resume("operator:test",
+                            _now=datetime.now(timezone.utc) + timedelta(days=1))
+        assert outcome.approved, f"resume denied, test proves nothing: {outcome.reason}"
+
+        assert _row(factory, yesterday).kill_switch is False
+
+
+class TestTheTrackerRestoresAcrossSeoulMidnight:
+    """The production restore path — the one `StartupRecovery` branches on.
+
+    `KillSwitch` is harness-only; `PersistentLossTracker` is what the live
+    worker boots with, so this is where missing a halt actually costs money.
+    """
+
+    def test_a_halt_fired_before_midnight_is_restored_after_it(
+            self, in_window, factory):
+        yesterday = KST_DAY - timedelta(days=1)
+        _seed(factory, yesterday, kill_switch=True, kill_reason="MDD 한도 초과")
+
+        t = _tracker(factory)
+
+        assert t.kill_switch is True, (
+            "a worker restarting just after Seoul midnight came up unhalted "
+            "while the overnight session's halt was still in force")
+        assert t.kill_reason == "MDD 한도 초과"
+
+    def test_equity_numbers_still_come_from_todays_row_only(
+            self, in_window, factory):
+        """Only the halt spans days. PnL and peak belong to their own day."""
+        _seed(factory, KST_DAY - timedelta(days=1),
+              weekly_pnl=-99_000.0, peak_equity=9_999_999.0)
+        _seed(factory, KST_DAY, weekly_pnl=-1_000.0, peak_equity=2_000_000.0)
+
+        t = _tracker(factory)
+
+        assert t.peak_equity == 2_000_000.0
+        assert t.weekly_pnl == -1_000.0
+
+    def test_a_cleared_previous_day_does_not_resurrect_a_halt(
+            self, in_window, factory):
+        _seed(factory, KST_DAY - timedelta(days=1), kill_switch=False)
+        assert _tracker(factory).kill_switch is False
+
+    def test_equity_is_not_taken_from_yesterday_when_today_has_no_row(
+            self, in_window, factory):
+        """The likely shape of a wrong fix: falling back to yesterday wholesale.
+
+        Before the first write of a Seoul day there is no row yet. Reaching
+        back for the equity numbers would restore a stale peak — and peak
+        equity is the denominator of the MDD limit, so a stale high one makes
+        the drawdown look worse and a stale low one hides a real breach.
+        """
+        _seed(factory, KST_DAY - timedelta(days=1),
+              kill_switch=True, kill_reason="MDD 한도 초과",
+              weekly_pnl=-99_000.0, peak_equity=9_999_999.0)
+
+        t = _tracker(factory)
+
+        assert t.kill_switch is True, "the halt must still cross the boundary"
+        assert t.peak_equity == 0.0
+        assert t.weekly_pnl == 0.0
+
+
+class TestTheDailyResetLeavesTheLiveCounterAlone:
+    """06:01 KST is six hours *into* the Seoul day, not the start of it.
+
+    That day already holds the 00:00–05:00 overnight US session. Zeroing its
+    `daily_pnl` and deleting its Redis key wiped both stores
+    `_restore_state()` reads, so a restart after 06:01 handed the Korean
+    session a fresh 3% budget on top of the overnight loss.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _wire_scheduler(self, monkeypatch, factory):
+        monkeypatch.setattr("backend.worker.scheduler._get_db", lambda: factory())
+
+    def test_the_overnight_loss_survives_the_reset(
+            self, in_window, factory, monkeypatch):
+        monkeypatch.setattr("redis.from_url", lambda *a, **k: _FakeRedis())
+        _seed(factory, KST_DAY, daily_pnl=-40_000.0, peak_equity=1_000_000.0)
+
+        from backend.worker.scheduler import _reset_daily_risk
+        _reset_daily_risk()
+
+        assert _row(factory, KST_DAY).daily_pnl == -40_000.0, (
+            "the reset erased the overnight session's realized loss")
+        assert _tracker(factory).daily_pnl == -40_000.0, (
+            "a restart after the reset came back with a clean slate")
+
+    def test_the_reset_does_not_delete_the_live_pnl_key(
+            self, in_window, factory, monkeypatch):
+        """Redis is the other store `_restore_state()` reads."""
+        fake = _FakeRedis()
+        monkeypatch.setattr("redis.from_url", lambda *a, **k: fake)
+        engine_key = _tracker(factory)._redis_key()
+
+        from backend.worker.scheduler import _reset_daily_risk
+        _reset_daily_risk()
+
+        assert engine_key not in fake.deleted, (
+            f"deleted {engine_key}, which is the counter the engine reads")
+
+    def test_the_legacy_halt_keys_are_still_cleared(
+            self, in_window, factory, monkeypatch):
+        """The job's remaining purpose: the self-expiring daily-loss halt."""
+        fake = _FakeRedis()
+        monkeypatch.setattr("redis.from_url", lambda *a, **k: fake)
+
+        from backend.worker.scheduler import _reset_daily_risk
+        _reset_daily_risk()
+
+        assert {"risk:daily_loss_pct", "risk:trading_halted"} <= fake.deleted
+
+
+class TestOneTradingDayValuePerOrderRow:
+    def test_the_idempotency_key_and_trade_date_cannot_disagree(self, monkeypatch):
+        """Two `trading_day()` calls could straddle midnight and split one row.
+
+        Driven by making the helper return a different day on each call: with a
+        single resolved value the row is coherent regardless, and with two calls
+        it is not.
+        """
+        import itertools
+        from backend.worker import runner as runner_mod
+
+        days = itertools.chain([KST_DAY, KST_DAY + timedelta(days=1)],
+                               itertools.repeat(KST_DAY + timedelta(days=9)))
+        monkeypatch.setattr("backend.database.models.trading_day",
+                            lambda: next(days))
+
+        captured = {}
+
+        class _Row:
+            # `_persist_order` builds a query against these before constructing
+            # a row; the values are irrelevant, only their presence.
+            broker_order_id = None
+            idempotency_key = None
+
+            def __init__(self, **kw):
+                captured.update(kw)
+
+        monkeypatch.setattr(runner_mod, "DBOrder", _Row)
+        monkeypatch.setattr(runner_mod, "_session", _null_session)
+
+        order = _StubOrder()
+        runner_mod.StrategyWorker._persist_order(object.__new__(
+            runner_mod.StrategyWorker), order)
+
+        assert captured, "the order row was never constructed"
+        key_day = captured["idempotency_key"].rsplit(":", 1)[1]
+        assert key_day == captured["trade_date"].isoformat(), (
+            f"key says {key_day}, column says {captured['trade_date']}"
+        )
+
+
+class TestTheReArmFailsClosed:
+    def test_a_failed_kill_switch_lookup_does_not_re_enable_trading(
+            self, in_window, monkeypatch):
+        """A swallowed lookup error used to fall through to `SAFE_MODE.enable()`.
+
+        So a database outage resumed trading with nobody having checked the kill
+        switch — the one question the guard exists to ask.
+        """
+        from backend.worker.recovery import SAFE_MODE
+
+        class _Exploding:
+            def get(self, *a, **k):
+                raise RuntimeError("database is down")
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr("backend.worker.scheduler._get_db",
+                            lambda: _Exploding())
+        monkeypatch.setattr("redis.from_url", lambda *a, **k: _FakeRedis())
+        SAFE_MODE.disable("야간 정지")
+
+        from backend.worker.scheduler import _reset_daily_risk
+        _reset_daily_risk()
+
+        assert SAFE_MODE.can_trade is False, (
+            "trading resumed although the kill-switch lookup never completed")
+
+
+class _StubOrder:
+    """The few fields `_persist_order` reads off a broker order."""
+
+    id = "0000117"
+    symbol = "AAPL"
+    side = "buy"
+    qty = 1
+    price = 100.0
+    filled_qty = 0
+    avg_fill_price = None
+
+    class status:
+        value = "submitted"
+
+
+@contextmanager
+def _null_session():
+    """A session that records nothing — the row construction is what is asserted."""
+    class _S:
+        def query(self, *a, **k):
+            return self
+
+        def filter(self, *a, **k):
+            return self
+
+        def first(self):
+            return None
+
+        def add(self, *a, **k):
+            pass
+
+        def commit(self):
+            pass
+
+    yield _S()
+
+
+class TestTheFlaskReportersSeeTheSameHalt:
+    """`/api/status` and `/api/metrics` are how an operator checks from outside.
+
+    They are read-only, but a dashboard saying "not halted" during the hours a
+    halt is actually in force is how someone decides nothing is wrong. Same
+    two-day read as the control endpoints.
+    """
+
+    @pytest.fixture()
+    def client(self, factory, monkeypatch):
+        from backend.api import server as srv
+        monkeypatch.setattr(srv, "_get_factory", lambda: factory)
+        monkeypatch.setattr(srv, "_API_KEY", "")
+        srv.app.config.update(TESTING=True)
+        return srv.app.test_client()
+
+    def test_status_reports_a_halt_fired_before_seoul_midnight(
+            self, in_window, factory, client):
+        _seed(factory, KST_DAY - timedelta(days=1),
+              kill_switch=True, kill_reason="MDD 한도 초과")
+
+        body = client.get("/api/status").get_json()
+
+        assert body["kill_switch"] is True
+        assert body["kill_reason"] == "MDD 한도 초과"
+
+    def test_status_stays_clear_when_neither_day_is_halted(
+            self, in_window, factory, client):
+        _seed(factory, KST_DAY - timedelta(days=1), kill_switch=False)
+        assert client.get("/api/status").get_json()["kill_switch"] is False
+
+    def test_metrics_reports_the_same_halt(self, in_window, factory, client):
+        _seed(factory, KST_DAY - timedelta(days=1), kill_switch=True)
+        assert client.get("/api/metrics").get_json()["kill_switch"] is True
+
+    def test_metrics_pnl_still_comes_from_todays_row_only(
+            self, in_window, factory, client):
+        """The halt spans days; the percentage does not."""
+        _seed(factory, KST_DAY - timedelta(days=1),
+              daily_pnl=-500_000.0, peak_equity=1_000_000.0)
+        _seed(factory, KST_DAY, daily_pnl=-10_000.0, peak_equity=1_000_000.0)
+
+        assert client.get("/api/metrics").get_json()["daily_pnl_pct"] == -1.0

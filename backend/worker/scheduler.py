@@ -80,41 +80,36 @@ def _reset_daily_risk():
         import redis as _redis
         r = _redis.from_url(os.environ.get("REDIS_URL", "redis://redis:6379"))
         r.delete("risk:daily_loss_pct", "risk:trading_halted")
-        # Also purge today's PnL key so PersistentLossTracker starts fresh.
-        # Must be the Seoul date: this job fires at 06:01 KST = 21:01 UTC the
-        # previous day, and the engine's `_redis_key()` is Seoul-based, so a
-        # UTC-keyed delete removed a key nobody reads (issue #160).
-        from backend.database.models import trading_day
-        r.delete(f"risk:daily_pnl:{trading_day().isoformat()}")
         logger.info("일일 리스크 카운터 리셋 (Redis)")
     except Exception as e:
         logger.warning("리스크 Redis 리셋 실패: %s", e)
 
-    db = None
-    try:
-        from backend.database.models import DailyRiskState, trading_day
-        db = _get_db()
-        # The day being opened, not the one being closed: at 06:01 KST the UTC
-        # date is still yesterday's, so this zeroed the *previous* trading day's
-        # result — silent record loss, since nothing rewrites that row (#160).
-        row = db.get(DailyRiskState, trading_day())
-        if row:
-            row.daily_pnl = 0.0
-            # kill_switch intentionally NOT cleared — requires manual operator reset
-            db.commit()
-        logger.info("일일 리스크 카운터 리셋 (DB)")
-    except Exception as e:
-        logger.warning("리스크 DB 리셋 실패: %s", e)
-    finally:
-        if db is not None:
-            db.close()
+    # `daily_pnl` is deliberately left alone here — it is not this job's to reset.
+    #
+    # `LossTracker.record_pnl()` already rolls the day over on the Seoul date,
+    # zeroing `daily_pnl` at KST midnight and persisting it, so the tracker owns
+    # that counter on the same boundary as the row key. This job runs at 06:01,
+    # six hours into the Seoul day it would be zeroing — a day that already
+    # holds the 00:00–05:00 overnight US session's losses.
+    #
+    # It used to look harmless because it keyed by the UTC date and so touched
+    # the *closed* day, missing both the live row and the live
+    # `risk:daily_pnl:<KST>` key. Once issue #160 aligned the keys, the same
+    # code wiped the live row *and* the live Redis key — and those two stores
+    # are exactly what `PersistentLossTracker._restore_state()` reads, so a
+    # restart after 06:01 came back with `daily_pnl = 0.0` and handed the
+    # Korean session a fresh 3% loss budget on top of the overnight loss.
+    #
+    # Two writers with different day boundaries is the shape of issue #158; the
+    # replacement here is the tracker's own rollover, which is already in place.
 
     # Re-arm SAFE_MODE for the new day — skip if a kill switch is still live
     try:
-        from datetime import timedelta
-        from backend.database.models import DailyRiskState, trading_day
+        from backend.database.models import DailyRiskState, trading_days_in_play
         from backend.worker.recovery import SAFE_MODE
         kill_active = False
+        #: Only a lookup that actually completed can license re-enabling trading.
+        checked = False
         db_check = None
         try:
             # Both days, because the US session straddles Seoul midnight
@@ -125,21 +120,24 @@ def _reset_daily_risk():
             # Yesterday must also be KST-yesterday: on the UTC date it landed a
             # further day back, normally an empty row, so even the pre-midnight
             # halt read as "no halt" (issue #160).
-            today = trading_day()
             db_check = _get_db()
-            for key in (today, today - timedelta(days=1)):
+            for key in trading_days_in_play():
                 row = db_check.get(DailyRiskState, key)
                 if row and row.kill_switch:
                     kill_active = True
                     break
-        except Exception:
-            pass
+            checked = True
+        except Exception as e:
+            # Fail closed. Swallowing this left `kill_active` False and fell
+            # through to SAFE_MODE.enable(), so a database outage re-opened
+            # trading without anyone having checked the kill switch.
+            logger.warning("킬스위치 조회 실패 — SAFE_MODE 재활성화 보류: %s", e)
         finally:
             if db_check is not None:
                 db_check.close()
         if kill_active:
             logger.warning("킬스위치 활성 — SAFE_MODE 재활성화 차단. 수동 해제 필요.")
-        elif not SAFE_MODE.can_trade:
+        elif checked and not SAFE_MODE.can_trade:
             SAFE_MODE.enable()
             logger.info("일일 리셋 후 SAFE_MODE 재활성화")
     except Exception as e:

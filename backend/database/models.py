@@ -31,6 +31,28 @@ def trading_day() -> date:
     return datetime.now(_KST).date()
 
 
+def trading_days_in_play() -> tuple[date, date]:
+    """The trading days a live halt can be sitting on — ``(today, yesterday)``.
+
+    The US session runs 22:30–05:00 KST, so it **straddles Seoul midnight**: a
+    halt that fires before midnight is on yesterday's row, one that fires after
+    it is on today's. Anything asking "is trading halted right now" has to read
+    both, or it misses half the session.
+
+    Including yesterday unconditionally does not over-block. A halt that was
+    cleared has ``kill_switch`` false and does not match; only an *uncleared*
+    one does, and that is exactly what should still be blocking.
+
+    Before issue #160 the row key was the UTC date, whose boundary falls at
+    09:00 KST — outside every session — so one row was enough and nothing here
+    was needed. Moving the key to KST put the boundary inside the US session,
+    which is what makes this the shared definition rather than one caller's
+    special case.
+    """
+    today = trading_day()
+    return today, today - timedelta(days=1)
+
+
 class Base(DeclarativeBase):
     pass
 

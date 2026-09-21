@@ -502,12 +502,17 @@ class KillSwitch:
         if self._db is None:
             return TradingState.RUNNING, None
         try:
-            from backend.database.models import DailyRiskState, trading_day
+            from backend.database.models import (
+                DailyRiskState, trading_days_in_play,
+            )
             sess = self._db()
             try:
-                row = sess.get(DailyRiskState, trading_day())
-                if row is not None and row.kill_switch:
-                    return TradingState.HALTED, now
+                # Both live days: the US session straddles Seoul midnight, so a
+                # halt fired before it is on yesterday's row (issue #167).
+                for key in trading_days_in_play():
+                    row = sess.get(DailyRiskState, key)
+                    if row is not None and row.kill_switch:
+                        return TradingState.HALTED, now
             finally:
                 sess.close()
         except Exception as e:
@@ -630,14 +635,22 @@ class KillSwitch:
         if self._db is None:
             return
         try:
-            from backend.database.models import DailyRiskState, trading_day
+            from backend.database.models import (
+                DailyRiskState, trading_days_in_play,
+            )
             sess = self._db()
             try:
-                today = trading_day()
-                row = sess.get(DailyRiskState, today)
-                if row is not None and row.kill_switch:
-                    row.kill_switch = False
-                    row.kill_reason = None
+                # Clear every live day, not just today's. A halt set at 23:10
+                # and resumed at 00:40 addresses two different rows; releasing
+                # one left the other blocking with nothing able to reach it.
+                cleared = False
+                for key in trading_days_in_play():
+                    row = sess.get(DailyRiskState, key)
+                    if row is not None and row.kill_switch:
+                        row.kill_switch = False
+                        row.kill_reason = None
+                        cleared = True
+                if cleared:
                     sess.commit()
                 else:
                     sess.rollback()

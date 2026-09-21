@@ -75,14 +75,24 @@ def _authorized(monkeypatch):
     monkeypatch.setenv("KILL_SWITCH_ADMINS", "a@example.com")
 
 
-def _risk_row(db, *, kill_switch: bool, reason: str | None = None):
-    from datetime import date
-    from backend.database.models import DailyRiskState
-    row = DailyRiskState(trade_date=date.today(), kill_switch=kill_switch,
+def _risk_row(db, *, kill_switch: bool, reason: str | None = None, day=None):
+    """Seed a risk row. Defaults to the current trading day.
+
+    Keyed by ``trading_day()`` rather than ``date.today()`` so the seed matches
+    what the router reads; the two differ for nine hours a day (issue #160).
+    """
+    from backend.database.models import DailyRiskState, trading_day
+    row = DailyRiskState(trade_date=day or trading_day(), kill_switch=kill_switch,
                          kill_reason=reason, peak_equity=2_000_000.0)
     db.add(row)
     db.commit()
     return row
+
+
+def _yesterday():
+    """The preceding trading day — where a halt fired before Seoul midnight sits."""
+    from backend.database.models import trading_days_in_play
+    return trading_days_in_play()[1]
 
 
 # ── the endpoint must exist and be reachable ─────────────────────────────────
@@ -120,7 +130,8 @@ def test_reset_clears_a_persistent_kill_switch(db, user):
         user, db)
 
     assert resp.code == 1, resp.msg
-    row = db.get(DailyRiskState, date.today())
+    from backend.database.models import trading_day
+    row = db.get(DailyRiskState, trading_day())
     assert row.kill_switch is False
 
 
@@ -402,3 +413,102 @@ def test_a_live_tracker_does_not_undo_the_reset(db, user):
     finally:
         sess.close()
     assert tracker.kill_switch is False, "the tracker did not converge to the row"
+
+
+# ── the overnight session straddles Seoul midnight (issue #160 follow-up) ────
+#
+# The US session runs 22:30–05:00 KST. Since the row key became the Seoul date,
+# a halt fired at 23:10 lands on one row and an operator arriving at 00:40
+# addresses the next. Reading only "today" made a live halt invisible here and
+# told the operator there was nothing to release — and with the 06:01 re-arm
+# guard reading both days, that unreleased row would then block trading with no
+# endpoint able to reach it.
+#
+# Before #160 the key was the UTC date, whose boundary is 09:00 KST — outside
+# every session — so this could not happen. It is a regression of that change,
+# and these pin it shut.
+
+
+def test_status_sees_a_halt_fired_before_seoul_midnight(db, user):
+    from api.routers import risk
+
+    _risk_row(db, kill_switch=True, reason="MDD 15% 초과", day=_yesterday())
+
+    resp = risk.kill_switch_status(user, db)
+    assert resp.data["active"] is True, (
+        "a halt from earlier in the same overnight session read as inactive")
+    assert resp.data["reason"] == "MDD 15% 초과"
+
+
+def test_reset_clears_a_halt_fired_before_seoul_midnight(db, user):
+    from backend.database.models import DailyRiskState
+    from api.routers import risk
+
+    yesterday = _yesterday()
+    _risk_row(db, kill_switch=True, reason="MDD 15% 초과", day=yesterday)
+
+    resp = risk.reset_kill_switch(
+        risk.KillSwitchResetRequest(reason="오탐 확인"), user, db)
+
+    assert resp.code == 1, resp.msg
+    assert db.get(DailyRiskState, yesterday).kill_switch is False
+
+
+def test_reset_clears_every_halted_day_not_just_one(db, user):
+    """Releasing one row and leaving the other is the trap this closes.
+
+    The 06:01 SAFE_MODE re-arm reads both days, so a leftover halt keeps
+    trading blocked — and no endpoint could reach it.
+    """
+    from backend.database.models import DailyRiskState, trading_day
+    from api.routers import risk
+
+    yesterday = _yesterday()
+    _risk_row(db, kill_switch=True, reason="어제 MDD", day=yesterday)
+    _risk_row(db, kill_switch=True, reason="오늘 일손실", day=trading_day())
+
+    risk.reset_kill_switch(
+        risk.KillSwitchResetRequest(reason="양일 정리"), user, db)
+
+    assert db.get(DailyRiskState, yesterday).kill_switch is False
+    assert db.get(DailyRiskState, trading_day()).kill_switch is False
+
+
+def test_status_prefers_todays_reason_when_both_days_are_halted(db, user):
+    """Two halted rows, one answer: the operator should see the newer decision."""
+    from backend.database.models import trading_day
+    from api.routers import risk
+
+    _risk_row(db, kill_switch=True, reason="어제 MDD", day=_yesterday())
+    _risk_row(db, kill_switch=True, reason="오늘 일손실", day=trading_day())
+
+    assert risk.kill_switch_status(user, db).data["reason"] == "오늘 일손실"
+
+
+def test_a_cleared_previous_day_does_not_keep_reporting_a_halt(db, user):
+    """Reading yesterday unconditionally must not resurrect a released halt."""
+    from backend.database.models import trading_day
+    from api.routers import risk
+
+    _risk_row(db, kill_switch=False, day=_yesterday())
+    _risk_row(db, kill_switch=False, day=trading_day())
+
+    assert risk.kill_switch_status(user, db).data["active"] is False
+
+
+def test_the_audit_row_names_every_day_it_cleared(db, user):
+    """Which rows were touched is the part a hand-edit never leaves behind."""
+    from backend.database.models import AuditLog, trading_day
+    from api.routers import risk
+
+    yesterday = _yesterday()
+    _risk_row(db, kill_switch=True, reason="어제 MDD", day=yesterday)
+    _risk_row(db, kill_switch=True, reason="오늘 일손실", day=trading_day())
+
+    risk.reset_kill_switch(
+        risk.KillSwitchResetRequest(reason="양일 정리"), user, db)
+
+    detail = db.query(AuditLog).filter(
+        AuditLog.event_type == "kill_switch_reset").one().detail
+    assert yesterday.isoformat() in detail
+    assert trading_day().isoformat() in detail

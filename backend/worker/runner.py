@@ -897,9 +897,12 @@ class StrategyWorker:
         # The trading day must be KIS's, i.e. Seoul's: on the UTC date the key
         # rolled over at 09:00 KST — the Korean market open — so one order seen
         # either side of the open produced two keys and two rows (issue #160).
+        # Resolved once: two calls could straddle Seoul midnight and put one
+        # date in the key and the next in `trade_date` on the same row.
         from backend.database.models import trading_day
+        day = trading_day()
         idem_key = (
-            f"{order.id}:{order.symbol}:{order.side}:{trading_day().isoformat()}"
+            f"{order.id}:{order.symbol}:{order.side}:{day.isoformat()}"
             if order.id else None
         )
         try:
@@ -930,12 +933,12 @@ class StrategyWorker:
                         price=order.price,
                         status=order.status.value,
                         market=market,
-                        # Same day as the idempotency key three lines up — a row
-                        # that says one thing in its key and another in its
-                        # column is how the next person copies the wrong one.
-                        # Nothing reads this column today, so this is a
-                        # coherence fix, not a behaviour change.
-                        trade_date=trading_day(),
+                        # The same `day` as the idempotency key — a row that
+                        # says one thing in its key and another in its column is
+                        # how the next person copies the wrong one. Nothing reads
+                        # this column today, so this is a coherence fix, not a
+                        # behaviour change.
+                        trade_date=day,
                     )
                     db.add(row)
                 db.commit()

@@ -459,10 +459,25 @@ class PersistentLossTracker(LossTracker):
         if db_state:
             self.weekly_pnl = db_state.weekly_pnl
             self.peak_equity = db_state.peak_equity
-            if db_state.kill_switch:
+
+        # The equity numbers above belong to today's row alone, but the halt
+        # does not: the US session runs 22:30–05:00 KST, so a halt fired at
+        # 23:10 is on yesterday's row while a worker restarting at 00:10 reads
+        # today's. Looking at one row let that worker come up unhalted, and
+        # `StartupRecovery._step_risk` branches on this flag — fail-open, in
+        # the middle of the session that set it.
+        #
+        # A live process does not hit this: `_write_db`'s `is_new` path carries
+        # the halt onto the new day's row at the first write after midnight.
+        # Only a restart in the gap before that write does.
+        from backend.database.models import trading_days_in_play
+        for key in trading_days_in_play():
+            row = db_state if key == today else self._load_db_full(key)
+            if row is not None and row.kill_switch:
                 self.kill_switch = True
-                self.kill_reason = db_state.kill_reason or ""
-                logger.warning("킬스위치 복원: %s", self.kill_reason)
+                self.kill_reason = row.kill_reason or ""
+                logger.warning("킬스위치 복원 (%s): %s", key, self.kill_reason)
+                break
 
     def record_pnl(self, pnl: float, current_equity: float) -> str:
         """As the base, plus ``"adopted"`` when the write picked up a halt that
