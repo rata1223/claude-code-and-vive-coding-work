@@ -15,10 +15,11 @@ Worker 프로세스가 시작될 때 이 모듈의 StartupRecovery를 먼저 실
   7. 미체결 주문 확인 → OrderFillPoller에 등록
   8. 정상 모드 진입 (can_trade = True)
 """
-import concurrent.futures as _cf
 import json
 import logging
 import os
+import threading
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from typing import Optional
@@ -28,7 +29,73 @@ from backend.risk.halt_policy import HaltCause
 _BROKER_STARTUP_TIMEOUT = int(os.environ.get("BROKER_STARTUP_TIMEOUT", "30"))
 _RECOVERY_STALE_ORDER_HOURS = float(os.environ.get("RECOVERY_STALE_ORDER_HOURS", "24"))
 
+#: How often a probe in flight looks up to notice a stop signal. Small enough
+#: that SIGTERM is answered well inside Docker's 10s grace, large enough not to
+#: spin.
+_ABORT_POLL_SEC = 0.25
+
 logger = logging.getLogger(__name__)
+
+
+class RecoveryAborted(Exception):
+    """A probe gave up because shutdown was requested while it was running."""
+
+
+def _call_with_deadline(fn, timeout: float, *, should_abort=None,
+                        label: str = "broker probe"):
+    """Call ``fn`` with a deadline that actually bounds this function's return.
+
+    ``ThreadPoolExecutor`` cannot do this. Used as a context manager its
+    ``__exit__`` runs ``shutdown(wait=True)``, so even after
+    ``.result(timeout=...)`` raises, the ``with`` block keeps waiting for the
+    call to come back — the timeout bounds *waiting for the result*, never the
+    step. And ``shutdown(wait=False)`` is not a fix either: that pool's threads
+    are non-daemon and joined by an ``atexit`` hook, so an abandoned call can
+    hold up interpreter exit instead (issue #161).
+
+    A plain daemon thread has neither problem. The abandoned call keeps running
+    — nothing can safely interrupt a socket read mid-flight — but it can no
+    longer delay this function or process exit, and these probes are read-only.
+
+    Why this is not just belt-and-braces over the HTTP timeout: the per-request
+    deadline is 10s (``kis_adapter.auth._http_timeout``) and GETs retry three
+    times with a 1s pause, so *one* request is already worst-case ~32s. A
+    balance probe makes two of those plus an FX lookup, and a position probe
+    makes one per holding — minutes, against a 10s SIGKILL.
+
+    ``should_abort`` is polled while waiting so a stop signal is answered
+    without sitting out the full deadline.
+
+    Raises ``TimeoutError`` on deadline, ``RecoveryAborted`` on abort, or
+    whatever ``fn`` raised.
+    """
+    box: dict = {}
+    done = threading.Event()
+
+    def _runner():
+        try:
+            box["value"] = fn()
+        except BaseException as exc:            # noqa: BLE001 - relayed below
+            box["error"] = exc
+        finally:
+            done.set()
+
+    threading.Thread(target=_runner, daemon=True,
+                     name=f"recovery-{label}").start()
+
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(f"{label} exceeded {timeout}s")
+        if done.wait(min(_ABORT_POLL_SEC, remaining)):
+            break
+        if should_abort is not None and should_abort():
+            raise RecoveryAborted(f"{label} abandoned — shutdown requested")
+
+    if "error" in box:
+        raise box["error"]
+    return box["value"]
 
 
 @dataclass
@@ -123,14 +190,20 @@ class StartupRecovery:
             ("정상 모드 진입", self._step_enable_trading),
         ]
         for i, (name, fn) in enumerate(steps, 1):
-            # Checked per step, not per instruction: the broker probes below wait
-            # up to _BROKER_STARTUP_TIMEOUT each, and Docker's SIGKILL lands 10s
-            # after SIGTERM. Stopping at the next boundary is what keeps a stop
-            # signal during startup from running the whole sequence out.
+            # Checked per step. **Steps 4 and 5 additionally** poll it while their
+            # request is in flight (`_call_with_deadline`), so a stop signal during
+            # a balance or position probe no longer waits the probe out — that pair
+            # used to run past Docker's 10s SIGKILL on its own (issue #161).
             #
-            # NOTE: a step *already in flight* is still not interruptible —
-            # _step_balance's ThreadPoolExecutor waits for its task on __exit__
-            # even after .result(timeout=...) has raised. Tracked separately.
+            # Bounded, not interruptible: nothing can safely cut off a socket read
+            # mid-flight, so an abandoned call runs on to its own end on a daemon
+            # thread. What changed is that it cannot hold up this loop or exit.
+            #
+            # ⚠️ Step 6 (reconcile) is still neither bounded nor abortable — it
+            # calls `get_positions`, then `get_order_status` per open order, and
+            # `cancel_order`. A SIGTERM landing there still overruns the grace
+            # period. Not folded in here because abandoning a *write* mid-flight
+            # is a different question from abandoning a read. Tracked separately.
             if self._should_abort is not None and self._should_abort():
                 logger.warning("[복구 %d/%d] 종료 요청 — %s 이전에 복구 중단",
                                i, len(steps), name)
@@ -143,6 +216,15 @@ class StartupRecovery:
                     logger.error("[복구 %d/%d] 실패: %s — SafeMode 유지", i, len(steps), name)
                     SAFE_MODE.disable(f"복구 실패: {name}")
                     return False
+            except RecoveryAborted as e:
+                # Same outcome as the boundary check above, and deliberately the
+                # same recorded reason: this was a stop signal, not a broker
+                # failure, and the next operator reading SafeMode should be able
+                # to tell those apart.
+                logger.warning("[복구 %d/%d] 종료 요청 — %s 중 복구 중단: %s",
+                               i, len(steps), name, e)
+                SAFE_MODE.disable("기동 중 종료 요청 — 복구 중단")
+                return False
             except Exception as e:
                 logger.exception("[복구 %d/%d] 예외: %s — %s", i, len(steps), name, e)
                 SAFE_MODE.disable(f"복구 예외: {name}: {e}")
@@ -202,11 +284,16 @@ class StartupRecovery:
             logger.warning("브로커 없음 — 잔고 단계 스킵")
             return True
         try:
-            with _cf.ThreadPoolExecutor(max_workers=1) as ex:
-                bal = ex.submit(self._broker.get_balance).result(timeout=_BROKER_STARTUP_TIMEOUT)
+            bal = _call_with_deadline(
+                self._broker.get_balance, _BROKER_STARTUP_TIMEOUT,
+                should_abort=self._should_abort, label="잔고 조회")
             logger.info("잔고 확인: 총평가 %.0f원", bal.total_eval_krw)
             return True
-        except _cf.TimeoutError:
+        except RecoveryAborted:
+            # Relayed to run(), which records the deliberate-shutdown reason.
+            # Swallowing it here would file a stop signal as a KIS outage.
+            raise
+        except TimeoutError:
             logger.error("잔고 조회 타임아웃 (%ds) — KIS API 응답 없음", _BROKER_STARTUP_TIMEOUT)
             return False
         except Exception as e:
@@ -217,12 +304,17 @@ class StartupRecovery:
         if self._broker is None:
             return True
         try:
-            with _cf.ThreadPoolExecutor(max_workers=1) as ex:
-                positions = ex.submit(self._broker.get_positions).result(timeout=_BROKER_STARTUP_TIMEOUT)
+            positions = _call_with_deadline(
+                self._broker.get_positions, _BROKER_STARTUP_TIMEOUT,
+                should_abort=self._should_abort, label="포지션 조회")
             logger.info("브로커 포지션: %d개 %s",
                         len(positions), [p.symbol for p in positions])
             return True
-        except _cf.TimeoutError:
+        except RecoveryAborted:
+            # Relayed to run(), which records the deliberate-shutdown reason.
+            # Swallowing it here would file a stop signal as a KIS outage.
+            raise
+        except TimeoutError:
             logger.error("포지션 조회 타임아웃 (%ds) — KIS API 응답 없음", _BROKER_STARTUP_TIMEOUT)
             return False
         except Exception as e:
