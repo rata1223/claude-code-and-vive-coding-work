@@ -303,7 +303,8 @@ def test_an_unauthorized_reset_does_not_clear_the_flag(db, user, monkeypatch):
 
     risk.reset_kill_switch(risk.KillSwitchResetRequest(reason="시도"), user, db)
 
-    assert db.get(DailyRiskState, date.today()).kill_switch is True
+    from backend.database.models import trading_day
+    assert db.get(DailyRiskState, trading_day()).kill_switch is True
 
 
 # ── a blank reason is not a reason ───────────────────────────────────────────
@@ -402,12 +403,10 @@ def test_a_live_tracker_does_not_undo_the_reset(db, user):
     tracker.reset_weekly()
     tracker.record_pnl(0.0, 1_000_000.0)
 
-    from datetime import date
-
-    from backend.database.models import DailyRiskState
+    from backend.database.models import DailyRiskState, trading_day
     sess = Session()
     try:
-        row = sess.get(DailyRiskState, date.today())
+        row = sess.get(DailyRiskState, trading_day())
         assert row.kill_switch is False, (
             "a live worker put the halt back — #158 is not actually fixed")
     finally:

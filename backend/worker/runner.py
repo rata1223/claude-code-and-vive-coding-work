@@ -485,21 +485,36 @@ class StrategyWorker:
             return
         from backend.database.models import DailyRiskState, trading_day
 
-        # The tracker's own mutex (P0-05) — read the three values consistently.
+        # The tracker's own mutex (P0-05) — read the four values consistently.
         with tracker._lock:
             daily_pnl = tracker.daily_pnl
             weekly_pnl = tracker.weekly_pnl
             peak_equity = tracker.peak_equity
+            halted = tracker.kill_switch
+            halt_reason = tracker.kill_reason or None
 
         with _session() as db:
             today = trading_day()
             row = db.get(DailyRiskState, today)
-            if row is None:
+            is_new = row is None
+            if is_new:
                 row = DailyRiskState(trade_date=today)
                 db.add(row)
             row.daily_pnl = daily_pnl
             row.weekly_pnl = weekly_pnl
             row.peak_equity = peak_equity
+            if is_new and halted:
+                # Only on a row this call creates, and only to *set* the flag.
+                #
+                # "Never writes the halt flag" is about not clobbering an external
+                # one, and on a brand-new row there is nothing external to clobber
+                # — while `kill_switch` would otherwise default to False, which is
+                # writing a clear by omission. Shutting down at 00:30 KST while
+                # halted would leave the new day's row reading "not halted".
+                #
+                # Same reasoning as `_write_db`'s `is_new` path (issue #158).
+                row.kill_switch = True
+                row.kill_reason = halt_reason
             db.commit()
 
     def _shutdown_heartbeat(self) -> None:
@@ -899,32 +914,33 @@ class StrategyWorker:
         # either side of the open produced two keys and two rows (issue #160).
         # Resolved once: two calls could straddle Seoul midnight and put one
         # date in the key and the next in `trade_date` on the same row.
-        from backend.database.models import trading_days_in_play
-        days = trading_days_in_play()
-        day = days[0]
+        from backend.database.models import trading_day
+        day = trading_day()
         idem_key = (
             f"{order.id}:{order.symbol}:{order.side}:{day.isoformat()}"
             if order.id else None
         )
         try:
             with _session() as db:
-                # Both days in play, not just today's.
+                # Matched on the broker id alone, deliberately.
                 #
-                # A KIS ODNO is only unique *within* a trading day, so matching
-                # on the broker id alone reached back to an older row with a
-                # recycled number and overwrote a settled order. But matching on
-                # today alone is worse: the US session runs 22:30–05:00 KST, so
-                # an order submitted at 23:50 has yesterday's `trade_date`, and
-                # its own fill arriving at 00:10 would not find it — inserting a
-                # *second* row for one order, the first stuck at "submitted".
-                # That is a nightly occurrence, not an edge case.
+                # A KIS ODNO is only unique *within* a trading day, so a recycled
+                # number can in principle reach an older row — issue #168. Two
+                # attempts to scope this by trading day inside this PR each broke
+                # something worse: an order submitted at 23:50 and filled at 00:10
+                # split into two rows, and then orders pending longer than the
+                # overnight window stopped matching at all (`_restore_pending_to_tracker`
+                # re-registers those with no date bound).
                 #
-                # The overnight window is exactly the two days in play, so a row
-                # outside it carrying the same number is a different order.
+                # Doing it right needs identity based on whether the order is still
+                # open, which is a design change reaching into recovery rather than
+                # a filter tweak — and this PR is about the *date key*, not order
+                # identity. So this stays exactly as it was before #160, and the
+                # scoping belongs to #168 along with the same pattern in
+                # `persistence.py` and `recovery.py`.
                 existing = db.query(DBOrder).filter(
-                    DBOrder.broker_order_id == order.id,
-                    DBOrder.trade_date.in_(days),
-                ).order_by(DBOrder.trade_date.desc()).first()
+                    DBOrder.broker_order_id == order.id
+                ).first()
                 if existing:
                     existing.status = order.status.value
                     existing.filled_qty = order.filled_qty
@@ -968,6 +984,9 @@ class StrategyWorker:
     def _persist_fill(self, fill: Fill, order: Order):
         try:
             with _session() as db:
+                # Resolved the same way as `_persist_order` — see there. The two
+                # must agree, or one fill event updates one row and files its Fill
+                # under another. Scoping both belongs to issue #168.
                 db_order = db.query(DBOrder).filter(
                     DBOrder.broker_order_id == order.id
                 ).first()

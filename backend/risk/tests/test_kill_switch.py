@@ -59,10 +59,16 @@ def _count_audit(factory, event_type: str) -> int:
 
 
 def _get_risk_row(factory):
-    from datetime import date
+    """The row as production keys it (issue #160).
+
+    Deliberately `trading_day()` and not `date.today()`: `KillSwitch` writes the
+    Seoul date, and the two differ for nine hours a day, so a UTC-keyed read here
+    found nothing between KST 00:00 and 09:00.
+    """
+    from backend.database.models import trading_day
     sess = factory()
     try:
-        return sess.get(DailyRiskState, date.today())
+        return sess.get(DailyRiskState, trading_day())
     finally:
         sess.close()
 
@@ -438,7 +444,8 @@ class TestKillSwitch:
         from datetime import date
         factory = _db()
         sess = factory()
-        sess.add(DailyRiskState(trade_date=date.today(), kill_switch=True, kill_reason="이전 세션 중단"))
+        from backend.database.models import trading_day
+        sess.add(DailyRiskState(trade_date=trading_day(), kill_switch=True, kill_reason="이전 세션 중단"))
         sess.commit()
         sess.close()
 

@@ -477,6 +477,19 @@ class PersistentLossTracker(LossTracker):
                 self.kill_switch = True
                 self.kill_reason = row.kill_reason or ""
                 logger.warning("킬스위치 복원 (%s): %s", key, self.kill_reason)
+                if key != today:
+                    # Restoring from *today's* row is not this process's opinion
+                    # — the row already says it, and counting it would re-break
+                    # issue #158. A halt found on an **earlier** day is different:
+                    # today's row does not carry it yet, so carrying it forward is
+                    # this process's job and has to be recorded as intent.
+                    #
+                    # Without this, `_write_db` sees nothing to assert, reads
+                    # today's row, adopts its `False` as an external clear and
+                    # **wipes the live halt on the very first write** — then the
+                    # old row ages out of `trading_days_in_play()` and the halt is
+                    # gone for good.
+                    self._mark_kill_switch_changed()
                 break
 
     def record_pnl(self, pnl: float, current_equity: float) -> str:

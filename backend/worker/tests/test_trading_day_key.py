@@ -674,52 +674,18 @@ class TestTheFlaskReportersSeeTheSameHalt:
         assert client.get("/api/metrics").get_json()["daily_pnl_pct"] == -1.0
 
 
-class TestOrderIdentityIsScopedToTheTradingDay:
-    """A KIS ODNO is unique *within* a trading day, not across them.
+class TestOrderRowsSurviveTheDateChange:
+    """`_persist_order` still matches on the broker id alone — see issue #168.
 
-    The idempotency key has always said so. The existing-row lookup beside it
-    did not, so a recycled order number reached back to an earlier day's row —
-    overwriting a settled order's status and fill quantity, and leaving the new
-    order unrecorded. Pre-existing, but it contradicts the key it sits next to.
+    Scoping that lookup by trading day was tried in this PR and reverted twice
+    over (it split overnight orders, then dropped long-pending ones), so what is
+    pinned here is that aligning the *date key* did not disturb the behaviour
+    that was already there.
     """
 
     def _persist(self, monkeypatch, factory, order):
         from backend.worker import runner as runner_mod
         _persist_via(monkeypatch, factory, runner_mod, order)
-
-    def test_a_recycled_order_number_does_not_overwrite_an_earlier_day(
-            self, in_window, factory, monkeypatch):
-        from backend.database.models import Order as DBOrder
-
-        stale = DBOrder(
-            broker_order_id=_StubOrder.id, symbol="TSLA", side="sell",
-            qty=3, price=400.0, filled_qty=3, status="filled", market="US",
-            idempotency_key="old-key",
-            trade_date=KST_DAY - timedelta(days=5),
-        )
-        sess = factory()
-        sess.add(stale)
-        sess.commit()
-        stale_pk = stale.id
-        sess.close()
-
-        self._persist(monkeypatch, factory, _StubOrder())
-
-        sess = factory()
-        try:
-            settled = sess.get(DBOrder, stale_pk)
-            assert settled.status == "filled", (
-                "an earlier trading day's order was overwritten by a recycled "
-                "broker order number")
-            assert settled.filled_qty == 3
-            assert settled.symbol == "TSLA"
-
-            rows = sess.query(DBOrder).filter(
-                DBOrder.trade_date == KST_DAY).all()
-            assert len(rows) == 1, "today's order was never recorded"
-            assert rows[0].symbol == "AAPL"
-        finally:
-            sess.close()
 
     def test_the_same_order_seen_twice_today_still_updates_in_place(
             self, in_window, factory, monkeypatch):
@@ -813,3 +779,196 @@ class TestOrderIdentityIsScopedToTheTradingDay:
             assert [r.symbol for r in rows] == ["AAPL", "MSFT"]
         finally:
             sess.close()
+
+
+class TestFillsAttachToTheRightOrder:
+    """`_persist_fill` resolves the order row too, and must agree with
+    `_persist_order` — they run on the same fill event.
+
+    Both still match on the broker id alone (issue #168). These pin that the
+    date-key change did not disturb the cases that already worked, including the
+    overnight one that a day-scoped lookup broke.
+    """
+
+    @staticmethod
+    def _fill():
+        from backend.execution.position_tracker import Fill
+        return Fill(order_id=_StubOrder.id, symbol="AAPL", side="buy",
+                    qty=1, price=101.5, market="US")
+
+    @staticmethod
+    def _order():
+        class _Filled(_StubOrder):
+            filled_qty = 1
+            avg_fill_price = 101.5
+
+            class status:
+                value = "filled"
+        return _Filled()
+
+    def _persist_fill(self, monkeypatch, factory):
+        from contextlib import contextmanager
+        from backend.worker import runner as runner_mod
+
+        @contextmanager
+        def _sess():
+            db = factory()
+            try:
+                yield db
+            finally:
+                db.close()
+
+        monkeypatch.setattr(runner_mod, "_session", _sess)
+        runner_mod.StrategyWorker._persist_fill(
+            object.__new__(runner_mod.StrategyWorker), self._fill(), self._order())
+
+    @staticmethod
+    def _seed_order(factory, day, status="submitted", filled_qty=0):
+        from backend.database.models import Order as DBOrder
+        sess = factory()
+        row = DBOrder(
+            broker_order_id=_StubOrder.id, symbol="AAPL", side="buy",
+            qty=1, price=100.0, filled_qty=filled_qty, status=status,
+            market="US", trade_date=day,
+            idempotency_key=f"{_StubOrder.id}:AAPL:buy:{day.isoformat()}",
+        )
+        sess.add(row)
+        sess.commit()
+        pk = row.id
+        sess.close()
+        return pk
+
+    def test_an_overnight_fill_attaches_to_the_submitting_days_order(
+            self, in_window, factory, monkeypatch):
+        """Submitted at 23:50, filled at 00:10 — still the same order."""
+        from backend.database.models import Fill as DBFill, Order as DBOrder
+
+        pk = self._seed_order(factory, KST_DAY - timedelta(days=1))
+
+        self._persist_fill(monkeypatch, factory)
+
+        sess = factory()
+        try:
+            row = sess.get(DBOrder, pk)
+            assert row.status == "filled"
+            assert row.filled_qty == 1
+            assert sess.query(DBFill).filter(DBFill.order_id == pk).count() == 1
+        finally:
+            sess.close()
+
+    def test_an_order_row_without_a_trade_date_still_receives_its_fill(
+            self, in_window, factory, monkeypatch):
+        """`trade_date` is nullable, and SQL `IN` never matches NULL.
+
+        Other writers leave the column unset, so scoping by day alone would
+        silently drop every fill for those orders. A row with no date claims no
+        day and cannot be excluded on day grounds.
+        """
+        from backend.database.models import Fill as DBFill, Order as DBOrder
+
+        sess = factory()
+        row = DBOrder(
+            broker_order_id=_StubOrder.id, symbol="AAPL", side="buy",
+            qty=1, price=100.0, filled_qty=0, status="submitted", market="US",
+        )
+        sess.add(row)
+        sess.commit()
+        pk = row.id
+        assert row.trade_date is None, "precondition: the row carries no date"
+        sess.close()
+
+        self._persist_fill(monkeypatch, factory)
+
+        sess = factory()
+        try:
+            assert sess.query(DBFill).filter(DBFill.order_id == pk).count() == 1
+            assert sess.get(DBOrder, pk).filled_qty == 1
+        finally:
+            sess.close()
+
+    def test_persist_order_updates_a_dateless_row_instead_of_duplicating_it(
+            self, in_window, factory, monkeypatch):
+        """`_persist_order` needs the same NULL tolerance as `_persist_fill`.
+
+        Excluding dateless rows would make every status update insert a second
+        row for orders other writers created without a `trade_date`.
+        """
+        from backend.database.models import Order as DBOrder
+        from backend.worker import runner as runner_mod
+
+        sess = factory()
+        row = DBOrder(
+            broker_order_id=_StubOrder.id, symbol="AAPL", side="buy",
+            qty=1, price=100.0, filled_qty=0, status="submitted", market="US",
+        )
+        sess.add(row)
+        sess.commit()
+        pk = row.id
+        assert row.trade_date is None, "precondition: the row carries no date"
+        sess.close()
+
+        class _Filled(_StubOrder):
+            filled_qty = 1
+            avg_fill_price = 101.5
+
+            class status:
+                value = "filled"
+
+        _persist_via(monkeypatch, factory, runner_mod, _Filled())
+
+        sess = factory()
+        try:
+            rows = sess.query(DBOrder).all()
+            assert len(rows) == 1, (
+                f"the dateless row was duplicated: "
+                f"{[(r.id, r.trade_date, r.status) for r in rows]}")
+            assert rows[0].id == pk
+            assert rows[0].status == "filled"
+        finally:
+            sess.close()
+
+
+
+class TestARestoredHaltIsCarriedOntoTodaysRow:
+    """Restoring a halt is not enough — it has to survive the next write.
+
+    Issue #158 established that restoring from the DB is *not* this process's
+    opinion, so it must not be asserted back. That rule is right for today's
+    row, which already says it. For a halt found on an **earlier** day it is
+    exactly wrong: today's row does not carry it, so with nothing to assert
+    `_write_db` reads today's row, adopts its `False` as an external clear and
+    **wipes the live halt on the first write** — after which the old row ages
+    out of the window and the halt is gone for good.
+    """
+
+    def test_it_survives_the_first_write_and_lands_on_todays_row(
+            self, in_window, factory):
+        _seed(factory, KST_DAY - timedelta(days=1),
+              kill_switch=True, kill_reason="MDD 한도 초과")
+        _seed(factory, KST_DAY, kill_switch=False, peak_equity=1_000_000.0)
+
+        t = _tracker(factory)
+        assert t.kill_switch is True, "precondition: the halt was restored"
+
+        t.record_pnl(0.0, 1_000_000.0)          # benign write, no new decision
+
+        assert t.kill_switch is True, (
+            "the first write adopted today's False and wiped the restored halt")
+        assert _row(factory, KST_DAY).kill_switch is True, (
+            "the halt was never carried onto today's row")
+
+    def test_a_halt_restored_from_todays_own_row_is_not_re_asserted(
+            self, in_window, factory):
+        """The #158 rule still holds where it belongs.
+
+        A halt read from today's row is the row's own statement, not this
+        process's. Counting it as intent would let a stale True replay over an
+        operator's clear — precisely what #158 fixed.
+        """
+        _seed(factory, KST_DAY, kill_switch=True, kill_reason="MDD 한도 초과",
+              peak_equity=1_000_000.0)
+
+        t = _tracker(factory)
+        assert t.kill_switch is True
+        assert t._ks_epoch == t._ks_written, (
+            "restoring from today's row claimed intent this process does not have")
