@@ -54,7 +54,7 @@ replaying over somebody else's halt — is explicitly dropped instead.
 import json
 import logging
 import os
-from datetime import date, datetime
+from datetime import datetime
 
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field, field_validator
@@ -128,9 +128,22 @@ def _is_risk_admin(user: User) -> bool:
     return (getattr(user, "email", "") or "").lower() in allowed
 
 
-def _today_row(db: Session):
-    from backend.database.models import DailyRiskState
-    return db.get(DailyRiskState, date.today())
+def _halt_rows(db: Session):
+    """Rows that can hold a live halt right now, today's first.
+
+    Not just today's. The US session straddles Seoul midnight, so a halt fired
+    at 23:10 sits on yesterday's row while a reset at 00:40 addresses today's.
+    Reading one row let an operator see "not halted" — and be told there was
+    nothing to release — while the halt was still in force.
+    """
+    from backend.database.models import DailyRiskState, trading_days_in_play
+    rows = [db.get(DailyRiskState, key) for key in trading_days_in_play()]
+    return [r for r in rows if r is not None]
+
+
+def _halted_rows(db: Session):
+    """The subset actually halted, today's first."""
+    return [r for r in _halt_rows(db) if r.kill_switch]
 
 
 @router.get("/kill-switch")
@@ -138,9 +151,12 @@ def kill_switch_status(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Whether today's persistent kill switch is set, and why."""
-    row = _today_row(db)
-    active = bool(row and row.kill_switch)
+    """Whether a persistent kill switch is set on either live trading day, and why."""
+    halted = _halted_rows(db)
+    active = bool(halted)
+    # Today's row first, so the detail shown is the most recent decision when
+    # both days are halted.
+    row = halted[0] if halted else None
     return Resp.ok({
         "active": active,
         "reason": (row.kill_reason if row else None),
@@ -155,20 +171,28 @@ def reset_kill_switch(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Clear today's persistent kill switch, recording who did it and why."""
+    """Clear the persistent kill switch on every live trading day, recording who and why."""
     from backend.database.models import AuditLog
 
     if not _is_risk_admin(current_user):
         # Fail closed, and say nothing about who is on the list.
         return Resp.err("권한이 없습니다 — KILL_SWITCH_ADMINS에 등록된 운영자만 해제할 수 있습니다.")
 
-    row = _today_row(db)
-    if row is None or not row.kill_switch:
+    halted = _halted_rows(db)
+    if not halted:
         # Report rather than succeed quietly: an operator who thinks they just
         # released a halt, and did not, will not go looking for the real one.
         return Resp.err("킬스위치가 활성 상태가 아닙니다 — 해제할 것이 없습니다.")
 
-    previous_reason = row.kill_reason
+    # Every halted row, in one transaction. Releasing only one leaves the other
+    # blocking the 06:01 SAFE_MODE re-arm with no endpoint able to reach it.
+    previous_reason = halted[0].kill_reason
+    # Each day's own reason, so the audit row does not drop the older one when
+    # both days are halted for different causes.
+    cleared = [
+        {"trade_date": r.trade_date.isoformat(), "kill_reason": r.kill_reason}
+        for r in halted
+    ]
 
     db.add(AuditLog(
         event_type="kill_switch_reset",
@@ -176,13 +200,15 @@ def reset_kill_switch(
         detail=json.dumps({
             "reason": body.reason,
             "previous_kill_reason": previous_reason,
+            "cleared": cleared,
             "user_id": current_user.id,
             "at": datetime.utcnow().isoformat(),
         }, ensure_ascii=False),
     ))
 
-    row.kill_switch = False
-    row.kill_reason = None
+    for row in halted:
+        row.kill_switch = False
+        row.kill_reason = None
     db.commit()
 
     logger.warning(

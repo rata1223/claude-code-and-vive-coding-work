@@ -536,17 +536,23 @@ class TestCheckpointDoesNotTouchTheHalt:
         t.daily_pnl = kw.get("daily_pnl", -1000.0)
         t.weekly_pnl = kw.get("weekly_pnl", -2000.0)
         t.peak_equity = kw.get("peak_equity", 2_000_000.0)
+        # Stated rather than left to MagicMock: the checkpoint reads these when it
+        # has to create the row, and a bare mock attribute is truthy, which would
+        # have it write a halt nobody asked for.
+        t.kill_switch = kw.get("kill_switch", False)
+        t.kill_reason = kw.get("kill_reason", "")
         return t
 
     def test_it_writes_the_equity_columns(self, patched_factory):
-        from datetime import date
-        from backend.database.models import DailyRiskState
+        # `trading_day()`, not `date.today()`: `_checkpoint_equity` keys the row
+        # by the Seoul date, and the two differ for nine hours a day (#160).
+        from backend.database.models import DailyRiskState, trading_day
 
         w = _worker(loss_tracker=self._tracker())
         w.shutdown()
 
         sess = patched_factory()
-        row = sess.get(DailyRiskState, date.today())
+        row = sess.get(DailyRiskState, trading_day())
         try:
             assert row is not None, "nothing was checkpointed"
             assert row.daily_pnl == -1000.0
@@ -557,8 +563,7 @@ class TestCheckpointDoesNotTouchTheHalt:
 
     def test_it_does_not_clear_a_kill_switch_set_by_the_watchdog(self, patched_factory):
         """The real tracker, not a mock — this is the end-to-end fail-open."""
-        from datetime import date
-        from backend.database.models import DailyRiskState
+        from backend.database.models import DailyRiskState, trading_day
         from backend.quant.risk.engine import PersistentLossTracker, RiskConfig
 
         # Built while nothing is halted, so its in-memory kill_switch is False.
@@ -570,9 +575,9 @@ class TestCheckpointDoesNotTouchTheHalt:
         # Now the API-side WorkerWatchdog sets the halt in the DB — the worker
         # process never learns of it (that is the whole point: Redis is down).
         sess = patched_factory()
-        row = sess.get(DailyRiskState, date.today())
+        row = sess.get(DailyRiskState, trading_day())
         if row is None:
-            row = DailyRiskState(trade_date=date.today())
+            row = DailyRiskState(trade_date=trading_day())
             sess.add(row)
         row.kill_switch = True
         row.kill_reason = "Worker 하트비트 없음 — 프로세스 재시작 필요"
@@ -582,7 +587,7 @@ class TestCheckpointDoesNotTouchTheHalt:
         _worker(loss_tracker=tracker).shutdown()
 
         sess = patched_factory()
-        row = sess.get(DailyRiskState, date.today())
+        row = sess.get(DailyRiskState, trading_day())
         try:
             assert row.kill_switch is True, (
                 "shutdown erased a halt the watchdog set — the worker would come "
@@ -1031,3 +1036,74 @@ class TestMainSkipsStartupWhenStopping:
 
         assert built["scheduler"] == 1
         worker.run.assert_called_once()
+
+
+class TestCheckpointCarriesAHaltOntoANewRow:
+    """A shutdown inside the overnight session must not open the new day clean.
+
+    `_checkpoint_equity` refuses to touch the halt flag so it cannot clobber one
+    set outside this process. But on a row it *creates*, leaving the column to
+    its `False` default is writing a clear by omission — and the US session runs
+    past Seoul midnight, so a restart at 00:30 KST hits exactly that path.
+    """
+
+    def _tracker(self, *, halted):
+        t = MagicMock()
+        t._lock = threading.Lock()
+        t.daily_pnl = -1000.0
+        t.weekly_pnl = -2000.0
+        t.peak_equity = 2_000_000.0
+        t.kill_switch = halted
+        t.kill_reason = "MDD 한도 초과" if halted else ""
+        return t
+
+    def test_a_row_it_creates_while_halted_records_the_halt(self, patched_factory):
+        from backend.database.models import DailyRiskState, trading_day
+
+        _worker(loss_tracker=self._tracker(halted=True)).shutdown()
+
+        sess = patched_factory()
+        try:
+            row = sess.get(DailyRiskState, trading_day())
+            assert row is not None, "nothing was checkpointed"
+            assert row.kill_switch is True, (
+                "the new day's row opened un-halted while the tracker was halted")
+            assert row.kill_reason == "MDD 한도 초과"
+        finally:
+            sess.close()
+
+    def test_a_row_it_creates_while_clear_stays_clear(self, patched_factory):
+        """It must not invent a halt — the flag is only ever set, never guessed."""
+        from backend.database.models import DailyRiskState, trading_day
+
+        _worker(loss_tracker=self._tracker(halted=False)).shutdown()
+
+        sess = patched_factory()
+        try:
+            row = sess.get(DailyRiskState, trading_day())
+            assert row.kill_switch is False
+        finally:
+            sess.close()
+
+    def test_it_still_refuses_to_clear_an_existing_external_halt(
+            self, patched_factory):
+        """The original promise, unchanged: an existing row's flag is untouched."""
+        from backend.database.models import DailyRiskState, trading_day
+
+        sess = patched_factory()
+        sess.add(DailyRiskState(
+            trade_date=trading_day(), kill_switch=True,
+            kill_reason="Worker 하트비트 없음 — 프로세스 재시작 필요"))
+        sess.commit()
+        sess.close()
+
+        _worker(loss_tracker=self._tracker(halted=False)).shutdown()
+
+        sess = patched_factory()
+        try:
+            row = sess.get(DailyRiskState, trading_day())
+            assert row.kill_switch is True, (
+                "the checkpoint cleared a halt set outside this process")
+            assert row.peak_equity == 2_000_000.0, "and the equity still landed"
+        finally:
+            sess.close()

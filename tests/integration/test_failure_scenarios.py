@@ -828,10 +828,10 @@ class TestServerRestart:
     """Server Restart: pre-existing kill-switch blocks resume until manually cleared."""
 
     def _seed_kill_switch(self, factory):
-        from datetime import date
+        from backend.database.models import trading_day
         sess = factory()
         sess.add(DailyRiskState(
-            trade_date=date.today(),
+            trade_date=trading_day(),
             kill_switch=True,
             kill_reason="일일 손실 한도 초과",
             daily_pnl=0.0,

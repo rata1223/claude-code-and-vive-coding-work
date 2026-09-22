@@ -16,7 +16,7 @@ import signal
 import threading
 import time
 from contextlib import contextmanager
-from datetime import date, datetime
+from datetime import datetime
 
 import redis
 from sqlalchemy.exc import IntegrityError
@@ -483,23 +483,38 @@ class StrategyWorker:
         tracker = self._loss_tracker
         if tracker is None:
             return
-        from backend.database.models import DailyRiskState
+        from backend.database.models import DailyRiskState, trading_day
 
-        # The tracker's own mutex (P0-05) — read the three values consistently.
+        # The tracker's own mutex (P0-05) — read the four values consistently.
         with tracker._lock:
             daily_pnl = tracker.daily_pnl
             weekly_pnl = tracker.weekly_pnl
             peak_equity = tracker.peak_equity
+            halted = tracker.kill_switch
+            halt_reason = tracker.kill_reason or None
 
         with _session() as db:
-            today = date.today()
+            today = trading_day()
             row = db.get(DailyRiskState, today)
-            if row is None:
+            is_new = row is None
+            if is_new:
                 row = DailyRiskState(trade_date=today)
                 db.add(row)
             row.daily_pnl = daily_pnl
             row.weekly_pnl = weekly_pnl
             row.peak_equity = peak_equity
+            if is_new and halted:
+                # Only on a row this call creates, and only to *set* the flag.
+                #
+                # "Never writes the halt flag" is about not clobbering an external
+                # one, and on a brand-new row there is nothing external to clobber
+                # — while `kill_switch` would otherwise default to False, which is
+                # writing a clear by omission. Shutting down at 00:30 KST while
+                # halted would leave the new day's row reading "not halted".
+                #
+                # Same reasoning as `_write_db`'s `is_new` path (issue #158).
+                row.kill_switch = True
+                row.kill_reason = halt_reason
             db.commit()
 
     def _shutdown_heartbeat(self) -> None:
@@ -894,13 +909,35 @@ class StrategyWorker:
         # Derive a deterministic idempotency key from broker order id + date.
         # KIS ODNO is unique per trading day per account, so this composite key
         # prevents duplicate DB rows when the same order is processed twice.
-        from datetime import date as _date
+        # The trading day must be KIS's, i.e. Seoul's: on the UTC date the key
+        # rolled over at 09:00 KST — the Korean market open — so one order seen
+        # either side of the open produced two keys and two rows (issue #160).
+        # Resolved once: two calls could straddle Seoul midnight and put one
+        # date in the key and the next in `trade_date` on the same row.
+        from backend.database.models import trading_day
+        day = trading_day()
         idem_key = (
-            f"{order.id}:{order.symbol}:{order.side}:{_date.today().isoformat()}"
+            f"{order.id}:{order.symbol}:{order.side}:{day.isoformat()}"
             if order.id else None
         )
         try:
             with _session() as db:
+                # Matched on the broker id alone, deliberately.
+                #
+                # A KIS ODNO is only unique *within* a trading day, so a recycled
+                # number can in principle reach an older row — issue #168. Two
+                # attempts to scope this by trading day inside this PR each broke
+                # something worse: an order submitted at 23:50 and filled at 00:10
+                # split into two rows, and then orders pending longer than the
+                # overnight window stopped matching at all (`_restore_pending_to_tracker`
+                # re-registers those with no date bound).
+                #
+                # Doing it right needs identity based on whether the order is still
+                # open, which is a design change reaching into recovery rather than
+                # a filter tweak — and this PR is about the *date key*, not order
+                # identity. So this stays exactly as it was before #160, and the
+                # scoping belongs to #168 along with the same pattern in
+                # `persistence.py` and `recovery.py`.
                 existing = db.query(DBOrder).filter(
                     DBOrder.broker_order_id == order.id
                 ).first()
@@ -927,7 +964,12 @@ class StrategyWorker:
                         price=order.price,
                         status=order.status.value,
                         market=market,
-                        trade_date=datetime.utcnow().date(),
+                        # The same `day` as the idempotency key — a row that
+                        # says one thing in its key and another in its column is
+                        # how the next person copies the wrong one. Nothing reads
+                        # this column today, so this is a coherence fix, not a
+                        # behaviour change.
+                        trade_date=day,
                     )
                     db.add(row)
                 db.commit()
@@ -942,6 +984,9 @@ class StrategyWorker:
     def _persist_fill(self, fill: Fill, order: Order):
         try:
             with _session() as db:
+                # Resolved the same way as `_persist_order` — see there. The two
+                # must agree, or one fill event updates one row and files its Fill
+                # under another. Scoping both belongs to issue #168.
                 db_order = db.query(DBOrder).filter(
                     DBOrder.broker_order_id == order.id
                 ).first()

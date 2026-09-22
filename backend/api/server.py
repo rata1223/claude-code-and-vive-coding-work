@@ -106,13 +106,17 @@ def get_status():
     pending_orders = -1
 
     try:
-        from backend.database.models import DailyRiskState
-        from datetime import date
+        from backend.database.models import DailyRiskState, trading_days_in_play
         db = get_db()
-        row = db.get(DailyRiskState, date.today())
-        if row:
-            kill_switch = row.kill_switch
-            kill_reason = row.kill_reason or ""
+        # Both live days: the US session straddles Seoul midnight, so reporting
+        # only today's row said "not halted" while a pre-midnight halt was in
+        # force. Same reason `api/routers/risk.py` reads both.
+        for _key in trading_days_in_play():
+            row = db.get(DailyRiskState, _key)
+            if row and row.kill_switch:
+                kill_switch = True
+                kill_reason = row.kill_reason or ""
+                break
         pending_orders = db.query(Order).filter(
             Order.status.in_(["pending", "submitted", "partial_filled"])
         ).count()
@@ -379,7 +383,6 @@ def worker_heartbeat_status():
 @app.get("/api/metrics")
 def get_metrics():
     """운영 메트릭 스냅샷 — 모니터링/대시보드용."""
-    from datetime import date as _date
     metrics: dict = {
         "timestamp": datetime.utcnow().isoformat(),
         "worker_alive": False,
@@ -403,12 +406,17 @@ def get_metrics():
             Order.status.in_(["pending", "submitted", "partial_filled"])
         ).count()
         metrics["open_positions"] = db.query(Position).count()
-        from backend.database.models import DailyRiskState
-        row = db.get(DailyRiskState, _date.today())
-        if row:
-            metrics["kill_switch"] = row.kill_switch
-            if row.peak_equity and row.peak_equity > 0:
-                metrics["daily_pnl_pct"] = round(row.daily_pnl / row.peak_equity * 100, 3)
+        from backend.database.models import (
+            DailyRiskState, trading_day, trading_days_in_play,
+        )
+        row = db.get(DailyRiskState, trading_day())
+        if row and row.peak_equity and row.peak_equity > 0:
+            # PnL is today's alone; the halt is not (see /api/status).
+            metrics["daily_pnl_pct"] = round(row.daily_pnl / row.peak_equity * 100, 3)
+        metrics["kill_switch"] = any(
+            (r is not None and r.kill_switch)
+            for r in (db.get(DailyRiskState, k) for k in trading_days_in_play())
+        )
     except Exception:
         pass
     return jsonify(metrics)

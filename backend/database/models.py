@@ -1,9 +1,56 @@
-from datetime import datetime
+from datetime import date, datetime, timedelta, timezone
 from sqlalchemy import (
     Boolean, Column, Date, DateTime, Float, Integer, String, Text,
     UniqueConstraint, create_engine,
 )
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
+
+_KST = timezone(timedelta(hours=9))
+
+
+def trading_day() -> date:
+    """This platform's trading day, in Asia/Seoul (UTC+9).
+
+    The one way to produce a ``DailyRiskState.trade_date`` key. It lives beside
+    the model because the primary key's meaning is the table's contract, not any
+    one caller's choice, and every caller already imports ``DailyRiskState``
+    from here.
+
+    Why it is needed: the rest of the platform already runs on KST — the
+    scheduler is ``BackgroundScheduler(timezone="Asia/Seoul")`` and
+    ``LossTracker`` rolls its day over on the Seoul date — but the containers
+    run on UTC (no ``TZ`` in ``docker-compose.yml``), so the writers that keyed
+    rows with ``date.today()`` were a day behind for the nine hours of
+    **KST 00:00–09:00**. Readers and writers then disagreed about which row was
+    "today", which lost a live halt across a worker restart (issue #160).
+
+    Callers import this *inside the function* that needs it, matching how
+    ``DailyRiskState`` is already imported, so that patching this one name
+    covers every site.
+    """
+    return datetime.now(_KST).date()
+
+
+def trading_days_in_play() -> tuple[date, date]:
+    """The trading days a live halt can be sitting on — ``(today, yesterday)``.
+
+    The US session runs 22:30–05:00 KST, so it **straddles Seoul midnight**: a
+    halt that fires before midnight is on yesterday's row, one that fires after
+    it is on today's. Anything asking "is trading halted right now" has to read
+    both, or it misses half the session.
+
+    Including yesterday unconditionally does not over-block. A halt that was
+    cleared has ``kill_switch`` false and does not match; only an *uncleared*
+    one does, and that is exactly what should still be blocking.
+
+    Before issue #160 the row key was the UTC date, whose boundary falls at
+    09:00 KST — outside every session — so one row was enough and nothing here
+    was needed. Moving the key to KST put the boundary inside the US session,
+    which is what makes this the shared definition rather than one caller's
+    special case.
+    """
+    today = trading_day()
+    return today, today - timedelta(days=1)
 
 
 class Base(DeclarativeBase):

@@ -10,7 +10,7 @@
 import logging
 import threading
 from dataclasses import dataclass, field
-from datetime import date, datetime, timezone, timedelta
+from datetime import date
 from typing import Optional
 
 import numpy as np
@@ -18,12 +18,17 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-_SEOUL_TZ = timezone(timedelta(hours=9))
-
 
 def _seoul_today() -> date:
-    """Return today's date in Asia/Seoul timezone (UTC+9)."""
-    return datetime.now(_SEOUL_TZ).date()
+    """Today in Asia/Seoul — delegated to the one definition (issue #160).
+
+    Kept as a name because this module reads it in a dozen places, but the
+    computation now lives beside ``DailyRiskState``, whose primary key it
+    produces. Imported inside the call so patching the one helper reaches every
+    caller, here and elsewhere.
+    """
+    from backend.database.models import trading_day
+    return trading_day()
 
 
 # ── 설정 ──────────────────────────────────────────────────────────────────────
@@ -454,10 +459,38 @@ class PersistentLossTracker(LossTracker):
         if db_state:
             self.weekly_pnl = db_state.weekly_pnl
             self.peak_equity = db_state.peak_equity
-            if db_state.kill_switch:
+
+        # The equity numbers above belong to today's row alone, but the halt
+        # does not: the US session runs 22:30–05:00 KST, so a halt fired at
+        # 23:10 is on yesterday's row while a worker restarting at 00:10 reads
+        # today's. Looking at one row let that worker come up unhalted, and
+        # `StartupRecovery._step_risk` branches on this flag — fail-open, in
+        # the middle of the session that set it.
+        #
+        # A live process does not hit this: `_write_db`'s `is_new` path carries
+        # the halt onto the new day's row at the first write after midnight.
+        # Only a restart in the gap before that write does.
+        from backend.database.models import trading_days_in_play
+        for key in trading_days_in_play():
+            row = db_state if key == today else self._load_db_full(key)
+            if row is not None and row.kill_switch:
                 self.kill_switch = True
-                self.kill_reason = db_state.kill_reason or ""
-                logger.warning("킬스위치 복원: %s", self.kill_reason)
+                self.kill_reason = row.kill_reason or ""
+                logger.warning("킬스위치 복원 (%s): %s", key, self.kill_reason)
+                if key != today:
+                    # Restoring from *today's* row is not this process's opinion
+                    # — the row already says it, and counting it would re-break
+                    # issue #158. A halt found on an **earlier** day is different:
+                    # today's row does not carry it yet, so carrying it forward is
+                    # this process's job and has to be recorded as intent.
+                    #
+                    # Without this, `_write_db` sees nothing to assert, reads
+                    # today's row, adopts its `False` as an external clear and
+                    # **wipes the live halt on the very first write** — then the
+                    # old row ages out of `trading_days_in_play()` and the halt is
+                    # gone for good.
+                    self._mark_kill_switch_changed()
+                break
 
     def record_pnl(self, pnl: float, current_equity: float) -> str:
         """As the base, plus ``"adopted"`` when the write picked up a halt that
@@ -552,8 +585,8 @@ class PersistentLossTracker(LossTracker):
 
         Returns True when this write adopted a halt from the row.
         """
-        from backend.database.models import DailyRiskState
-        today = date.today()
+        from backend.database.models import DailyRiskState, trading_day
+        today = trading_day()
         with self._lock:
             daily_pnl = self.daily_pnl
             weekly_pnl = self.weekly_pnl

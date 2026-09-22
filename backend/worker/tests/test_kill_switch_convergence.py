@@ -70,13 +70,14 @@ def factory():
     return sessionmaker(bind=engine, expire_on_commit=False)
 
 
-#: The key `_write_db` uses. Deliberately `date.today()` and not
-#: `_seoul_today()`: the tracker reads with one and writes with the other, which
-#: is its own bug (issue #160) and explicitly out of scope here. These tests key
-#: off the *write* side so they keep testing convergence rather than #160.
+#: The key `_write_db` uses. This used to be `date.today()` while the tracker
+#: *read* with `_seoul_today()` — a split that was its own bug (issue #160) and
+#: out of scope for this module, so these tests deliberately keyed off the write
+#: side. #160 closed the split: both sides now go through `trading_day()`, and
+#: this follows the write side as it always did.
 def _write_key():
-    from datetime import date
-    return date.today()
+    from backend.database.models import trading_day
+    return trading_day()
 
 
 def _row(factory):
@@ -426,16 +427,16 @@ class TestNewRowIsNotAnExternalOpinion:
     """
 
     def _tomorrow_key(self, monkeypatch):
-        import backend.quant.risk.engine as eng
-        real = eng.date
-        tomorrow = real.today() + _timedelta(days=1)
+        """Advance the trading day.
 
-        class _T:
-            @staticmethod
-            def today():
-                return tomorrow
-
-        monkeypatch.setattr(eng, "date", _T)
+        Patches `trading_day` itself. Before #160 this had to stub
+        `engine.date`, because the read side and the write side derived the day
+        separately; now there is one door, and moving it moves both.
+        """
+        from backend.database.models import trading_day
+        tomorrow = trading_day() + _timedelta(days=1)
+        monkeypatch.setattr("backend.database.models.trading_day",
+                            lambda: tomorrow)
         return tomorrow
 
     def test_a_restored_halt_survives_the_day_boundary(self, factory, monkeypatch):

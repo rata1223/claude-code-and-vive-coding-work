@@ -199,7 +199,8 @@ def test_s19_startup_recovery(db_factory):
                               status=ActionStatus.UNKNOWN))   # unknown → 차단
     s = db_factory()
     try:
-        s.add(DailyRiskState(trade_date=date.today(), kill_switch=True,
+        from backend.database.models import trading_day
+        s.add(DailyRiskState(trade_date=trading_day(), kill_switch=True,
                              kill_reason="이전 세션 손실 한도"))
         s.commit()
     finally:
