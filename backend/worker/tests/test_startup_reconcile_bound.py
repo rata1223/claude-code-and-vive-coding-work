@@ -121,15 +121,6 @@ def cleanup():
         b.release.set()
 
 
-def _wait_until(pred, timeout=3.0):
-    end = time.monotonic() + timeout
-    while time.monotonic() < end:
-        if pred():
-            return True
-        time.sleep(0.01)
-    return False
-
-
 def _factory_for(broker, db_factory):
     return lambda gate: PositionReconciler(
         broker=gate(broker), db_factory=db_factory, broker_name="kis")
@@ -245,14 +236,21 @@ class TestRunReconcileBounded:
         b = FakeBroker(hang_on="HANG", statuses={"LOST2": None})
         cleanup.append(b)
 
+        # Identify *this* test's orphan, not any thread by name — an earlier
+        # test's abandoned reconcile shares it and may still be winding down.
+        before = set(threading.enumerate())
         with pytest.raises(TimeoutError):
             run_reconcile_bounded(_factory_for(b, db_factory), "startup", 0.3)
         assert b.entered.is_set()
+        orphans = [t for t in threading.enumerate()
+                   if t not in before and t.name == "recovery-reconcile-startup"]
+        assert len(orphans) == 1
 
         b.release.set()               # the in-flight lookup finally answers
-        # The orphan drains: its answer is discarded and the next read refused.
-        assert _wait_until(lambda: len(b.calls) >= 2 or not _orphan_alive())
-        time.sleep(0.2)
+        # Wait for the orphan to finish, not for a fixed sleep: asserting while
+        # it is still running would pass even with the gate broken.
+        orphans[0].join(3.0)
+        assert not orphans[0].is_alive(), "the abandoned reconcile did not drain"
 
         assert "cancel_order" not in b.names(), \
             "an abandoned reconcile cancelled an order during shutdown"
@@ -291,11 +289,6 @@ class TestRunReconcileBounded:
             "startup", 5.0)
         assert not result.ok
         assert b.calls == []
-
-
-def _orphan_alive() -> bool:
-    return any(t.name == "recovery-reconcile-startup" and t.is_alive()
-               for t in threading.enumerate())
 
 
 # ── wired into StartupRecovery step 6 ───────────────────────────────────────
