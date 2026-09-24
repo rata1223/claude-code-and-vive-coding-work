@@ -616,24 +616,26 @@ class TestStartupIsInterruptible:
         first spends the SIGKILL clock before the teardown even starts."""
         w = _worker()
         w._restore_active = MagicMock()
+        w._startup_reconcile = MagicMock()
         w._run_with_pubsub = MagicMock()
         w.request_shutdown()
 
         w.run()
 
         w._restore_active.assert_not_called()
-        w._reconciler.reconcile.assert_not_called()
+        w._startup_reconcile.assert_not_called()
         w._run_with_pubsub.assert_not_called()
 
     def test_reconcile_is_skipped_when_the_signal_lands_during_restore(self, patched_factory):
         w = _worker()
         w._restore_active = MagicMock(side_effect=lambda: w.request_shutdown())
+        w._startup_reconcile = MagicMock()
         w._run_with_pubsub = MagicMock()
 
         w.run()
 
         w._restore_active.assert_called_once()
-        w._reconciler.reconcile.assert_not_called()
+        w._startup_reconcile.assert_not_called()
 
     def test_the_budget_runs_from_the_signal_not_from_shutdown(self, patched_factory):
         """A teardown that starts 7s after the signal has 1s left, not 8."""

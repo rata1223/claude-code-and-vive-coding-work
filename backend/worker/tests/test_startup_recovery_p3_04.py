@@ -21,6 +21,7 @@ from datetime import datetime
 
 import pytest
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
 
 from backend.brokers.paper_broker import ScriptedPaperBroker
 from backend.database.models import Base, Order as DBOrder, Position as DBPosition
@@ -34,7 +35,9 @@ BROKER = "kis"
 
 @pytest.fixture()
 def db_factory():
-    eng = make_test_engine()
+    # StaticPool: the startup reconcile runs on its own thread (issue #170), and a
+    # plain in-memory SQLite engine hands that thread's connection an empty DB.
+    eng = make_test_engine(poolclass=StaticPool)
     Base.metadata.create_all(eng)
     return sessionmaker(bind=eng, expire_on_commit=False)
 

@@ -26,7 +26,7 @@ import time
 import pytest
 
 from backend.worker.recovery import (
-    RecoveryAborted, StartupRecovery, _call_with_deadline,
+    RecoveryAborted, StartupRecovery, call_with_deadline,
 )
 
 
@@ -64,7 +64,7 @@ class TestTheDeadlineBoundsTheCall:
             self, hang):
         t0 = time.monotonic()
         with pytest.raises(TimeoutError):
-            _call_with_deadline(hang, 0.5, label="test")
+            call_with_deadline(hang, 0.5, label="test")
         elapsed = time.monotonic() - t0
 
         assert hang.entered.is_set(), "the call never started — wrong thing timed"
@@ -80,7 +80,7 @@ class TestTheDeadlineBoundsTheCall:
         """
         before = {t for t in threading.enumerate()}
         with pytest.raises(TimeoutError):
-            _call_with_deadline(hang, 0.3, label="probe")
+            call_with_deadline(hang, 0.3, label="probe")
 
         new = [t for t in threading.enumerate() if t not in before]
         assert new, "expected the abandoned call to still be running"
@@ -91,7 +91,7 @@ class TestTheDeadlineBoundsTheCall:
         """A SIGTERM mid-probe must not sit out the whole deadline."""
         t0 = time.monotonic()
         with pytest.raises(RecoveryAborted):
-            _call_with_deadline(hang, 30.0, should_abort=lambda: True,
+            call_with_deadline(hang, 30.0, should_abort=lambda: True,
                                 label="probe")
         elapsed = time.monotonic() - t0
 
@@ -99,18 +99,18 @@ class TestTheDeadlineBoundsTheCall:
             f"took {elapsed:.2f}s to notice the stop signal")
 
     def test_a_result_is_returned_and_an_error_is_relayed(self):
-        assert _call_with_deadline(lambda: 7, 5.0, label="ok") == 7
+        assert call_with_deadline(lambda: 7, 5.0, label="ok") == 7
 
         def _boom():
             raise ValueError("broker said no")
 
         with pytest.raises(ValueError, match="broker said no"):
-            _call_with_deadline(_boom, 5.0, label="boom")
+            call_with_deadline(_boom, 5.0, label="boom")
 
     def test_it_does_not_wait_the_full_deadline_on_a_fast_call(self):
         """The poll interval must not become a floor on every probe."""
         t0 = time.monotonic()
-        _call_with_deadline(lambda: "quick", 10.0, label="fast")
+        call_with_deadline(lambda: "quick", 10.0, label="fast")
         assert time.monotonic() - t0 < 1.0
 
 
