@@ -578,8 +578,9 @@ This function is called by:
 - Startup recovery (pending order fills detected at restart, Phase 3)
 
 It is not acceptable to have separate fill persistence implementations in
-`runner.py`, `recovery.py`, and `persistence.py`. One function, one set of
-guards, one place to maintain idempotency logic.
+`runner.py` and `recovery.py`. One function, one set of guards, one place to
+maintain idempotency logic. (A third copy, `backend/worker/persistence.py`, had
+no callers and was removed under issue #168.)
 
 ### 12.3 OrderStateMachine Idempotency
 
