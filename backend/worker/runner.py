@@ -295,10 +295,9 @@ class StrategyWorker:
                 logger.info("기동 중 shutdown 요청 — 시작 조정 생략")
                 return
             # Startup reconciliation: broker is ground truth on boot
-            try:
-                self._reconciler.reconcile("startup")
-            except Exception as e:
-                logger.warning("시작 조정 실패 (계속 진행): %s", e)
+            if not self._startup_reconcile():
+                logger.info("기동 중 shutdown 요청 — 시작 조정 중단")
+                return
 
             if self._shutdown.is_set():
                 return
@@ -308,6 +307,38 @@ class StrategyWorker:
             # exception. It is the only place that guarantees the checkpoint and
             # the shutdown record happen at all.
             self.shutdown()
+
+    def _startup_reconcile(self) -> bool:
+        """Boot-time reconcile. Returns False only when shutdown cut it short.
+
+        Bounded and abortable (issue #170): one ``get_order_status`` per open
+        order, at up to ~32s each, used to hold a SIGTERM here past Docker's
+        SIGKILL. It runs on its own reconciler with a gated broker rather than
+        on ``self._reconciler``, so when this gives up the abandoned run stops
+        at its next broker read instead of carrying on into the teardown — see
+        ``StopGatedBroker``. Any other failure is logged and boot continues, as
+        before.
+        """
+        from backend.worker.recovery import (
+            _RECONCILE_STARTUP_TIMEOUT, RecoveryAborted, run_reconcile_bounded,
+        )
+        try:
+            run_reconcile_bounded(
+                lambda gate: PositionReconciler(
+                    broker=gate(get_kis_broker()),
+                    db_factory=_get_session_factory(),
+                    redis_client=self._redis,
+                    poller=self._poller,
+                    ca_runtime=self._ca_runtime,
+                ),
+                "startup", _RECONCILE_STARTUP_TIMEOUT,
+                should_abort=self._shutdown.is_set,
+            )
+        except RecoveryAborted:
+            return False
+        except Exception as e:
+            logger.warning("시작 조정 실패 (계속 진행): %s", e)
+        return True
 
     # ── graceful shutdown (P0-10) ────────────────────────────────────────────
 

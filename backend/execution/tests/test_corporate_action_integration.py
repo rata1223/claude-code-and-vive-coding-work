@@ -8,6 +8,7 @@ from unittest.mock import MagicMock
 
 import pytest
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
 
 from backend.database.testing import make_test_engine
 from backend.brokers.models import Position as BPosition
@@ -25,7 +26,9 @@ _EFF = date(2026, 6, 5)
 
 @pytest.fixture()
 def factory():
-    engine = make_test_engine()
+    # StaticPool: the startup reconcile runs on its own thread (issue #170), and a
+    # plain in-memory SQLite engine hands that thread's connection an empty DB.
+    engine = make_test_engine(poolclass=StaticPool)
     Base.metadata.create_all(engine)
     return sessionmaker(bind=engine, expire_on_commit=False)
 

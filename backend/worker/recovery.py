@@ -27,6 +27,11 @@ from typing import Optional
 from backend.risk.halt_policy import HaltCause
 
 _BROKER_STARTUP_TIMEOUT = int(os.environ.get("BROKER_STARTUP_TIMEOUT", "30"))
+#: The startup reconcile is one position lookup plus one status lookup per open
+#: order, and a single retried KIS GET is already worst-case ~32s — so it gets
+#: its own budget rather than one probe's. A stop signal does not wait for this;
+#: it only catches a broker that hangs with nobody asking the worker to stop.
+_RECONCILE_STARTUP_TIMEOUT = int(os.environ.get("RECONCILE_STARTUP_TIMEOUT", "180"))
 _RECOVERY_STALE_ORDER_HOURS = float(os.environ.get("RECOVERY_STALE_ORDER_HOURS", "24"))
 
 #: How often a probe in flight looks up to notice a stop signal. Small enough
@@ -41,7 +46,7 @@ class RecoveryAborted(Exception):
     """A probe gave up because shutdown was requested while it was running."""
 
 
-def _call_with_deadline(fn, timeout: float, *, should_abort=None,
+def call_with_deadline(fn, timeout: float, *, should_abort=None,
                         label: str = "broker probe"):
     """Call ``fn`` with a deadline that actually bounds this function's return.
 
@@ -96,6 +101,84 @@ def _call_with_deadline(fn, timeout: float, *, should_abort=None,
     if "error" in box:
         raise box["error"]
     return box["value"]
+
+
+class StopGatedBroker:
+    """Broker proxy whose *reads* refuse to run once ``stop()`` is true.
+
+    ``call_with_deadline`` bounds a startup reconcile but cannot stop it: the
+    abandoned ``PositionReconciler.reconcile()`` would carry on through every
+    open order on its daemon thread. Passing this in its place gives that
+    reconcile clean stopping points without touching the reconciler — its
+    per-order loop already records a failed broker read as an error and moves
+    on, so once stopped the rest of the loop drains in microseconds and the
+    result comes back ``ok=False`` (fail-closed).
+
+    Checked on both sides of the call: before, so no new request goes out;
+    after, so a request that was in flight when the stop landed has its answer
+    discarded instead of being acted on (a ``resync`` or DB sync).
+
+    ``cancel_order`` is deliberately **not** gated. ``_mark_order_lost`` treats
+    a failed cancel as a warning and still commits the row as CANCELED, so
+    refusing the cancel would write "canceled" for an order that may still be
+    live at the broker. It is only reached after a gated ``get_order_status``
+    returned, so a stop can never land between deciding to cancel and sending
+    it — either both the cancel and its commit happen, or neither does.
+    """
+
+    _GATED = frozenset({"get_positions", "get_order_status"})
+
+    def __init__(self, broker, stop):
+        self._broker = broker
+        self._stop = stop
+
+    def __getattr__(self, name):
+        attr = getattr(self._broker, name)
+        if name not in self._GATED:
+            return attr
+
+        def _gated(*args, **kwargs):
+            if self._stop():
+                raise RecoveryAborted(f"{name} skipped — shutdown requested")
+            value = attr(*args, **kwargs)
+            if self._stop():
+                raise RecoveryAborted(f"{name} discarded — shutdown requested")
+            return value
+        return _gated
+
+
+def run_reconcile_bounded(reconciler_factory, trigger: str, timeout: float, *,
+                          should_abort=None):
+    """Run a startup reconcile that can neither outlive ``timeout`` nor a stop.
+
+    ``reconciler_factory(broker_wrapper)`` builds the ``PositionReconciler``;
+    it receives a function to wrap its broker with so every read goes through
+    a ``StopGatedBroker`` tied to this call. When this returns — normally, on
+    deadline, or on abort — the gate is closed, so an abandoned reconcile stops
+    at its next broker read instead of running on through every open order.
+
+    Raises ``TimeoutError`` or ``RecoveryAborted`` like ``call_with_deadline``.
+    """
+    closed = threading.Event()
+
+    def _stop() -> bool:
+        return closed.is_set() or (should_abort is not None and should_abort())
+
+    reconciler = reconciler_factory(lambda broker: StopGatedBroker(broker, _stop))
+    try:
+        result = call_with_deadline(lambda: reconciler.reconcile(trigger), timeout,
+                                    should_abort=should_abort,
+                                    label=f"reconcile-{trigger}")
+    finally:
+        closed.set()
+    # Once the gate trips, the rest of the reconcile turns into caught errors
+    # and returns in microseconds — usually before the wait above next looks
+    # at `should_abort`. Without this check that comes back as an ordinary
+    # failed reconcile, and SafeMode records a broker failure for what was a
+    # stop signal.
+    if should_abort is not None and should_abort():
+        raise RecoveryAborted(f"reconcile-{trigger} stopped — shutdown requested")
+    return result
 
 
 @dataclass
@@ -190,20 +273,17 @@ class StartupRecovery:
             ("정상 모드 진입", self._step_enable_trading),
         ]
         for i, (name, fn) in enumerate(steps, 1):
-            # Checked per step. **Steps 4 and 5 additionally** poll it while their
-            # request is in flight (`_call_with_deadline`), so a stop signal during
-            # a balance or position probe no longer waits the probe out — that pair
-            # used to run past Docker's 10s SIGKILL on its own (issue #161).
+            # Checked per step. **Steps 4–6 additionally** poll it while their
+            # broker work is in flight (`call_with_deadline`), so a stop signal
+            # during a probe or the reconcile no longer waits it out — those used
+            # to run past Docker's 10s SIGKILL on their own (issues #161, #170).
             #
             # Bounded, not interruptible: nothing can safely cut off a socket read
             # mid-flight, so an abandoned call runs on to its own end on a daemon
             # thread. What changed is that it cannot hold up this loop or exit.
-            #
-            # ⚠️ Step 6 (reconcile) is still neither bounded nor abortable — it
-            # calls `get_positions`, then `get_order_status` per open order, and
-            # `cancel_order`. A SIGTERM landing there still overruns the grace
-            # period. Not folded in here because abandoning a *write* mid-flight
-            # is a different question from abandoning a read. Tracked separately.
+            # Step 6 also writes (`cancel_order`), so its abandoned reconcile is
+            # additionally gated to stop at its next broker read — never between
+            # a cancel and its commit (`StopGatedBroker`).
             if self._should_abort is not None and self._should_abort():
                 logger.warning("[복구 %d/%d] 종료 요청 — %s 이전에 복구 중단",
                                i, len(steps), name)
@@ -284,7 +364,7 @@ class StartupRecovery:
             logger.warning("브로커 없음 — 잔고 단계 스킵")
             return True
         try:
-            bal = _call_with_deadline(
+            bal = call_with_deadline(
                 self._broker.get_balance, _BROKER_STARTUP_TIMEOUT,
                 should_abort=self._should_abort, label="잔고 조회")
             logger.info("잔고 확인: 총평가 %.0f원", bal.total_eval_krw)
@@ -304,7 +384,7 @@ class StartupRecovery:
         if self._broker is None:
             return True
         try:
-            positions = _call_with_deadline(
+            positions = call_with_deadline(
                 self._broker.get_positions, _BROKER_STARTUP_TIMEOUT,
                 should_abort=self._should_abort, label="포지션 조회")
             logger.info("브로커 포지션: %d개 %s",
@@ -333,13 +413,21 @@ class StartupRecovery:
                 r = _redis.from_url(os.environ.get("REDIS_URL", "redis://redis:6379"))
             except Exception:
                 pass
-            result = PositionReconciler(
-                broker=self._broker,
-                db_factory=self._factory,
-                redis_client=r,
-                broker_name="kis",
-                ca_runtime=self._ca_runtime,  # P2-02C: classify splits during startup reconcile
-            ).reconcile("startup")
+            try:
+                result = run_reconcile_bounded(
+                    lambda gate: PositionReconciler(
+                        broker=gate(self._broker),
+                        db_factory=self._factory,
+                        redis_client=r,
+                        broker_name="kis",
+                        ca_runtime=self._ca_runtime,  # P2-02C: classify splits during startup reconcile
+                    ),
+                    "startup", _RECONCILE_STARTUP_TIMEOUT,
+                    should_abort=self._should_abort,
+                )
+            except TimeoutError as e:
+                logger.error("스타트업 조정 시간 초과 — 매매 차단 유지: %s", e)
+                return False
             # P2-02C: rebuild the corporate-action gate from the DB so a pending/UNKNOWN
             # action persisted before the restart still blocks trading (fail-closed).
             # If the restore cannot be confirmed, keep SafeMode disabled (return False)
@@ -368,6 +456,8 @@ class StartupRecovery:
             if not result.ok:
                 logger.error("스타트업 조정 오류 — 매매 차단 유지: %s", result.errors)
             return result.ok
+        except RecoveryAborted:
+            raise
         except Exception as e:
             logger.error("Reconcile 실패 — 안전을 위해 매매 차단: %s", e)
             return False  # fail-closed
