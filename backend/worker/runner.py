@@ -78,6 +78,70 @@ def _session():
         sess.close()
 
 
+# ── Which DB row is this broker order? (issue #168) ─────────────────────────
+#
+# A KIS order number (ODNO → `Order.broker_order_id`) is unique only within one
+# trading day, and it restarts every day — so yesterday's 0000117 and today's
+# 0000117 are routinely two different orders. Finding "the row" by the number
+# alone overwrote old orders, filed fills under them, and left new orders with
+# no row at all.
+#
+# The date cannot tell them apart either (both attempts in PR #165 were rolled
+# back): the US session crosses Seoul midnight, so one order legitimately spans
+# two trading days, and an order can stay open for longer than any window.
+#
+# What does tell them apart is whether the order is still open. A number is
+# live on at most one order at a time, so an *open* row with that number is
+# this order whatever its date, and a *closed* one is some earlier order that
+# happened to get the same number. The one step that must reach a row after it
+# closed — `_persist_fill`, which runs after the FILLED transition has already
+# been written — does not look it up at all: it uses the primary key this
+# worker recorded while the order was open.
+#
+# Every match also requires the same symbol and side. An earlier order that was
+# never closed (a stuck `unknown` row, say) stays "open" forever, and without
+# this it would capture the next order to draw its number. Quantity is not
+# compared: KIS can omit `ord_qty`, and gating on it would drop a real fill.
+
+#: Non-terminal statuses. `unknown` is included because the state machine and
+#: the poller still treat such an order as live (`OrderStateMachine.active_orders`).
+_OPEN_ORDER_STATUSES = (
+    OrderStatus.PENDING.value, OrderStatus.SUBMITTED.value,
+    OrderStatus.PARTIAL_FILLED.value, OrderStatus.UNKNOWN.value,
+)
+_TERMINAL_NEGATIVE = (
+    OrderStatus.CANCELED, OrderStatus.REJECTED, OrderStatus.EXPIRED,
+)
+
+
+def _same_order(row, order) -> bool:
+    return row.symbol == order.symbol and row.side == order.side
+
+
+def _open_order_row(db, order, broker: str = "kis"):
+    """The open row for this broker order, or None.
+
+    Never returns a closed row: a closed row with this number is a different,
+    earlier order. More than one open row means an earlier order was never
+    closed (see `_step_validate_state`); the newest is the one a live event can
+    be about.
+    """
+    if not order.id:
+        return None
+    rows = (db.query(DBOrder)
+            .filter(DBOrder.broker_order_id == order.id,
+                    DBOrder.broker == broker,
+                    DBOrder.symbol == order.symbol,
+                    DBOrder.side == order.side,
+                    DBOrder.status.in_(_OPEN_ORDER_STATUSES))
+            .order_by(DBOrder.id.desc())
+            .all())
+    if len(rows) > 1:
+        logger.warning("같은 주문번호의 미종결 행 %d개 (%s) — 최신 행(id=%d) 사용",
+                       len(rows), order.id, rows[0].id)
+    return rows[0] if rows else None
+
+
 def _audit(event_type: str, symbol: str = None, order_id: str = None,
            actor: str = "worker", detail: dict = None):
     """Fire-and-forget append-only audit log write. Never raises."""
@@ -211,6 +275,10 @@ class StrategyWorker:
         #: broker I/O and DB writes, so they are tracked in order to be joined on
         #: the way out rather than SIGKILLed mid-flight.
         self._aux_threads: list[threading.Thread] = []
+        #: broker order number → DB primary key, for orders this process has seen
+        #: open. See `_open_order_row` for why the number alone is not enough.
+        self._order_row_ids: dict[str, int] = {}
+        self._order_row_lock = threading.Lock()
 
         # Process-level OrderFillPoller — shared across all strategy sessions
         try:
@@ -936,6 +1004,36 @@ class StrategyWorker:
         return on_filled
 
     # ── DB 연동 ───────────────────────────────────────────────────────────
+    def _row_ids(self) -> tuple[dict, threading.Lock]:
+        # setdefault, not a plain attribute read: workers built with
+        # ``StrategyWorker.__new__`` (the test suites do) never ran __init__.
+        return (self.__dict__.setdefault("_order_row_ids", {}),
+                self.__dict__.setdefault("_order_row_lock", threading.Lock()))
+
+    def _remember_order_row(self, broker_order_id: str, row_id: int) -> None:
+        ids, lock = self._row_ids()
+        with lock:
+            ids[broker_order_id] = row_id
+
+    def _forget_order_row(self, broker_order_id: str) -> None:
+        ids, lock = self._row_ids()
+        with lock:
+            ids.pop(broker_order_id, None)
+
+    def _remembered_order_row(self, broker_order_id: str) -> int | None:
+        ids, lock = self._row_ids()
+        with lock:
+            return ids.get(broker_order_id)
+
+    def _forget_if_filled(self, order: Order) -> None:
+        """Once the closing fill is on file, nothing else will ask for this row.
+
+        Only after a successful write: a failed one is retried by the poller,
+        and the retry still needs the mapping.
+        """
+        if order.id and order.status == OrderStatus.FILLED:
+            self._forget_order_row(order.id)
+
     def _persist_order(self, order: Order):
         # Derive a deterministic idempotency key from broker order id + date.
         # KIS ODNO is unique per trading day per account, so this composite key
@@ -953,31 +1051,35 @@ class StrategyWorker:
         )
         try:
             with _session() as db:
-                # Matched on the broker id alone, deliberately.
-                #
-                # A KIS ODNO is only unique *within* a trading day, so a recycled
-                # number can in principle reach an older row — issue #168. Two
-                # attempts to scope this by trading day inside this PR each broke
-                # something worse: an order submitted at 23:50 and filled at 00:10
-                # split into two rows, and then orders pending longer than the
-                # overnight window stopped matching at all (`_restore_pending_to_tracker`
-                # re-registers those with no date bound).
-                #
-                # Doing it right needs identity based on whether the order is still
-                # open, which is a design change reaching into recovery rather than
-                # a filter tweak — and this PR is about the *date key*, not order
-                # identity. So this stays exactly as it was before #160, and the
-                # scoping belongs to #168 along with the same pattern in
-                # `persistence.py` and `recovery.py`.
-                existing = db.query(DBOrder).filter(
-                    DBOrder.broker_order_id == order.id
-                ).first()
+                # Only ever an *open* row — see `_open_order_row` (issue #168).
+                # Every call here is a state transition of a live order: terminal
+                # states have no outgoing transitions, so an order never comes
+                # back through this after closing, and a closed row with this
+                # number is an earlier order that must not be overwritten. With no
+                # open row this is a new order and gets its own row — including
+                # the overnight case, where the row is still open until the fill
+                # that closes it, so 23:50-submitted / 00:10-filled stays one row.
+                existing = None
+                known = self._remembered_order_row(order.id) if order.id else None
+                if known is not None:
+                    row = db.get(DBOrder, known)
+                    if (row is not None and row.status in _OPEN_ORDER_STATUSES
+                            and _same_order(row, order)):
+                        existing = row
+                if existing is None:
+                    existing = _open_order_row(db, order)
                 if existing:
                     existing.status = order.status.value
                     existing.filled_qty = order.filled_qty
                     existing.avg_fill_price = order.avg_fill_price or None
                     existing.updated_at = datetime.utcnow()
+                    row_id = existing.id
                 else:
+                    # A leftover mapping points at a closed earlier order. Drop it
+                    # before inserting, so a failed insert cannot leave the next
+                    # fill resolving to that old row.
+                    if order.id:
+                        self._forget_order_row(order.id)
                     if idem_key:
                         dup = db.query(DBOrder).filter(
                             DBOrder.idempotency_key == idem_key
@@ -1003,7 +1105,17 @@ class StrategyWorker:
                         trade_date=day,
                     )
                     db.add(row)
+                    db.flush()
+                    row_id = row.id
                 db.commit()
+                if order.id:
+                    # Kept past FILLED: `_persist_fill` runs after this transition
+                    # and needs the row it just closed. A cancel/reject/expire
+                    # has no fill to follow, so it is dropped here.
+                    if order.status in _TERMINAL_NEGATIVE:
+                        self._forget_order_row(order.id)
+                    else:
+                        self._remember_order_row(order.id, row_id)
         except IntegrityError:
             # Unique-constraint violation on idempotency_key — another path persisted the
             # same order concurrently (crash-replay or duplicate event). Treat as a duplicate
@@ -1015,12 +1127,24 @@ class StrategyWorker:
     def _persist_fill(self, fill: Fill, order: Order):
         try:
             with _session() as db:
-                # Resolved the same way as `_persist_order` — see there. The two
-                # must agree, or one fill event updates one row and files its Fill
-                # under another. Scoping both belongs to issue #168.
-                db_order = db.query(DBOrder).filter(
-                    DBOrder.broker_order_id == order.id
-                ).first()
+                # By the row `_persist_order` recorded, not by the number: the
+                # FILLED transition was written a moment ago in step 1, so the
+                # row is already closed — and a closed row is exactly what an
+                # earlier order holding a recycled number looks like (issue #168).
+                # With nothing recorded (the machine skipped this order, or that
+                # write failed) the row is still open and found as such. A closed
+                # row is never guessed at.
+                db_order = None
+                known = self._remembered_order_row(order.id) if order.id else None
+                if known is not None:
+                    row = db.get(DBOrder, known)
+                    # Checked, not trusted: the mapping is dropped only after a
+                    # successful write, so a run of failures could leave it
+                    # pointing at an earlier order with this number.
+                    if row is not None and _same_order(row, order):
+                        db_order = row
+                if db_order is None:
+                    db_order = _open_order_row(db, order)
                 if db_order is None:
                     logger.warning("체결 DB 저장 스킵: 미등록 주문 %s", order.id)
                     return
@@ -1034,6 +1158,7 @@ class StrategyWorker:
                 ).first()
                 if dup is not None:
                     logger.info("중복 체결 감지 — Fill 삽입 스킵: order=%s qty=%d", order.id, fill.qty)
+                    self._forget_if_filled(order)
                     return
                 row = DBFill(order_id=db_order.id, qty=fill.qty, price=fill.price)
                 db.add(row)
@@ -1041,6 +1166,7 @@ class StrategyWorker:
                 db_order.filled_qty = (db_order.filled_qty or 0) + fill.qty
                 db_order.avg_fill_price = order.avg_fill_price or fill.price
                 db.commit()
+                self._forget_if_filled(order)
 
                 # Immutable audit trail for fill events
                 try:
@@ -1095,15 +1221,26 @@ class StrategyWorker:
                     DBOrder.broker == broker,
                     DBOrder.status.in_(["pending", "submitted", "partial_filled"]),
                     DBOrder.broker_order_id.isnot(None),
-                ).all()
-                # Extract scalars before the session closes (avoid DetachedInstanceError)
-                pending = [
-                    {"symbol": r.symbol, "order_id": r.broker_order_id, "side": r.side,
-                     "qty": r.qty, "price": r.price or 0.0, "status": r.status,
-                     "filled_qty": r.filled_qty or 0}
-                    for r in rows
-                ]
+                ).order_by(DBOrder.id.desc()).all()
+                # Extract scalars before the session closes (avoid DetachedInstanceError).
+                # One row per order number, the newest: the poller and the state
+                # machine are keyed by the number, so a second open row with it
+                # would silently replace the first there anyway — just without
+                # saying which. Only an earlier order that was never closed can
+                # produce one; `_step_validate_state` reports it (issue #168).
+                pending, seen = [], set()
+                for r in rows:
+                    if r.broker_order_id in seen:
+                        logger.warning("같은 주문번호의 미종결 행 중복 — 옛 행(id=%d) 복원 제외: %s",
+                                       r.id, r.broker_order_id)
+                        continue
+                    seen.add(r.broker_order_id)
+                    pending.append(
+                        {"row_id": r.id, "symbol": r.symbol, "order_id": r.broker_order_id,
+                         "side": r.side, "qty": r.qty, "price": r.price or 0.0,
+                         "status": r.status, "filled_qty": r.filled_qty or 0})
             for p in pending:
+                self._remember_order_row(p["order_id"], p["row_id"])
                 tracker.mark_pending(p["symbol"], p["order_id"])
                 if self._poller is not None and on_filled_cb is not None:
                     self._register_recovered_order(p, tracker, on_filled_cb, on_timeout_cb,
@@ -1136,12 +1273,17 @@ class StrategyWorker:
             filled_qty=p.get("filled_qty", 0),
         )
 
+        row_id = p.get("row_id")
+
         def _guarded_on_filled(order: Order):
             try:
                 with _session() as db:
-                    row = db.query(DBOrder).filter(
-                        DBOrder.broker_order_id == order.id
-                    ).first()
+                    # By primary key: the row was known when the order was
+                    # restored. By number, an earlier FILLED order that held the
+                    # same number could answer instead and suppress this live
+                    # order's whole fill pipeline (issue #168).
+                    row = (db.get(DBOrder, row_id) if row_id is not None
+                           else _open_order_row(db, order))
                     already_done = row is not None and row.status == OrderStatus.FILLED.value
             except Exception as e:
                 # Can't confirm whether the startup recovery callback already processed this
