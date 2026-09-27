@@ -939,7 +939,7 @@ class StrategyWorker:
             closed = machine.get(order.id)
             if order.id and (closed.status if closed is not None
                              else order.status) == OrderStatus.FILLED:
-                self._forget_order_row(order.id)
+                self._forget_order_row(order.id, row_id)
 
             # 2. Position tracker
             try:
@@ -1028,10 +1028,18 @@ class StrategyWorker:
         with lock:
             ids[broker_order_id] = row_id
 
-    def _forget_order_row(self, broker_order_id: str) -> None:
+    def _forget_order_row(self, broker_order_id: str, row_id: int | None = None) -> None:
+        """Drop the record for this number — only if it still names ``row_id``.
+
+        With ``row_id`` given this is compare-and-delete: an order closing must
+        not erase the record of a newer order that has since drawn the same
+        number. Without it the record is dropped whatever it holds, which is
+        for discarding a leftover before a new order's row is inserted.
+        """
         ids, lock = self._row_ids()
         with lock:
-            ids.pop(broker_order_id, None)
+            if row_id is None or ids.get(broker_order_id) == row_id:
+                ids.pop(broker_order_id, None)
 
     def _remembered_order_row(self, broker_order_id: str) -> int | None:
         ids, lock = self._row_ids()
@@ -1119,7 +1127,7 @@ class StrategyWorker:
                     # A cancel/reject/expire has no fill to follow, so it is
                     # dropped here.
                     if order.status in _TERMINAL_NEGATIVE:
-                        self._forget_order_row(order.id)
+                        self._forget_order_row(order.id, row_id)
                     else:
                         self._remember_order_row(order.id, row_id)
         except IntegrityError:

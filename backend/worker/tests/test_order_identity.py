@@ -331,6 +331,22 @@ class TestPersistFill:
         _fill(w, _submit(w))
         assert w._remembered_order_row(ODNO) is None
 
+    def test_closing_an_order_never_erases_a_newer_orders_record(self, factory, day):
+        """Compare-and-delete (CodeRabbit hardening proposal): the record is
+        dropped only while it still names the closing order's row."""
+        w = _worker()
+        w._remember_order_row(ODNO, 202)                # a newer order's row
+
+        w._forget_order_row(ODNO, 101)                  # the earlier order closes
+        assert w._remembered_order_row(ODNO) == 202
+
+        w._forget_order_row(ODNO, 202)
+        assert w._remembered_order_row(ODNO) is None
+
+        w._remember_order_row(ODNO, 303)
+        w._forget_order_row(ODNO)                       # unconditional: leftover discard
+        assert w._remembered_order_row(ODNO) is None
+
     def test_a_cancel_drops_the_record(self, factory, day):
         w = _worker()
         machine = _submit(w)
