@@ -583,7 +583,7 @@ class StrategyWorker:
         tracker = self._loss_tracker
         if tracker is None:
             return
-        from backend.database.models import DailyRiskState, trading_day
+        from backend.database.models import lock_risk_row, trading_day
 
         # The tracker's own mutex (P0-05) — read the four values consistently.
         with tracker._lock:
@@ -594,12 +594,8 @@ class StrategyWorker:
             halt_reason = tracker.kill_reason or None
 
         with _session() as db:
-            today = trading_day()
-            row = db.get(DailyRiskState, today)
-            is_new = row is None
-            if is_new:
-                row = DailyRiskState(trade_date=today)
-                db.add(row)
+            # Locked like every other writer of this row (#164).
+            row, is_new = lock_risk_row(db, trading_day())
             row.daily_pnl = daily_pnl
             row.weekly_pnl = weekly_pnl
             row.peak_equity = peak_equity

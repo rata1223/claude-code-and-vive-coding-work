@@ -585,7 +585,7 @@ class PersistentLossTracker(LossTracker):
 
         Returns True when this write adopted a halt from the row.
         """
-        from backend.database.models import DailyRiskState, trading_day
+        from backend.database.models import lock_risk_row, trading_day
         today = trading_day()
         with self._lock:
             daily_pnl = self.daily_pnl
@@ -599,9 +599,9 @@ class PersistentLossTracker(LossTracker):
         def _apply(row, is_new: bool) -> tuple[bool, str | None] | None:
             """Write into ``row``; return the flag to adopt, or None if asserted.
 
-            ``is_new`` matters: a row that did not exist holds nobody's decision.
-            Its ``kill_switch`` is still ``None`` before flush, so adopting
-            ``bool(None)`` would **clear a live halt** — every day at the first
+            ``is_new`` matters: a row this call just created holds nobody's
+            decision — its ``kill_switch`` is only the column default, so
+            adopting it would **clear a live halt** every day at the first
             write against a new date key. There is nothing external to defer to,
             so this process's value is simply carried forward.
             """
@@ -686,11 +686,9 @@ class PersistentLossTracker(LossTracker):
         if self._db_factory is not None:
             sess = self._db_factory()
             try:
-                row = sess.get(DailyRiskState, today)
-                if row is None:
-                    row = DailyRiskState(trade_date=today)
-                    sess.add(row)
-                    is_new_row[0] = True
+                # Locked, so the halt flag read here is the committed one and no
+                # other writer can commit between this read and our commit (#164).
+                row, is_new_row[0] = lock_risk_row(sess, today)
                 adopted = _apply(row, is_new_row[0])
                 sess.commit()
                 return _settle(adopted)
@@ -703,11 +701,7 @@ class PersistentLossTracker(LossTracker):
         elif self._db is not None:
             # Legacy: long-lived session path
             try:
-                row = self._db.get(DailyRiskState, today)
-                if row is None:
-                    row = DailyRiskState(trade_date=today)
-                    self._db.add(row)
-                    is_new_row[0] = True
+                row, is_new_row[0] = lock_risk_row(self._db, today)
                 adopted = _apply(row, is_new_row[0])
                 self._db.commit()
                 return _settle(adopted)
