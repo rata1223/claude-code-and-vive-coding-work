@@ -918,6 +918,14 @@ class StrategyWorker:
                     entry_price = pos.avg_price
 
             # 1. State machine
+            #
+            # The poller hands this callback the *increment* (`filled_qty` is
+            # replaced with what is new since its watermark), and the machine
+            # turns it into the running total, which `_persist_order` writes to
+            # the row. Step 4 must then set that total, not add the increment on
+            # top — adding counted every fill twice (issue #172). Only when the
+            # machine did not take the fill is there no total, and step 4 adds.
+            filled_total = None
             try:
                 if machine.get(order.id) is not None:
                     event = FillEvent(
@@ -925,7 +933,7 @@ class StrategyWorker:
                         filled_qty=fill.qty,
                         fill_price=fill.price,
                     )
-                    machine.process_fill(event)
+                    filled_total = machine.process_fill(event).filled_qty
             except Exception as e:
                 logger.warning("machine.process_fill 오류: %s", e)
 
@@ -1004,7 +1012,7 @@ class StrategyWorker:
                     logger.warning("P&L 기록 실패: %s", e)
 
             # 4. Persist fill + update order status
-            self._persist_fill(fill, order, row_id=row_id)
+            self._persist_fill(fill, order, row_id=row_id, filled_total=filled_total)
 
             # 5. Upsert position in DB to reflect fill
             self._upsert_position_db(fill.symbol, fill.market, tracker.get_position(fill.symbol))
@@ -1138,7 +1146,8 @@ class StrategyWorker:
         except Exception as e:
             logger.warning("주문 DB 저장 실패: %s", e)
 
-    def _persist_fill(self, fill: Fill, order: Order, row_id: int | None = None):
+    def _persist_fill(self, fill: Fill, order: Order, row_id: int | None = None,
+                      filled_total: int | None = None):
         """File one fill under its order's row.
 
         ``row_id`` is the row the fill pipeline settled on while the symbol was
@@ -1149,6 +1158,12 @@ class StrategyWorker:
         its write failed) the row is still open and found as such. A closed row
         is never guessed at, and the shared record is never read here: by now
         the lock is released and a newer order may own that entry.
+
+        ``filled_total`` is the order's cumulative filled quantity from the
+        state machine, when it processed this fill. The row already holds it
+        (`_persist_order` wrote it in step 1), so it is set, never added to.
+        Without it — the machine skipped this order — ``fill.qty`` is the
+        increment and is added, which is the only write in that case.
         """
         try:
             with _session() as db:
@@ -1179,7 +1194,8 @@ class StrategyWorker:
                 row = DBFill(order_id=db_order.id, qty=fill.qty, price=fill.price)
                 db.add(row)
                 db_order.status = order.status.value
-                db_order.filled_qty = (db_order.filled_qty or 0) + fill.qty
+                db_order.filled_qty = (filled_total if filled_total is not None
+                                       else (db_order.filled_qty or 0) + fill.qty)
                 db_order.avg_fill_price = order.avg_fill_price or fill.price
                 db.commit()
 
