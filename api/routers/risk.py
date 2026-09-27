@@ -146,6 +146,21 @@ def _halted_rows(db: Session):
     return [r for r in _halt_rows(db) if r.kill_switch]
 
 
+def _lock_halted_rows(db: Session):
+    """Like ``_halted_rows``, but locked until this transaction ends (#164).
+
+    The reset decides what to clear from the rows *as locked*. Read unlocked,
+    a halt committed between that read and the reset's commit was erased
+    without anyone having seen it — failing open. Now a halt committed before
+    the lock is part of what the operator clears (and is named in the audit
+    row), and one committed after it waits and survives.
+    """
+    from backend.database.models import lock_risk_rows, trading_days_in_play
+    rows = lock_risk_rows(db, trading_days_in_play())
+    return sorted((r for r in rows if r.kill_switch),
+                  key=lambda r: r.trade_date, reverse=True)
+
+
 @router.get("/kill-switch")
 def kill_switch_status(
     current_user: User = Depends(get_current_user),
@@ -178,8 +193,9 @@ def reset_kill_switch(
         # Fail closed, and say nothing about who is on the list.
         return Resp.err("권한이 없습니다 — KILL_SWITCH_ADMINS에 등록된 운영자만 해제할 수 있습니다.")
 
-    halted = _halted_rows(db)
+    halted = _lock_halted_rows(db)
     if not halted:
+        db.rollback()   # release the row locks
         # Report rather than succeed quietly: an operator who thinks they just
         # released a halt, and did not, will not go looking for the real one.
         return Resp.err("킬스위치가 활성 상태가 아닙니다 — 해제할 것이 없습니다.")

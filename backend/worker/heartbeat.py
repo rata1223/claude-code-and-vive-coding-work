@@ -131,21 +131,23 @@ class WorkerWatchdog:
         # DB is the only cross-process channel available without additional infrastructure.
         try:
             import os
-            from backend.database.models import init_db_factory, DailyRiskState, trading_day
+            from backend.database.models import init_db_factory, lock_risk_row, trading_day
             db_url = os.environ.get("DB_URL", "postgresql://quantdinger:quantdinger@postgres:5432/quantdinger")
             factory = init_db_factory(db_url)
             sess = factory()
             try:
-                today = trading_day()
-                row = sess.get(DailyRiskState, today)
-                if row is None:
-                    row = DailyRiskState(trade_date=today)
-                    sess.add(row)
+                # Locked (#164): kis-api runs one watchdog per gunicorn worker,
+                # and the worker's tracker writes the same row. Without the lock
+                # "only if not already set" could not see a halt committed a
+                # moment earlier, and the later commit replaced its reason.
+                row, _ = lock_risk_row(sess, trading_day())
                 if not row.kill_switch:
                     row.kill_switch = True
                     row.kill_reason = "Worker 하트비트 없음 — 프로세스 재시작 필요"
                     sess.commit()
                     logger.critical("WorkerWatchdog: DB kill_switch 설정")
+                else:
+                    sess.rollback()   # release the row lock
             except Exception as e:
                 logger.warning("WorkerWatchdog: DB kill_switch 기록 실패: %s", e)
                 try:

@@ -596,8 +596,8 @@ class KillSwitch:
 
     def _write_halt_to_db(self, reason: str, now: datetime) -> None:
         """Writes DailyRiskState.kill_switch=True using the EXACT
-        sess.get / create-if-missing / set-only-if-not-already-set pattern
-        WorkerWatchdog._alert_dead_worker uses (heartbeat.py:139-149) —
+        lock / create-if-missing / set-only-if-not-already-set pattern
+        WorkerWatchdog._alert_dead_worker uses (``lock_risk_row``, #164) —
         first-reason-wins, so a later trigger never clobbers an earlier
         subsystem's halt reason. Failure is logged and swallowed; the
         in-memory state transition has already happened and is authoritative
@@ -606,14 +606,10 @@ class KillSwitch:
         if self._db is None:
             return
         try:
-            from backend.database.models import DailyRiskState, trading_day
+            from backend.database.models import lock_risk_row, trading_day
             sess = self._db()
             try:
-                today = trading_day()
-                row = sess.get(DailyRiskState, today)
-                if row is None:
-                    row = DailyRiskState(trade_date=today)
-                    sess.add(row)
+                row, _ = lock_risk_row(sess, trading_day())   # #164
                 if not row.kill_switch:
                     row.kill_switch = True
                     row.kill_reason = reason
@@ -636,7 +632,7 @@ class KillSwitch:
             return
         try:
             from backend.database.models import (
-                DailyRiskState, trading_days_in_play,
+                lock_risk_rows, trading_days_in_play,
             )
             sess = self._db()
             try:
@@ -644,9 +640,8 @@ class KillSwitch:
                 # and resumed at 00:40 addresses two different rows; releasing
                 # one left the other blocking with nothing able to reach it.
                 cleared = False
-                for key in trading_days_in_play():
-                    row = sess.get(DailyRiskState, key)
-                    if row is not None and row.kill_switch:
+                for row in lock_risk_rows(sess, trading_days_in_play()):   # #164
+                    if row.kill_switch:
                         row.kill_switch = False
                         row.kill_reason = None
                         cleared = True

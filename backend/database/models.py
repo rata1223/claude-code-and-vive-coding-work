@@ -147,6 +147,65 @@ class DailyRiskState(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
+def lock_risk_row(sess: Session, day: date) -> tuple["DailyRiskState", bool]:
+    """The ``DailyRiskState`` row for ``day``, created if missing and locked.
+
+    **Every write to this table goes through here** (issue #164). Four writers
+    in two processes read-modify-write the row — the worker's loss tracker, the
+    operator reset API, the API-side ``WorkerWatchdog`` (one per gunicorn
+    worker), and the worker's shutdown checkpoint — and with no lock the last
+    commit silently erased whatever the others had decided. The worst case
+    failed open: a reset read the row, a new halt committed, and the reset's
+    ``False`` wiped it.
+
+    ``SELECT … FOR UPDATE`` makes each writer wait for the one ahead of it and
+    then decide against the row *as committed*, so every existing
+    set-only-if-not-set check means what it says. Creation is
+    ``INSERT … ON CONFLICT DO NOTHING``: two writers opening a new trading day
+    no longer race to a duplicate-key error — the loser waits, finds the
+    winner's row, and locks that.
+
+    Returns ``(row, created)``. ``created`` is True only for the session whose
+    insert made the row; it then holds nobody's decision yet.
+
+    The lock is held until the caller commits or rolls back — keep that short
+    and do no I/O inside it. SQLite ignores ``FOR UPDATE``; tests there cover
+    the logic, and the Postgres suite covers the locking.
+    """
+    created = _insert_risk_row_if_missing(sess, day)
+    row = sess.get(DailyRiskState, day, with_for_update=True, populate_existing=True)
+    return row, created
+
+
+def lock_risk_rows(sess: Session, days) -> list["DailyRiskState"]:
+    """Lock the *existing* rows among ``days``, always in date order.
+
+    For writers that act on several trading days at once (the US session
+    straddles Seoul midnight). A fixed order is what keeps two such writers
+    from deadlocking on each other; a missing day is skipped, not created.
+    """
+    rows = []
+    for day in sorted(set(days)):
+        row = sess.get(DailyRiskState, day, with_for_update=True, populate_existing=True)
+        if row is not None:
+            rows.append(row)
+    return rows
+
+
+def _insert_risk_row_if_missing(sess: Session, day: date) -> bool:
+    dialect = sess.get_bind().dialect.name
+    if dialect == "postgresql":
+        from sqlalchemy.dialects.postgresql import insert
+    elif dialect == "sqlite":
+        from sqlalchemy.dialects.sqlite import insert
+    else:
+        raise NotImplementedError(f"lock_risk_row: unsupported dialect {dialect!r}")
+    result = sess.execute(
+        insert(DailyRiskState).values(trade_date=day).on_conflict_do_nothing(
+            index_elements=[DailyRiskState.trade_date]))
+    return result.rowcount == 1
+
+
 class Command(Base):
     __tablename__ = "commands"
     id = Column(Integer, primary_key=True, autoincrement=True)
