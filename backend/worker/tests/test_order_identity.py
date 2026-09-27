@@ -20,9 +20,10 @@ Fill rows land — not the `filled_qty` total: the pipeline counts that twice
 today (step 1 writes the cumulative figure, step 4 adds the fill on top), which
 predates this change and is issue #172.
 
-Most tests here drive the real sequence: `OrderStateMachine.register` →
-`process_fill` (each fires `_persist_order`) → `_persist_fill`, in the order
-the fill pipeline runs them.
+Most tests here drive the real sequence: `OrderStateMachine.register` (fires
+`_persist_order`), then the worker's own fill callback, which runs
+`process_fill` → `_persist_order`, releases the symbol lock, and only then
+calls `_persist_fill`.
 """
 import json
 from datetime import date, datetime, timedelta
@@ -37,7 +38,7 @@ from backend.database.models import (
     AuditLog, Base, Fill as DBFill, Order as DBOrder,
 )
 from backend.database.testing import make_test_engine
-from backend.execution.order_machine import FillEvent, OrderStateMachine
+from backend.execution.order_machine import OrderStateMachine
 from backend.execution.position_tracker import Fill, PositionTracker
 
 ODNO = "0000117"
@@ -116,13 +117,28 @@ def _submit(worker, *, qty=10, symbol="005930", odno=ODNO):
     return machine
 
 
-def _fill(worker, machine, *, qty=10, odno=ODNO, symbol="005930"):
-    """Steps 1 and 4 of the fill pipeline, in its order."""
-    order = machine.process_fill(FillEvent(order_id=odno, filled_qty=qty,
-                                           fill_price=70100.0))   # → _persist_order
-    worker._persist_fill(Fill(order_id=odno, symbol=symbol, side="buy", qty=qty,
-                              price=70100.0, market="KR"), order)
-    return order
+def _fill(worker, machine, *, qty=10, odno=ODNO, symbol="005930", during_step_2=None):
+    """One fill through the worker's real fill callback (`_make_fill_callback`).
+
+    ``during_step_2`` runs right after the position tracker releases the
+    symbol's pending lock — the moment another order for the symbol becomes
+    possible.
+    """
+    tracker = PositionTracker(machine)
+    if during_step_2 is not None:
+        release = tracker.on_fill
+
+        def on_fill(f):
+            release(f)
+            during_step_2()
+        tracker.on_fill = on_fill
+    worker._publish_order_update = lambda o: None
+    live = machine.get(odno)
+    final = live.filled_qty + qty >= live.qty
+    worker._make_fill_callback(tracker, machine, run_id=1)(BOrder(
+        id=odno, symbol=symbol, side="buy", qty=live.qty, price=70000.0,
+        status=OrderStatus.FILLED if final else OrderStatus.PARTIAL_FILLED,
+        filled_qty=qty, avg_fill_price=70100.0))
 
 
 # ── the bug: a recycled number ──────────────────────────────────────────────
@@ -160,6 +176,29 @@ class TestRecycledNumber:
         assert len(rows) == 2
         assert rows[0][:3] == (old, "filled", 10)
         assert _fills(factory, old) == 0
+
+    def test_a_new_order_drawing_the_number_mid_pipeline(self, factory, day):
+        """Review finding (CodeRabbit): the pipeline releases the symbol lock
+        in step 2 and files the fill in step 4, with a broker call between. A
+        new order for the symbol that draws the same number in that gap — only
+        possible across a KIS day boundary — used to replace the recorded row,
+        and the earlier order's fill then closed the new order."""
+        w = _worker()
+        machine = _submit(w)
+        earlier = _rows(factory)[0][0]
+
+        def next_order_draws_the_number():
+            day["day"] = TODAY + timedelta(days=1)
+            _submit(w)
+
+        _fill(w, machine, during_step_2=next_order_draws_the_number)
+
+        rows = _rows(factory)
+        assert len(rows) == 2
+        assert rows[0][:2] == (earlier, "filled")
+        assert rows[1][1] == "submitted", "an earlier order's fill closed the new order"
+        assert _fills(factory, earlier) == 1
+        assert _fills(factory, rows[1][0]) == 0
 
     def test_a_stuck_earlier_order_does_not_capture_the_number(self, factory, day):
         """Review finding: a row that was never closed (nothing re-polls an
@@ -274,16 +313,15 @@ class TestPersistFill:
         assert _fills(factory, old) == 0
         assert _rows(factory)[0][2] == 10
 
-    def test_a_leftover_record_for_another_order_is_not_trusted(self, factory, day):
-        """Review finding: the record is dropped only after a successful write,
-        so a run of failures can leave it pointing at an earlier order."""
+    def test_a_row_id_for_another_order_is_checked_not_trusted(self, factory, day):
+        """Review finding: the record the row id comes from is dropped only
+        when an order closes, so a run of failed writes can leave it pointing
+        at an earlier order."""
         earlier = _seed(factory, status="filled", filled_qty=5, symbol="360750",
                         trade_date=TODAY - timedelta(days=1))
         live = _seed(factory, status="submitted", trade_date=TODAY)
-        w = _worker()
-        w._remember_order_row(ODNO, earlier)
 
-        w._persist_fill(self._event(), self._filled())
+        _worker()._persist_fill(self._event(), self._filled(), row_id=earlier)
 
         assert _fills(factory, earlier) == 0
         assert _fills(factory, live) == 1
@@ -315,9 +353,11 @@ class TestPersistFill:
 
         w._persist_order(BOrder(id=ODNO, symbol="005930", side="buy", qty=10,
                                 price=70000.0, status=OrderStatus.SUBMITTED))
-        w._persist_fill(self._event(), self._filled())
-
         assert w._remembered_order_row(ODNO) is None
+        # what the fill pipeline would read at its capture point
+        w._persist_fill(self._event(), self._filled(),
+                        row_id=w._remembered_order_row(ODNO))
+
         assert _fills(factory, old) == 0
 
 

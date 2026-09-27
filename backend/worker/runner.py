@@ -95,8 +95,9 @@ def _session():
 # this order whatever its date, and a *closed* one is some earlier order that
 # happened to get the same number. The one step that must reach a row after it
 # closed — `_persist_fill`, which runs after the FILLED transition has already
-# been written — does not look it up at all: it uses the primary key this
-# worker recorded while the order was open.
+# been written — does not look it up at all: the fill pipeline hands it the
+# primary key this worker recorded while the order was open, read before the
+# symbol's pending lock is released.
 #
 # Every match also requires the same symbol and side. An earlier order that was
 # never closed (a stuck `unknown` row, say) stays "open" forever, and without
@@ -928,6 +929,18 @@ class StrategyWorker:
             except Exception as e:
                 logger.warning("machine.process_fill 오류: %s", e)
 
+            # Which DB row this fill belongs to — settled *here*, before step 2
+            # releases the symbol's pending lock (issue #168). Until then no other
+            # order for this symbol can exist, so the recorded row can only be
+            # this order's. After it, a new order could draw the same number
+            # across a KIS day boundary and replace the record while step 3 waits
+            # on the broker; step 4 then gets the row explicitly, not by lookup.
+            row_id = self._remembered_order_row(order.id) if order.id else None
+            closed = machine.get(order.id)
+            if order.id and (closed.status if closed is not None
+                             else order.status) == OrderStatus.FILLED:
+                self._forget_order_row(order.id)
+
             # 2. Position tracker
             try:
                 tracker.on_fill(fill)
@@ -991,7 +1004,7 @@ class StrategyWorker:
                     logger.warning("P&L 기록 실패: %s", e)
 
             # 4. Persist fill + update order status
-            self._persist_fill(fill, order)
+            self._persist_fill(fill, order, row_id=row_id)
 
             # 5. Upsert position in DB to reflect fill
             self._upsert_position_db(fill.symbol, fill.market, tracker.get_position(fill.symbol))
@@ -1024,15 +1037,6 @@ class StrategyWorker:
         ids, lock = self._row_ids()
         with lock:
             return ids.get(broker_order_id)
-
-    def _forget_if_filled(self, order: Order) -> None:
-        """Once the closing fill is on file, nothing else will ask for this row.
-
-        Only after a successful write: a failed one is retried by the poller,
-        and the retry still needs the mapping.
-        """
-        if order.id and order.status == OrderStatus.FILLED:
-            self._forget_order_row(order.id)
 
     def _persist_order(self, order: Order):
         # Derive a deterministic idempotency key from broker order id + date.
@@ -1109,9 +1113,11 @@ class StrategyWorker:
                     row_id = row.id
                 db.commit()
                 if order.id:
-                    # Kept past FILLED: `_persist_fill` runs after this transition
-                    # and needs the row it just closed. A cancel/reject/expire
-                    # has no fill to follow, so it is dropped here.
+                    # Kept past FILLED: the fill pipeline reads it right after
+                    # this transition, while the symbol is still locked, to know
+                    # which closed row its fill belongs to — and drops it there.
+                    # A cancel/reject/expire has no fill to follow, so it is
+                    # dropped here.
                     if order.status in _TERMINAL_NEGATIVE:
                         self._forget_order_row(order.id)
                     else:
@@ -1124,23 +1130,26 @@ class StrategyWorker:
         except Exception as e:
             logger.warning("주문 DB 저장 실패: %s", e)
 
-    def _persist_fill(self, fill: Fill, order: Order):
+    def _persist_fill(self, fill: Fill, order: Order, row_id: int | None = None):
+        """File one fill under its order's row.
+
+        ``row_id`` is the row the fill pipeline settled on while the symbol was
+        still locked (see `on_filled`). It is needed because the FILLED
+        transition was written a moment ago, so the row is already closed — and
+        a closed row is exactly what an earlier order holding a recycled number
+        looks like (issue #168). Without it (the machine skipped this order, or
+        its write failed) the row is still open and found as such. A closed row
+        is never guessed at, and the shared record is never read here: by now
+        the lock is released and a newer order may own that entry.
+        """
         try:
             with _session() as db:
-                # By the row `_persist_order` recorded, not by the number: the
-                # FILLED transition was written a moment ago in step 1, so the
-                # row is already closed — and a closed row is exactly what an
-                # earlier order holding a recycled number looks like (issue #168).
-                # With nothing recorded (the machine skipped this order, or that
-                # write failed) the row is still open and found as such. A closed
-                # row is never guessed at.
                 db_order = None
-                known = self._remembered_order_row(order.id) if order.id else None
-                if known is not None:
-                    row = db.get(DBOrder, known)
-                    # Checked, not trusted: the mapping is dropped only after a
-                    # successful write, so a run of failures could leave it
-                    # pointing at an earlier order with this number.
+                if row_id is not None:
+                    row = db.get(DBOrder, row_id)
+                    # Checked, not trusted: the record it came from is dropped
+                    # only when an order closes, so a run of failed writes could
+                    # leave it pointing at an earlier order with this number.
                     if row is not None and _same_order(row, order):
                         db_order = row
                 if db_order is None:
@@ -1158,7 +1167,6 @@ class StrategyWorker:
                 ).first()
                 if dup is not None:
                     logger.info("중복 체결 감지 — Fill 삽입 스킵: order=%s qty=%d", order.id, fill.qty)
-                    self._forget_if_filled(order)
                     return
                 row = DBFill(order_id=db_order.id, qty=fill.qty, price=fill.price)
                 db.add(row)
@@ -1166,7 +1174,6 @@ class StrategyWorker:
                 db_order.filled_qty = (db_order.filled_qty or 0) + fill.qty
                 db_order.avg_fill_price = order.avg_fill_price or fill.price
                 db.commit()
-                self._forget_if_filled(order)
 
                 # Immutable audit trail for fill events
                 try:

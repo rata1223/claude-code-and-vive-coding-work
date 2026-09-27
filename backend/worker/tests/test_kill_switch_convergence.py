@@ -598,7 +598,7 @@ class TestAdoptedHaltIsNotBlamedOnAFill:
         w._poller = None
         w._last_known_equity = 1_000_000.0
         w._publish_order_update = lambda order: None
-        w._persist_fill = lambda fill, order: None
+        w._persist_fill = lambda *a, **k: None
         w._upsert_position_db = lambda *a: None
         return w, PositionTracker(OrderStateMachine()), OrderStateMachine()
 
