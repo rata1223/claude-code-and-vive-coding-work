@@ -76,7 +76,7 @@ def _get_risk_row(factory):
 class FailingCommitSession:
     """Session stub whose commit() raises — records whether rollback/close ran,
     so tests can prove the established sess.rollback()-before-close() convention
-    (heartbeat.py / reconciler.py / runner.py / persistence.py / emergency.py /
+    (heartbeat.py / reconciler.py / runner.py / emergency.py /
     risk/engine.py / watchdog.py) is honored on a failed write."""
 
     def __init__(self):

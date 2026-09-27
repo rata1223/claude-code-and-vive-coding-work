@@ -470,11 +470,25 @@ class StartupRecovery:
             from backend.execution.order_poller import OrderFillPoller
             from backend.brokers.models import Order as BOrder, OrderStatus
             db = self._factory()
-            pending = (db.query(DBOrder)
-                       .filter(DBOrder.status.in_(["pending", "submitted", "partial_filled"]))
-                       .filter(DBOrder.broker_order_id.isnot(None))
-                       .all())
+            rows = (db.query(DBOrder)
+                    .filter(DBOrder.status.in_(["pending", "submitted", "partial_filled"]))
+                    .filter(DBOrder.broker_order_id.isnot(None))
+                    .order_by(DBOrder.id.desc())
+                    .all())
             db.close()
+            # One registration per order number, the newest row. The poller is
+            # keyed by the number, so a second open row with it would replace the
+            # first there anyway, without saying which. A KIS number restarts
+            # every day, so two open rows sharing one means an earlier order was
+            # never closed — `_step_validate_state` reports it (issue #168).
+            pending, seen = [], set()
+            for row in rows:
+                if row.broker_order_id in seen:
+                    logger.warning("같은 주문번호의 미종결 행 중복 — 옛 행(id=%d) 재등록 제외: %s",
+                                   row.id, row.broker_order_id)
+                    continue
+                seen.add(row.broker_order_id)
+                pending.append(row)
             if pending:
                 logger.info("미체결 주문 %d개 발견 — OrderFillPoller에 재등록", len(pending))
                 # Reuse Worker's shared poller to avoid duplicate polling threads
@@ -637,8 +651,16 @@ class StartupRecovery:
           1. positions with qty <= 0 (should have been deleted on flat/close)
           2. pending orders with NULL broker_order_id (orphaned intent — never confirmed)
           3. pending orders older than RECOVERY_STALE_ORDER_HOURS with non-terminal status
+          4. two or more open rows sharing one broker order number — a KIS number
+             restarts every day, so this means an earlier order was never closed
+             and is now indistinguishable, by number, from a live one (issue #168)
+
+        Checks 3 and 4 count `unknown` as open, as the worker's order matching
+        does: nothing re-polls such a row, so this report is how anyone learns
+        it is stuck. Check 2 keeps its original three statuses.
         """
         try:
+            from sqlalchemy import func
             from backend.database.models import Order as DBOrder, Position as DBPosition
             issues = 0
             cutoff = datetime.utcnow() - timedelta(hours=_RECOVERY_STALE_ORDER_HOURS)
@@ -651,11 +673,18 @@ class StartupRecovery:
                             .all())
                 # Exclude orphaned (NULL broker_order_id) rows — they are already reported
                 # by the orphaned check above; avoid double-counting the same row.
+                open_statuses = ["pending", "submitted", "partial_filled", "unknown"]
                 stale = (db.query(DBOrder)
-                         .filter(DBOrder.status.in_(["pending", "submitted", "partial_filled"]),
+                         .filter(DBOrder.status.in_(open_statuses),
                                  DBOrder.broker_order_id.isnot(None),
                                  DBOrder.created_at < cutoff)
                          .all())
+                shared = (db.query(DBOrder.broker_order_id, func.count(DBOrder.id))
+                          .filter(DBOrder.status.in_(open_statuses),
+                                  DBOrder.broker_order_id.isnot(None))
+                          .group_by(DBOrder.broker_order_id)
+                          .having(func.count(DBOrder.id) > 1)
+                          .all())
                 bad_pos_data = [{"symbol": p.symbol, "qty": p.qty, "broker": p.broker}
                                 for p in bad_positions]
                 orphaned_data = [{"order_id": str(o.id), "symbol": o.symbol, "status": o.status}
@@ -664,6 +693,7 @@ class StartupRecovery:
                                "status": o.status, "created_at": o.created_at.isoformat()
                                if o.created_at else None}
                               for o in stale]
+                shared_data = [{"order_id": oid, "open_rows": n} for oid, n in shared]
             finally:
                 db.close()
 
@@ -679,6 +709,11 @@ class StartupRecovery:
                 logger.warning("일관성 경고 — 오래된 미체결 주문(>%.0fh): %s %s",
                                _RECOVERY_STALE_ORDER_HOURS, d["order_id"], d["symbol"])
                 self._audit_inconsistency("stale_open_order", d)
+                issues += 1
+            for d in shared_data:
+                logger.warning("일관성 경고 — 같은 주문번호의 미종결 행 %d개: %s",
+                               d["open_rows"], d["order_id"])
+                self._audit_inconsistency("duplicate_open_broker_order_id", d)
                 issues += 1
 
             if issues:

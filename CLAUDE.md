@@ -12,7 +12,7 @@
 
 ---
 
-## 프로젝트 진행 현황 (2026-09-24 기준, main `fe128e8` = PR #169)
+## 프로젝트 진행 현황 (2026-09-25 기준, main `b4fc34a` = PR #171)
 
 > **이 섹션이 최신 상태의 단일 진실 공급원(SoT).** 아래 "다음 작업 목록(Stage 1~9)"은 초기 설계 로드맵으로,
 > 대부분 이미 구현 완료됐다. 실제 진행은 `AUDIT.md` → `ROADMAP.md` 기반 하드닝 트랙으로 이어지고 있다.
@@ -44,6 +44,7 @@
 | 킬스위치 소유권 | #163 | **#158 근본 수정** — 플래그를 "마지막에 쓴 쪽"이 아니라 "의도가 있는 쪽"이 소유한다(`_ks_epoch` 카운터). 운영자 해제도 워치독 halt도 더 이상 조용히 덮이지 않는다 |
 | 거래일 날짜 키 | #165 | **#160·#167 수정** — `DailyRiskState.trade_date`를 `trading_day()`(KST) 하나로 통일. 컨테이너가 UTC라 **KST 00~09시** 아홉 시간 동안 읽는 쪽과 쓰는 쪽이 하루 어긋났다. 덤으로 미국 세션이 서울 자정을 가로지르는 문제까지(`trading_days_in_play()`) |
 | 기동 중 종료 | #169 | **#161 수정** — 복구 4·5단계 브로커 조회를 `call_with_deadline`(데몬 스레드 + `should_abort` 폴링)으로 묶음. `ThreadPoolExecutor`의 `with` 블록은 타임아웃 뒤에도 호출이 끝날 때까지 기다렸다. 기동 중 SIGTERM은 브로커 실패가 아니라 `기동 중 종료 요청 — 복구 중단`으로 기록 |
+| 기동 중 종료 | #171 | **#170 수정** — 기동 시 reconcile 두 곳(복구 6단계 + `StrategyWorker._startup_reconcile`)을 `run_reconcile_bounded`로 유계화(전용 예산 `RECONCILE_STARTUP_TIMEOUT` 180초). 포기된 reconcile은 `StopGatedBroker`가 다음 브로커 **읽기**에서 멈춘다 — `cancel_order`는 게이팅하지 않아 취소와 그 커밋이 쪼개지지 않는다 |
 
 **열린 PR 0건.** 다음 작업은 `origin/main`에서 새로 분기하면 된다.
 
@@ -446,7 +447,7 @@ KR_ETF   = ["069500", "360750", "091160"]  # KODEX200, TIGER S&P500, KODEX반도
 - **PR #79** (`claude/update-MW7LQ`): 실패 시나리오 통합테스트 (TASK 4-1C) — **머지됨** (2026-06-16)
 - 하드닝 트랙 PR #85~#156: 위 "프로젝트 진행 현황" 표 참조 — **모두 머지됨**
 - **PR #116**은 미머지 종료(2026-07-05). 같은 작업을 **#119**가 대체 구현해 머지했다
-- **현재 열린 PR 0건.** main = `fe128e8` (PR #169)
+- **현재 열린 PR 0건.** main = `b4fc34a` (PR #171)
 
 > 작업 방식: 기능별 새 브랜치에서 작업 → `main`으로 드래프트 PR → CodeRabbit/CodeQL 리뷰 → 머지.
 > 브랜치 보호 룰셋(PR 필수 + 코드 스캐닝)이 적용돼 `main` 직접 푸시 불가.
@@ -477,17 +478,18 @@ git checkout -B <새-작업-브랜치> origin/main
 3. `P2-01` `order_events` append-only 테이블 (큰 변경)
 4. `P3-04` Pinia 스토어 분리 — `frontend/src/stores/`가 아직 `index.js` 하나 (큰 변경)
 5. 열린 이슈:
-   - **#170** 기동 시 reconcile(복구 6단계 + `StrategyWorker.run()`의 시작 조정)이 무한정 —
-     #161의 남은 절반. **작업 중**: `run_reconcile_bounded` + `StopGatedBroker`(읽기만 게이팅,
-     `cancel_order`는 게이팅 안 함 — 취소와 커밋이 쪼개지지 않게). `backend/execution/` 무수정
+   - **#172** 체결 파이프라인이 DB `filled_qty`를 **두 번 센다**(1단계 `_persist_order`가 누적값을
+     쓰고 4단계 `_persist_fill`이 그 위에 더한다). 재기동 시 폴러 워터마크(`initial_reported_qty`)가
+     이 값으로 시드되므로 **실제 체결을 삼킬 수 있다.** `main`에서 재현됨(10주에 4+6 → 16)
    - **#164** `kill_switch` 컬럼의 프로세스 간 lost update (행 잠금 없음 — `version` 컬럼
      또는 `SELECT … FOR UPDATE`를 세 writer 전부에 일관 적용해야 한다. 스키마 변경 동반)
    - **#166** `daily_pnl`의 날 경계를 어디에 둘 것인가 — 미국 세션이 서울 자정을 가로지르므로
      한 야간 세션의 손익이 두 거래일로 쪼개진다. 리스크 정책 판단
-   - **#168** `broker_order_id` 단독 조회 (`runner`·`persistence`·`recovery`) — KIS ODNO는
-     거래일 안에서만 유일하다. PR #165에서 두 번 시도하고 **되돌렸다**: 날짜만으로는 판별이
-     안 되고 "아직 열린 주문인가"에 기반한 동일성이 필요하다
-   - ~~#161~~ 완료(PR #169) · ~~#160~~ 완료(PR #165) · ~~#158~~ 완료(PR #163) · ~~#167~~ 완료(PR #165)
+   - **#168** `broker_order_id` 단독 조회 — KIS ODNO는 **매일 리셋**된다. **작업 중**: 날짜가 아니라
+     "아직 열린 주문인가"로 판정(`runner._open_order_row`). 종결된 행에 닿아야 하는 유일한 단계
+     (`_persist_fill`)는 번호가 아니라 워커가 열린 동안 기억한 **PK**를 쓴다. 죽은 모듈
+     `backend/worker/persistence.py` 삭제. 브로커 쪽(`kis.py`의 30일 조회에서 첫 `odno` 일치)은 **#173**
+   - ~~#170~~ 완료(PR #171) · ~~#161~~ 완료(PR #169) · ~~#160~~ 완료(PR #165) · ~~#158~~ 완료(PR #163) · ~~#167~~ 완료(PR #165)
 
 > ~~`P0-10` SIGTERM 핸들러~~ — 완료(PR #159, `install_signal_handlers` +
 > `StrategyWorker.shutdown`, 종료 예산 8초).

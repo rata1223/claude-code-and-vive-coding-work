@@ -675,12 +675,12 @@ class TestTheFlaskReportersSeeTheSameHalt:
 
 
 class TestOrderRowsSurviveTheDateChange:
-    """`_persist_order` still matches on the broker id alone — see issue #168.
+    """Aligning the *date key* must not split or duplicate an order's row.
 
-    Scoping that lookup by trading day was tried in this PR and reverted twice
-    over (it split overnight orders, then dropped long-pending ones), so what is
-    pinned here is that aligning the *date key* did not disturb the behaviour
-    that was already there.
+    The row is matched by whether the order is still open, not by trading day
+    (issue #168; the recycled-number cases are in ``test_order_identity.py``).
+    Scoping it by day was tried and reverted twice — it split overnight orders,
+    then dropped long-pending ones — and these pin both of those cases.
     """
 
     def _persist(self, monkeypatch, factory, order):
@@ -785,9 +785,9 @@ class TestFillsAttachToTheRightOrder:
     """`_persist_fill` resolves the order row too, and must agree with
     `_persist_order` — they run on the same fill event.
 
-    Both still match on the broker id alone (issue #168). These pin that the
-    date-key change did not disturb the cases that already worked, including the
-    overnight one that a day-scoped lookup broke.
+    These pin that the date-key change did not disturb the cases that already
+    worked, including the overnight one that a day-scoped lookup broke. How the
+    row is chosen is issue #168 (``test_order_identity.py``).
     """
 
     @staticmethod
