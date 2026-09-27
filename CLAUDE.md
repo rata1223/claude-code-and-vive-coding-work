@@ -12,7 +12,7 @@
 
 ---
 
-## 프로젝트 진행 현황 (2026-09-27 기준, main `8dd489a` = PR #175)
+## 프로젝트 진행 현황 (2026-09-27 기준, main `8f05e68` = PR #177)
 
 > **이 섹션이 최신 상태의 단일 진실 공급원(SoT).** 아래 "다음 작업 목록(Stage 1~9)"은 초기 설계 로드맵으로,
 > 대부분 이미 구현 완료됐다. 실제 진행은 `AUDIT.md` → `ROADMAP.md` 기반 하드닝 트랙으로 이어지고 있다.
@@ -47,6 +47,7 @@
 | 기동 중 종료 | #171 | **#170 수정** — 기동 시 reconcile 두 곳(복구 6단계 + `StrategyWorker._startup_reconcile`)을 `run_reconcile_bounded`로 유계화(전용 예산 `RECONCILE_STARTUP_TIMEOUT` 180초). 포기된 reconcile은 `StopGatedBroker`가 다음 브로커 **읽기**에서 멈춘다 — `cancel_order`는 게이팅하지 않아 취소와 그 커밋이 쪼개지지 않는다 |
 | 주문 행 동일성 | #174 | **#168 수정** — KIS 주문번호는 **매일 리셋**되는데 워커가 번호 하나로 행을 찾아 옛 주문을 덮어쓰고 체결을 엉뚱한 주문에 붙였다. 날짜가 아니라 "아직 열린 주문인가"(+종목·매매구분)로 판정. 체결은 번호가 아니라 **종목 락이 잡혀 있을 때 확보한 PK**로 기록(CodeRabbit 지적). 죽은 모듈 `backend/worker/persistence.py` 삭제 |
 | 체결 수량 | #175 | **#172 수정** — 체결 파이프라인이 DB `filled_qty`를 두 번 셌다(1단계 누적값 + 4단계 증분 → 10주에 16). 머신이 처리한 체결은 4단계에서 누적값을 *설정*하고, 머신이 모르는 주문만 증분을 더한다 |
+| 리스크 행 잠금 | #177 | **#164 수정** — `DailyRiskState`를 두 프로세스의 writer 넷(트래커·해제 API·워치독×2·종료 체크포인트)이 잠금 없이 읽기→쓰기 해 나중 커밋이 앞 결정을 지웠다(해제가 새 halt를 지우는 fail-open 포함). 모든 쓰기가 `lock_risk_row(s)`(`SELECT … FOR UPDATE`, 생성은 `ON CONFLICT DO NOTHING`, 여러 날은 날짜순)를 거친다. 정적 가드 + Postgres 동시성 테스트 |
 
 **열린 PR 0건.** 다음 작업은 `origin/main`에서 새로 분기하면 된다.
 
@@ -112,9 +113,9 @@
    #153이 고친 오라우팅이 그 경로로 재현된다. 제대로 닫으려면 종목 마스터가 필요
 6. **`tr_cont` 페이지네이션 미구현 (7곳)**: `CTX_AREA_NK100/NK200`을 전부 `""`로 보내고 응답의
    연속 키를 읽지 않아, 2페이지 이상이면 **조용히 1페이지만** 돌아온다
-7. **미구현 P0 (ROADMAP 참고)**: `P0-03` `EmergencyFlattenManager`
-   `dry_run` 기본값이 아직 `True`(`backend/worker/emergency.py:57`) · `P0-11`은 기동 시점이 아니라
-   `crypto.py:_get_fernet()` 최초 호출 시점에만 키를 검증
+7. **미구현 P0 (ROADMAP 참고)**: `P0-11`은 기동 시점이 아니라 `crypto.py:_get_fernet()` 최초 호출
+   시점에만 키를 검증 · `P0-04`(브로커별 SAFE_MODE)는 워커가 KIS 단일 브로커라 **보류**
+   (키움이 워커에 들어올 때 재검토)
 8. **킬스위치 해제는 유지되지만, 그것만으로 매매가 재개되지는 않는다.**
    이슈 #158(`_write_db`가 메모리 값으로 덮어쓰던 문제)은 해결됐다 — 트래커가 행을 다시
    읽고 **자기 판단이 있을 때만** 플래그를 주장한다. "워커 정지 → 해제 → 기동" 절차는
@@ -125,6 +126,10 @@
 9. **워커 종료 예산은 8초**(`_SHUTDOWN_BUDGET_SEC`). `docker-compose.yml`은 `kis-worker`에
    `stop_grace_period`를 지정하지 않아 도커 기본값 10초가 적용된다. 종료 단계를 늘리려면
    예산과 grace period를 함께 봐야 한다
+10. **MDD 자동 비상청산은 기본 dry-run이다**(`MDD_AUTO_FLATTEN=true`로 켠다). MDD가 쓰는
+   `KISBroker.get_balance().total_eval_krw`가 USD 현금을 빼고, 미국 잔고를 `NASD`로만 조회하고,
+   미국 요약 필드가 없으면 0으로 읽는다 — 낮게 읽히면 **가짜 MDD로 전 포지션 매도**가 된다(#178).
+   모의투자에서 실제 드로다운 없이 `[DRY RUN] 비상청산`이 찍히지 않는지 확인한 뒤 켤 것
 
 ---
 
@@ -449,7 +454,7 @@ KR_ETF   = ["069500", "360750", "091160"]  # KODEX200, TIGER S&P500, KODEX반도
 - **PR #79** (`claude/update-MW7LQ`): 실패 시나리오 통합테스트 (TASK 4-1C) — **머지됨** (2026-06-16)
 - 하드닝 트랙 PR #85~#156: 위 "프로젝트 진행 현황" 표 참조 — **모두 머지됨**
 - **PR #116**은 미머지 종료(2026-07-05). 같은 작업을 **#119**가 대체 구현해 머지했다
-- **현재 열린 PR 0건.** main = `8dd489a` (PR #175)
+- **현재 열린 PR 0건.** main = `8f05e68` (PR #177)
 
 > 작업 방식: 기능별 새 브랜치에서 작업 → `main`으로 드래프트 PR → CodeRabbit/CodeQL 리뷰 → 머지.
 > 브랜치 보호 룰셋(PR 필수 + 코드 스캐닝)이 적용돼 `main` 직접 푸시 불가.
@@ -466,15 +471,11 @@ git checkout -B <새-작업-브랜치> origin/main
 
 현재 방침: **배포·모의투자 시계는 나중, 하드닝을 계속한다.**
 
-1. **`P0-03`은 로드맵 설명이 틀렸다 — 착수 전에 읽을 것.** 로드맵은
-   "`dry_run` 기본값이 `True`이고 한 번도 오버라이드되지 않는다"고 하지만 **기본값을
-   뒤집는 것은 무동작이다**: 프로덕션 유일 생성 지점 `backend/api/server.py:340-345`가 이미
-   `ENABLE_LIVE_TRADING`에서 `dry_run`을 명시로 넘기고, 테스트 생성 지점도 전부 명시한다.
-   **진짜 공백은 MDD 킬스위치가 flatten을 아예 호출하지 않는다는 것**이다 —
-   `_fire_kill_switch_alert`(`backend/quant/risk/engine.py`)는 SAFE_MODE 차단·텔레그램·
-   WebSocket 세 가지만 하고 `EmergencyFlattenManager`를 import조차 하지 않는다.
-   그 배선은 **P0-04 의존**이다. `backend/worker/emergency.py`의 docstring이 MDD를
-   트리거로 광고하는 것도 사실과 다르니 함께 고칠 것
+1. **`P0-03` 작업 중** — MDD 위반이 실제로 비상청산을 호출하게 한다(`LossTracker._request_mdd_flatten` →
+   `StrategyWorker._on_mdd_breach`). `_evaluate`는 MDD를 **먼저** 본다(일손실이 먼저 `return`해 폭락일에
+   MDD가 평가조차 안 되던 문제). ⚠️ **자동 청산은 `MDD_AUTO_FLATTEN=true`를 켜기 전까지 dry-run** —
+   MDD의 총자산 값이 낮게 읽힐 수 있어서다(#178). 수동 API는 `flatten_dry_run()`(`ENABLE_LIVE_TRADING` +
+   `EMERGENCY_FLATTEN_DRY_RUN=true` 강제 레버). 청산 주문은 폴러/DB 주문 행에 등록되지 않는다(수동 API와 동일한 기존 한계)
 2. `P0-12` — ⚠️ **부분 완료**. 위 알려진 이슈 8번 참고. 남은 건 (a) 인메모리 `SAFE_MODE`
    무재시작 해제(P0-04 의존), (b) 위반 조건이 유효할 때의 재개 의미 정의(리스크 정책 판단)
 3. `P2-01` `order_events` append-only 테이블 (큰 변경)
@@ -482,14 +483,12 @@ git checkout -B <새-작업-브랜치> origin/main
 5. 열린 이슈:
    - **#173** 브로커 조회가 30일 창에서 첫 `odno` 일치 행 반환(#168의 브로커 쪽 절반). KIS가 같은
      번호를 여러 날짜로 돌려주는지 라이브 없이 확인 불가 — 모의투자 관측 필요
-   - **#164** `DailyRiskState` 행의 프로세스 간 lost update — **작업 중**: `SELECT … FOR UPDATE`.
-     모든 쓰기가 `backend/database/models.py`의 `lock_risk_row(s)`를 거친다(생성은 `ON CONFLICT DO NOTHING`,
-     여러 날은 날짜 오름차순으로 잠금). 스키마 변경 없음. 정적 가드 `test_risk_row_writers.py`
+   - **#178** MDD 총자산(`get_balance().total_eval_krw`)이 낮게 읽힐 수 있음 — 자동 청산 활성화 전제. 모의투자 관측 필요
    - **#176** `WorkerWatchdog`가 장애 이벤트마다 엔진 생성 + `create_all`(엔진 누수)
    - **#127** `api/tests/`가 어느 CI 워크플로에서도 돌지 않는다(킬스위치 해제 API 테스트 포함)
    - **#166** `daily_pnl`의 날 경계를 어디에 둘 것인가 — 미국 세션이 서울 자정을 가로지르므로
      한 야간 세션의 손익이 두 거래일로 쪼개진다. 리스크 정책 판단
-   - ~~#172~~ 완료(PR #175) · ~~#168~~ 완료(PR #174) · ~~#170~~ 완료(PR #171) · ~~#161~~ 완료(PR #169) · ~~#160~~ 완료(PR #165) · ~~#158~~ 완료(PR #163) · ~~#167~~ 완료(PR #165)
+   - ~~#164~~ 완료(PR #177) · ~~#172~~ 완료(PR #175) · ~~#168~~ 완료(PR #174) · ~~#170~~ 완료(PR #171) · ~~#161~~ 완료(PR #169) · ~~#160~~ 완료(PR #165) · ~~#158~~ 완료(PR #163) · ~~#167~~ 완료(PR #165)
 
 > ~~`P0-10` SIGTERM 핸들러~~ — 완료(PR #159, `install_signal_handlers` +
 > `StrategyWorker.shutdown`, 종료 예산 8초).

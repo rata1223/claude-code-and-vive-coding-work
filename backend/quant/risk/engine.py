@@ -11,7 +11,7 @@ import logging
 import threading
 from dataclasses import dataclass, field
 from datetime import date
-from typing import Optional
+from typing import Callable, Optional
 
 import numpy as np
 import pandas as pd
@@ -213,6 +213,10 @@ class ExposureManager:
 
 # ── 킬스위치 + 손실 한도 ──────────────────────────────────────────────────────
 
+#: How an MDD halt's reason begins. Written by ``_evaluate`` and read back by
+#: ``_restore_state`` to recognise a restored MDD halt, so it is one constant.
+MDD_REASON_PREFIX = "MDD 한도 초과"
+
 @dataclass
 class LossTracker:
     """일별·주별 손실 추적 + 킬스위치."""
@@ -226,6 +230,14 @@ class LossTracker:
     kill_reason: str = ""
     trade_date: date = field(default_factory=_seoul_today)
     week_start: date = field(default_factory=_seoul_today)
+    #: Called with the reason when a fresh MDD breach should liquidate the book
+    #: (P0-03). The worker wires this to ``EmergencyFlattenManager``. It runs
+    #: under the caller's lock, so it must hand the work off and return at once.
+    on_mdd_breach: Optional[Callable[[str], None]] = field(
+        default=None, repr=False, compare=False)
+    #: Set once a flatten has been requested; re-armed only when the kill switch
+    #: is cleared. Without it every fill during the breach re-requests one.
+    _mdd_flatten_requested: bool = field(default=False, repr=False, compare=False)
 
     def reset_daily(self) -> None:
         self.daily_pnl = 0.0
@@ -273,7 +285,30 @@ class LossTracker:
         """
 
     def _evaluate(self) -> None:
+        """Halt on the first limit breached — **MDD checked first**.
+
+        The order matters (P0-03). MDD is the only breach that liquidates, and it
+        used to be checked last, behind early returns: on a crash day the daily
+        limit (3%) and MDD (15%) break together, the daily branch returned, and
+        MDD was never evaluated — no flatten on exactly the day it was for.
+
+        Every branch re-runs on each PnL write while the breach holds; that is
+        what re-halts after a reset (see ``api/routers/risk.py``). The flatten
+        request is therefore guarded separately, in ``_request_mdd_flatten``.
+        """
         capital = max(self.peak_equity, 1.0)
+
+        # MDD 한도 — 유일하게 청산까지 가는 위반이라 먼저 본다
+        if self.peak_equity > 0:
+            mdd = (self.current_equity - self.peak_equity) / self.peak_equity
+            if mdd < -self.config.mdd_limit_pct:
+                self.kill_switch = True
+                self._mark_kill_switch_changed()
+                self.kill_reason = f"{MDD_REASON_PREFIX} ({mdd:.2%})"
+                logger.error("킬스위치 [MDD] %s", self.kill_reason)
+                self._fire_kill_switch_alert(self.kill_reason)
+                self._request_mdd_flatten(self.kill_reason)
+                return
 
         # 일일 손실 한도
         if self.daily_pnl / capital < -self.config.daily_loss_limit_pct:
@@ -291,17 +326,40 @@ class LossTracker:
             self.kill_reason = f"주간 손실 한도 초과 ({self.weekly_pnl/capital:.2%})"
             logger.error("킬스위치 [주간] %s", self.kill_reason)
             self._fire_kill_switch_alert(self.kill_reason)
-            return
 
-        # MDD 한도
-        if self.peak_equity > 0:
-            mdd = (self.current_equity - self.peak_equity) / self.peak_equity
-            if mdd < -self.config.mdd_limit_pct:
-                self.kill_switch = True
-                self._mark_kill_switch_changed()
-                self.kill_reason = f"MDD 한도 초과 ({mdd:.2%})"
-                logger.error("킬스위치 [MDD] %s", self.kill_reason)
-                self._fire_kill_switch_alert(self.kill_reason)
+    def _request_mdd_flatten(self, reason: str) -> None:
+        """Ask for the book to be liquidated — once per breach (P0-03).
+
+        Keyed on its own flag, not on ``kill_switch``: a book already halted for
+        the daily limit must still be flattened when MDD breaks later.
+
+        Re-armed by ``_rearm_mdd_flatten`` in three cases only:
+
+        * the kill switch is cleared — ``manual_reset``, or an operator clear
+          the tracker adopts. That adoption happens only once the breach no
+          longer holds: while it does, ``_evaluate`` re-halts first and the
+          clear is overwritten (issue #158), so no second flatten follows;
+        * the worker's flatten sent nothing and failed, so the next fill
+          retries it (``StrategyWorker._emergency_flatten``).
+
+        Only a breach this process *measured* gets here. A halt adopted from
+        another process never does, and an MDD halt restored at boot counts as
+        already requested (``_restore_state``) — a restart must not fire a
+        liquidation by itself (ROADMAP R-CRIT-07).
+        """
+        if self._mdd_flatten_requested or self.on_mdd_breach is None:
+            return
+        self._mdd_flatten_requested = True
+        try:
+            self.on_mdd_breach(reason)
+        except Exception as e:  # noqa: BLE001 - the halt itself must stand
+            logger.error("MDD 비상청산 요청 실패: %s", e)
+
+    def _rearm_mdd_flatten(self) -> None:
+        """Let the next MDD breach request a flatten again (see
+        ``_request_mdd_flatten`` for when). Callers from other threads hold the
+        tracker's lock."""
+        self._mdd_flatten_requested = False
 
     def _fire_kill_switch_alert(self, reason: str) -> None:
         """Telegram + WebSocket 동시 발행 — 실패해도 킬스위치 자체는 영향 없음."""
@@ -339,6 +397,7 @@ class LossTracker:
         self.kill_switch = False
         self._mark_kill_switch_changed()
         self.kill_reason = ""
+        self._rearm_mdd_flatten()
         logger.info("킬스위치 수동 해제")
 
 
@@ -477,6 +536,13 @@ class PersistentLossTracker(LossTracker):
                 self.kill_switch = True
                 self.kill_reason = row.kill_reason or ""
                 logger.warning("킬스위치 복원 (%s): %s", key, self.kill_reason)
+                if self.kill_reason.startswith(MDD_REASON_PREFIX):
+                    # The process that measured this breach already requested
+                    # the flatten; its sells may still be resting. Requesting
+                    # again on the first fill after boot is the startup
+                    # liquidation R-CRIT-07 forbids. A daily/weekly halt stays
+                    # armed: MDD breaking later still flattens (P0-03).
+                    self._mdd_flatten_requested = True
                 if key != today:
                     # Restoring from *today's* row is not this process's opinion
                     # — the row already says it, and counting it would re-break
@@ -636,6 +702,10 @@ class PersistentLossTracker(LossTracker):
                     self.kill_switch, self.kill_reason = adopted[0], adopted[1] or ""
                     if adopted[0] and not was:
                         adopt_halt = adopted[1] or "외부 킬스위치"
+                    elif was and not adopted[0]:
+                        # Somebody cleared it (the operator reset): a breach
+                        # after this is a new one, and flattens again (P0-03).
+                        self._rearm_mdd_flatten()
 
             if adopt_halt is not None:
                 # Converging the attribute is not enough to stop anything:

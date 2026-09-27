@@ -61,7 +61,46 @@ Any single incomplete P0 item is sufficient to block the paper→real transition
 
 ---
 
-#### P0-03 — Fix `EmergencyFlattenManager`: change `dry_run` default to `False`, wire into production path
+#### P0-03 — Fix `EmergencyFlattenManager`: change `dry_run` default to `False`, wire into production path — ✅ DONE
+
+> **The description below was wrong about the gap.** Flipping the default was a
+> no-op: every construction site already passed `dry_run` explicitly (the API
+> from `ENABLE_LIVE_TRADING`). The real gap was that **nothing automatic called
+> the flatten at all** — the MDD kill switch closed `SAFE_MODE` and alerted.
+>
+> **Evidence**:
+> * `backend/quant/risk/engine.py` — `LossTracker._evaluate` checks **MDD first**
+>   and calls `_request_mdd_flatten`. MDD used to be checked last behind early
+>   returns, so a crash day breaking the daily limit and MDD together never
+>   evaluated MDD. The request is sent once per breach (`_mdd_flatten_requested`),
+>   re-armed when the kill switch is cleared (`manual_reset`, an operator clear
+>   adopted after the breach stops holding) or when the worker's flatten sent no
+>   order and failed. A halt adopted from another process never requests one, and
+>   an MDD halt restored at boot counts as already requested (R-CRIT-07: no
+>   liquidation on startup — a crash before the flatten ran is left to the alert
+>   and the manual endpoint).
+> * `backend/worker/runner.py` — `StrategyWorker._on_mdd_breach` runs
+>   `EmergencyFlattenManager.flatten_all` on a tracked thread (`shutdown()` joins
+>   it), selling straight to the KIS broker; `SAFE_MODE` does not gate it.
+> * `backend/worker/emergency.py` — `flatten_dry_run()`: dry run unless
+>   `ENABLE_LIVE_TRADING=true`; `EMERGENCY_FLATTEN_DRY_RUN=true` forces a dry run
+>   (the R-CRIT-07 rollback lever). `dry_run` is now a required keyword — no
+>   silent default. The API uses the same helper.
+> * ⚠️ **The automatic path is dry-run until armed**: `auto_flatten_dry_run()`
+>   also requires `MDD_AUTO_FLATTEN=true`. The equity MDD is computed from
+>   (`KISBroker.get_balance().total_eval_krw`) is unverified and may read low
+>   (issue #178); misread, it would liquidate the book. Arm it after paper
+>   trading shows no `[DRY RUN] 비상청산` without a real drawdown. A failed live
+>   flatten that sent no order alerts the operator and retries on the next fill.
+> * Tests: `backend/worker/tests/test_mdd_flatten.py` — including the paper-mode
+>   criterion below (sell orders for held symbols only, nothing else).
+>
+> Daily and weekly halts deliberately do **not** flatten ("당일 매매 중단").
+> Not covered: flatten orders are not registered with the fill poller / order
+> rows (same as the manual endpoint), and cross-process duplicate flattens remain
+> the risk noted in `docs/EMERGENCY_FLATTEN_VALIDATION.md`.
+>
+> Dependency on P0-04: not needed — see P0-04.
 
 | Field | Value |
 |---|---|
@@ -76,7 +115,15 @@ Any single incomplete P0 item is sufficient to block the paper→real transition
 
 ---
 
-#### P0-04 — Per-broker `SAFE_MODE`: replace global singleton with per-broker instance map
+#### P0-04 — Per-broker `SAFE_MODE`: replace global singleton with per-broker instance map — ⏸ DEFERRED
+
+> **Not needed while the worker is single-broker.** Every broker the worker
+> builds comes from `get_kis_broker()`; a per-broker map would hold one entry and
+> change nothing. The reason P0-03 listed it as a dependency — a flatten must not
+> be blocked by another broker's halt, and a KIS breach must not flatten Kiwoom —
+> is met without it: the flatten sells directly on the KIS broker instance and
+> never consults `SAFE_MODE`. **Revisit when Kiwoom is wired into the worker**;
+> P0-12's in-process release still names this as its dependency.
 
 | Field | Value |
 |---|---|
