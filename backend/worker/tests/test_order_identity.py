@@ -16,9 +16,8 @@ FILLED transition was already written — uses the primary key the worker
 recorded while the order was open.
 
 What these tests assert is *identity* — which row, how many rows, where the
-Fill rows land — not the `filled_qty` total: the pipeline counts that twice
-today (step 1 writes the cumulative figure, step 4 adds the fill on top), which
-predates this change and is issue #172.
+Fill rows land. The `filled_qty` total is pinned separately, in
+``test_filled_qty_total.py`` (issue #172).
 
 Most tests here drive the real sequence: `OrderStateMachine.register` (fires
 `_persist_order`), then the worker's own fill callback, which runs
