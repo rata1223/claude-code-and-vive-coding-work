@@ -339,13 +339,12 @@ def trigger_flatten():
     if not body.get("confirm"):
         return jsonify({"error": "confirm=true 필요"}), 400
     try:
-        from backend.worker.emergency import EmergencyFlattenManager
+        from backend.worker.emergency import EmergencyFlattenManager, flatten_dry_run
         from backend.brokers.kis import get_kis_broker
-        dry_run = os.environ.get("ENABLE_LIVE_TRADING", "false").lower() != "true"
         mgr = EmergencyFlattenManager(
             broker=get_kis_broker(),
             db_factory=_get_factory(),
-            dry_run=dry_run,
+            dry_run=flatten_dry_run(),
         )
         mgr.flatten_all(reason=body.get("reason", "수동 비상청산"))
         # 상세 실패 사유(원본 예외 텍스트 포함)는 emergency.py의 _audit()이 이미

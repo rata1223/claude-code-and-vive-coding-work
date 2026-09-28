@@ -309,6 +309,9 @@ class StrategyWorker:
                 redis_client=self._redis,
                 db_factory=_get_session_factory(),  # per-op sessions, not long-lived
             )
+            # P0-03: an MDD breach liquidates. Wired after construction, so the
+            # halt restored from the DB in __init__ cannot fire it.
+            self._loss_tracker.on_mdd_breach = self._on_mdd_breach
             logger.info("PersistentLossTracker 초기화 완료 (kill_switch=%s)", self._loss_tracker.kill_switch)
 
             # Seed equity from a live balance fetch at startup. This always sets
@@ -485,10 +488,22 @@ class StrategyWorker:
         #    re-registered with the poller by ``StartupRecovery`` on the next boot
         #    (backend/worker/recovery.py:333), so abandoning the thread costs
         #    tracking until restart, not the order.
-        _step("aux-threads",
-              lambda: self._join_aux_threads(min(_AUX_JOIN_CAP_SEC, _left(reserve=2.0))))
+        seen: set = set()
+
+        def _join_first() -> None:
+            seen.update(self._join_aux_threads(min(_AUX_JOIN_CAP_SEC, _left(reserve=2.0))))
+
+        _step("aux-threads", _join_first)
         # 4. Poller — the "drain active polls" half of P0-10.
         _step("poller", lambda: self._shutdown_poller(_left(reserve=1.0)))
+        # 4b. Threads the drain started. A fill it delivers can breach MDD, and
+        #     the flatten that triggers runs on a new aux thread (P0-03) that the
+        #     pass above never saw — a daemon, so the process would exit under
+        #     it. Only new threads: ones already waited on in step 3 are not
+        #     waited on twice.
+        _step("aux-threads-late",
+              lambda: self._join_aux_threads(
+                  min(_AUX_JOIN_CAP_SEC, _left(reserve=1.0)), skip=frozenset(seen)))
         # 5. Checkpoint equity to the DB.
         _step("equity-checkpoint", self._checkpoint_equity)
         # 6. Heartbeat LAST, so the API-side watchdog does not see a dead worker
@@ -536,16 +551,22 @@ class StrategyWorker:
             logger.warning("전략 스레드 미종료 run_id=%s — 데몬이라 프로세스와 함께 끝난다",
                            stuck)
 
-    def _join_aux_threads(self, budget: float) -> None:
-        """Wait, briefly, for tracked one-shot threads to finish their I/O."""
+    def _join_aux_threads(self, budget: float, skip=frozenset()) -> set:
+        """Wait, briefly, for tracked one-shot threads to finish their I/O.
+
+        Returns every thread it looked at, so a later pass can ``skip`` them:
+        ``shutdown()`` joins once before the poller drain and again after it,
+        and the second pass is only for threads the drain itself started.
+        """
         with self._lock:
-            threads = [t for t in self._aux_threads if t.is_alive()]
+            threads = [t for t in self._aux_threads if t.is_alive() and t not in skip]
         deadline = time.monotonic() + budget
         for t in threads:
             t.join(max(0.0, deadline - time.monotonic()))
         stuck = [t.name for t in threads if t.is_alive()]
         if stuck:
             logger.warning("보조 스레드 미종료: %s", stuck)
+        return set(skip) | set(threads)
 
     def _shutdown_poller(self, budget: float) -> None:
         """Stop the fill poller and wait for its current cycle — the drain."""
@@ -621,6 +642,60 @@ class StrategyWorker:
         # missing (backend/worker/heartbeat.py:_alert_dead_worker). Tidying it up
         # here would halt trading on every deploy; letting the 90s TTL lapse is
         # what gives a restart room to come back unnoticed.
+
+    def _on_mdd_breach(self, reason: str) -> None:
+        """The loss tracker measured an MDD breach: liquidate (P0-03).
+
+        Called under the tracker's lock from a fill thread, so the flatten —
+        quotes and orders for every position — runs on a tracked thread that
+        ``shutdown()`` waits for. The tracker has already closed ``SAFE_MODE``
+        to new entries; the flatten sells straight to the broker, which is the
+        one path a halt does not block.
+        """
+        self._spawn_aux(self._emergency_flatten, args=(reason,), name="emergency-flatten")
+
+    def _emergency_flatten(self, reason: str) -> None:
+        """Run the flatten; if it sent nothing and failed, let the next fill retry.
+
+        The tracker requests one flatten per breach. Without a retry, a broker
+        that was down at that moment left the book invested through the whole
+        drawdown. The retry is deliberately narrow: only when **no order went
+        out**. Once any sell is resting, a second run would ask for the same
+        shares again — the unknown-sellable fallback sells the held quantity —
+        so a partial result is left to the alert and the operator.
+        """
+        from backend.worker.emergency import EmergencyFlattenManager, auto_flatten_dry_run
+        dry_run = auto_flatten_dry_run()
+        retry = False
+        try:
+            mgr = EmergencyFlattenManager(
+                get_kis_broker(),
+                db_factory=_get_session_factory(),
+                dry_run=dry_run,
+            )
+            mgr.flatten_all(reason=f"MDD 킬스위치: {reason}")
+            retry = (mgr.last_status is None and mgr.last_submitted == 0
+                     and mgr.last_failed_count > 0)
+        except Exception as e:  # noqa: BLE001 - logged; the halt already stands
+            logger.error("MDD 비상청산 실패: %s", e)
+            retry = True
+        if dry_run or not retry:
+            return   # a dry run sells nothing either way — nothing to retry
+        # Loud, because the retry may never come: it rides on the next fill, and
+        # with entries halted and no sell resting there may be none. The early
+        # failure paths inside flatten_all() send no alert of their own.
+        msg = ("MDD 비상청산 실패 — 주문 0건. 포지션이 남아 있다. "
+               "수동 청산 필요(/api/admin/flatten). 다음 체결 시 자동 재시도")
+        logger.critical(msg)
+        try:
+            from bot.notifier import alert_emergency
+            alert_emergency(msg)
+        except Exception:
+            pass
+        tracker = self._loss_tracker
+        if tracker is not None:
+            with tracker._lock:
+                tracker._rearm_mdd_flatten()
 
     def _spawn_aux(self, target, args=(), name=None) -> threading.Thread:
         """Start a tracked one-shot thread so ``shutdown()`` can wait for it."""

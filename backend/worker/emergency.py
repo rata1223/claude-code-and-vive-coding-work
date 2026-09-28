@@ -9,6 +9,7 @@ NOTE (R-11): the former ``StaleDataWatchdog`` lived here but was dead code
 """
 import logging
 import math
+import os
 import threading
 from contextlib import contextmanager
 from typing import Callable, Optional, Tuple
@@ -29,6 +30,40 @@ PRICE_REJECTED_EVENT = "emergency_flatten_price_rejected"
 _FLATTEN_LOCK = threading.Lock()
 
 
+def flatten_dry_run() -> bool:
+    """Whether a flatten should only log, decided from the environment.
+
+    One rule for every caller — the worker's MDD trigger and the manual
+    ``/api/admin/flatten`` endpoint:
+
+    * ``ENABLE_LIVE_TRADING`` not ``"true"`` → dry run. The same switch gates
+      every other order this system sends (``backend/strategy/base.py``), so a
+      shadow deployment never liquidates for real.
+    * ``EMERGENCY_FLATTEN_DRY_RUN=true`` → dry run even when live. The rollback
+      lever ROADMAP R-CRIT-07 calls for, should an automatic flatten misfire.
+    """
+    if os.environ.get("EMERGENCY_FLATTEN_DRY_RUN", "").lower() == "true":
+        return True
+    return os.environ.get("ENABLE_LIVE_TRADING", "false").lower() != "true"
+
+
+def auto_flatten_dry_run() -> bool:
+    """``flatten_dry_run()``, and also dry unless ``MDD_AUTO_FLATTEN=true``.
+
+    For the **automatic** MDD trigger only; the manual endpoint uses
+    ``flatten_dry_run()``. The MDD it acts on is computed from
+    ``KISBroker.get_balance().total_eval_krw``, which is not yet verified against
+    a live account — USD cash is left out, the US balance is queried for NASD
+    only, and a missing US summary field reads as 0. Misread low, it looks like a
+    drawdown. Before the auto flatten existed that only halted trading; with it,
+    it would sell every position. So it logs ``[DRY RUN]`` until paper trading
+    has shown the reading is sound, and an operator turns it on.
+    """
+    if os.environ.get("MDD_AUTO_FLATTEN", "").lower() != "true":
+        return True
+    return flatten_dry_run()
+
+
 @contextmanager
 def _session(factory):
     sess = factory()
@@ -46,15 +81,17 @@ class EmergencyFlattenManager:
     모든 브로커 포지션을 즉시 매도.
 
     트리거:
-      - MDD 한도 초과 (LossTracker → _fire_kill_switch_alert)
+      - MDD 한도 초과 — ``LossTracker._request_mdd_flatten`` → 워커의
+        ``StrategyWorker._on_mdd_breach`` (P0-03). 일·주 손실 정지는 청산하지 않는다
       - 수동 API 호출 (/api/admin/flatten)
-      - 운영자 텔레그램 명령
 
-    주의: dry_run=True 이면 실제 주문을 내지 않고 로그만 남긴다.
+    ``dry_run`` 은 필수 인자다: True 이면 실제 주문을 내지 않고 로그만 남긴다.
+    기본값이 있던 시절에는 빠뜨린 호출이 조용히 dry run 이 됐다 — 호출자는
+    보통 ``flatten_dry_run()`` 을 넘긴다.
     """
 
     def __init__(self, broker: BrokerAdapter, db_factory: Optional[Callable] = None,
-                 dry_run: bool = True):
+                 *, dry_run: bool):
         self._broker = broker
         self._factory = db_factory
         self._dry_run = dry_run

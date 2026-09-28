@@ -687,6 +687,49 @@ class TestAuxJoinIsCapped:
         assert poller._thread.joined_with, "poller lost its drain to the aux join"
 
 
+class TestThreadsTheDrainStarts:
+    """PR #179 review: the poller drain delivers fills, a fill can breach MDD, and
+    the flatten then starts on a new aux thread (P0-03). The aux join ran before
+    the drain, so that thread was never waited for — a daemon, cut off
+    mid-liquidation when the process exited."""
+
+    def _draining_poller(self, w, target):
+        """A poller whose drain spawns an aux thread, as an MDD fill would."""
+        poller = MagicMock()
+        thread = FakeThread(name="order-poller")
+        real_join = thread.join
+
+        def join(timeout=None):
+            w._spawn_aux(target, name="emergency-flatten")
+            real_join(timeout)
+
+        thread.join = join
+        poller._thread = thread
+        w._poller = poller
+        return poller
+
+    def test_a_flatten_started_during_the_drain_is_waited_for(self, patched_factory):
+        w = _worker()
+        finished = threading.Event()
+        self._draining_poller(w, lambda: (time.sleep(0.3), finished.set()))
+
+        w.shutdown()
+
+        assert finished.is_set(), "shutdown returned while the flatten was still running"
+
+    def test_a_thread_already_waited_on_is_not_waited_on_again(self, patched_factory):
+        """The late pass is for new threads only — a stuck scan from before the
+        drain must not spend the budget twice."""
+        w = _worker()
+        self._draining_poller(w, lambda: None)
+        stuck = FakeThread(alive_after_join=True, name="market-open-1")
+        w._aux_threads.append(stuck)
+
+        w.shutdown()
+
+        assert len(stuck.joined_with) == 1
+
+
 # ── Review findings: the first Ctrl-C during a teardown is not a kill ────────
 
 class TestSecondSignalCounting:
