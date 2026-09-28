@@ -488,10 +488,22 @@ class StrategyWorker:
         #    re-registered with the poller by ``StartupRecovery`` on the next boot
         #    (backend/worker/recovery.py:333), so abandoning the thread costs
         #    tracking until restart, not the order.
-        _step("aux-threads",
-              lambda: self._join_aux_threads(min(_AUX_JOIN_CAP_SEC, _left(reserve=2.0))))
+        seen: set = set()
+
+        def _join_first() -> None:
+            seen.update(self._join_aux_threads(min(_AUX_JOIN_CAP_SEC, _left(reserve=2.0))))
+
+        _step("aux-threads", _join_first)
         # 4. Poller — the "drain active polls" half of P0-10.
         _step("poller", lambda: self._shutdown_poller(_left(reserve=1.0)))
+        # 4b. Threads the drain started. A fill it delivers can breach MDD, and
+        #     the flatten that triggers runs on a new aux thread (P0-03) that the
+        #     pass above never saw — a daemon, so the process would exit under
+        #     it. Only new threads: ones already waited on in step 3 are not
+        #     waited on twice.
+        _step("aux-threads-late",
+              lambda: self._join_aux_threads(
+                  min(_AUX_JOIN_CAP_SEC, _left(reserve=1.0)), skip=frozenset(seen)))
         # 5. Checkpoint equity to the DB.
         _step("equity-checkpoint", self._checkpoint_equity)
         # 6. Heartbeat LAST, so the API-side watchdog does not see a dead worker
@@ -539,16 +551,22 @@ class StrategyWorker:
             logger.warning("전략 스레드 미종료 run_id=%s — 데몬이라 프로세스와 함께 끝난다",
                            stuck)
 
-    def _join_aux_threads(self, budget: float) -> None:
-        """Wait, briefly, for tracked one-shot threads to finish their I/O."""
+    def _join_aux_threads(self, budget: float, skip=frozenset()) -> set:
+        """Wait, briefly, for tracked one-shot threads to finish their I/O.
+
+        Returns every thread it looked at, so a later pass can ``skip`` them:
+        ``shutdown()`` joins once before the poller drain and again after it,
+        and the second pass is only for threads the drain itself started.
+        """
         with self._lock:
-            threads = [t for t in self._aux_threads if t.is_alive()]
+            threads = [t for t in self._aux_threads if t.is_alive() and t not in skip]
         deadline = time.monotonic() + budget
         for t in threads:
             t.join(max(0.0, deadline - time.monotonic()))
         stuck = [t.name for t in threads if t.is_alive()]
         if stuck:
             logger.warning("보조 스레드 미종료: %s", stuck)
+        return set(skip) | set(threads)
 
     def _shutdown_poller(self, budget: float) -> None:
         """Stop the fill poller and wait for its current cycle — the drain."""
