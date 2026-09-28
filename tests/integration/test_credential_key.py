@@ -94,6 +94,31 @@ class TestAKeyThatDoesNotMatchTheStoredData:
         _store(factory, stale)
         crypto.validate_key(factory)            # returns, does not raise
 
+    def test_every_encrypted_field_is_checked_not_only_the_app_key(self, key, factory):
+        """PR #183 review: an app key that opens next to a secret that does not
+        is just as broken — the request paths read every field."""
+        from api.models import Credential
+        other = Fernet(Fernet.generate_key())
+        with factory() as s:
+            s.add(Credential(user_id=1, name="half", exchange_id="kis",
+                             app_key_enc=crypto.encrypt("app-key"),
+                             app_secret_enc=other.encrypt(b"old-secret").decode()))
+            s.add(Credential(user_id=1, name="no-app-key", exchange_id="kis",
+                             account_no_enc=other.encrypt(b"old-account").decode()))
+            s.commit()
+        assert crypto.validate_key(factory) == 2
+
+    def test_a_credential_is_counted_once_however_many_fields_fail(self, key, factory):
+        from api.models import Credential
+        other = Fernet(Fernet.generate_key())
+        with factory() as s:
+            s.add(Credential(user_id=1, name="all-stale", exchange_id="kis",
+                             app_key_enc=other.encrypt(b"a").decode(),
+                             app_secret_enc=other.encrypt(b"b").decode(),
+                             hts_id_enc=other.encrypt(b"c").decode()))
+            s.commit()
+        assert crypto.validate_key(factory) == 1
+
     def test_decrypt_says_so_once_and_still_returns_none(self, key, caplog):
         stale = Fernet(Fernet.generate_key()).encrypt(b"x").decode()
         with caplog.at_level(logging.WARNING, logger="api.crypto"):

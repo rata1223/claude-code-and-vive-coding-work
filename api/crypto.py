@@ -90,23 +90,35 @@ def validate_key(session_factory=None) -> int:
     if session_factory is None:
         return 0
 
+    from sqlalchemy import or_
+
     from api.models import Credential
 
+    # Every encrypted field, not just the app key: the request paths read all
+    # of them with ``decrypt(...) or ""``, so a credential whose app key opens
+    # but whose secret does not is just as broken.
+    columns = [Credential.app_key_enc, Credential.app_secret_enc,
+               Credential.account_no_enc, Credential.hts_id_enc,
+               Credential.api_key_enc]
     db = session_factory()
     try:
-        rows = (db.query(Credential.app_key_enc)
-                .filter(Credential.app_key_enc.isnot(None))
+        rows = (db.query(*columns)
+                .filter(or_(*(c.isnot(None) for c in columns)))
                 .limit(_CANARY_ROWS).all())
     finally:
         db.close()
 
     fernet = get_fernet()
     bad = 0
-    for (ciphertext,) in rows:
-        try:
-            fernet.decrypt(ciphertext.encode())
-        except InvalidToken:
-            bad += 1
+    for row in rows:
+        for ciphertext in row:
+            if not ciphertext:
+                continue
+            try:
+                fernet.decrypt(ciphertext.encode())
+            except InvalidToken:
+                bad += 1            # one per credential, however many fields fail
+                break
     if bad:
         logger.critical(
             "저장된 자격증명 %d/%d건이 현재 %s로 복호화되지 않는다 — 키가 바뀌었거나 틀렸다. "

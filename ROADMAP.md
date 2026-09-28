@@ -301,8 +301,9 @@ Any single incomplete P0 item is sufficient to block the paper→real transition
 
 > **The item as written was stale.** `docker-compose.yml` already refuses to
 > start the `api` service without the key (`${KIS_CREDENTIAL_KEY:?…}`), and the
-> worker never decrypts stored credentials (only `api/routers/` import
-> `api/crypto.py`), so a worker-side check would add a failure mode for nothing.
+> worker never decrypts stored credentials (only the `api/` package imports
+> `api/crypto.py` — its routers and `api/main.py`), so a worker-side check would
+> add a failure mode for nothing.
 >
 > **What was actually open, and is now closed** (`api/crypto.py`, `api/main.py`):
 > * A **malformed** key used to surface only on the first credential request,
@@ -310,8 +311,9 @@ Any single incomplete P0 item is sufficient to block the paper→real transition
 >   fails startup.
 > * A **valid key that does not match** the stored data (rotated, mistyped) was
 >   silent — `decrypt` swallowed the error and callers sent an empty app key to
->   the broker. Once the database answers, a background check test-decrypts up
->   to 20 stored credentials (off the startup path) and logs
+>   the broker. Once the database answers, a background check test-decrypts
+>   every encrypted field of up to 20 stored credentials (off the startup path)
+>   and logs
 >   `N/M` mismatches CRITICAL (counts only), and `decrypt` warns once per
 >   process on `InvalidToken`. A mismatch does **not** refuse startup:
 >   re-entering credentials through this API is the fix.
@@ -320,12 +322,12 @@ Any single incomplete P0 item is sufficient to block the paper→real transition
 
 | Field | Value |
 |---|---|
-| **Purpose** | `docker-compose.yml` sets `KIS_CREDENTIAL_KEY` to an empty string default. Credentials are stored encrypted with this key. An empty key means all credential data is either unencrypted or silently corrupt. |
+| **Purpose** | Credentials are stored encrypted with `KIS_CREDENTIAL_KEY`. Compose already refuses an empty key; the gaps were a malformed key surfacing only on first use, and a key that no longer matches the stored data failing silently. |
 | **Risk Level** | HIGH |
-| **Implementation Complexity** | Low — add startup assertion: `if not os.getenv("KIS_CREDENTIAL_KEY"): raise EnvironmentError(...)` |
+| **Implementation Complexity** | Low — `crypto.validate_key()` first in the API lifespan (fails startup); a background stored-data check logs mismatches |
 | **Dependencies** | None |
 | **Operational Impact** | Prevents silent credential exposure; fails fast on misconfigured deployments |
-| **Affected Files** | `backend/worker/runner.py`, `backend/api/routers/credentials.py`, `docker-compose.yml` |
+| **Affected Files** | `api/crypto.py`, `api/main.py` |
 | **Deployment Priority** | 11 of 15 |
 | **Audit Reference** | AUDIT.md DB-02 |
 
@@ -962,7 +964,7 @@ All sprints are 2 weeks. Exit criteria are binary: either all listed tasks pass 
 | P0-14 Alembic init | `alembic upgrade head` runs clean on fresh DB |
 | P0-01 Retry fix | POST to `/trading/order` with simulated 500 response does NOT create second order |
 | P0-07 Idempotency key | Every `orders` row has non-null `idempotency_key` after insert |
-| P0-11 Credential key check | Worker refuses to start if `KIS_CREDENTIAL_KEY` is empty |
+| P0-11 Credential key check | API refuses to start with a missing or malformed `KIS_CREDENTIAL_KEY`; stored credentials the key cannot open are logged |
 | P0-05 LossTracker lock | Concurrent `record_pnl()` calls do not under-count loss (verified by stress test) |
 | P0-06 US status fix | Poller raises `OrderNotFound` instead of returning wrong order status |
 | P0-15 CORS fix | Browser rejects credentialed cross-origin request from non-allowlisted origin |
