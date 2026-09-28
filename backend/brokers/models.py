@@ -117,3 +117,8 @@ class Balance:
     cash_krw: float
     cash_usd: float
     total_eval_krw: float
+    #: False when ``total_eval_krw`` is known to be incomplete — a field it is
+    #: built from was missing, or it leaves out money that exists (issue #178).
+    #: The number is still returned; this says how far to trust it. The MDD
+    #: auto-flatten will not sell on an unverified reading.
+    equity_verified: bool = True

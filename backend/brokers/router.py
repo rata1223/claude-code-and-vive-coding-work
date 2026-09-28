@@ -92,14 +92,19 @@ class MarketRouter(BrokerAdapter):
     def get_balance(self) -> Balance:
         """Returns summed balance across both brokers; swallows NotImplementedError from stubs."""
         cash_krw = cash_usd = total_eval_krw = 0.0
+        verified = True
         for broker, label in ((self._kr, "kr"), (self._us, "us")):
             try:
                 b = broker.get_balance()
                 cash_krw += b.cash_krw
                 cash_usd += b.cash_usd
                 total_eval_krw += b.total_eval_krw
+                verified = verified and b.equity_verified
             except NotImplementedError:
                 pass
             except Exception as exc:
+                # The sum now leaves out a whole broker — say so (issue #178).
+                verified = False
                 logger.warning("MarketRouter.get_balance [%s] 실패: %s", label, exc)
-        return Balance(cash_krw=cash_krw, cash_usd=cash_usd, total_eval_krw=total_eval_krw)
+        return Balance(cash_krw=cash_krw, cash_usd=cash_usd,
+                       total_eval_krw=total_eval_krw, equity_verified=verified)

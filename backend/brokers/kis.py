@@ -16,6 +16,33 @@ from backend.quant.data.universe import KR_ETF
 
 logger = logging.getLogger(__name__)
 
+#: The balance summary fields ``get_balance`` builds its numbers from. None of
+#: them has been confirmed against a live KIS response (issue #178).
+_BALANCE_FIELDS = {"kr": ("dnca_tot_amt", "tot_evlu_amt"),
+                   "us": ("frcr_dncl_amt_2", "tot_evlu_amt")}
+_reported_missing: set = set()
+
+
+def _missing_balance_fields(kr_summary, us_summary) -> list:
+    """The fields read as 0 because the response did not have them.
+
+    Each distinct gap is logged once per process, with the **names** of the
+    fields the response did carry — no values, which are account balances. One
+    paper-trading session then shows what KIS actually sends, which is what
+    #178 needs to be closed.
+    """
+    missing = []
+    for side, summary in (("kr", kr_summary), ("us", us_summary)):
+        keys = set(summary) if isinstance(summary, dict) else set()
+        gap = tuple(k for k in _BALANCE_FIELDS[side] if k not in keys)
+        missing.extend(f"{side}.{k}" for k in gap)
+        if gap and (side, gap) not in _reported_missing:
+            _reported_missing.add((side, gap))
+            logger.warning(
+                "KIS %s 잔고 응답에 %s 필드 없음 — 0으로 계산됨, 총자산 미검증(#178). "
+                "응답 필드: %s", side, list(gap), sorted(keys))
+    return missing
+
 
 def _order_excd(symbol: str) -> str:
     """``OVRS_EXCG_CD`` for a US order or order inquiry.
@@ -127,10 +154,15 @@ class KISBroker(BrokerAdapter):
             kr_eval = float(kr["summary"].get("tot_evlu_amt", 0))
             us_eval_usd = float(us["summary"].get("tot_evlu_amt", 0))
             self._breaker.record_success()
+            missing = _missing_balance_fields(kr["summary"], us["summary"])
             return Balance(
                 cash_krw=kr_cash,
                 cash_usd=us_cash,
                 total_eval_krw=kr_eval + us_eval_usd * self._get_fx(),
+                # Unverified when a field read as 0 because it was absent, or
+                # when USD cash exists: the total does not include it, and
+                # whether the US evaluation already does is unconfirmed (#178).
+                equity_verified=not missing and us_cash == 0,
             )
         except Exception:
             self._breaker.record_failure()

@@ -38,6 +38,12 @@ from backend.strategy.indicator.strategy import IndicatorStrategy
 
 logger = logging.getLogger(__name__)
 
+#: Whether the equity reading the current thread just handed to the loss
+#: tracker is complete (issue #178). ``record_pnl`` calls the MDD breach hook
+#: synchronously on the same thread, so the hook reads the flag of the reading
+#: that actually caused the breach — fills arrive on several threads at once.
+_EQUITY_READING = threading.local()
+
 _REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:6379")
 _DB_URL = os.environ.get("DB_URL", "postgresql://quantdinger:quantdinger@postgres:5432/quantdinger")
 
@@ -302,6 +308,8 @@ class StrategyWorker:
         # when the broker balance API is temporarily unavailable (prevents MDD = 0%
         # masking). Seeded below from a real startup balance fetch.
         self._last_known_equity: float | None = None
+        #: ``equity_verified`` of that reading — it travels with the number (#178).
+        self._last_known_equity_verified: bool = True
         try:
             from backend.quant.risk.engine import PersistentLossTracker, RiskConfig
             self._loss_tracker = PersistentLossTracker(
@@ -319,9 +327,11 @@ class StrategyWorker:
             # if the balance API is briefly down later) and bootstraps peak_equity
             # on a cold start (peak_equity == 0).
             try:
-                _eq = get_kis_broker().get_balance().total_eval_krw
+                _bal = get_kis_broker().get_balance()
+                _eq = _bal.total_eval_krw
                 if _eq > 0:
                     self._last_known_equity = _eq
+                    self._last_known_equity_verified = getattr(_bal, "equity_verified", True)
                     if self._loss_tracker.peak_equity == 0:
                         self._loss_tracker.peak_equity = _eq
                         self._loss_tracker._persist()
@@ -652,9 +662,11 @@ class StrategyWorker:
         to new entries; the flatten sells straight to the broker, which is the
         one path a halt does not block.
         """
-        self._spawn_aux(self._emergency_flatten, args=(reason,), name="emergency-flatten")
+        breach_verified = getattr(_EQUITY_READING, "verified", True)
+        self._spawn_aux(self._emergency_flatten, args=(reason, breach_verified),
+                        name="emergency-flatten")
 
-    def _emergency_flatten(self, reason: str) -> None:
+    def _emergency_flatten(self, reason: str, breach_verified: bool = True) -> None:
         """Run the flatten; if it sent nothing and failed, let the next fill retry.
 
         The tracker requests one flatten per breach. Without a retry, a broker
@@ -666,6 +678,15 @@ class StrategyWorker:
         """
         from backend.worker.emergency import EmergencyFlattenManager, auto_flatten_dry_run
         dry_run = auto_flatten_dry_run()
+        held = not dry_run and not self._equity_verified_for_flatten(breach_verified)
+        if held:
+            # Nothing is sold, so the next fill — with a fresh reading — may ask
+            # again. Without this the held breach could never flatten at all.
+            dry_run = True
+            tracker = self._loss_tracker
+            if tracker is not None:
+                with tracker._lock:
+                    tracker._rearm_mdd_flatten()
         retry = False
         try:
             mgr = EmergencyFlattenManager(
@@ -696,6 +717,40 @@ class StrategyWorker:
         if tracker is not None:
             with tracker._lock:
                 tracker._rearm_mdd_flatten()
+
+    def _equity_verified_for_flatten(self, breach_verified: bool = True) -> bool:
+        """Whether the equity behind this breach can be trusted enough to sell.
+
+        The MDD that asked for the flatten is computed from
+        ``get_balance().total_eval_krw``, which can read low (issue #178): a
+        missing field reads as 0, and USD cash is left out. A low reading looks
+        like a drawdown. The halt stands either way — entries stay closed — but
+        liquidating the book on a number the broker adapter itself flags as
+        incomplete is the one step this refuses, and says so.
+
+        Both readings must pass: the one that **caused** the breach
+        (``breach_verified`` — possibly the cached last-known value), and a
+        fresh one now. A fresh call that *fails* is not a verdict on the number,
+        so it defers to the breach reading.
+        """
+        verified = breach_verified
+        if verified:
+            try:
+                bal = get_kis_broker().get_balance()
+                verified = getattr(bal, "equity_verified", True)
+            except Exception as e:  # noqa: BLE001 - see docstring
+                logger.warning("비상청산 전 잔고 확인 실패 — 위반 시점 판독으로 판단: %s", e)
+        if verified:
+            return True
+        msg = ("MDD 비상청산 보류 — 총자산 판독이 불완전하다(#178). 매매 정지는 유지된다. "
+               "포지션·잔고를 직접 확인하고 필요하면 수동 청산(/api/admin/flatten)")
+        logger.critical(msg)
+        try:
+            from bot.notifier import alert_emergency
+            alert_emergency(msg)
+        except Exception:
+            pass
+        return False
 
     def _spawn_aux(self, target, args=(), name=None) -> threading.Thread:
         """Start a tracked one-shot thread so ``shutdown()`` can wait for it."""
@@ -1043,10 +1098,15 @@ class StrategyWorker:
                     # Never fall back to peak_equity: MDD = (peak - peak)/peak = 0% masks drawdown.
                     # Use last-known-good equity; skip MDD evaluation if none available.
                     try:
-                        current_equity = get_kis_broker().get_balance().total_eval_krw
+                        _bal = get_kis_broker().get_balance()
+                        current_equity = _bal.total_eval_krw
+                        equity_verified = getattr(_bal, "equity_verified", True)
                         self._last_known_equity = current_equity
+                        self._last_known_equity_verified = equity_verified
                     except Exception as _be:
                         current_equity = self._last_known_equity
+                        # The cached reading, with its own completeness.
+                        equity_verified = getattr(self, "_last_known_equity_verified", True)
                         if current_equity is None:
                             logger.warning("잔고 조회 실패, 기준 잔고 없음 — MDD 평가 스킵: %s", _be)
                             _audit("balance_fetch_failed", symbol=fill.symbol,
@@ -1061,8 +1121,12 @@ class StrategyWorker:
                         # counter) before and after would let one fill claim
                         # another's breach and file it against the wrong symbol
                         # and P&L.
-                        outcome = self._loss_tracker.record_pnl(
-                            realized_pnl, current_equity)
+                        _EQUITY_READING.verified = equity_verified
+                        try:
+                            outcome = self._loss_tracker.record_pnl(
+                                realized_pnl, current_equity)
+                        finally:
+                            _EQUITY_READING.verified = True
                         logger.info("손익 기록: %s %.0f원 (entry=%s fill=%.4f qty=%d)",
                                     fill.symbol, realized_pnl,
                                     f"{entry_price:.4f}" if entry_price is not None else "n/a",

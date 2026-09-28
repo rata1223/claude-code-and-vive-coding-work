@@ -274,7 +274,7 @@ class TestTheWorkerLiquidates:
         started = threading.Event()
         release = threading.Event()
 
-        def slow(reason):
+        def slow(*_args):
             started.set()
             release.wait(5)
 
@@ -352,6 +352,70 @@ class TestTheWorkerLiquidates:
         t = _breach_through_the_worker()
         assert [o.symbol for o in _orders(paper)] == ["069500"]
         assert t._mdd_flatten_requested is True
+
+    def test_an_unverified_equity_reading_holds_the_flatten(self, paper, monkeypatch):
+        """#178: the MDD came from a number the adapter flags as incomplete.
+        The halt stands; selling the book on it does not happen."""
+        from backend.brokers.models import Balance
+        _armed_live(monkeypatch)
+        alerts = []
+        monkeypatch.setattr("bot.notifier.alert_emergency", alerts.append, raising=False)
+        paper.get_balance = lambda: Balance(0.0, 250.0, 800_000.0, equity_verified=False)
+
+        t = _breach_through_the_worker()
+
+        assert t.kill_switch is True
+        assert _orders(paper) == []
+        assert any("비상청산 보류" in a for a in alerts)
+
+    def test_a_hold_rearms_so_a_later_verified_reading_flattens(self, paper, monkeypatch):
+        from backend.brokers.models import Balance
+        _armed_live(monkeypatch)
+        w = _bare_worker()
+        paper.get_balance = lambda: Balance(0.0, 250.0, 800_000.0, equity_verified=False)
+        t = _breach_through_the_worker(w)
+        assert _orders(paper) == [] and t._mdd_flatten_requested is False
+
+        paper.get_balance = lambda: Balance(0.0, 0.0, 800_000.0)
+        t.record_pnl(0.0, PEAK * 0.80)               # next fill, reading now complete
+        _join(w)
+        assert sorted(o.symbol for o in _orders(paper)) == ["069500", "AAPL"]
+
+    def test_the_reading_that_caused_the_breach_is_checked_not_only_a_fresh_one(
+            self, paper, monkeypatch):
+        """Review finding: an unverified breach reading, then a failed fresh
+        call, must not fall through to a live liquidation."""
+        from backend.worker import runner
+        _armed_live(monkeypatch)
+        paper.get_balance = lambda: (_ for _ in ()).throw(RuntimeError("balance down"))
+        w = _bare_worker()
+        t = _Quiet(config=RiskConfig())
+        t._lock = threading.RLock()
+        t.peak_equity = PEAK
+        t.on_mdd_breach = w._on_mdd_breach
+        w._loss_tracker = t
+
+        runner._EQUITY_READING.verified = False      # what the fill path sets
+        try:
+            t.record_pnl(0.0, PEAK * 0.80)
+        finally:
+            runner._EQUITY_READING.verified = True
+        _join(w)
+
+        assert _orders(paper) == []
+
+    def test_the_fill_path_hands_the_readings_flag_to_the_tracker(self):
+        import inspect
+        from backend.worker import runner
+        src = inspect.getsource(runner.StrategyWorker)
+        assert "_EQUITY_READING.verified = equity_verified" in src
+
+    def test_a_failed_balance_check_does_not_hold_it(self, paper, monkeypatch):
+        """A failed call is not a verdict on the number — the flatten goes on."""
+        _armed_live(monkeypatch)
+        paper.get_balance = lambda: (_ for _ in ()).throw(RuntimeError("balance down"))
+        _breach_through_the_worker()
+        assert sorted(o.symbol for o in _orders(paper)) == ["069500", "AAPL"]
 
     def test_the_real_worker_wires_the_tracker_to_it(self):
         """``__init__`` opens Redis and a broker, so it is checked at the source:
