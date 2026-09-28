@@ -98,6 +98,10 @@ class WorkerWatchdog:
         self._interval = check_interval_sec
         self._was_dead = False
         self._stop = threading.Event()
+        #: Built on the first outage and reused (issue #176). Each call used to
+        #: create an engine and run ``create_all`` — never disposed, one per
+        #: outage, in every gunicorn worker.
+        self._db_factory = None
         self._thread: threading.Thread | None = None
 
     def start(self) -> None:
@@ -132,9 +136,12 @@ class WorkerWatchdog:
         try:
             import os
             from backend.database.models import init_db_factory, lock_risk_row, trading_day
-            db_url = os.environ.get("DB_URL", "postgresql://quantdinger:quantdinger@postgres:5432/quantdinger")
-            factory = init_db_factory(db_url)
-            sess = factory()
+            if self._db_factory is None:
+                # Cached only once it succeeds: a DB that is down at this outage
+                # is retried at the next one.
+                db_url = os.environ.get("DB_URL", "postgresql://quantdinger:quantdinger@postgres:5432/quantdinger")
+                self._db_factory = init_db_factory(db_url)
+            sess = self._db_factory()
             try:
                 # Locked (#164): kis-api runs one watchdog per gunicorn worker,
                 # and the worker's tracker writes the same row. Without the lock
