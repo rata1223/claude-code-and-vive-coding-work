@@ -207,16 +207,16 @@ def _trigger_us_session():
 
 def _periodic_reconcile():
     """30분 주기 포지션·주문 조정 — 장중 브로커 desync 감지."""
-    db_url = os.environ.get("DB_URL", "postgresql://quantdinger:quantdinger@postgres:5432/quantdinger")
     try:
         from backend.execution.reconciler import PositionReconciler
         from backend.brokers.kis import get_kis_broker
-        from backend.database.models import init_db_factory
         import redis as _redis
         r = _redis.from_url(os.environ.get("REDIS_URL", "redis://redis:6379"))
         result = PositionReconciler(
             broker=get_kis_broker(),
-            db_factory=init_db_factory(db_url),
+            # The module's one factory — init_db_factory() here built a new
+            # engine (and ran create_all) every 30 minutes and never disposed it.
+            db_factory=_get_db_factory(),
             redis_client=r,
         ).reconcile("periodic")
         logger.info("주기 조정 완료: 갭=%d 수정=%d", len(result.gaps), len(result.repairs))
