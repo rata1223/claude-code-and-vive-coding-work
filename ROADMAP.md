@@ -92,6 +92,9 @@ Any single incomplete P0 item is sufficient to block the paper→real transition
 >   (issue #178); misread, it would liquidate the book. Arm it after paper
 >   trading shows no `[DRY RUN] 비상청산` without a real drawdown. A failed live
 >   flatten that sent no order alerts the operator and retries on the next fill.
+>   Even armed, a reading flagged `Balance.equity_verified=False` (a summary
+>   field missing, USD cash held, a router leg failed) holds the flatten and
+>   alerts — `StrategyWorker._equity_verified_for_flatten`.
 > * Tests: `backend/worker/tests/test_mdd_flatten.py` — including the paper-mode
 >   criterion below (sell orders for held symbols only, nothing else).
 >
