@@ -52,12 +52,34 @@ async def lifespan(app: FastAPI):
     joined on the way out. Every recovery step is best-effort and can never
     crash startup.
     """
+    # P0-11: a missing or malformed credential key fails startup here, instead of
+    # the first credential request failing with a 500 after the app came up.
+    from api import crypto
+    crypto.validate_key()
+
     logger.info("Creating database tables…")
+    tables_ready = False
     try:
         create_tables()
+        tables_ready = True
         logger.info("Database tables ready.")
     except Exception as e:
         logger.error("Failed to create tables: %s", e)
+
+    # A valid key that does not open the stored credentials is logged, not
+    # fatal: re-entering credentials through this API is how it gets fixed.
+    # Only once the database answered, and off the startup path: a second
+    # blocking connect to a database that just failed would delay /health.
+    if tables_ready:
+        def _check_stored_credentials() -> None:
+            try:
+                from api.database import SessionLocal
+                crypto.validate_key(SessionLocal)
+            except Exception as e:  # noqa: BLE001 - diagnostic only
+                logger.warning("자격증명 키 일치 검사 실패: %s", e)
+
+        threading.Thread(target=_check_stored_credentials, daemon=True,
+                         name="credential-key-check").start()
 
     # Reconcile Quick Trade orders left RESERVED by an indeterminate broker
     # submit before a crash/restart. The future and its own stop signal are kept

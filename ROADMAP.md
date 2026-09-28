@@ -297,7 +297,26 @@ Any single incomplete P0 item is sufficient to block the paper→real transition
 
 ---
 
-#### P0-11 — Enforce `KIS_CREDENTIAL_KEY` non-empty at startup
+#### P0-11 — Enforce `KIS_CREDENTIAL_KEY` non-empty at startup — ✅ DONE
+
+> **The item as written was stale.** `docker-compose.yml` already refuses to
+> start the `api` service without the key (`${KIS_CREDENTIAL_KEY:?…}`), and the
+> worker never decrypts stored credentials (only `api/routers/` import
+> `api/crypto.py`), so a worker-side check would add a failure mode for nothing.
+>
+> **What was actually open, and is now closed** (`api/crypto.py`, `api/main.py`):
+> * A **malformed** key used to surface only on the first credential request,
+>   as a 500. `crypto.validate_key()` now runs first in the API lifespan and
+>   fails startup.
+> * A **valid key that does not match** the stored data (rotated, mistyped) was
+>   silent — `decrypt` swallowed the error and callers sent an empty app key to
+>   the broker. Once the database answers, a background check test-decrypts up
+>   to 20 stored credentials (off the startup path) and logs
+>   `N/M` mismatches CRITICAL (counts only), and `decrypt` warns once per
+>   process on `InvalidToken`. A mismatch does **not** refuse startup:
+>   re-entering credentials through this API is the fix.
+> * Tests: `tests/integration/test_credential_key.py` (the lifespan case needs
+>   FastAPI and runs locally only — #127).
 
 | Field | Value |
 |---|---|
