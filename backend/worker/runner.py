@@ -307,9 +307,10 @@ class StrategyWorker:
         # Last successfully fetched live equity — used as the kill-switch fallback
         # when the broker balance API is temporarily unavailable (prevents MDD = 0%
         # masking). Seeded below from a real startup balance fetch.
-        self._last_known_equity: float | None = None
-        #: ``equity_verified`` of that reading — it travels with the number (#178).
-        self._last_known_equity_verified: bool = True
+        #: ``(amount, equity_verified)`` of that reading, as **one** value: fills
+        #: run on several threads, and two attributes could pair a new amount
+        #: with the previous reading's flag (#178). A tuple is swapped whole.
+        self._last_equity_reading: tuple[float | None, bool] = (None, True)
         try:
             from backend.quant.risk.engine import PersistentLossTracker, RiskConfig
             self._loss_tracker = PersistentLossTracker(
@@ -330,8 +331,7 @@ class StrategyWorker:
                 _bal = get_kis_broker().get_balance()
                 _eq = _bal.total_eval_krw
                 if _eq > 0:
-                    self._last_known_equity = _eq
-                    self._last_known_equity_verified = getattr(_bal, "equity_verified", True)
+                    self._last_equity_reading = (_eq, getattr(_bal, "equity_verified", True))
                     if self._loss_tracker.peak_equity == 0:
                         self._loss_tracker.peak_equity = _eq
                         self._loss_tracker._persist()
@@ -653,6 +653,16 @@ class StrategyWorker:
         # here would halt trading on every deploy; letting the 90s TTL lapse is
         # what gives a restart room to come back unnoticed.
 
+    @property
+    def _last_known_equity(self) -> float | None:
+        """The last good equity amount — the half of ``_last_equity_reading``
+        most callers want."""
+        return getattr(self, "_last_equity_reading", (None, True))[0]
+
+    @_last_known_equity.setter
+    def _last_known_equity(self, value: float | None) -> None:
+        self._last_equity_reading = (value, True)
+
     def _on_mdd_breach(self, reason: str) -> None:
         """The loss tracker measured an MDD breach: liquidate (P0-03).
 
@@ -730,8 +740,9 @@ class StrategyWorker:
 
         Both readings must pass: the one that **caused** the breach
         (``breach_verified`` — possibly the cached last-known value), and a
-        fresh one now. A fresh call that *fails* is not a verdict on the number,
-        so it defers to the breach reading.
+        fresh one now. A fresh call that *fails* counts as unverified: selling
+        is the one thing this gate exists to refuse without both readings. The
+        hold re-arms, so the next fill tries again.
         """
         verified = breach_verified
         if verified:
@@ -739,7 +750,8 @@ class StrategyWorker:
                 bal = get_kis_broker().get_balance()
                 verified = getattr(bal, "equity_verified", True)
             except Exception as e:  # noqa: BLE001 - see docstring
-                logger.warning("비상청산 전 잔고 확인 실패 — 위반 시점 판독으로 판단: %s", e)
+                logger.warning("비상청산 전 잔고 확인 실패 — 청산 보류: %s", e)
+                verified = False
         if verified:
             return True
         msg = ("MDD 비상청산 보류 — 총자산 판독이 불완전하다(#178). 매매 정지는 유지된다. "
@@ -1101,12 +1113,10 @@ class StrategyWorker:
                         _bal = get_kis_broker().get_balance()
                         current_equity = _bal.total_eval_krw
                         equity_verified = getattr(_bal, "equity_verified", True)
-                        self._last_known_equity = current_equity
-                        self._last_known_equity_verified = equity_verified
+                        self._last_equity_reading = (current_equity, equity_verified)
                     except Exception as _be:
-                        current_equity = self._last_known_equity
-                        # The cached reading, with its own completeness.
-                        equity_verified = getattr(self, "_last_known_equity_verified", True)
+                        # The cached reading, amount and completeness together.
+                        current_equity, equity_verified = self._last_equity_reading
                         if current_equity is None:
                             logger.warning("잔고 조회 실패, 기준 잔고 없음 — MDD 평가 스킵: %s", _be)
                             _audit("balance_fetch_failed", symbol=fill.symbol,

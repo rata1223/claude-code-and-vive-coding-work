@@ -410,12 +410,33 @@ class TestTheWorkerLiquidates:
         src = inspect.getsource(runner.StrategyWorker)
         assert "_EQUITY_READING.verified = equity_verified" in src
 
-    def test_a_failed_balance_check_does_not_hold_it(self, paper, monkeypatch):
-        """A failed call is not a verdict on the number — the flatten goes on."""
+    def test_a_failed_balance_check_holds_it_and_rearms(self, paper, monkeypatch):
+        """PR #181 review: selling needs **both** readings verified, and a fresh
+        call that failed verified nothing. Held, re-armed, and the next fill
+        with a good reading liquidates."""
+        from backend.brokers.models import Balance
         _armed_live(monkeypatch)
+        w = _bare_worker()
         paper.get_balance = lambda: (_ for _ in ()).throw(RuntimeError("balance down"))
-        _breach_through_the_worker()
+        t = _breach_through_the_worker(w)
+        assert _orders(paper) == [] and t._mdd_flatten_requested is False
+
+        paper.get_balance = lambda: Balance(0.0, 0.0, 800_000.0)
+        t.record_pnl(0.0, PEAK * 0.80)
+        _join(w)
         assert sorted(o.symbol for o in _orders(paper)) == ["069500", "AAPL"]
+
+    def test_the_cached_reading_keeps_its_amount_and_flag_together(self):
+        """PR #181 review: one value, so a failed lookup can never pair a new
+        amount with an older reading's flag."""
+        import inspect
+        from backend.worker import runner
+        src = inspect.getsource(runner.StrategyWorker)
+        assert "current_equity, equity_verified = self._last_equity_reading" in src
+        assert "_last_known_equity_verified" not in src
+        w = _bare_worker()
+        w._last_equity_reading = (123.0, False)
+        assert w._last_known_equity == 123.0
 
     def test_the_real_worker_wires_the_tracker_to_it(self):
         """``__init__`` opens Redis and a broker, so it is checked at the source:
