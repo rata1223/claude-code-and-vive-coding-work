@@ -5,7 +5,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
 
-from api.crypto import decrypt
+from api.crypto import kis_credential_fields
 from api.database import get_db
 from api.deps import get_current_user
 from api.models import Credential, Strategy, Trade, User
@@ -32,16 +32,13 @@ def _build_kis_client_from_cred(cred: Credential):
     Credentials are injected explicitly into the client instance (P0-03); the
     process-wide ``os.environ`` is never mutated, so concurrent requests from
     different users cannot leak or overwrite each other's credentials.
+
+    Raises ``CredentialUnreadable`` before any client exists when a stored
+    field does not open under the current key (#182).
     """
     from kis_adapter import KISClient, KISCredentials, KISPortfolio
 
-    creds = KISCredentials(
-        app_key=decrypt(cred.app_key_enc) or "",
-        app_secret=decrypt(cred.app_secret_enc) or "",
-        account_no=decrypt(cred.account_no_enc) or "",
-        hts_id=decrypt(cred.hts_id_enc) or "",
-        env=cred.env,
-    )
+    creds = KISCredentials(**kis_credential_fields(cred), env=cred.env)
     client = KISClient(creds)
     portfolio = KISPortfolio(client)
     return client, portfolio
@@ -162,8 +159,7 @@ def get_pending_orders(
         from kis_adapter import KISMarketData
 
         md = KISMarketData(_client)
-        account_no = decrypt(cred.account_no_enc) or ""
-        pending = md.get_pending_us(account_no)
+        pending = md.get_pending_us(_client.auth.account_no)
         return Resp.ok({"items": pending})
     except Exception as e:
         logger.warning("Pending orders fetch failed: %s", e)

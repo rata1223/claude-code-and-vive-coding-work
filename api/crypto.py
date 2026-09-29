@@ -48,29 +48,82 @@ def encrypt(plaintext: Optional[str]) -> Optional[str]:
     return get_fernet().encrypt(plaintext.encode()).decode()
 
 
+def _report_mismatch() -> None:
+    global _mismatch_reported
+    if not _mismatch_reported:
+        _mismatch_reported = True
+        logger.warning(
+            "저장된 자격증명이 현재 %s로 복호화되지 않는다 — 키가 바뀌었거나 틀렸다. "
+            "자격증명을 다시 입력하거나 이전 키를 복원할 것", _KEY_ENV)
+
+
 def decrypt(ciphertext: Optional[str]) -> Optional[str]:
     """Plaintext, or None when there is nothing to decrypt or it cannot be.
 
     A value that does not open under the current key usually means the key was
-    rotated or mistyped, and every caller then passes an empty credential to
-    the broker — an authentication failure with no visible cause. The return
-    stays None (callers are unchanged); the first such failure in the process
-    is logged so the cause is visible (P0-11).
+    rotated or mistyped. The return stays None here; the first such failure in
+    the process is logged so the cause is visible (P0-11). Anything that hands
+    the value to a broker uses :func:`decrypt_required` instead (#182).
     """
-    global _mismatch_reported
     if not ciphertext:
         return None
     try:
         return get_fernet().decrypt(ciphertext.encode()).decode()
     except InvalidToken:
-        if not _mismatch_reported:
-            _mismatch_reported = True
-            logger.warning(
-                "저장된 자격증명이 현재 %s로 복호화되지 않는다 — 키가 바뀌었거나 틀렸다. "
-                "자격증명을 다시 입력하거나 이전 키를 복원할 것", _KEY_ENV)
+        _report_mismatch()
         return None
     except Exception:
         return None
+
+
+class CredentialUnreadable(Exception):
+    """A stored credential field does not open under the current key.
+
+    The message names the field only — never the value or the ciphertext — so
+    it is safe to return to the caller and to log.
+    """
+
+    def __init__(self, field: str):
+        self.field = field
+        super().__init__(
+            f"저장된 KIS 자격증명({field})이 현재 {_KEY_ENV}로 복호화되지 않습니다 — "
+            "자격증명을 다시 입력하세요")
+
+
+def decrypt_required(ciphertext: Optional[str], field: str) -> Optional[str]:
+    """Like :func:`decrypt`, but a stored value that does not open **raises**.
+
+    ``decrypt(...) or ""`` turned an unreadable app key into an empty one, and
+    the broker was then called with it (#182). An absent value is still None —
+    optional fields stay optional; only "stored but unreadable" fails closed.
+    """
+    if not ciphertext:
+        return None
+    try:
+        return get_fernet().decrypt(ciphertext.encode()).decode()
+    except InvalidToken:
+        _report_mismatch()
+        raise CredentialUnreadable(field) from None
+
+
+#: Credential column → ``KISCredentials`` field, for every value a KIS client needs.
+_KIS_FIELDS = (
+    ("app_key_enc", "app_key"),
+    ("app_secret_enc", "app_secret"),
+    ("account_no_enc", "account_no"),
+    ("hts_id_enc", "hts_id"),
+)
+
+
+def kis_credential_fields(cred) -> dict:
+    """The decrypted KIS fields of ``cred``, ready for ``KISCredentials(**…)``.
+
+    A field that is not stored comes back as ``""`` (as before); a field that is
+    stored but does not open raises :class:`CredentialUnreadable`, so no broker
+    call is ever made with a blanked credential. Needs no network.
+    """
+    return {name: decrypt_required(getattr(cred, column, None), name) or ""
+            for column, name in _KIS_FIELDS}
 
 
 def validate_key(session_factory=None) -> int:
