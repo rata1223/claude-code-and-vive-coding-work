@@ -5,7 +5,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
 
-from api.crypto import kis_credential_fields
+from api.crypto import CredentialUnreadable, kis_credential_fields
 from api.database import get_db
 from api.deps import get_current_user
 from api.models import Credential, Strategy, Trade, User
@@ -161,6 +161,9 @@ def get_pending_orders(
         md = KISMarketData(_client)
         pending = md.get_pending_us(_client.auth.account_no)
         return Resp.ok({"items": pending})
+    except CredentialUnreadable as e:
+        # Not "no pending orders": the broker was never asked (#182).
+        return Resp.err(str(e))
     except Exception as e:
         logger.warning("Pending orders fetch failed: %s", e)
         return Resp.ok({"items": []})

@@ -152,6 +152,16 @@ class TestReadPaths:
         with pytest.raises(crypto.CredentialUnreadable):
             dashboard._build_kis_client_from_cred(cred)
 
+    def test_pending_orders_say_the_credential_is_unreadable_not_none_pending(
+            self, db, user, no_client):
+        """PR #184 review: an empty list read as "nothing pending"."""
+        _stale_secret(db)
+
+        resp = dashboard.get_pending_orders(1, user, db)
+
+        assert resp.code == -1
+        assert "app_secret" in resp.msg
+
     def test_pending_orders_use_the_account_number_the_client_was_built_with(
             self, db, user, monkeypatch):
         import kis_adapter
