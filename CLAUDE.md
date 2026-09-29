@@ -52,7 +52,7 @@
 | DB 엔진 누수 | #180 | **#176 수정** — 워치독(장애마다)과 주기 조정(30분마다)이 `init_db_factory`로 엔진+`create_all`을 매번 새로 만들고 dispose하지 않았다. 워치독은 인스턴스 캐시(성공 시만), 주기 조정은 모듈 팩토리 재사용 |
 | 총자산 신뢰도 | #181 | **#178 부분** — `Balance.equity_verified`(필드 누락·USD 현금 보유·라우터 한쪽 실패 시 False) + 누락 필드 **이름** 진단 로그. 자동 MDD 청산은 위반 판독과 청산 직전 새 판독이 **모두** 검증돼야 매도, 아니면 보류·경보·재무장. 숫자 자체는 그대로(USD 현금 가산은 이중 계산 위험) |
 | 자격증명 키 | #183 | **P0-11** — 키가 없거나 형식이 틀리면 API 기동 실패(lifespan 맨 앞 `crypto.validate_key()`). DB 응답 후 백그라운드에서 저장 자격증명 최대 20건의 암호화 필드 5개를 시험 복호화해 불일치를 `N/M` CRITICAL로(건수만, 기동은 막지 않음 — 재입력이 복구 경로) |
-| 자격증명 fail-closed | (이 PR) | **#182** — 저장돼 있는데 현재 키로 **풀리지 않는** 필드는 `CredentialUnreadable`(`decrypt_required`/`kis_credential_fields`). 빈 값으로 KIS를 부르지 않고 "자격증명을 다시 입력하세요"를 돌려준다. `place_order`는 **예약 전에** 판정한다(예전엔 `broker_submit` 안에서 실패해 **보내지도 않은 주문이 RESERVED로 남았다**). NULL(선택 필드)은 기존처럼 허용 |
+| 자격증명 fail-closed | #184 | **#182** — 저장돼 있는데 현재 키로 **풀리지 않는** 필드는 `CredentialUnreadable`(`decrypt_required`/`kis_credential_fields`). 빈 값으로 KIS를 부르지 않고 "자격증명을 다시 입력하세요"를 돌려준다. `place_order`는 **예약 전에** 판정한다(예전엔 `broker_submit` 안에서 실패해 **보내지도 않은 주문이 RESERVED로 남았다**). NULL(선택 필드)은 기존처럼 허용 |
 
 **열린 PR 0건.** 다음 작업은 `origin/main`에서 새로 분기하면 된다.
 
