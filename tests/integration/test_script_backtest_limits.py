@@ -151,6 +151,21 @@ def test_the_slot_comes_back_after_every_outcome(prices, one_slot, monkeypatch):
     assert _no_child_left()
 
 
+def test_a_price_download_does_not_hold_a_slot(prices, one_slot, monkeypatch):
+    """Code review: the cap bounds children's memory; a slow download in the
+    parent runs no child, so it must not turn other users away."""
+    seen = []
+
+    def fetch(self):
+        seen.append(_free(one_slot))
+        return prices
+
+    monkeypatch.setattr(Backtester, "_fetch", fetch)
+    run_script_backtest(_IDLE, {}, "AAPL", initial_capital=1_000_000,
+                        period="1y", timeout_sec=30)
+    assert seen == [True]
+
+
 def test_a_third_concurrent_backtest_is_refused_while_two_run(prices, monkeypatch):
     monkeypatch.setattr(sb, "_SLOTS", threading.BoundedSemaphore(2))
     outcomes = []

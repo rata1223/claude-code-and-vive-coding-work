@@ -101,6 +101,11 @@ def run_script_backtest(code: str, params: dict | None, symbol: str, *,
     ``ScriptBacktestTimeout`` when the budget runs out (the child is killed)
     and ``ScriptBacktestError`` when the child ends without a result.
     """
+    if df is None:
+        # Before taking a slot: the cap bounds children's memory, and a slow
+        # price download (KR tries .KS then .KQ) runs no child at all.
+        from strategy.backtest import Backtester
+        df = Backtester(None, symbol, period=period)._fetch()
     if not _SLOTS.acquire(blocking=False):
         raise ScriptBacktestBusy(
             f"다른 백테스트가 실행 중입니다(동시 {MAX_CONCURRENT}개) — 잠시 후 다시 시도하세요")
@@ -117,10 +122,6 @@ def _run(code: str, params: dict | None, symbol: str, *, initial_capital: float,
          memory_mb: int | None) -> dict[str, Any]:
     timeout = DEFAULT_TIMEOUT_SEC if timeout_sec is None else timeout_sec
     memory = DEFAULT_MEMORY_MB if memory_mb is None else memory_mb
-    if df is None:
-        from strategy.backtest import Backtester
-        df = Backtester(None, symbol, period=period)._fetch()
-
     recv_conn, send_conn = _CTX.Pipe(duplex=False)
     proc = _CTX.Process(
         target=_child, name="script-backtest", daemon=True,
