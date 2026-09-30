@@ -1,6 +1,7 @@
 import logging
 from .auth import KISCredentials
 from .client import KISClient
+from .pagination import get_all_pages
 
 logger = logging.getLogger(__name__)
 
@@ -41,5 +42,6 @@ class KISMarketData:
             "CTX_AREA_FK200": "",
             "CTX_AREA_NK200": "",
         }
-        data = self._client.get(PENDING_US_PATH, tr_id, params)
+        data = get_all_pages(self._client, PENDING_US_PATH, tr_id, params,
+                             ctx="200", list_key="output")
         return data.get("output", [])

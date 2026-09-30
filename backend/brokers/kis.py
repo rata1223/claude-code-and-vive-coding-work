@@ -10,6 +10,7 @@ from .semantic_mapper import KIS_DOMESTIC_MAPPER, KIS_OVERSEAS_MAPPER
 from .validator import BrokerCapabilityValidator, OrderRequest
 from kis_adapter import KISClient, KISMarketData, KISOrders, KISPortfolio
 from kis_adapter.dates import inquiry_date_range
+from kis_adapter.pagination import get_all_pages
 from backend.execution.circuit_breaker import ConsecutiveFailureBreaker
 from backend.market.symbols import resolve_exchange, to_quote_excd
 from backend.quant.data.universe import KR_ETF
@@ -339,7 +340,8 @@ class KISBroker(BrokerAdapter):
                 "CTX_AREA_FK100": "",
                 "CTX_AREA_NK100": "",
             }
-            resp = self._client.get("/uapi/domestic-stock/v1/trading/inquire-order", tr_id, params)
+            resp = get_all_pages(self._client, "/uapi/domestic-stock/v1/trading/inquire-order",
+                                 tr_id, params, ctx="100", list_key="output1")
             output = resp.get("output1") or resp.get("output", [])
             if not output:
                 return None
@@ -391,7 +393,8 @@ class KISBroker(BrokerAdapter):
                 "CTX_AREA_FK200": "",
                 "CTX_AREA_NK200": "",
             }
-            resp = self._client.get("/uapi/overseas-stock/v1/trading/inquire-order", tr_id, params)
+            resp = get_all_pages(self._client, "/uapi/overseas-stock/v1/trading/inquire-order",
+                                 tr_id, params, ctx="200", list_key="output")
             output = resp.get("output") or []
             if not output:
                 return None
