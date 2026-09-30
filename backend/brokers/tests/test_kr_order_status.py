@@ -12,6 +12,9 @@ class _StubClient:
     def get(self, path, tr_id, params):
         return self._resp
 
+    def get_page(self, path, tr_id, params, tr_cont=""):
+        return self.get(path, tr_id, params), ""   # a single, last page
+
 
 def _broker(resp):
     b = KISBroker.__new__(KISBroker)
@@ -69,6 +72,9 @@ class _RecordingClient:
     def get(self, path, tr_id, params):
         self.params = params
         return self._resp
+
+    def get_page(self, path, tr_id, params, tr_cont=""):
+        return self.get(path, tr_id, params), ""   # a single, last page
 
 
 def _recording_broker(resp):

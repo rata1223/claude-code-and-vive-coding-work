@@ -110,7 +110,25 @@ class KISClient:
         return self.auth.base_url
 
     def get(self, path: str, tr_id: str, params: dict = None) -> dict:
+        return self._get(path, tr_id, params)[0]
+
+    def get_page(self, path: str, tr_id: str, params: dict = None,
+                 tr_cont: str = "") -> tuple[dict, str]:
+        """One page of a paginated inquiry: ``(body, response tr_cont)``.
+
+        KIS pages long inquiries. The request header ``tr_cont`` is empty for
+        the first page and ``"N"`` for each next one (with the ``CTX_AREA_*``
+        keys from the previous body); the response header says whether more
+        pages follow (``"F"``/``"M"``) or not (``"D"``/``"E"``). Follow the
+        pages with ``kis_adapter.pagination.get_all_pages``.
+        """
+        data, resp = self._get(path, tr_id, params, tr_cont=tr_cont)
+        return data, (resp.headers.get("tr_cont") or "").strip()
+
+    def _get(self, path: str, tr_id: str, params: dict = None, *, tr_cont: str = ""):
         headers = self.auth.get_headers(tr_id)
+        if tr_cont:
+            headers["tr_cont"] = tr_cont
         url = f"{self.base_url}{path}"
 
         # An ``rt_cd`` rejection is normally the broker's answer, not a failed
@@ -173,7 +191,7 @@ class KISClient:
                     time.sleep(1)
                     continue
                 raise RuntimeError(f"KIS API error: {msg}")
-            return data
+            return data, resp
 
     def post(self, path: str, tr_id: str, body: dict, *, idempotent: bool = False) -> dict:
         # **A new order is sent once and never re-sent.** A failure here does

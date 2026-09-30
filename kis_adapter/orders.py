@@ -1,6 +1,7 @@
 import logging
 from .auth import KISCredentials
 from .client import KISClient
+from .pagination import get_all_pages
 from .dates import inquiry_date_range
 
 logger = logging.getLogger(__name__)
@@ -117,7 +118,8 @@ class KISOrders:
                 "CTX_AREA_FK100": "",
                 "CTX_AREA_NK100": "",
             }
-            data = self._client.get(INQUIRE_KR_PATH, self._tr("inquire_kr"), params)
+            data = get_all_pages(self._client, INQUIRE_KR_PATH, self._tr("inquire_kr"), params,
+                                 ctx="100", list_key=("output1", "output"))
             return data.get("output1") or data.get("output", []) or []
 
         params = {
@@ -134,7 +136,8 @@ class KISOrders:
             "CTX_AREA_FK200": "",
             "CTX_AREA_NK200": "",
         }
-        data = self._client.get(INQUIRE_US_PATH, self._tr("inquire_us"), params)
+        data = get_all_pages(self._client, INQUIRE_US_PATH, self._tr("inquire_us"), params,
+                             ctx="200", list_key="output")
         return data.get("output") or []
 
     def cancel_kr(self, org_order_no: str, symbol: str, qty: int, price: float) -> dict:

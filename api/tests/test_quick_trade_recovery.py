@@ -298,6 +298,9 @@ class _RecordingClient:
         self.calls.append((path, tr_id, params))
         return self.response
 
+    def get_page(self, path, tr_id, params, tr_cont=""):
+        return self.get(path, tr_id, params), ""   # a single, last page
+
 
 def _make_kis_orders(env, client):
     from kis_adapter import KISOrders
@@ -315,6 +318,9 @@ class _FakeClientWrap:
 
     def get(self, path, tr_id, params):
         return self._rec.get(path, tr_id, params)
+
+    def get_page(self, path, tr_id, params, tr_cont=""):
+        return self._rec.get_page(path, tr_id, params, tr_cont)
 
 
 def test_inquire_orders_us_tr_and_parsing_paper():
