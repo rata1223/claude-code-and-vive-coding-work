@@ -55,7 +55,7 @@
 | 자격증명 fail-closed | #184 | **#182** — 저장돼 있는데 현재 키로 **풀리지 않는** 필드는 `CredentialUnreadable`(`decrypt_required`/`kis_credential_fields`). 빈 값으로 KIS를 부르지 않고 "자격증명을 다시 입력하세요"를 돌려준다. `place_order`는 **예약 전에** 판정한다(예전엔 `broker_submit` 안에서 실패해 **보내지도 않은 주문이 RESERVED로 남았다**). NULL(선택 필드)은 기존처럼 허용 |
 | 테스트 안정성 | #186 | **#185**(①) + #184 후속(②) — 간헐 실패 두 건을 원인 확정 후 테스트에서만 수정(skip 없음). ① 킬스위치 해제 테스트: `kill-switch-alert` 스레드의 감사 쓰기가 SQLite `StaticPool` 단일 연결에서 해제 API의 읽기와 섞여 halt가 안 보였다(프로브 9/200 → 스텁 시 0/200, 운영은 세션마다 연결이라 무관). ② #184의 재생 테스트: 서버 유도 키에 10초 버킷이 있어 경계를 넘으면 재생이 아니었다 → 명시 키 |
 | 스크립트 샌드박스 | #187 | RestrictedPython 8.0→8.4(Dependabot high 2건). 레거시 `strategy/script_strategy.py`는 RestrictedPython을 쓰지 않고 사용자 코드를 그대로 실행하고 있었다 — `/api/strategies/backtest` 경로. 이제 `compile_restricted` + 가드 훅, `math`/`statistics`는 허용 함수만 담은 네임스페이스, `pandas`·`type` 제거. 부수 효과로 깨져 있던 템플릿 2개가 다시 동작 |
-| API 의존성 | (이 PR) | `pip-audit` 지적 전부 해소. fastapi 0.111→0.142.1 + starlette 0.37.2→1.7.0(권고 다수) + pydantic 2.7→2.13. `python-jose`→`PyJWT`(HS256만 사용 — ecdsa·rsa·pyasn1 제거). 라우트 목록 테스트는 `app.openapi()` 기준(새 FastAPI는 `app.routes`에 포함 라우터를 평탄화하지 않는다) |
+| API 의존성 | #190 | `pip-audit` 지적 전부 해소. fastapi 0.111→0.142.1 + starlette 0.37.2→1.7.0(권고 다수) + pydantic 2.7→2.13. `python-jose`→`PyJWT`(HS256만 사용 — ecdsa·rsa·pyasn1 제거). 라우트 목록 테스트는 `app.openapi()` 기준(새 FastAPI는 `app.routes`에 포함 라우터를 평탄화하지 않는다) |
 
 **열린 PR 0건.** 다음 작업은 `origin/main`에서 새로 분기하면 된다.
 
