@@ -9,17 +9,21 @@ import os
 
 import pytest
 
+from api.crypto import encrypt
 from api.routers import dashboard, quick_trade
 
 _KIS_ENV_VARS = ("KIS_APP_KEY", "KIS_APP_SECRET", "KIS_ACCOUNT_NO", "KIS_HTS_ID", "KIS_ENV")
 
 
 class _FakeCred:
-    app_key_enc = "AK"
-    app_secret_enc = "AS"
-    account_no_enc = "1234567890"
-    hts_id_enc = "HTS"
-    env = "paper"
+    # Real ciphertext under the test key: the injectors decrypt through
+    # api.crypto.kis_credential_fields, which fails closed on anything else (#182).
+    def __init__(self):
+        self.app_key_enc = encrypt("AK")
+        self.app_secret_enc = encrypt("AS")
+        self.account_no_enc = encrypt("1234567890")
+        self.hts_id_enc = encrypt("HTS")
+        self.env = "paper"
 
 
 @pytest.fixture(autouse=True)
@@ -32,7 +36,6 @@ def _no_redis(monkeypatch):
 def test_load_kis_does_not_mutate_environ(monkeypatch):
     for k in _KIS_ENV_VARS:
         monkeypatch.delenv(k, raising=False)
-    monkeypatch.setattr(quick_trade, "decrypt", lambda v: v)
     before = dict(os.environ)
 
     client, orders, portfolio = quick_trade._load_kis(_FakeCred())
@@ -49,7 +52,6 @@ def test_load_kis_does_not_mutate_environ(monkeypatch):
 def test_dashboard_build_client_does_not_mutate_environ(monkeypatch):
     for k in _KIS_ENV_VARS:
         monkeypatch.delenv(k, raising=False)
-    monkeypatch.setattr(dashboard, "decrypt", lambda v: v)
     before = dict(os.environ)
 
     client, portfolio = dashboard._build_kis_client_from_cred(_FakeCred())

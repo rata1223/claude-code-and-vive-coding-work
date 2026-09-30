@@ -6,7 +6,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, Header, Query
 from sqlalchemy.orm import Session
 
-from api.crypto import decrypt
+from api.crypto import CredentialUnreadable, kis_credential_fields
 from api.database import get_db
 from api.deps import get_current_user
 from api.models import (
@@ -92,16 +92,13 @@ def _load_kis(cred: Credential):
     Credentials are injected explicitly into the client instance (P0-03); the
     process-wide ``os.environ`` is never mutated, so concurrent requests from
     different users cannot leak or overwrite each other's credentials.
+
+    Raises ``CredentialUnreadable`` before any client exists when a stored
+    field does not open under the current key (#182).
     """
     from kis_adapter import KISClient, KISCredentials, KISOrders, KISPortfolio
 
-    creds = KISCredentials(
-        app_key=decrypt(cred.app_key_enc) or "",
-        app_secret=decrypt(cred.app_secret_enc) or "",
-        account_no=decrypt(cred.account_no_enc) or "",
-        hts_id=decrypt(cred.hts_id_enc) or "",
-        env=cred.env,
-    )
+    creds = KISCredentials(**kis_credential_fields(cred), env=cred.env)
     client = KISClient(creds)
     orders = KISOrders(client)
     portfolio = KISPortfolio(client)
@@ -487,6 +484,9 @@ def get_position(
             if sym_key.upper() == symbol.upper():
                 return Resp.ok({"symbol": symbol, "position": pos})
         return Resp.ok({"symbol": symbol, "position": None})
+    except CredentialUnreadable as e:
+        # Not "no position": nothing was asked of the broker at all (#182).
+        return Resp.err(str(e))
     except Exception as e:
         logger.warning("position fetch failed: %s", e)
         return Resp.ok({"symbol": symbol, "position": None})
@@ -548,11 +548,24 @@ def place_order(
         key = idempotency_key or derive_idempotency_key(**fp_args)
         req_hash = request_fingerprint(**fp_args)
 
+        # #182: a stored credential that does not open is known *now*, with no
+        # network. Found inside broker_submit it would surface after the
+        # reservation commits, as a non-RuntimeError — which the service reads
+        # as an indeterminate submit and leaves RESERVED, for a recovery sweep
+        # that cannot open the credential either. Nothing was ever sent, so
+        # reject before reserving. A replay of an existing reservation never
+        # reaches the broker and still reports that order's state.
+        if not _existing_order(db, current_user.id, key):
+            try:
+                kis_credential_fields(cred)
+            except CredentialUnreadable as e:
+                return Resp.err(str(e))
+
         # Built at most once per request and shared with broker_submit below —
         # each _load_kis call decrypts four credential fields and constructs
-        # three clients. Lazy so a buy still builds them inside broker_submit,
-        # exactly as before: constructing them earlier would move a credential
-        # failure from "order failed" to "rejected before reservation".
+        # three clients. Lazy so a buy still builds the clients inside
+        # broker_submit, exactly as before; only an unreadable credential (just
+        # above) is rejected before reservation.
         _clients = []
 
         def _kis():

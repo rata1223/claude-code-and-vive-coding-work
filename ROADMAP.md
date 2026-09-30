@@ -319,6 +319,14 @@ Any single incomplete P0 item is sufficient to block the paper→real transition
 >   re-entering credentials through this API is the fix.
 > * Tests: `tests/integration/test_credential_key.py` (the lifespan case needs
 >   FastAPI and runs locally only — #127).
+>
+> **Follow-up (#182):** the broker paths no longer take `decrypt(...) or ""`.
+> A stored field that does not open raises `CredentialUnreadable`
+> (`api/crypto.py` `decrypt_required` / `kis_credential_fields`) before any KIS
+> client is built, and QuickTrade `place_order` checks it **before reserving** —
+> found inside `broker_submit` it left a never-sent order RESERVED. An absent
+> (NULL) field is still allowed. Tests: `tests/integration/test_credential_unreadable.py`,
+> `api/tests/test_quick_trade_credential_unreadable.py`.
 
 | Field | Value |
 |---|---|
