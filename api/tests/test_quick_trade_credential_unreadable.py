@@ -101,15 +101,20 @@ class TestPlaceOrder:
     def test_a_replay_of_an_existing_reservation_still_reports_it(
             self, db, user, monkeypatch):
         """The replay never reaches the broker, so the check must not hide the
-        state of an order that was already sent."""
+        state of an order that was already sent.
+
+        An explicit key, as a real retry sends: the server-derived key includes
+        a 10-second time bucket, so two calls straddling a boundary were not a
+        replay at all and the test failed intermittently (#185).
+        """
         orders = _Orders()
         monkeypatch.setattr(quick_trade, "_load_kis",
                             lambda cred: (object(), orders, FakePortfolio()))
-        first = quick_trade.place_order(_buy(), None, user, db, _allow())
+        first = quick_trade.place_order(_buy(), "retry-1", user, db, _allow())
         assert first.code == 1, first.msg
 
         _stale_secret(db)
-        again = quick_trade.place_order(_buy(), None, user, db, _allow())
+        again = quick_trade.place_order(_buy(), "retry-1", user, db, _allow())
 
         assert again.code == 1, again.msg
         assert again.data["status"] == QT_SUBMITTED

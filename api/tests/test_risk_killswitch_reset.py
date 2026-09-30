@@ -75,6 +75,24 @@ def _authorized(monkeypatch):
     monkeypatch.setenv("KILL_SWITCH_ADMINS", "a@example.com")
 
 
+@pytest.fixture(autouse=True)
+def _no_alert_thread(monkeypatch):
+    """A tracker that halts dispatches Telegram/WebSocket/audit I/O onto a
+    ``kill-switch-alert`` daemon thread. On SQLite's single StaticPool
+    connection its audit write interleaves with the reset's read of the halted
+    rows, which then comes back empty — a few percent of runs in isolation, far more under load
+    (#185). Production sessions each get their own pooled connection.
+
+    Stubbed as in ``backend/worker/tests/test_kill_switch_convergence.py``.
+    Nothing asserted here comes from that thread: the halt row is written by
+    ``_write_db`` on the caller's thread, and the audit rows checked below are
+    the reset endpoint's own ``kill_switch_reset`` entries.
+    """
+    from backend.quant.risk.engine import PersistentLossTracker
+    monkeypatch.setattr(PersistentLossTracker, "_do_kill_switch_io",
+                        lambda self, reason: None)
+
+
 def _risk_row(db, *, kill_switch: bool, reason: str | None = None, day=None):
     """Seed a risk row. Defaults to the current trading day.
 
