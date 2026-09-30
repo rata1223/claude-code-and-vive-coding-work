@@ -121,6 +121,7 @@ class RecoveryOutcome(Enum):
     NOT_FOUND = "not_found"    # broker has no record → safe to re-submit
     IN_FLIGHT = "in_flight"    # order still open → re-register with poller
     COMPLETED = "completed"    # order terminal → skip re-submission
+    UNKNOWN = "unknown"        # broker lookup failed → do NOT re-submit; retry later
 
 
 @dataclass(frozen=True)
@@ -371,6 +372,7 @@ class RecoveryVerifier:
             NOT_FOUND  — broker has no record; safe to re-submit
             IN_FLIGHT  — order still open; re-register with poller
             COMPLETED  — order reached terminal state; skip re-submission
+            UNKNOWN    — the broker could not be asked; never re-submit on this
         """
         # 1. Fast path: idempotency store
         record = self._detector._store.get(key.fingerprint)
@@ -382,11 +384,13 @@ class RecoveryVerifier:
             )
 
         # 2. Broker ground truth
-        broker_order: Optional[Order] = None
         try:
-            broker_order = self._broker.get_order_status(order_id, key.symbol)
+            broker_order: Optional[Order] = self._broker.get_order_status(order_id, key.symbol)
         except Exception as e:
+            # A failed lookup is not "no record": NOT_FOUND licenses a re-submit,
+            # and an order that did reach the broker would then be placed twice.
             logger.warning("RecoveryVerifier: 브로커 조회 실패 %s: %s", order_id, e)
+            return VerificationResult(outcome=RecoveryOutcome.UNKNOWN, order_id=order_id)
 
         if broker_order is None:
             return VerificationResult(outcome=RecoveryOutcome.NOT_FOUND)

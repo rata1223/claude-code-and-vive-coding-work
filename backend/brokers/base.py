@@ -23,7 +23,14 @@ class BrokerAdapter(ABC):
     def cancel_order(self, order_id: str, symbol: str = "", qty: int = 0, price: float = 0.0) -> bool: ...
 
     @abstractmethod
-    def get_order_status(self, order_id: str, symbol: str = "") -> Optional[Order]: ...
+    def get_order_status(self, order_id: str, symbol: str = "") -> Optional[Order]:
+        """The order as the broker reports it.
+
+        ``None`` means the lookup succeeded and the broker has no such order.
+        A lookup that could not be completed must **raise** — callers act on
+        ``None`` (the reconciler cancels a stale order it believes lost), so
+        "unknown" must never be reported as "absent".
+        """
 
     @abstractmethod
     def get_price(self, symbol: str) -> float: ...
