@@ -68,11 +68,12 @@ def test_a_script_that_never_finishes_is_stopped(prices, body):
 
 
 def test_an_oversized_allocation_is_refused_in_the_child(prices):
-    """The allocation fails under the address-space cap; ScriptStrategy treats
-    it like any script error, and the backtest still returns."""
-    result = _run("def on_bar(bar, ctx):\n    x = 'x' * (4 * 1024 ** 3)\n",
-                  prices, timeout_sec=30, memory_mb=256)
-    assert result["total_trades"] == 0
+    """The allocation fails under the address-space cap and the backtest is an
+    error — not a "successful" result built from the bars before the failure."""
+    with pytest.raises(ScriptBacktestError, match="메모리 한도"):
+        _run("def on_bar(bar, ctx):\n    x = 'x' * (4 * 1024 ** 3)\n",
+             prices, timeout_sec=30, memory_mb=256)
+    assert _no_child_left()
 
 
 def test_a_failure_inside_the_child_is_reported(prices):

@@ -108,3 +108,50 @@ class TestWhatAScriptCanStillDo:
         assert not [r for r in caplog.records if "실행 오류" in r.getMessage()]
         if key in ("ma_crossover", "mean_reversion"):
             assert actions, f"{key} produced no signal on an oscillating series"
+
+
+class TestAMemoryErrorIsNotAScriptError:
+    """#188 — under the child's address-space cap a failed allocation raises
+    ``MemoryError``. The callbacks swallow ordinary script errors, but this one
+    must end the backtest, or it returns a result built from the bars before
+    the failure. Scripts cannot name exception classes, so the error comes from
+    a callable passed in ``params``."""
+
+    @staticmethod
+    def _raises(exc):
+        def boom():
+            raise exc
+        return boom
+
+    def _strategy(self, hook: str, exc) -> ScriptStrategy:
+        body = {
+            "on_start": "def on_start(ctx):\n    ctx['params']['boom']()\n",
+            "on_bar": "def on_bar(bar, ctx):\n    ctx['params']['boom']()\n",
+            "on_order_filled": "def on_order_filled(order, ctx):\n    ctx['params']['boom']()\n",
+            "on_stop": "def on_stop(ctx):\n    ctx['params']['boom']()\n",
+        }[hook]
+        if hook != "on_bar":
+            body += "def on_bar(bar, ctx):\n    return None\n"
+        s = ScriptStrategy(code=body, params={"boom": self._raises(exc)})
+        assert s.compile(), s.compile_error
+        return s
+
+    @staticmethod
+    def _call(s: ScriptStrategy, hook: str):
+        if hook == "on_bar":
+            return s.on_bar(_bar(0, 100.0))
+        if hook == "on_order_filled":
+            return s.on_order_filled(
+                Order(id="1", symbol="AAPL", side="sell", qty=1, price=100.0))
+        return getattr(s, hook)()
+
+    @pytest.mark.parametrize("hook", ["on_start", "on_bar", "on_order_filled", "on_stop"])
+    def test_memory_error_propagates(self, hook):
+        s = self._strategy(hook, MemoryError())
+        with pytest.raises(MemoryError):
+            self._call(s, hook)
+
+    @pytest.mark.parametrize("hook", ["on_start", "on_bar", "on_order_filled", "on_stop"])
+    def test_an_ordinary_error_is_still_tolerated(self, hook):
+        s = self._strategy(hook, ValueError("bad"))
+        assert self._call(s, hook) is None

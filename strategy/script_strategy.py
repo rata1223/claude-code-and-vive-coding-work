@@ -179,6 +179,9 @@ class ScriptStrategy:
             logger.error("ScriptStrategy 컴파일 실패: %s", e)
             return False
 
+    # 콜백은 스크립트 오류를 로그만 남기고 계속 가지만, MemoryError는 스크립트 오류가
+    # 아니라 자원 한도(#188 자식 프로세스의 RLIMIT_AS) 초과다 — 삼키면 백테스트가 불완전한
+    # 데이터로 "성공"을 돌려준다. 그래서 MemoryError만 다시 올린다.
     def on_start(self) -> None:
         if not self._compiled:
             self.compile()
@@ -186,6 +189,8 @@ class ScriptStrategy:
         if callable(fn):
             try:
                 fn(self._context)
+            except MemoryError:
+                raise
             except Exception as e:
                 logger.error("on_start 실행 오류: %s", e)
 
@@ -203,6 +208,8 @@ class ScriptStrategy:
                 logger.warning("on_bar가 Signal이 아닌 값을 반환했습니다: %s", type(result))
                 return None
             return result
+        except MemoryError:
+            raise
         except Exception as e:
             logger.error("on_bar 실행 오류: %s", e)
             return None
@@ -212,6 +219,8 @@ class ScriptStrategy:
         if callable(fn):
             try:
                 fn(order, self._context)
+            except MemoryError:
+                raise
             except Exception as e:
                 logger.error("on_order_filled 실행 오류: %s", e)
 
@@ -220,6 +229,8 @@ class ScriptStrategy:
         if callable(fn):
             try:
                 fn(self._context)
+            except MemoryError:
+                raise
             except Exception as e:
                 logger.error("on_stop 실행 오류: %s", e)
 
