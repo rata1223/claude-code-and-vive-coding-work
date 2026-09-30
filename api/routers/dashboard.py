@@ -44,45 +44,107 @@ def _build_kis_client_from_cred(cred: Credential):
     return client, portfolio
 
 
+def _summary_row(result: dict) -> dict:
+    """``output2`` as one dict — KIS returns it as a dict or a one-row list."""
+    row = result.get("summary") or {}
+    if isinstance(row, list):
+        row = row[0] if row else {}
+    if not isinstance(row, dict):
+        raise TypeError(f"unexpected balance summary: {type(row).__name__}")
+    return row
+
+
+def _read_kr(portfolio) -> dict:
+    result = portfolio.get_kr_balance()
+    row = _summary_row(result)
+    eval_amt = float(row.get("tot_evlu_amt", 0) or 0)
+    pnl = float(row.get("evlu_pfls_smtl_amt", 0) or 0)
+    rate = 0.0
+    cost = eval_amt - pnl          # guard on the cost basis: a position written
+    if cost > 0:                   # down to 0 is -100%, not 0%
+        rate = round(pnl / cost * 100, 2)
+    return {"eval": eval_amt, "pnl": pnl, "rate": rate,
+            "positions": result.get("positions", [])}
+
+
+def _read_us(portfolio) -> dict:
+    result = portfolio.get_us_balance()
+    row = _summary_row(result)
+    return {"eval": float(row.get("tot_evlu_amt", 0) or 0),
+            "positions": result.get("positions", [])}
+
+
+def _market_summary(read, portfolio, market: str, errors: dict) -> Optional[dict]:
+    """One market's parsed balance, or ``None`` with ``errors[market]`` set.
+
+    Fetching *and* parsing sit inside the guard, so an unexpected response
+    shape fails that market rather than the whole summary. The detail goes to
+    the log, never to the client: a KIS error body is internal, and the user
+    only needs to know this side is unknown.
+    """
+    try:
+        return read(portfolio)
+    except Exception as e:  # noqa: BLE001 - reported, never masked as zeros
+        logger.warning("KIS %s balance fetch failed: %s", market.upper(), e)
+        errors[market] = f"{market.upper()} 잔고 조회 실패"
+        return None
+
+
 @router.get("/summary")
 def get_summary(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Return portfolio summary. Falls back to zeros if no KIS credential."""
-    total_assets_krw = 0.0
-    total_assets_usd = 0.0
-    total_profit_krw = 0.0
-    total_profit_rate = 0.0
-    kr_positions = []
-    us_positions = []
+    """Portfolio summary plus our own strategy/trade figures.
+
+    Portfolio fields are ``None`` — never 0 — when they are unknown, and
+    ``portfolio_status`` says why: ``no_credential``, ``unavailable`` (nothing
+    could be read), ``partial`` (one market failed) or ``ok``. Zeros used to
+    make an outage, an unreadable credential and an empty account identical,
+    which on a home screen reads as "you hold nothing" (#149 for QuickTrade).
+
+    The response stays ``Resp.ok``: strategy counts and recent trades come from
+    our DB and are valid either way.
+    """
+    total_assets_krw = None
+    total_assets_usd = None
+    total_profit_krw = None
+    total_profit_rate = None
+    kr_positions = None
+    us_positions = None
+    errors: dict[str, str] = {}
 
     cred = _get_kis_credential(current_user.id, db)
-    if cred:
+    if not cred:
+        status = "no_credential"
+    else:
+        kr = us = None
         try:
             _client, portfolio = _build_kis_client_from_cred(cred)
-            kr_result = portfolio.get_kr_balance()
-            us_result = portfolio.get_us_balance()
+        except CredentialUnreadable as e:
+            errors["credential"] = str(e)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("KIS client build failed: %s", e)
+            errors["credential"] = "KIS 클라이언트를 만들 수 없습니다"
+        else:
+            kr = _market_summary(_read_kr, portfolio, "kr", errors)
+            us = _market_summary(_read_us, portfolio, "us", errors)
 
-            kr_summary = kr_result.get("summary", {})
-            us_summary = us_result.get("summary", {})
+        if kr is not None:
+            total_assets_krw = kr["eval"]
+            total_profit_krw = kr["pnl"]
+            total_profit_rate = kr["rate"]
+            kr_positions = kr["positions"]
+        if us is not None:
+            total_assets_usd = us["eval"]
+            us_positions = us["positions"]
 
-            kr_eval = float(kr_summary.get("tot_evlu_amt", 0) or 0)
-            us_eval_usd = float(us_summary.get("tot_evlu_amt", 0) or 0)
-
-            total_assets_krw = kr_eval
-            total_assets_usd = us_eval_usd
-
-            kr_positions = kr_result.get("positions", [])
-            us_positions = us_result.get("positions", [])
-
-            # PnL from KR balance
-            kr_pnl = float(kr_summary.get("evlu_pfls_smtl_amt", 0) or 0)
-            total_profit_krw = kr_pnl
-            if kr_eval > 0:
-                total_profit_rate = round(kr_pnl / (kr_eval - kr_pnl) * 100, 2) if (kr_eval - kr_pnl) else 0.0
-        except Exception as e:
-            logger.warning("KIS portfolio fetch failed: %s", e)
+        if kr is not None and us is not None:
+            status = "ok"
+        elif kr is not None or us is not None:
+            status = "partial"
+        else:
+            status = "unavailable"
 
     # Strategy counts
     strategy_count = (
@@ -127,6 +189,8 @@ def get_summary(
             "kr_positions": kr_positions,
             "us_positions": us_positions,
             "recent_trades": recent_trades,
+            "portfolio_status": status,
+            "portfolio_errors": errors,
         }
     )
 
@@ -164,6 +228,7 @@ def get_pending_orders(
     except CredentialUnreadable as e:
         # Not "no pending orders": the broker was never asked (#182).
         return Resp.err(str(e))
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - reported, never masked
+        # An empty list here read as "nothing pending" during a broker outage.
         logger.warning("Pending orders fetch failed: %s", e)
-        return Resp.ok({"items": []})
+        return Resp.err("미체결 주문 조회 실패")
