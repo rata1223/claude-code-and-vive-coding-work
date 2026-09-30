@@ -127,6 +127,35 @@ def test_an_outage_is_unknown_not_zero(db, user, portfolio):
     assert data["strategy_count"] == 0 and data["recent_trades"] == []
 
 
+def test_a_one_row_list_summary_is_read(db, user, portfolio):
+    """KIS returns ``output2`` as a dict or a one-row list; both read the same."""
+    kr = _kr()
+    kr["summary"] = [kr["summary"]]
+    portfolio(_Portfolio(kr=kr, us=_us()))
+    data = _summary(user, db)
+
+    assert data["portfolio_status"] == "ok"
+    assert data["total_assets_krw"] == 1_100_000.0
+    assert data["total_profit_rate"] == 10.0
+
+
+@pytest.mark.parametrize("bad_kr", [
+    {"summary": "garbage", "positions": []},                       # wrong shape
+    {"summary": {"tot_evlu_amt": "n/a"}, "positions": []},        # not a number
+])
+def test_an_unparseable_response_fails_that_market_not_the_summary(
+        db, user, portfolio, bad_kr):
+    """Code review: parsing sat outside the guard, so a bad shape was a 500
+    that also took the strategy counts and recent trades with it."""
+    portfolio(_Portfolio(kr=bad_kr, us=_us()))
+    data = _summary(user, db)
+
+    assert data["portfolio_status"] == "partial"
+    assert set(data["portfolio_errors"]) == {"kr"}
+    assert all(data[f] is None for f in _KR_FIELDS)
+    assert data["total_assets_usd"] == 1234.5
+
+
 def test_no_credential_is_unknown_not_zero(db, user):
     db.query(Credential).delete()
     db.commit()

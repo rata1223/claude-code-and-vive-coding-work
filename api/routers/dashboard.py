@@ -44,14 +44,45 @@ def _build_kis_client_from_cred(cred: Credential):
     return client, portfolio
 
 
-def _market_summary(fetch, market: str, errors: dict) -> Optional[dict]:
-    """One market's balance, or ``None`` with ``errors[market]`` set.
+def _summary_row(result: dict) -> dict:
+    """``output2`` as one dict — KIS returns it as a dict or a one-row list."""
+    row = result.get("summary") or {}
+    if isinstance(row, list):
+        row = row[0] if row else {}
+    if not isinstance(row, dict):
+        raise TypeError(f"unexpected balance summary: {type(row).__name__}")
+    return row
 
-    The detail goes to the log, never to the client: a KIS error body is
-    internal, and the user only needs to know this side is unknown.
+
+def _read_kr(portfolio) -> dict:
+    result = portfolio.get_kr_balance()
+    row = _summary_row(result)
+    eval_amt = float(row.get("tot_evlu_amt", 0) or 0)
+    pnl = float(row.get("evlu_pfls_smtl_amt", 0) or 0)
+    rate = 0.0
+    if eval_amt > 0 and (eval_amt - pnl):
+        rate = round(pnl / (eval_amt - pnl) * 100, 2)
+    return {"eval": eval_amt, "pnl": pnl, "rate": rate,
+            "positions": result.get("positions", [])}
+
+
+def _read_us(portfolio) -> dict:
+    result = portfolio.get_us_balance()
+    row = _summary_row(result)
+    return {"eval": float(row.get("tot_evlu_amt", 0) or 0),
+            "positions": result.get("positions", [])}
+
+
+def _market_summary(read, portfolio, market: str, errors: dict) -> Optional[dict]:
+    """One market's parsed balance, or ``None`` with ``errors[market]`` set.
+
+    Fetching *and* parsing sit inside the guard, so an unexpected response
+    shape fails that market rather than the whole summary. The detail goes to
+    the log, never to the client: a KIS error body is internal, and the user
+    only needs to know this side is unknown.
     """
     try:
-        return fetch()
+        return read(portfolio)
     except Exception as e:  # noqa: BLE001 - reported, never masked as zeros
         logger.warning("KIS %s balance fetch failed: %s", market.upper(), e)
         errors[market] = f"{market.upper()} 잔고 조회 실패"
@@ -86,7 +117,7 @@ def get_summary(
     if not cred:
         status = "no_credential"
     else:
-        kr_result = us_result = None
+        kr = us = None
         try:
             _client, portfolio = _build_kis_client_from_cred(cred)
         except CredentialUnreadable as e:
@@ -95,28 +126,21 @@ def get_summary(
             logger.warning("KIS client build failed: %s", e)
             errors["credential"] = "KIS 클라이언트를 만들 수 없습니다"
         else:
-            kr_result = _market_summary(portfolio.get_kr_balance, "kr", errors)
-            us_result = _market_summary(portfolio.get_us_balance, "us", errors)
+            kr = _market_summary(_read_kr, portfolio, "kr", errors)
+            us = _market_summary(_read_us, portfolio, "us", errors)
 
-        if kr_result is not None:
-            kr_summary = kr_result.get("summary", {})
-            kr_eval = float(kr_summary.get("tot_evlu_amt", 0) or 0)
-            kr_pnl = float(kr_summary.get("evlu_pfls_smtl_amt", 0) or 0)
-            total_assets_krw = kr_eval
-            total_profit_krw = kr_pnl
-            total_profit_rate = 0.0
-            if kr_eval > 0 and (kr_eval - kr_pnl):
-                total_profit_rate = round(kr_pnl / (kr_eval - kr_pnl) * 100, 2)
-            kr_positions = kr_result.get("positions", [])
+        if kr is not None:
+            total_assets_krw = kr["eval"]
+            total_profit_krw = kr["pnl"]
+            total_profit_rate = kr["rate"]
+            kr_positions = kr["positions"]
+        if us is not None:
+            total_assets_usd = us["eval"]
+            us_positions = us["positions"]
 
-        if us_result is not None:
-            us_summary = us_result.get("summary", {})
-            total_assets_usd = float(us_summary.get("tot_evlu_amt", 0) or 0)
-            us_positions = us_result.get("positions", [])
-
-        if kr_result is not None and us_result is not None:
+        if kr is not None and us is not None:
             status = "ok"
-        elif kr_result is not None or us_result is not None:
+        elif kr is not None or us is not None:
             status = "partial"
         else:
             status = "unavailable"
