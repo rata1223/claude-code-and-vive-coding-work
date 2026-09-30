@@ -654,15 +654,21 @@ def run_backtest(
         )
 
     try:
-        from strategy import Backtester, IndicatorStrategy, ScriptStrategy
+        from strategy import Backtester, IndicatorStrategy
+        from strategy.script_backtest import ScriptBacktestError, run_script_backtest
 
         if s and s.type == "indicator" and s.config:
             strat = IndicatorStrategy.from_config(s.config)
             sym = symbol or s.symbol or "AAPL"
         elif s and s.type == "script" and s.script_code:
-            strat = ScriptStrategy(code=s.script_code, params=s.config or {})
-            strat.on_start()
-            sym = symbol or s.symbol or "AAPL"
+            # User code runs in a child process with a time and memory budget,
+            # never in this worker: an endless script used to hold it (#188).
+            try:
+                return Resp.ok(run_script_backtest(
+                    s.script_code, s.config or {}, symbol or s.symbol or "AAPL",
+                    initial_capital=initial_capital, period=period))
+            except ScriptBacktestError as e:
+                return Resp.err(f"백테스트 실패: {e}", code=-1)
         else:
             strat = IndicatorStrategy.from_config(body.get("config", {}))
             sym = symbol or "AAPL"
