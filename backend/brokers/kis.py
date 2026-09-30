@@ -313,7 +313,11 @@ class KISBroker(BrokerAdapter):
     def get_order_status(self, order_id: str, symbol: str = "") -> Order | None:
         """
         단건 주문 조회. symbol로 KR/US 라우팅.
-        반환 None = 조회 실패 또는 주문 미존재.
+
+        ``None`` = 조회는 성공했고 그 주문이 없다(모든 페이지를 읽고도 미매칭).
+        조회 자체가 실패하면(네트워크·오류 응답·페이지네이션·행 파싱) **예외**를
+        던진다 — "알 수 없음"이다. 예전엔 둘 다 None이었고, 재조정기는 None을
+        "브로커에 없음"으로 읽어 1시간 지난 주문을 분실로 취소 처리했다.
         """
         is_us = bool(symbol) and not self._is_kr(symbol)
         if is_us:
@@ -362,8 +366,10 @@ class KISBroker(BrokerAdapter):
                 filled_qty=filled_qty, avg_fill_price=avg_price,
             )
         except Exception as e:
+            # Unknown, not absent: the reconciler treats an exception as an error
+            # and leaves the order alone, but None as "gone" and cancels it.
             logger.warning("KR 주문 조회 실패 %s: %s", order_id, e)
-            return None
+            raise RuntimeError(f"KR 주문 조회 실패 {order_id}: {e}") from e
 
     def _get_us_order_status(self, order_id: str, symbol: str) -> Order | None:
         """KIS 해외주식 주문 조회. TR: TTTS3035R (실전) / VTTS3035R (모의)."""
@@ -405,8 +411,10 @@ class KISBroker(BrokerAdapter):
                 filled_qty=filled_qty, avg_fill_price=avg_price,
             )
         except Exception as e:
+            # Unknown, not absent: the reconciler treats an exception as an error
+            # and leaves the order alone, but None as "gone" and cancels it.
             logger.warning("US 주문 조회 실패 %s: %s", order_id, e)
-            return None
+            raise RuntimeError(f"US 주문 조회 실패 {order_id}: {e}") from e
 
     def get_price(self, symbol: str) -> float:
         if self._breaker.is_open():

@@ -263,13 +263,18 @@ class TestWorkerRestart:
         assert result.outcome == RecoveryOutcome.COMPLETED
         broker.get_order_status.assert_not_called()  # store was sufficient
 
-    def test_recovery_verifier_broker_exception_returns_not_found(self):
+    def test_recovery_verifier_broker_exception_returns_unknown(self):
+        """A failed lookup is not "no record": NOT_FOUND means safe to re-submit,
+        which would place an order twice if the first one did reach the broker."""
         d = _detector()
+        k = _key()
         broker = MagicMock()
         broker.get_order_status.side_effect = RuntimeError("timeout")
         verifier = RecoveryVerifier(broker, d)
-        result = verifier.verify(_key(), "ORD007")
-        assert result.outcome == RecoveryOutcome.NOT_FOUND
+        result = verifier.verify(k, "ORD007")
+        assert result.outcome == RecoveryOutcome.UNKNOWN
+        assert result.outcome != RecoveryOutcome.NOT_FOUND
+        assert d.check(k).is_duplicate is False      # nothing recorded as completed
 
     def test_recovery_verifier_marks_completed_in_store_on_terminal_broker_status(self):
         r = FakeRedis()
