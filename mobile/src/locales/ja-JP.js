@@ -106,6 +106,8 @@ export default {
     total_assets: '総資産',
     asset_note: 'ローカルの戦略とアカウントを集計',
     total_pnl: '累積損益',
+    portfolio_unavailable: '残高を取得できませんでした — ゼロではなく不明です',
+    portfolio_partial: '一方の市場の残高を取得できませんでした（— で表示）',
     unread_notifications: '未読',
     setup_title: 'まず証券会社の API Key を設定してください',
     setup_desc: 'KIS の API Key を追加すると、残高照会とモバイルでのクイック取引が利用できます。',

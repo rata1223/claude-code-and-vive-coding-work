@@ -199,7 +199,9 @@ export default {
       // caller that narrowed `markets` on a tab outside its own list — the
       // hot chips and the first keyword search would both offer symbols it
       // said it could not use. Accept it only if it is actually on offer.
-      const options = this.marketOptions
+      // Called from data(), where computed properties do not exist yet —
+      // `this.marketOptions` is undefined there, so read the prop directly.
+      const options = this.markets || DEFAULT_MARKET_OPTIONS
       const wanted = this.defaultMarket
       if (wanted && options.some((m) => m.value === wanted)) return wanted
       return options[0]?.value || 'Crypto'

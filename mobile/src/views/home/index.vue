@@ -28,12 +28,16 @@
         </div>
       </div>
       <div class="asset-value-row">
-        <span class="asset-value">{{ showAsset ? formatMoney(totalAssets) : '••••••' }}</span>
-        <span class="asset-currency">USD</span>
+        <span class="asset-value">{{ showAsset ? formatMoney(assetsKrw) : '••••••' }}</span>
+        <span class="asset-currency">KRW</span>
       </div>
-      <div :class="['asset-pnl', totalPnl >= 0 ? 'profit' : 'loss']">
-        <span class="pnl-arrow">{{ totalPnl >= 0 ? '↑' : '↓' }}</span>
-        {{ showAsset ? formatSignedMoney(totalPnl) : '••••' }}
+      <div class="asset-value-row asset-value-sub">
+        <span class="asset-currency">{{ showAsset ? formatMoney(assetsUsd) : '••••' }} USD</span>
+      </div>
+      <div v-if="portfolioNotice" class="asset-notice">{{ portfolioNotice }}</div>
+      <div :class="['asset-pnl', profitKrw === null ? '' : (profitKrw >= 0 ? 'profit' : 'loss')]">
+        <span v-if="profitKrw !== null" class="pnl-arrow">{{ profitKrw >= 0 ? '↑' : '↓' }}</span>
+        {{ showAsset ? formatSignedMoney(profitKrw) : '••••' }}
         <span class="pnl-label">{{ $t('home.total_pnl') }}</span>
       </div>
     </div>
@@ -310,11 +314,23 @@ export default {
       if (hour < 18) return this.$t('home.greeting_afternoon')
       return this.$t('home.greeting_evening')
     },
-    totalAssets() {
-      return this.dashboardStore.totalAssets
+    assetsKrw() {
+      return this.dashboardStore.assetsKrw
     },
-    totalPnl() {
-      return this.dashboardStore.totalPnl
+    assetsUsd() {
+      return this.dashboardStore.assetsUsd
+    },
+    profitKrw() {
+      return this.dashboardStore.profitKrw
+    },
+    portfolioNotice() {
+      // no_credential is covered by the setup card below
+      const status = this.dashboardStore.portfolioStatus
+      if (status === 'unavailable') {
+        return this.dashboardStore.portfolioErrors.credential || this.$t('home.portfolio_unavailable')
+      }
+      if (status === 'partial') return this.$t('home.portfolio_partial')
+      return ''
     },
     todayPnl() {
       return this.dashboardStore.todayPnl
@@ -323,7 +339,8 @@ export default {
       return this.dashboardStore.unrealizedPnl
     },
     positionsCount() {
-      return this.dashboardStore.positions.length
+      const list = this.dashboardStore.positions
+      return list === null ? '—' : list.length
     },
     winRate() {
       return this.dashboardStore.winRate
@@ -481,7 +498,8 @@ export default {
     },
 
     formatMoney(value) {
-      const num = Number(value || 0)
+      if (value === null || value === undefined) return '—'
+      const num = Number(value)
       return new Intl.NumberFormat('en-US', {
         minimumFractionDigits: 2,
         maximumFractionDigits: 2
@@ -489,7 +507,8 @@ export default {
     },
 
     formatSignedMoney(value) {
-      const num = Number(value || 0)
+      if (value === null || value === undefined) return '—'
+      const num = Number(value)
       const sign = num > 0 ? '+' : ''
       return `${sign}${this.formatMoney(num)}`
     },
@@ -641,6 +660,15 @@ export default {
   font-size: 13px;
   font-weight: 600;
   color: var(--text-3);
+}
+.asset-value-sub {
+  margin-top: 4px;
+}
+.asset-notice {
+  margin-top: 8px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--warning, #d48806);
 }
 .asset-pnl {
   margin-top: 12px;

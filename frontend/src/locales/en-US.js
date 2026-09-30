@@ -106,6 +106,8 @@ export default {
     total_assets: 'Total Assets',
     asset_note: 'Aggregated from local strategies & accounts',
     total_pnl: 'Cumulative PnL',
+    portfolio_unavailable: 'Balance unavailable — unknown, not zero',
+    portfolio_partial: 'Balance for one market could not be loaded (shown as —)',
     unread_notifications: 'Unread',
     setup_title: 'Connect your brokerage first',
     setup_desc: 'Add your KIS credentials to enable balance queries and quick trading on mobile.',

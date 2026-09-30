@@ -102,6 +102,8 @@ export const useCredentialsStore = defineStore('credentials', {
   }
 })
 
+const knownNumber = (v) => (v === null || v === undefined ? null : Number(v))
+
 export const useDashboardStore = defineStore('dashboard', {
   state: () => ({
     summary: null,
@@ -109,11 +111,21 @@ export const useDashboardStore = defineStore('dashboard', {
   }),
 
   getters: {
-    totalAssets: (state) => Number(state.summary?.total_equity || 0),
-    totalPnl: (state) => Number(state.summary?.total_pnl || 0),
+    // Portfolio figures from /api/dashboard/summary. null means unknown (lookup
+    // failed or no credential) — never shown as 0; portfolioStatus says why.
+    portfolioStatus: (state) => state.summary?.portfolio_status || null,
+    portfolioErrors: (state) => state.summary?.portfolio_errors || {},
+    assetsKrw: (state) => knownNumber(state.summary?.total_assets_krw),
+    assetsUsd: (state) => knownNumber(state.summary?.total_assets_usd),
+    profitKrw: (state) => knownNumber(state.summary?.total_profit_krw),
     realizedPnl: (state) => Number(state.summary?.total_realized_pnl || 0),
     unrealizedPnl: (state) => Number(state.summary?.total_unrealized_pnl || 0),
-    positions: (state) => Array.isArray(state.summary?.current_positions) ? state.summary.current_positions : [],
+    positions: (state) => {
+      const kr = state.summary?.kr_positions
+      const us = state.summary?.us_positions
+      if (!Array.isArray(kr) && !Array.isArray(us)) return null
+      return [...(Array.isArray(kr) ? kr : []), ...(Array.isArray(us) ? us : [])]
+    },
     recentTrades: (state) => Array.isArray(state.summary?.recent_trades) ? state.summary.recent_trades : [],
     performance: (state) => (state.summary?.performance && typeof state.summary.performance === 'object') ? state.summary.performance : {},
     winRate: (state) => Number(state.summary?.performance?.win_rate || 0),
