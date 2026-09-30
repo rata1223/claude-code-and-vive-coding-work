@@ -12,18 +12,28 @@ the child rather than the API process.
 The parent fetches prices (it has the network) and passes the frame in; the
 child only compiles, runs and reports ``BacktestResult.to_dict()``. User code
 never executes in the API process.
+
+At most ``MAX_CONCURRENT`` backtests run at once per API process; one more is
+refused at once rather than queued. Each child may use up to its memory budget,
+so without a cap a burst of requests multiplies that budget on the host. The
+API runs a single uvicorn worker, so the per-process cap is the global one.
 """
 from __future__ import annotations
 
 import logging
 import multiprocessing as mp
 import os
+import threading
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_TIMEOUT_SEC = float(os.environ.get("SCRIPT_BACKTEST_TIMEOUT_SEC", "30"))
 DEFAULT_MEMORY_MB = int(os.environ.get("SCRIPT_BACKTEST_MEMORY_MB", "1024"))
+MAX_CONCURRENT = max(1, int(os.environ.get("SCRIPT_BACKTEST_MAX_CONCURRENT", "2")))
+
+# The route runs in FastAPI's threadpool, so a thread semaphore bounds it.
+_SLOTS = threading.BoundedSemaphore(MAX_CONCURRENT)
 
 # spawn, not fork: the API process runs threads (uvicorn workers, DB pools), and
 # forking a threaded process can copy a held lock into the child.
@@ -36,6 +46,10 @@ class ScriptBacktestError(Exception):
 
 class ScriptBacktestTimeout(ScriptBacktestError):
     """The script backtest ran past its time budget and was stopped."""
+
+
+class ScriptBacktestBusy(ScriptBacktestError):
+    """Every backtest slot is taken; nothing was started."""
 
 
 def _limit_memory(extra_mb: int, cpu_sec: float) -> None:
@@ -83,9 +97,24 @@ def run_script_backtest(code: str, params: dict | None, symbol: str, *,
                         memory_mb: int | None = None) -> dict[str, Any]:
     """Backtest ``code`` on ``symbol`` in a child process; the result dict.
 
-    Raises ``ScriptBacktestTimeout`` when the budget runs out (the child is
-    killed) and ``ScriptBacktestError`` when the child ends without a result.
+    Raises ``ScriptBacktestBusy`` when every slot is taken (nothing starts),
+    ``ScriptBacktestTimeout`` when the budget runs out (the child is killed)
+    and ``ScriptBacktestError`` when the child ends without a result.
     """
+    if not _SLOTS.acquire(blocking=False):
+        raise ScriptBacktestBusy(
+            f"다른 백테스트가 실행 중입니다(동시 {MAX_CONCURRENT}개) — 잠시 후 다시 시도하세요")
+    try:
+        return _run(code, params, symbol, initial_capital=initial_capital,
+                    period=period, df=df, timeout_sec=timeout_sec,
+                    memory_mb=memory_mb)
+    finally:
+        _SLOTS.release()
+
+
+def _run(code: str, params: dict | None, symbol: str, *, initial_capital: float,
+         period: str, df, timeout_sec: float | None,
+         memory_mb: int | None) -> dict[str, Any]:
     timeout = DEFAULT_TIMEOUT_SEC if timeout_sec is None else timeout_sec
     memory = DEFAULT_MEMORY_MB if memory_mb is None else memory_mb
     if df is None:
