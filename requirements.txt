@@ -51,8 +51,11 @@ python-engineio==4.13.2
 gunicorn==22.0.0
 
 # Security & Authentication
-# pyjwt removed: codebase uses `from jose import jwt` (python-jose), not PyJWT.
-# PyJWT is unused and carries HIGH advisories (PYSEC-2025-183, GHSA-752w-5fwx-jx9f).
+# JWT lives in requirements-api.txt (PyJWT 2.15.1): api/auth.py moved off
+# python-jose. Not pinned here yet. kis-ws runs from this image and should verify
+# tokens, but it lacks api/, a JWT library and JWT_SECRET_KEY, so every WS client
+# is refused (fail-closed) — tracked in #189. (The old PyJWT pin here carried
+# PYSEC-2025-183 / GHSA-752w-5fwx-jx9f; 2.15.1 is clean.)
 cryptography==50.0.0
 
 # Monitoring & Logging

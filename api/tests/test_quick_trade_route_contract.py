@@ -20,13 +20,23 @@ _APPS = ("frontend", "mobile")
 _CALL = re.compile(r"http\.(get|post|put|delete)\(\s*['\"`](/api/quick-trade/[^'\"`]+)")
 
 
+_HTTP_METHODS = {"get", "post", "put", "patch", "delete"}
+
+
 def _registered_paths():
+    """(METHOD, path) for every route the app serves, from its OpenAPI schema.
+
+    Not ``app.routes``: since FastAPI 0.13x an included router stays one
+    ``_IncludedRouter`` entry there instead of being flattened into routes with
+    a ``.path``. The schema is FastAPI's public listing of what is served.
+    """
     from api.main import app
 
     return {
-        (method.upper(), route.path)
-        for route in app.routes
-        for method in getattr(route, "methods", set()) or set()
+        (method.upper(), path)
+        for path, ops in app.openapi()["paths"].items()
+        for method in ops
+        if method in _HTTP_METHODS
     }
 
 

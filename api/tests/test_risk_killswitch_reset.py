@@ -120,7 +120,7 @@ def test_the_reset_endpoint_is_registered():
     way out of a persistent kill switch was hand-editing the DB."""
     from api.main import app
 
-    paths = {r.path for r in app.routes}
+    paths = set(app.openapi()["paths"])   # app.routes nests included routers
     assert "/api/risk/kill-switch/reset" in paths, (
         f"no kill-switch reset route registered (have: "
         f"{sorted(p for p in paths if 'risk' in p)})")
@@ -130,7 +130,7 @@ def test_the_status_endpoint_is_registered():
     """An operator has to be able to see the flag before deciding to clear it."""
     from api.main import app
 
-    paths = {r.path for r in app.routes}
+    paths = set(app.openapi()["paths"])   # app.routes nests included routers
     assert "/api/risk/kill-switch" in paths
 
 

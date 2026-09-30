@@ -3,7 +3,7 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 import bcrypt
-from jose import JWTError, jwt
+import jwt
 
 _raw_secret = os.environ.get("JWT_SECRET_KEY", "")
 if not _raw_secret:
@@ -46,5 +46,5 @@ def decode_access_token(token: str) -> Optional[dict]:
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         return payload
-    except JWTError:
+    except jwt.PyJWTError:   # bad signature, expired, malformed, wrong algorithm
         return None

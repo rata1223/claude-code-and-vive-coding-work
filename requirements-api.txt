@@ -1,9 +1,16 @@
-fastapi==0.111.0
+# 0.142.1 (was 0.111.0): 0.111 capped starlette <0.38, and every starlette
+# advisory against 0.37.2 (form-size limits, Host/path validation in request.url,
+# HTTPEndpoint method dispatch) is fixed only in 1.x. Needs pydantic>=2.9.
+fastapi==0.142.1
+starlette==1.7.0
 uvicorn[standard]==0.29.0
 sqlalchemy==2.0.30
 psycopg2-binary==2.9.9
 alembic==1.13.1
-python-jose[cryptography]==3.4.0
+# PyJWT (was python-jose[cryptography]==3.4.0): api/auth.py only signs/verifies
+# HS256. python-jose pulled in ecdsa (Minerva timing advisory, no fixed release),
+# rsa and pyasn1 0.4.8 (four DoS advisories) for algorithms we never use.
+PyJWT==2.15.1
 bcrypt==4.1.3
 python-multipart==0.0.31
 cryptography==50.0.0
@@ -13,7 +20,7 @@ pandas==2.2.2
 requests==2.33.0
 slowapi==0.1.9
 python-dotenv==1.2.2
-pydantic[email]==2.7.1
+pydantic[email]==2.13.5
 # 0.25.2 (was 0.27.0): python-telegram-bot==20.7 requires httpx~=0.25.2, so 0.27.0 made
 # this file unresolvable on every interpreter (broke Dockerfile.api build too). fastapi
 # 0.111 only needs httpx>=0.23.0, so 0.25.2 satisfies both.
