@@ -150,7 +150,10 @@
 
 11. **기존 DB의 `trades` 잔존 테이블**(PR #194): API가 먼저 떴던 DB에는 `trades`가 API 스키마로 남아 있다.
    비어 있고 워커는 이 모델을 쓰지 않아 런타임 영향은 없지만, 나중에 `alembic upgrade`로 초기 스키마를 적용하면
-   충돌한다 — 비어 있음을 확인하고 `DROP TABLE trades` 후 적용할 것
+   충돌한다 — 비어 있음을 확인하고 `DROP TABLE trades` 후 적용할 것. 코드상 이 테이블에 쓰는 곳이 없어 비어 있어야
+   정상이다. 만약 행이 있으면(코드 밖에서 넣은 경우) 버리지 말고 먼저 옮긴다:
+   `INSERT INTO strategy_trades (strategy_id, symbol, side, qty, price, filled_at, pnl, fee) SELECT strategy_id, symbol, side, qty, price, filled_at, pnl, fee FROM trades;`
+   API 테이블은 Alembic이 아니라 `create_all`로 관리되므로(`alembic/env.py`의 target은 backend `Base`) 자동 마이그레이션을 두지 않았다
 
 ---
 
