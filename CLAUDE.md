@@ -12,7 +12,7 @@
 
 ---
 
-## 프로젝트 진행 현황 (2026-09-30 기준, main `14b542a` = PR #193)
+## 프로젝트 진행 현황 (2026-09-30 기준, main `8b958c6` = PR #194)
 
 > **이 섹션이 최신 상태의 단일 진실 공급원(SoT).** 아래 "다음 작업 목록(Stage 1~9)"은 초기 설계 로드맵으로,
 > 대부분 이미 구현 완료됐다. 실제 진행은 `AUDIT.md` → `ROADMAP.md` 기반 하드닝 트랙으로 이어지고 있다.
@@ -60,6 +60,7 @@
 | 대시보드 0 보고 | #192 | **#149를 대시보드에** — `/api/dashboard/summary`가 어떤 실패든 0을 돌려 장애·풀리지 않는 자격증명·한쪽 시장 실패·빈 계좌가 모두 "총 자산 0"이었다. 알 수 없는 값은 `None` + `portfolio_status`(`ok`/`partial`/`unavailable`/`no_credential`)·`portfolio_errors`, KR·US를 따로 조회·파싱(응답 모양이 틀려도 그 시장만 실패). `/pendingOrders` 실패는 빈 목록이 아니라 오류. 프론트 스토어가 API가 안 보내는 `total_equity`를 읽어 **성공해도 0**이던 것 수정(KRW·USD 따로, null은 `—`). **별건**: #151 이후 `SymbolPicker.data()`가 computed를 읽어 홈·퀵트레이드·봇 폼이 **마운트 중 TypeError** — prop 직접 읽기로 수정 |
 | 백테스트 동시성 | #193 | 스크립트 백테스트 동시 실행 상한 — 프로세스당 `BoundedSemaphore`(`SCRIPT_BACKTEST_MAX_CONCURRENT`, 기본 2, uvicorn 워커 1개라 전역). 슬롯이 없으면 대기 없이 즉시 `ScriptBacktestBusy`(아무것도 시작 안 함). 슬롯은 자식 회수 후 반환, 가격 조회는 슬롯 밖(느린 다운로드가 슬롯을 차지하지 않게) |
 | trades 충돌·홈 KPI | #194 | **`trades` 테이블 이중 정의** — api와 backend ORM이 같은 이름을 다른 컬럼으로 매핑, 같은 DB + 비변경 `create_all`이라 워커가 먼저 뜨면 API의 `Trade` 쿼리(대시보드·전략 상세·퀵트레이드 내역)가 `UndefinedColumn`으로 500. API 테이블을 `strategy_trades`로 분리 + 두 ORM 테이블명 교집합 0 정적 가드 + Postgres 시작 순서 테스트. 홈 KPI는 실제 값 또는 `—`(오늘 손익 원천 없음, 미실현은 US 보유 시 `—`, 거래 통계는 `/summary.performance`) |
+| KIS 페이지네이션 | #195 | **알려진 이슈 6** — 잔고(KR·US)·US 미체결·주문 조회(KR·US, `kis_adapter`·`KISBroker`) 7곳이 `CTX_AREA_*`를 빈 값으로만 보내 2페이지부터 조용히 버려졌다. `KISClient.get_page()`(요청·응답 헤더 `tr_cont`) + `kis_adapter.pagination.get_all_pages()`(F/M 동안 `ctx_area_*` 되돌려 보내며 행 병합, 요약은 첫 페이지). 연속인데 키·행 목록이 없거나 20페이지 초과면 일부 반환 대신 raise |
 
 **열린 PR 0건.** 다음 작업은 `origin/main`에서 새로 분기하면 된다.
 
@@ -123,8 +124,9 @@
    거부되면 여기부터 의심할 것.** `backend/quant/data/universe.py` 주석 참고
 5. **`EXCD_MAP`에 없는 미국 티커는 `NASD`로 폴백**한다. 검색 폴백이 임의 티커를 피커에 넘기므로
    #153이 고친 오라우팅이 그 경로로 재현된다. 제대로 닫으려면 종목 마스터가 필요
-6. **`tr_cont` 페이지네이션 미구현 (7곳)**: `CTX_AREA_NK100/NK200`을 전부 `""`로 보내고 응답의
-   연속 키를 읽지 않아, 2페이지 이상이면 **조용히 1페이지만** 돌아온다
+6. ~~`tr_cont` 페이지네이션 미구현 (7곳)~~ — PR #195에서 해결. **모의투자에서 확인할 것**: 연속 키 값을
+   공백 포함 그대로 되돌려 보낸다(공식 예제와 같음). KR 주문 조회 경로 `/trading/inquire-order`가
+   `TTTC8036R`의 실제 경로인지(보통 `inquire-psbl-rvsecncl`)는 이 PR 이전부터의 미검증 사항
 7. **보류된 P0**: `P0-04`(브로커별 SAFE_MODE)는 워커가 KIS 단일 브로커라 **보류**
    (키움이 워커에 들어올 때 재검토). `P0-11`은 완료(PR #183). 대시보드 요약의 0 보고는
    PR #192에서 해결(알 수 없으면 `None` + `portfolio_status`). 홈 KPI는 PR #194에서 실제 값 또는 `—`로.
@@ -478,7 +480,7 @@ KR_ETF   = ["069500", "360750", "091160"]  # KODEX200, TIGER S&P500, KODEX반도
 - **PR #79** (`claude/update-MW7LQ`): 실패 시나리오 통합테스트 (TASK 4-1C) — **머지됨** (2026-06-16)
 - 하드닝 트랙 PR #85~#156: 위 "프로젝트 진행 현황" 표 참조 — **모두 머지됨**
 - **PR #116**은 미머지 종료(2026-07-05). 같은 작업을 **#119**가 대체 구현해 머지했다
-- **현재 열린 PR 0건.** main = `14b542a` (PR #193)
+- **현재 열린 PR 0건.** main = `8b958c6` (PR #194)
 
 > 작업 방식: 기능별 새 브랜치에서 작업 → `main`으로 드래프트 PR → CodeRabbit/CodeQL 리뷰 → 머지.
 > 브랜치 보호 룰셋(PR 필수 + 코드 스캐닝)이 적용돼 `main` 직접 푸시 불가.
