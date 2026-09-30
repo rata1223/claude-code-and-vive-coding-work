@@ -66,7 +66,16 @@ python-json-logger==2.0.7
 #   fixed by dropping try/except* support entirely (patched 8.0,
 #   CVE-2025-22153). backend/strategy/script/sandbox.py's own AST checker
 #   also no longer allows ast.TryStar, as defense in depth.
-RestrictedPython==8.0
+# 8.4 (was 8.0): two more.
+# - A positional-only argument named after a guard hook (`def f(_write_=w, /)`)
+#   replaced that hook inside the function (PYSEC-2026-3917, patched 8.3).
+#   Reachable here: our AST checker allowed it, and it let a script write to
+#   context objects the missing `_write_` otherwise refuses. sandbox.py now
+#   also rejects "_"-prefixed argument names.
+# - string.Formatter field traversal bypassed the guards (CVE-2026-76825,
+#   patched 8.4). Not reachable here: imports are rejected and `string` is
+#   not an allowed builtin.
+RestrictedPython==8.4
 
 # Development & Testing (optional)
 # pytest==7.4.3

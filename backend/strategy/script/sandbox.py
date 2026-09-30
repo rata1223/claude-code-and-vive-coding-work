@@ -103,6 +103,17 @@ class _ASTChecker(ast.NodeVisitor):
                 raise SandboxViolation(f"__dunder__ 호출 차단: {node.func.attr}")
         self.generic_visit(node)
 
+    def visit_arg(self, node):
+        # Argument names that start with "_" can shadow RestrictedPython's guard
+        # hooks (_getattr_, _write_, _getiter_ …) inside the function body. 8.0
+        # rejected them for every kind of argument except positional-only ones
+        # (PYSEC-2026-3917, fixed in 8.3): `def f(_write_=w, /)` turned every
+        # attribute write in f into a call to the script's own hook. Rejected
+        # here too, as defense in depth.
+        if node.arg.startswith("_"):
+            raise SandboxViolation(f"'_'로 시작하는 인자 이름 금지: {node.arg}")
+        self.generic_visit(node)
+
     def visit_Attribute(self, node):
         # Block any dunder attribute access — prevents subclass traversal attacks
         # e.g. ().__class__.__bases__[0].__subclasses__()
