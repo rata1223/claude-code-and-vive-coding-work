@@ -119,7 +119,7 @@ class KISOrders:
                 "CTX_AREA_NK100": "",
             }
             data = get_all_pages(self._client, INQUIRE_KR_PATH, self._tr("inquire_kr"), params,
-                                 ctx="100", list_key="output1")
+                                 ctx="100", list_key=("output1", "output"))
             return data.get("output1") or data.get("output", []) or []
 
         params = {

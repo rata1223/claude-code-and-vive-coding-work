@@ -341,7 +341,7 @@ class KISBroker(BrokerAdapter):
                 "CTX_AREA_NK100": "",
             }
             resp = get_all_pages(self._client, "/uapi/domestic-stock/v1/trading/inquire-order",
-                                 tr_id, params, ctx="100", list_key="output1")
+                                 tr_id, params, ctx="100", list_key=("output1", "output"))
             output = resp.get("output1") or resp.get("output", [])
             if not output:
                 return None

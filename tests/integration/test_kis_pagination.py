@@ -89,6 +89,32 @@ class TestGetAllPages:
         assert get_all_pages(c, "/p", "TR", {}, ctx="200", list_key="output")["output"] == []
 
 
+class TestCandidateRowKeys:
+    """Code review: KR order inquiries accept rows under ``output1`` or
+    ``output``; later pages must follow whichever key page 1 used."""
+
+    def test_the_key_page_one_uses_is_merged(self):
+        c = _Pages(_two_pages("output", "100", [1], [2]))
+        out = get_all_pages(c, "/p", "TR", {}, ctx="100", list_key=("output1", "output"))
+        assert out["output"] == [1, 2]
+
+    def test_a_continuation_with_no_known_row_key_raises(self):
+        c = _Pages([({"rows": [1], "ctx_area_nk100": "K"}, "M")])
+        with pytest.raises(RuntimeError, match="행 목록"):
+            get_all_pages(c, "/p", "TR", {}, ctx="100", list_key=("output1", "output"))
+
+    def test_kr_order_inquiry_under_output(self):
+        from kis_adapter.orders import KISOrders
+        c = _Pages(_two_pages("output", "100", [{"odno": "1"}], [{"odno": "2"}]))
+        assert KISOrders(client=c).inquire_orders("005930", market="kr") == [
+            {"odno": "1"}, {"odno": "2"}]
+
+    def test_broker_kr_order_on_page_two_under_output(self):
+        c = _Pages(_two_pages("output", "100", [_order_row("A")], [_order_row("B")]))
+        order = _broker(c)._get_kr_order_status("B")
+        assert order is not None and order.id == "B"
+
+
 # ── the client sends and reads tr_cont ─────────────────────────────────────
 
 class _Resp:
