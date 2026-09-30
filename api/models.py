@@ -114,7 +114,11 @@ class Strategy(Base):
 
 
 class Trade(Base):
-    __tablename__ = "trades"
+    # Not "trades": backend/database/models.py (the worker, kis-api and Alembic)
+    # owns a different ``trades`` table in the same database. Both sides use a
+    # non-altering create_all, so whichever started first won the name and the
+    # other's queries failed on missing columns (``trades.strategy_id``).
+    __tablename__ = "strategy_trades"
 
     id = Column(Integer, primary_key=True, index=True)
     strategy_id = Column(Integer, ForeignKey("strategies.id"), nullable=False)
