@@ -90,6 +90,31 @@ def _market_summary(read, portfolio, market: str, errors: dict) -> Optional[dict
         return None
 
 
+def _performance(user_id: int, db: Session) -> dict:
+    """Trade statistics for the home KPIs; a ratio with nothing to divide is ``None``.
+
+    Only trades with a non-zero ``pnl`` are closed trades — an opening buy
+    carries 0 and says nothing about winning or losing. With no closed trade
+    there is no win rate, and with no losing trade no profit factor: ``None``,
+    which the app shows as "—", never 0.
+    """
+    pnls = [
+        p for (p,) in db.query(Trade.pnl)
+        .join(Strategy, Trade.strategy_id == Strategy.id)
+        .filter(Strategy.user_id == user_id)
+        .all()
+    ]
+    total = len(pnls)
+    closed = [p for p in pnls if p]
+    wins = [p for p in closed if p > 0]
+    gross_loss = -sum(p for p in closed if p < 0)
+    return {
+        "total_trades": total,
+        "win_rate": round(len(wins) / len(closed) * 100, 1) if closed else None,
+        "profit_factor": round(sum(wins) / gross_loss, 2) if gross_loss else None,
+    }
+
+
 @router.get("/summary")
 def get_summary(
     current_user: User = Depends(get_current_user),
@@ -156,6 +181,8 @@ def get_summary(
         .count()
     )
 
+    performance = _performance(current_user.id, db)
+
     # Recent trades
     recent_trades_q = (
         db.query(Trade)
@@ -189,6 +216,7 @@ def get_summary(
             "kr_positions": kr_positions,
             "us_positions": us_positions,
             "recent_trades": recent_trades,
+            "performance": performance,
             "portfolio_status": status,
             "portfolio_errors": errors,
         }

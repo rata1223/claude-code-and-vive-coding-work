@@ -85,11 +85,11 @@
       <div class="kpi-grid">
         <div class="kpi-cell">
           <span class="kpi-lab">{{ $t('home.kpi_today_pnl') }}</span>
-          <span :class="['kpi-val', todayPnl >= 0 ? 'up' : 'down']">{{ formatSignedMoney(todayPnl) }}</span>
+          <span :class="['kpi-val', pnlClass(todayPnl)]">{{ formatSignedMoney(todayPnl) }}</span>
         </div>
         <div class="kpi-cell">
           <span class="kpi-lab">{{ $t('home.kpi_unrealized') }}</span>
-          <span :class="['kpi-val', unrealizedPnl >= 0 ? 'up' : 'down']">{{ formatSignedMoney(unrealizedPnl) }}</span>
+          <span :class="['kpi-val', pnlClass(unrealizedPnl)]">{{ formatSignedMoney(unrealizedPnl) }}</span>
         </div>
         <div class="kpi-cell">
           <span class="kpi-lab">{{ $t('home.kpi_positions') }}</span>
@@ -97,15 +97,15 @@
         </div>
         <div class="kpi-cell">
           <span class="kpi-lab">{{ $t('home.kpi_win_rate') }}</span>
-          <span class="kpi-val">{{ winRate.toFixed(1) }}%</span>
+          <span class="kpi-val">{{ winRate === null ? '—' : `${winRate.toFixed(1)}%` }}</span>
         </div>
         <div class="kpi-cell">
           <span class="kpi-lab">{{ $t('home.kpi_trades') }}</span>
-          <span class="kpi-val">{{ totalTrades }}</span>
+          <span class="kpi-val">{{ totalTrades === null ? '—' : totalTrades }}</span>
         </div>
         <div class="kpi-cell">
           <span class="kpi-lab">{{ $t('home.kpi_profit_factor') }}</span>
-          <span class="kpi-val">{{ profitFactor.toFixed(2) }}</span>
+          <span class="kpi-val">{{ profitFactor === null ? '—' : profitFactor.toFixed(2) }}</span>
         </div>
       </div>
     </div>
@@ -498,6 +498,11 @@ export default {
       const num = Number(value || 0)
       const sign = num > 0 ? '+' : ''
       return `${sign}${num.toFixed(2)}%`
+    },
+
+    pnlClass(value) {
+      if (value === null || value === undefined) return ''
+      return value >= 0 ? 'up' : 'down'
     },
 
     formatMoney(value) {

@@ -129,8 +129,8 @@ export const useDashboardStore = defineStore('dashboard', {
     assetsKrw: (state) => knownNumber(state.summary?.total_assets_krw),
     assetsUsd: (state) => knownNumber(state.summary?.total_assets_usd),
     profitKrw: (state) => knownNumber(state.summary?.total_profit_krw),
-    realizedPnl: (state) => Number(state.summary?.total_realized_pnl || 0),
-    unrealizedPnl: (state) => Number(state.summary?.total_unrealized_pnl || 0),
+    // KIS evaluation P&L (evlu_pfls_smtl_amt) is the unrealized P&L of holdings.
+    unrealizedPnl: (state) => knownNumber(state.summary?.total_profit_krw),
     positions: (state) => {
       const kr = state.summary?.kr_positions
       const us = state.summary?.us_positions
@@ -138,22 +138,12 @@ export const useDashboardStore = defineStore('dashboard', {
       return [...(Array.isArray(kr) ? kr : []), ...(Array.isArray(us) ? us : [])]
     },
     recentTrades: (state) => Array.isArray(state.summary?.recent_trades) ? state.summary.recent_trades : [],
-    performance: (state) => (state.summary?.performance && typeof state.summary.performance === 'object') ? state.summary.performance : {},
-    winRate: (state) => Number(state.summary?.performance?.win_rate || 0),
-    totalTrades: (state) => Number(state.summary?.performance?.total_trades || 0),
-    profitFactor: (state) => Number(state.summary?.performance?.profit_factor || 0),
-    maxDrawdownPct: (state) => Number(state.summary?.performance?.max_drawdown_pct || 0),
-    dailyPnlChart: (state) => Array.isArray(state.summary?.daily_pnl_chart) ? state.summary.daily_pnl_chart : [],
-    todayPnl: (state) => {
-      const list = Array.isArray(state.summary?.daily_pnl_chart) ? state.summary.daily_pnl_chart : []
-      if (!list.length) return 0
-      const today = new Date()
-      const key = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`
-      const found = list.find((d) => d.date === key)
-      return Number(found?.profit || 0)
-    },
-    aiStrategyCount: (state) => Number(state.summary?.ai_strategy_count || 0),
-    indicatorStrategyCount: (state) => Number(state.summary?.indicator_strategy_count || 0)
+    // null when there is nothing to divide (no closed or no losing trade)
+    winRate: (state) => knownNumber(state.summary?.performance?.win_rate),
+    totalTrades: (state) => knownNumber(state.summary?.performance?.total_trades),
+    profitFactor: (state) => knownNumber(state.summary?.performance?.profit_factor),
+    // No source: the API has no per-day P&L for the account. Unknown, not 0.
+    todayPnl: () => null
   },
 
   actions: {

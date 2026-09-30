@@ -227,3 +227,52 @@ class TestPendingOrders:
 
         assert resp.code == 1
         assert resp.data == {"items": []}
+
+
+class TestPerformance:
+    """Home KPIs: a ratio with nothing to divide is ``None`` ("—"), never 0."""
+
+    @staticmethod
+    def _trades(db, *pnls, user_id=1, strategy_id=10):
+        from api.models import Strategy, Trade, User
+
+        if not db.get(User, user_id):
+            db.add(User(id=user_id, email=f"u{user_id}@example.com", password_hash="x"))
+        if not db.get(Strategy, strategy_id):
+            db.add(Strategy(id=strategy_id, user_id=user_id, name="s", type="script"))
+        for p in pnls:
+            db.add(Trade(strategy_id=strategy_id, symbol="AAPL", side="sell",
+                         qty=1, price=100.0, pnl=p))
+        db.commit()
+
+    def test_no_trades_is_unknown_not_zero(self, db, user, portfolio):
+        portfolio(_Portfolio(kr=_kr(), us=_us()))
+        perf = _summary(user, db)["performance"]
+        assert perf == {"total_trades": 0, "win_rate": None, "profit_factor": None}
+
+    def test_win_rate_and_profit_factor_come_from_closed_trades(self, db, user, portfolio):
+        portfolio(_Portfolio(kr=_kr(), us=_us()))
+        self._trades(db, 0.0, 30.0, 10.0, -20.0)      # 0.0 is an opening buy
+        perf = _summary(user, db)["performance"]
+        assert perf["total_trades"] == 4
+        assert perf["win_rate"] == 66.7                # 2 of 3 closed
+        assert perf["profit_factor"] == 2.0            # 40 / 20
+
+    def test_no_losing_trade_has_no_profit_factor(self, db, user, portfolio):
+        portfolio(_Portfolio(kr=_kr(), us=_us()))
+        self._trades(db, 5.0)
+        perf = _summary(user, db)["performance"]
+        assert perf["win_rate"] == 100.0
+        assert perf["profit_factor"] is None
+
+    def test_other_users_trades_are_not_counted(self, db, user, portfolio):
+        portfolio(_Portfolio(kr=_kr(), us=_us()))
+        self._trades(db, 50.0, user_id=2, strategy_id=20)
+        assert _summary(user, db)["performance"]["total_trades"] == 0
+
+    def test_the_performance_block_survives_a_broker_outage(self, db, user, portfolio):
+        portfolio(_Portfolio(kr=RuntimeError(_SECRET), us=RuntimeError(_SECRET)))
+        self._trades(db, 5.0)
+        data = _summary(user, db)
+        assert data["portfolio_status"] == "unavailable"
+        assert data["performance"]["total_trades"] == 1
