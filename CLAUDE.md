@@ -12,7 +12,7 @@
 
 ---
 
-## 프로젝트 진행 현황 (2026-09-30 기준, main `27ead8b` = PR #191)
+## 프로젝트 진행 현황 (2026-09-30 기준, main `0e6330f` = PR #192)
 
 > **이 섹션이 최신 상태의 단일 진실 공급원(SoT).** 아래 "다음 작업 목록(Stage 1~9)"은 초기 설계 로드맵으로,
 > 대부분 이미 구현 완료됐다. 실제 진행은 `AUDIT.md` → `ROADMAP.md` 기반 하드닝 트랙으로 이어지고 있다.
@@ -58,6 +58,7 @@
 | API 의존성 | #190 | `pip-audit` 지적 전부 해소. fastapi 0.111→0.142.1 + starlette 0.37.2→1.7.0(권고 다수) + pydantic 2.7→2.13. `python-jose`→`PyJWT`(HS256만 사용 — ecdsa·rsa·pyasn1 제거). 라우트 목록 테스트는 `app.openapi()` 기준(새 FastAPI는 `app.routes`에 포함 라우터를 평탄화하지 않는다) |
 | 스크립트 시간 제한 | #191 | **#188** — 스크립트 백테스트를 `spawn` 자식 프로세스에서 실행(`strategy/script_backtest.py`). 예산(`SCRIPT_BACKTEST_TIMEOUT_SEC`, 기본 30초) 초과 시 kill, 주소 공간 상한(`SCRIPT_BACKTEST_MEMORY_MB`, 기본 1024) + `RLIMIT_CPU` 백스톱. 무한 루프·긴 C 호출 모두 중단. 가격은 부모가 받아 넘기고, 사용자 코드는 API 프로세스에서 실행되지 않는다 |
 | 대시보드 0 보고 | #192 | **#149를 대시보드에** — `/api/dashboard/summary`가 어떤 실패든 0을 돌려 장애·풀리지 않는 자격증명·한쪽 시장 실패·빈 계좌가 모두 "총 자산 0"이었다. 알 수 없는 값은 `None` + `portfolio_status`(`ok`/`partial`/`unavailable`/`no_credential`)·`portfolio_errors`, KR·US를 따로 조회·파싱(응답 모양이 틀려도 그 시장만 실패). `/pendingOrders` 실패는 빈 목록이 아니라 오류. 프론트 스토어가 API가 안 보내는 `total_equity`를 읽어 **성공해도 0**이던 것 수정(KRW·USD 따로, null은 `—`). **별건**: #151 이후 `SymbolPicker.data()`가 computed를 읽어 홈·퀵트레이드·봇 폼이 **마운트 중 TypeError** — prop 직접 읽기로 수정 |
+| 백테스트 동시성 | #193 | 스크립트 백테스트 동시 실행 상한 — 프로세스당 `BoundedSemaphore`(`SCRIPT_BACKTEST_MAX_CONCURRENT`, 기본 2, uvicorn 워커 1개라 전역). 슬롯이 없으면 대기 없이 즉시 `ScriptBacktestBusy`(아무것도 시작 안 함). 슬롯은 자식 회수 후 반환, 가격 조회는 슬롯 밖(느린 다운로드가 슬롯을 차지하지 않게) |
 
 **열린 PR 0건.** 다음 작업은 `origin/main`에서 새로 분기하면 된다.
 
@@ -468,7 +469,7 @@ KR_ETF   = ["069500", "360750", "091160"]  # KODEX200, TIGER S&P500, KODEX반도
 - **PR #79** (`claude/update-MW7LQ`): 실패 시나리오 통합테스트 (TASK 4-1C) — **머지됨** (2026-06-16)
 - 하드닝 트랙 PR #85~#156: 위 "프로젝트 진행 현황" 표 참조 — **모두 머지됨**
 - **PR #116**은 미머지 종료(2026-07-05). 같은 작업을 **#119**가 대체 구현해 머지했다
-- **현재 열린 PR 0건.** main = `27ead8b` (PR #191)
+- **현재 열린 PR 0건.** main = `0e6330f` (PR #192)
 
 > 작업 방식: 기능별 새 브랜치에서 작업 → `main`으로 드래프트 PR → CodeRabbit/CodeQL 리뷰 → 머지.
 > 브랜치 보호 룰셋(PR 필수 + 코드 스캐닝)이 적용돼 `main` 직접 푸시 불가.
