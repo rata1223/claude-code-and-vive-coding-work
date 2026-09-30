@@ -224,3 +224,53 @@ def test_broker_finds_a_us_order_on_the_second_page():
     order = _broker(c)._get_us_order_status("B", "AAPL")
     assert order is not None and order.id == "B"
     _assert_continued(c, "200")
+
+
+# ── an order found on an early page is not lost to a later page's failure ──
+
+class _FailsAfter(_Pages):
+    """Plays back its pages, then raises on the next request."""
+
+    def get_page(self, path, tr_id, params, tr_cont=""):
+        if not self.pages:
+            self.calls.append((dict(params), tr_cont))
+            raise ConnectionError("page request failed")
+        return super().get_page(path, tr_id, params, tr_cont)
+
+
+class TestFindRow:
+    """CodeRabbit architecture review: the broker status lookups turn any
+    exception into None, which the reconciler reads as "absent at the broker".
+    Reading every page before matching let a page-2 failure hide an order
+    already on page 1 — one the single-page code found."""
+
+    def test_stops_at_the_page_with_the_row(self):
+        from kis_adapter.pagination import find_row
+        c = _Pages(_two_pages("output", "200", [{"odno": "A"}], [{"odno": "B"}]))
+        assert find_row(c, "/p", "TR", {}, ctx="200", list_key="output",
+                        match=lambda r: r["odno"] == "A") == {"odno": "A"}
+        assert len(c.calls) == 1
+
+    def test_none_only_after_every_page(self):
+        from kis_adapter.pagination import find_row
+        c = _Pages(_two_pages("output", "200", [{"odno": "A"}], [{"odno": "B"}]))
+        assert find_row(c, "/p", "TR", {}, ctx="200", list_key="output",
+                        match=lambda r: r["odno"] == "Z") is None
+        assert len(c.calls) == 2
+
+    def test_a_failure_before_the_row_still_raises(self):
+        from kis_adapter.pagination import find_row
+        c = _FailsAfter([({"output": [{"odno": "A"}], "ctx_area_nk200": "K"}, "M")])
+        with pytest.raises(ConnectionError):
+            find_row(c, "/p", "TR", {}, ctx="200", list_key="output",
+                     match=lambda r: r["odno"] == "B")
+
+    def test_broker_kr_finds_a_page_one_order_when_page_two_fails(self):
+        c = _FailsAfter([({"output1": [_order_row("A")], "ctx_area_nk100": "K"}, "M")])
+        order = _broker(c)._get_kr_order_status("A")
+        assert order is not None and order.id == "A"
+
+    def test_broker_us_finds_a_page_one_order_when_page_two_fails(self):
+        c = _FailsAfter([({"output": [_order_row("A")], "ctx_area_nk200": "K"}, "M")])
+        order = _broker(c)._get_us_order_status("A", "AAPL")
+        assert order is not None and order.id == "A"

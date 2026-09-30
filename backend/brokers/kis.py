@@ -10,7 +10,7 @@ from .semantic_mapper import KIS_DOMESTIC_MAPPER, KIS_OVERSEAS_MAPPER
 from .validator import BrokerCapabilityValidator, OrderRequest
 from kis_adapter import KISClient, KISMarketData, KISOrders, KISPortfolio
 from kis_adapter.dates import inquiry_date_range
-from kis_adapter.pagination import get_all_pages
+from kis_adapter.pagination import find_row
 from backend.execution.circuit_breaker import ConsecutiveFailureBreaker
 from backend.market.symbols import resolve_exchange, to_quote_excd
 from backend.quant.data.universe import KR_ETF
@@ -340,24 +340,16 @@ class KISBroker(BrokerAdapter):
                 "CTX_AREA_FK100": "",
                 "CTX_AREA_NK100": "",
             }
-            resp = get_all_pages(self._client, "/uapi/domestic-stock/v1/trading/inquire-order",
-                                 tr_id, params, ctx="100", list_key=("output1", "output"))
-            output = resp.get("output1") or resp.get("output", [])
-            if not output:
+            # Match the specific order_id; never fall back to a different
+            # order's row (the inquiry can return multiple orders). Stop at the
+            # page that has it: a failure on a later page must not hide it —
+            # the caller reads None as "absent at the broker".
+            row = find_row(self._client, "/uapi/domestic-stock/v1/trading/inquire-order",
+                           tr_id, params, ctx="100", list_key=("output1", "output"),
+                           match=lambda r: r.get("odno") == order_id)
+            if row is None:
+                logger.warning("KR 주문 %s 응답에서 미매칭 — None 반환", order_id)
                 return None
-            if isinstance(output, list):
-                # Match the specific order_id; never fall back to a different
-                # order's row (the inquiry can return multiple orders).
-                row = next((r for r in output if r.get("odno") == order_id), None)
-                if row is None:
-                    logger.warning("KR 주문 %s 응답에서 미매칭 — None 반환", order_id)
-                    return None
-            else:
-                # Single-object response: still fail-closed on a mismatched odno.
-                row = output
-                if row.get("odno") != order_id:
-                    logger.warning("KR 주문 %s 응답에서 미매칭(단일) — None 반환", order_id)
-                    return None
             filled_qty = KIS_DOMESTIC_MAPPER.extract_filled_qty(row)
             ord_qty = KIS_DOMESTIC_MAPPER.extract_order_qty(row)
             avg_price = KIS_DOMESTIC_MAPPER.extract_avg_price(row)
@@ -393,13 +385,11 @@ class KISBroker(BrokerAdapter):
                 "CTX_AREA_FK200": "",
                 "CTX_AREA_NK200": "",
             }
-            resp = get_all_pages(self._client, "/uapi/overseas-stock/v1/trading/inquire-order",
-                                 tr_id, params, ctx="200", list_key="output")
-            output = resp.get("output") or []
-            if not output:
-                return None
-            # Match the specific order_id; never fall back to a different order's row.
-            row = next((r for r in output if r.get("odno") == order_id), None)
+            # Match the specific order_id; never fall back to a different order's
+            # row. Stop at the page that has it (see _get_kr_order_status).
+            row = find_row(self._client, "/uapi/overseas-stock/v1/trading/inquire-order",
+                           tr_id, params, ctx="200", list_key="output",
+                           match=lambda r: r.get("odno") == order_id)
             if row is None:
                 logger.warning("US 주문 %s 응답에서 미매칭 — None 반환", order_id)
                 return None
