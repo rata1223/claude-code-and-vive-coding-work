@@ -31,6 +31,14 @@ export const useUserStore = defineStore('user', {
       this.userInfo = null
       this.isLoggedIn = false
       localStorage.removeItem('token')
+      // Account-scoped stores live in memory until a reload; without this the
+      // next account to sign in on this device sees the previous one's
+      // balances and strategies until its own data arrives. Settings are
+      // per-device and stay.
+      for (const useStore of [useDashboardStore, useStrategyStore, useCredentialsStore,
+        useNotificationStore, useWatchlistStore, useQuickTradeStore]) {
+        useStore().$reset()
+      }
     }
   }
 })
