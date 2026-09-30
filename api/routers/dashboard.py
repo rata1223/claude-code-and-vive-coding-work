@@ -97,6 +97,10 @@ def _performance(user_id: int, db: Session) -> dict:
     carries 0 and says nothing about winning or losing. With no closed trade
     there is no win rate, and with no losing trade no profit factor: ``None``,
     which the app shows as "—", never 0.
+
+    No row at all is ``None`` too, not "0 trades": nothing in the live path
+    writes ``strategy_trades`` yet (fills go to the worker's ``orders``/
+    ``fills``), so an empty table cannot tell "no trades" from "not recorded".
     """
     pnls = [
         p for (p,) in db.query(Trade.pnl)
@@ -109,7 +113,7 @@ def _performance(user_id: int, db: Session) -> dict:
     wins = [p for p in closed if p > 0]
     gross_loss = -sum(p for p in closed if p < 0)
     return {
-        "total_trades": total,
+        "total_trades": total or None,
         "win_rate": round(len(wins) / len(closed) * 100, 1) if closed else None,
         "profit_factor": round(sum(wins) / gross_loss, 2) if gross_loss else None,
     }

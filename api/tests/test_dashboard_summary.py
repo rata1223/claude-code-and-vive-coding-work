@@ -248,7 +248,8 @@ class TestPerformance:
     def test_no_trades_is_unknown_not_zero(self, db, user, portfolio):
         portfolio(_Portfolio(kr=_kr(), us=_us()))
         perf = _summary(user, db)["performance"]
-        assert perf == {"total_trades": 0, "win_rate": None, "profit_factor": None}
+        # nothing writes strategy_trades yet: an empty table is "not recorded"
+        assert perf == {"total_trades": None, "win_rate": None, "profit_factor": None}
 
     def test_win_rate_and_profit_factor_come_from_closed_trades(self, db, user, portfolio):
         portfolio(_Portfolio(kr=_kr(), us=_us()))
@@ -268,7 +269,7 @@ class TestPerformance:
     def test_other_users_trades_are_not_counted(self, db, user, portfolio):
         portfolio(_Portfolio(kr=_kr(), us=_us()))
         self._trades(db, 50.0, user_id=2, strategy_id=20)
-        assert _summary(user, db)["performance"]["total_trades"] == 0
+        assert _summary(user, db)["performance"]["total_trades"] is None
 
     def test_the_performance_block_survives_a_broker_outage(self, db, user, portfolio):
         portfolio(_Portfolio(kr=RuntimeError(_SECRET), us=RuntimeError(_SECRET)))

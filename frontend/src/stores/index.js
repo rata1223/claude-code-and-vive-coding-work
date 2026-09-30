@@ -129,8 +129,13 @@ export const useDashboardStore = defineStore('dashboard', {
     assetsKrw: (state) => knownNumber(state.summary?.total_assets_krw),
     assetsUsd: (state) => knownNumber(state.summary?.total_assets_usd),
     profitKrw: (state) => knownNumber(state.summary?.total_profit_krw),
-    // KIS evaluation P&L (evlu_pfls_smtl_amt) is the unrealized P&L of holdings.
-    unrealizedPnl: (state) => knownNumber(state.summary?.total_profit_krw),
+    // KIS evaluation P&L (evlu_pfls_smtl_amt) — KR holdings only; US P&L is
+    // not parsed yet (#178), so with any US position the total is unknown.
+    unrealizedPnl: (state) => {
+      const us = state.summary?.us_positions
+      if (!Array.isArray(us) || us.length) return null
+      return knownNumber(state.summary?.total_profit_krw)
+    },
     positions: (state) => {
       const kr = state.summary?.kr_positions
       const us = state.summary?.us_positions
