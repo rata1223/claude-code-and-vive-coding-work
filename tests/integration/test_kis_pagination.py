@@ -79,6 +79,16 @@ class TestGetAllPages:
             get_all_pages(c, "/p", "TR", {}, ctx="200", list_key="output")
         assert len(c.calls) == MAX_PAGES
 
+    def test_a_later_page_without_the_row_key_raises(self):
+        """CodeRabbit: a missing key used to count as no rows on that page."""
+        c = _Pages([({"output": [1], "ctx_area_nk200": "K"}, "M"), ({"rt_cd": "0"}, "D")])
+        with pytest.raises(RuntimeError, match="다음 페이지에 행 목록"):
+            get_all_pages(c, "/p", "TR", {}, ctx="200", list_key="output")
+
+    def test_a_later_page_with_an_empty_row_list_is_fine(self):
+        c = _Pages([({"output": [1], "ctx_area_nk200": "K"}, "M"), ({"output": []}, "D")])
+        assert get_all_pages(c, "/p", "TR", {}, ctx="200", list_key="output")["output"] == [1]
+
     def test_a_single_object_row_is_a_list_of_one(self):
         c = _Pages([({"output": {"odno": "1"}}, "D")])
         assert get_all_pages(c, "/p", "TR", {}, ctx="200",

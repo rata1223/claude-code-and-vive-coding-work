@@ -62,6 +62,9 @@ def get_all_pages(client, path: str, tr_id: str, params: dict, *, ctx: str,
             raise RuntimeError(
                 f"KIS {tr_id}: {max_pages}페이지를 넘었습니다 — 일부만 반환하지 않음")
         data, cont = client.get_page(path, tr_id, {**params, fk_req: fk, nk_req: nk}, "N")
+        if key not in data:                 # an explicit empty list is fine
+            raise RuntimeError(
+                f"KIS {tr_id}: 다음 페이지에 행 목록({key})이 없습니다 — 일부만 반환하지 않음")
         rows.extend(_rows(data.get(key)))
         pages += 1
     merged[key] = rows
