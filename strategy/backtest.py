@@ -67,8 +67,12 @@ class Backtester:
             df = yf.Ticker(f"{self.symbol}.KQ").history(period=self.period)
         return df
 
-    def run(self) -> BacktestResult:
-        df = self._fetch()
+    def run(self, df: pd.DataFrame | None = None) -> BacktestResult:
+        """``df`` lets a caller fetch prices itself — the script runner fetches in
+        the API process and hands the frame to a child that has no need for the
+        network (strategy/script_backtest.py)."""
+        if df is None:
+            df = self._fetch()
         if df.empty:
             return BacktestResult(symbol=self.symbol)
 
