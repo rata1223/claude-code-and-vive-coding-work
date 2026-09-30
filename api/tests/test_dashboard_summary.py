@@ -96,6 +96,15 @@ def test_an_empty_account_is_still_zero(db, user, portfolio):
     assert data["kr_positions"] == [] and data["us_positions"] == []
 
 
+def test_a_position_written_down_to_zero_is_minus_100_percent(db, user, portfolio):
+    """Review: the old ``eval > 0`` guard reported a total loss as 0%."""
+    portfolio(_Portfolio(kr=_kr(eval_amt="0", pnl="-500000"), us=_us()))
+    data = _summary(user, db)
+
+    assert data["total_assets_krw"] == 0.0
+    assert data["total_profit_rate"] == -100.0
+
+
 def test_one_failing_market_does_not_blank_the_other(db, user, portfolio):
     portfolio(_Portfolio(kr=RuntimeError(_SECRET), us=_us()))
     data = _summary(user, db)

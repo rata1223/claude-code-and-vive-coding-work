@@ -327,7 +327,10 @@ export default {
       // no_credential is covered by the setup card below
       const status = this.dashboardStore.portfolioStatus
       if (status === 'unavailable') {
-        return this.dashboardStore.portfolioErrors.credential || this.$t('home.portfolio_unavailable')
+        // The server's error text is Korean-only; show a localized notice.
+        return this.dashboardStore.portfolioErrors.credential
+          ? this.$t('home.portfolio_credential')
+          : this.$t('home.portfolio_unavailable')
       }
       if (status === 'partial') return this.$t('home.portfolio_partial')
       return ''

@@ -60,8 +60,9 @@ def _read_kr(portfolio) -> dict:
     eval_amt = float(row.get("tot_evlu_amt", 0) or 0)
     pnl = float(row.get("evlu_pfls_smtl_amt", 0) or 0)
     rate = 0.0
-    if eval_amt > 0 and (eval_amt - pnl):
-        rate = round(pnl / (eval_amt - pnl) * 100, 2)
+    cost = eval_amt - pnl          # guard on the cost basis: a position written
+    if cost > 0:                   # down to 0 is -100%, not 0%
+        rate = round(pnl / cost * 100, 2)
     return {"eval": eval_amt, "pnl": pnl, "rate": rate,
             "positions": result.get("positions", [])}
 
