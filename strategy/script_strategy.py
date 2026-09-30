@@ -3,10 +3,23 @@ ScriptStrategy: 사용자가 Python 스크립트로 직접 작성하는 이벤�
 RestrictedPython 기반 샌드박스 실행.
 """
 import logging
+import math
+import operator
+import statistics
 import time
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any
-import pandas as pd
+
+from RestrictedPython import compile_restricted
+from RestrictedPython.Eval import default_guarded_getitem, default_guarded_getiter
+from RestrictedPython.Guards import (
+    full_write_guard,
+    guarded_iter_unpack_sequence,
+    guarded_unpack_sequence,
+    safer_getattr,
+)
+from RestrictedPython.PrintCollector import PrintCollector
 
 logger = logging.getLogger(__name__)
 
@@ -50,14 +63,86 @@ SAFE_BUILTINS = {
     "isinstance": isinstance, "len": len, "list": list, "map": map,
     "max": max, "min": min, "print": print, "range": range,
     "round": round, "set": set, "sorted": sorted, "str": str, "sum": sum,
-    "tuple": tuple, "type": type, "zip": zip,
+    "tuple": tuple, "zip": zip,
     "True": True, "False": False, "None": None,
 }
 
+
+def _public_functions(module, names):
+    """A namespace holding only the named callables — never the module itself.
+
+    A module object hands out everything it imported: ``statistics.sys`` is a
+    public attribute, and from ``sys`` every other module is one lookup away.
+    """
+    return SimpleNamespace(**{n: getattr(module, n) for n in names})
+
+
 SAFE_MODULES = {
-    "math": __import__("math"),
-    "statistics": __import__("statistics"),
+    "math": SimpleNamespace(
+        pi=math.pi, e=math.e, inf=math.inf, nan=math.nan,
+        **vars(_public_functions(math, [
+            "sqrt", "exp", "log", "log10", "log2", "pow", "fabs", "floor", "ceil",
+            "isnan", "isinf", "isfinite", "copysign", "fsum", "prod", "tanh",
+            "sin", "cos", "tan", "atan", "atan2", "hypot",
+        ]))),
+    "statistics": _public_functions(statistics, [
+        "mean", "fmean", "geometric_mean", "harmonic_mean", "median",
+        "median_low", "median_high", "mode", "multimode", "stdev", "pstdev",
+        "variance", "pvariance", "quantiles",
+    ]),
 }
+
+_INPLACE_OPS = {
+    "+=": operator.iadd, "-=": operator.isub, "*=": operator.imul,
+    "/=": operator.itruediv, "//=": operator.ifloordiv, "%=": operator.imod,
+    "**=": operator.ipow,
+}
+
+
+def _inplacevar(op, x, y):
+    """RestrictedPython routes ``x += y`` here; only arithmetic is supported."""
+    fn = _INPLACE_OPS.get(op)
+    if fn is None:
+        raise SyntaxError(f"지원하지 않는 복합 대입: {op}")
+    return fn(x, y)
+
+
+def _guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
+    """``import math`` / ``import statistics`` resolve to the vetted namespaces
+    above; every other import is refused."""
+    if level == 0 and name in SAFE_MODULES and not fromlist:
+        return SAFE_MODULES[name]
+    raise ImportError(f"허용되지 않은 import: {name}")
+
+
+def _restricted_globals() -> dict[str, Any]:
+    """The globals a script runs under: RestrictedPython's guard hooks, our
+    builtin allowlist, and the vetted modules.
+
+    User scripts used to run through plain ``exec`` with this module's builtins,
+    ``pandas`` and the real ``math``/``statistics`` modules — no guard at all.
+    Every attribute read now goes through ``safer_getattr`` (no ``_``-prefixed
+    names), writes only reach dicts and lists (``full_write_guard``), and
+    ``pandas`` is gone: its I/O functions carry no underscore to stop them.
+    """
+    builtins = dict(SAFE_BUILTINS)
+    builtins["__import__"] = _guarded_import
+    return {
+        "__builtins__": builtins,
+        "__name__": "strategy_script",
+        "_getattr_": safer_getattr,
+        "_getitem_": default_guarded_getitem,
+        "_getiter_": default_guarded_getiter,
+        "_iter_unpack_sequence_": guarded_iter_unpack_sequence,
+        "_unpack_sequence_": guarded_unpack_sequence,
+        "_write_": full_write_guard,
+        "_inplacevar_": _inplacevar,
+        "_print_": PrintCollector,
+        "_apply_": lambda f, *a, **kw: f(*a, **kw),
+        **SAFE_MODULES,
+        "Signal": Signal,
+        "Bar": Bar,
+    }
 
 
 class ScriptStrategy:
@@ -83,14 +168,10 @@ class ScriptStrategy:
 
     def compile(self) -> bool:
         try:
-            restricted_globals = {
-                "__builtins__": SAFE_BUILTINS,
-                **SAFE_MODULES,
-                "pd": pd,
-                "Signal": Signal,
-                "Bar": Bar,
-            }
-            exec(compile(self.code, "<strategy>", "exec"), restricted_globals, self._ns)
+            code = compile_restricted(self.code, "<strategy>", "exec")
+            env = _restricted_globals()
+            exec(code, env)
+            self._ns = env
             self._compiled = True
             return True
         except Exception as e:
@@ -229,7 +310,7 @@ def on_order_filled(order, ctx):
 def on_start(ctx):
     ctx['state'] = {'prices': {}, 'position': {}}
 
-def _bollinger(prices, length=20, std_mult=2.0):
+def bollinger_bands(prices, length=20, std_mult=2.0):
     import statistics
     if len(prices) < length:
         return None, None, None
@@ -250,7 +331,7 @@ def on_bar(bar, ctx):
     state['prices'][bar.symbol].append(bar.close)
 
     prices = state['prices'][bar.symbol]
-    lower, mid, upper = _bollinger(prices, length, std_mult)
+    lower, mid, upper = bollinger_bands(prices, length, std_mult)
     if lower is None:
         return None
 
