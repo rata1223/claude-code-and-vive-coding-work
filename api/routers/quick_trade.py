@@ -10,7 +10,7 @@ from api.crypto import CredentialUnreadable, kis_credential_fields
 from api.database import get_db
 from api.deps import get_current_user
 from api.models import (
-    Credential, QT_CANCELED, QT_REJECTED, QT_SUBMITTED, Strategy, Trade, User, qt_transition,
+    Credential, QT_CANCELED, QT_REJECTED, QT_SUBMITTED, QuickTradeOrder, User, qt_transition,
 )
 from api.schemas import (
     CancelOrderRequest, ClosePositionRequest, EmergencyFlattenRequest,
@@ -332,8 +332,6 @@ def _existing_order(db, user_id: int, idempotency_key: str):
     figure the *first* submission has already reduced, and reject it — turning
     a safe idempotent retry into a spurious "sellable exceeded".
     """
-    from api.models import QuickTradeOrder
-
     return (
         db.query(QuickTradeOrder)
         .filter(QuickTradeOrder.user_id == user_id,
@@ -366,7 +364,6 @@ def _open_sell_qty(db, user_id: int, credential_id: int, market: str, symbol: st
     """
     from sqlalchemy import func
 
-    from api.models import QuickTradeOrder
     from backend.risk.sellable_qty import pending_sell_qty_from_rows
 
     q = (
@@ -921,7 +918,24 @@ def close_position(
         return Resp.err(f"Close position failed: {e}")
 
 
-# ── Trade history ─────────────────────────────────────────────────────────
+# ── Order history ─────────────────────────────────────────────────────────
+
+def serialize_order(r) -> dict:
+    """One ``quick_trade_orders`` row as the order lists return it."""
+    return {
+        "id": r.id,
+        "credential_id": r.credential_id,
+        "symbol": r.symbol,
+        "side": r.side,
+        "qty": r.qty,
+        "price": r.price,
+        "market": r.market,
+        "exchange": r.exchange,
+        "broker_order_id": r.broker_order_id,
+        "status": r.status,
+        "created_at": r.created_at.isoformat() if r.created_at else None,
+    }
+
 
 @router.get("/history")
 def get_history(
@@ -931,30 +945,27 @@ def get_history(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Return trade history across all user strategies."""
-    q = (
-        db.query(Trade)
-        .join(Strategy, Trade.strategy_id == Strategy.id)
-        .filter(Strategy.user_id == current_user.id)
-        .order_by(Trade.filled_at.desc())
-    )
+    """The caller's own Quick Trade orders, newest first, in every status.
+
+    These are orders — what was sent and how it ended — not fills: the stored
+    status is a submission outcome (``submitted`` means the broker accepted it,
+    not that it filled), and there is no P&L. It used to read
+    ``strategy_trades``, which nothing writes, so the list was always empty.
+    The worker's ``orders``/``fills`` are not an alternative: they belong to
+    the single ``.env`` account and carry no user, so they must not be shown
+    to API users.
+    """
+    q = db.query(QuickTradeOrder).filter(QuickTradeOrder.user_id == current_user.id)
+    if credential_id is not None:
+        q = q.filter(QuickTradeOrder.credential_id == credential_id)
     total = q.count()
-    trades = q.offset((page - 1) * page_size).limit(page_size).all()
-    items = [
-        {
-            "id": t.id,
-            "strategy_id": t.strategy_id,
-            "symbol": t.symbol,
-            "side": t.side,
-            "qty": t.qty,
-            "price": t.price,
-            "pnl": t.pnl or 0.0,
-            "fee": t.fee or 0.0,
-            "filled_at": t.filled_at.isoformat() if t.filled_at else None,
-        }
-        for t in trades
-    ]
-    return Resp.ok({"total": total, "items": items})
+    rows = (
+        q.order_by(QuickTradeOrder.created_at.desc(), QuickTradeOrder.id.desc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+        .all()
+    )
+    return Resp.ok({"total": total, "items": [serialize_order(r) for r in rows]})
 
 
 # ── Open orders ───────────────────────────────────────────────────────────
@@ -972,13 +983,9 @@ def get_open_orders(
     to the reconciler, not to a cancel), and a terminal row is already finished
     — listing either would offer the user an action that cannot succeed.
 
-    This is not the ``/history`` fix. ``get_history`` still reads strategy
-    trades only; this is the minimum read path that makes cancellation
-    reachable at all, since without it the UI has no row to attach a Cancel
-    button to.
+    ``/history`` lists every order; this is the subset a Cancel button can
+    act on.
     """
-    from api.models import QuickTradeOrder
-
     cred = _get_cred(credential_id, current_user.id, db)
     if not cred:
         return Resp.err("No KIS credential found for that id — Quick Trade routes to KIS only")
@@ -994,21 +1001,7 @@ def get_open_orders(
         .order_by(QuickTradeOrder.created_at.desc())
         .all()
     )
-    items = [
-        {
-            "id": r.id,
-            "symbol": r.symbol,
-            "side": r.side,
-            "qty": r.qty,
-            "price": r.price,
-            "market": r.market,
-            "exchange": r.exchange,
-            "broker_order_id": r.broker_order_id,
-            "status": r.status,
-            "created_at": r.created_at.isoformat() if r.created_at else None,
-        }
-        for r in rows
-    ]
+    items = [serialize_order(r) for r in rows]
     return Resp.ok({"total": len(items), "items": items})
 
 
@@ -1038,8 +1031,6 @@ def cancel_order(
     they are flat while they are not, which is worse than any error message.
     Only a confirmed cancel moves the row to ``QT_CANCELED``.
     """
-    from api.models import QuickTradeOrder
-
     cred = _get_cred(body.credential_id, current_user.id, db)
     if not cred:
         return Resp.err("No KIS credential found for that id — Quick Trade routes to KIS only")

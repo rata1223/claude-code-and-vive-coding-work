@@ -593,9 +593,11 @@ export default {
 
     getStatusText(value) {
       const map = {
-        filled: this.$t('quick_trade.status_filled'),
+        reserved: this.$t('quick_trade.status_reserved'),
         submitted: this.$t('quick_trade.status_submitted'),
+        rejected: this.$t('quick_trade.status_rejected'),
         failed: this.$t('quick_trade.status_failed'),
+        blocked: this.$t('quick_trade.status_blocked'),
         canceled: this.$t('quick_trade.status_canceled')
       }
       return map[value] || (value || '-')

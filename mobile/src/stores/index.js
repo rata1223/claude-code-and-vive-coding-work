@@ -139,7 +139,7 @@ export const useDashboardStore = defineStore('dashboard', {
       if (!Array.isArray(kr) && !Array.isArray(us)) return null
       return [...(Array.isArray(kr) ? kr : []), ...(Array.isArray(us) ? us : [])]
     },
-    recentTrades: (state) => Array.isArray(state.summary?.recent_trades) ? state.summary.recent_trades : [],
+    recentOrders: (state) => Array.isArray(state.summary?.recent_orders) ? state.summary.recent_orders : [],
     // null when there is nothing to divide (no closed or no losing trade)
     winRate: (state) => knownNumber(state.summary?.performance?.win_rate),
     totalTrades: (state) => knownNumber(state.summary?.performance?.total_trades),

@@ -133,7 +133,7 @@ def test_an_outage_is_unknown_not_zero(db, user, portfolio):
     assert data["portfolio_status"] == "unavailable"
     assert set(data["portfolio_errors"]) == {"kr", "us"}
     assert all(data[f] is None for f in _KR_FIELDS + _US_FIELDS)
-    assert data["strategy_count"] == 0 and data["recent_trades"] == []
+    assert data["strategy_count"] == 0 and data["recent_orders"] == []
 
 
 def test_a_one_row_list_summary_is_read(db, user, portfolio):

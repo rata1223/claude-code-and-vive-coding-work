@@ -214,27 +214,25 @@
       </div>
     </div>
 
-    <!-- Recent trades -->
-    <div v-if="recentTrades.length" class="ios-section">
+    <!-- Recent orders: the user's own Quick Trade orders (orders, not fills — no P&L) -->
+    <div v-if="recentOrders.length" class="ios-section">
       <div class="ios-section-head">
-        <span class="ios-section-title">{{ $t('home.recent_trades') }}</span>
+        <span class="ios-section-title">{{ $t('home.recent_orders') }}</span>
       </div>
       <div class="ios-grouped">
         <div
-          v-for="trade in recentTrades.slice(0, 5)"
-          :key="trade.id || trade.created_at"
+          v-for="order in recentOrders"
+          :key="order.id"
           class="ios-row"
         >
-          <div :class="['ios-row-icon', Number(trade.profit || 0) >= 0 ? 'up' : 'down']">
-            <van-icon :name="Number(trade.profit || 0) >= 0 ? 'arrow-up' : 'arrow-down'" />
+          <div :class="['ios-row-icon', order.side === 'sell' ? 'down' : 'up']">
+            <van-icon :name="order.side === 'sell' ? 'arrow-down' : 'arrow-up'" />
           </div>
           <div class="ios-row-main">
-            <span class="ios-row-title">{{ trade.symbol || trade.instrument || '--' }}</span>
-            <span class="ios-row-sub">{{ formatTradeMeta(trade) }}</span>
+            <span class="ios-row-title">{{ order.symbol || '--' }}</span>
+            <span class="ios-row-sub">{{ formatOrderMeta(order) }}</span>
           </div>
-          <span :class="['pnl', Number(trade.profit || 0) >= 0 ? 'profit' : 'loss']">
-            {{ formatSignedMoney(trade.profit || 0) }}
-          </span>
+          <span class="order-status">{{ orderStatusText(order.status) }}</span>
         </div>
       </div>
     </div>
@@ -360,8 +358,8 @@ export default {
     alertStrategies() {
       return this.strategyStore.alertStrategies
     },
-    recentTrades() {
-      return this.dashboardStore.recentTrades
+    recentOrders() {
+      return this.dashboardStore.recentOrders
     },
     hasCredentials() {
       return this.credentialsStore.hasCredentials
@@ -521,12 +519,18 @@ export default {
       return `${sign}${this.formatMoney(num)}`
     },
 
-    formatTradeMeta(trade) {
-      const parts = [
-        trade.side || trade.type || '-',
-        trade.created_at ? this.formatTime(trade.created_at) : null
-      ].filter(Boolean)
-      return parts.join(' · ')
+    formatOrderMeta(order) {
+      const side = order.side === 'sell' ? this.$t('quick_trade.side_sell') : this.$t('quick_trade.side_buy')
+      return [
+        side,
+        this.$t('quick_trade.shares_unit', { count: order.qty }),
+        order.created_at ? this.formatTime(order.created_at) : null
+      ].filter(Boolean).join(' · ')
+    },
+
+    orderStatusText(status) {
+      const key = `quick_trade.status_${status}`
+      return this.$te(key) ? this.$t(key) : (status || '-')
     },
 
     formatTime(value) {
@@ -1079,14 +1083,12 @@ export default {
   font-size: 14px;
 }
 
-.pnl {
+.order-status {
   flex-shrink: 0;
-  font-size: 14px;
-  font-weight: 700;
-  font-variant-numeric: tabular-nums;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-3);
 }
-.pnl.profit { color: var(--up); }
-.pnl.loss { color: var(--down); }
 
 .page-loading {
   position: fixed;
