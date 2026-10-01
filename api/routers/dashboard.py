@@ -8,7 +8,8 @@ from sqlalchemy.orm import Session
 from api.crypto import CredentialUnreadable, kis_credential_fields
 from api.database import get_db
 from api.deps import get_current_user
-from api.models import Credential, Strategy, Trade, User
+from api.models import Credential, QuickTradeOrder, Strategy, Trade, User
+from api.routers.quick_trade import serialize_order
 from api.schemas import Resp
 
 logger = logging.getLogger(__name__)
@@ -187,26 +188,15 @@ def get_summary(
 
     performance = _performance(current_user.id, db)
 
-    # Recent trades
-    recent_trades_q = (
-        db.query(Trade)
-        .join(Strategy, Trade.strategy_id == Strategy.id)
-        .filter(Strategy.user_id == current_user.id)
-        .order_by(Trade.filled_at.desc())
+    # The caller's own latest Quick Trade orders. Orders, not fills: nothing
+    # records fills per user (see quick_trade.get_history).
+    recent_orders = [
+        serialize_order(r)
+        for r in db.query(QuickTradeOrder)
+        .filter(QuickTradeOrder.user_id == current_user.id)
+        .order_by(QuickTradeOrder.created_at.desc(), QuickTradeOrder.id.desc())
         .limit(5)
         .all()
-    )
-    recent_trades = [
-        {
-            "id": t.id,
-            "symbol": t.symbol,
-            "side": t.side,
-            "qty": t.qty,
-            "price": t.price,
-            "pnl": t.pnl or 0.0,
-            "filled_at": t.filled_at.isoformat() if t.filled_at else None,
-        }
-        for t in recent_trades_q
     ]
 
     return Resp.ok(
@@ -219,7 +209,7 @@ def get_summary(
             "running_strategies": running_count,
             "kr_positions": kr_positions,
             "us_positions": us_positions,
-            "recent_trades": recent_trades,
+            "recent_orders": recent_orders,
             "performance": performance,
             "portfolio_status": status,
             "portfolio_errors": errors,

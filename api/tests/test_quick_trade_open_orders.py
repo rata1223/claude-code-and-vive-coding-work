@@ -1,13 +1,13 @@
 """P0 — the open-orders list that makes cancellation reachable.
 
 A cancel endpoint with nothing to cancel is not a feature. ``get_history``
-queries ``Trade ⋈ Strategy`` and never touches ``quick_trade_orders``, so the
-user's own manual orders are invisible in the UI — there is no row to put a
+used to query ``Trade ⋈ Strategy`` and never touched ``quick_trade_orders``, so the
+user's own manual orders were invisible in the UI — there was no row to put a
 Cancel button on.
 
 This is the **minimum** read path, not the history fix: only orders that can
 actually be cancelled (broker-acknowledged, with a broker id) are listed.
-Rewriting ``get_history`` is out of scope.
+``get_history`` now lists every order (``test_quick_trade_history``).
 """
 import pytest
 
