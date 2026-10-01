@@ -239,7 +239,7 @@ export default {
     avg_loss: 'Avg loss',
     sharpe_ratio: 'Sharpe',
     delete_success: 'Strategy deleted',
-    start_success: 'Strategy started',
+    start_unavailable: 'Auto-run isn\'t connected in the app yet. Backtests and Quick Trade still work.',
     stop_success: 'Strategy stopped',
     ref_price: 'Reference Price',
     enabled: 'Enabled',

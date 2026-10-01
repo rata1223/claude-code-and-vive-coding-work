@@ -118,9 +118,8 @@
             <van-button
               v-else
               size="small"
-              type="primary"
-              :loading="!!strategy._loading"
-              @click.stop="startStrategy(strategy)"
+              plain
+              @click.stop="explainStartUnavailable"
             >
               {{ $t('trading.start') }}
             </van-button>
@@ -460,17 +459,10 @@ export default {
       }
     },
 
-    async startStrategy(strategy) {
-      strategy._loading = true
-      try {
-        await strategyApi.start(strategy.id)
-        showToast({ message: this.$t('trading.start'), type: 'success' })
-        await this.loadStrategies()
-      } catch (error) {
-        console.error('Start strategy failed:', error)
-      } finally {
-        strategy._loading = false
-      }
+    // The app runs no strategy yet (docs/STRATEGY_START_AUDIT.md): say so
+    // instead of calling a start that would only be refused.
+    explainStartUnavailable() {
+      showToast(this.$t('trading.start_unavailable'))
     },
 
     async stopStrategy(strategy) {

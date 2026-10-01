@@ -1,7 +1,6 @@
 """Strategy CRUD + lifecycle (start/stop) + trades/positions/logs/notifications."""
 import json
 import logging
-import os
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -21,46 +20,6 @@ from api.schemas import (
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/strategies", tags=["strategies"])
-
-# ── Redis (optional – graceful fallback if unavailable) ───────────────────
-_redis = None
-
-def _get_redis():
-    global _redis
-    if _redis is not None:
-        return _redis
-    try:
-        import redis
-
-        _redis = redis.from_url(
-            os.environ.get("REDIS_URL", "redis://redis:6379/0"),
-            decode_responses=True,
-        )
-        _redis.ping()
-    except Exception:
-        _redis = None
-    return _redis
-
-
-RUNNING_KEY = "running_strategies"
-
-
-def _mark_running(strategy_id: int):
-    r = _get_redis()
-    if r:
-        try:
-            r.sadd(RUNNING_KEY, str(strategy_id))
-        except Exception:
-            pass
-
-
-def _mark_stopped(strategy_id: int):
-    r = _get_redis()
-    if r:
-        try:
-            r.srem(RUNNING_KEY, str(strategy_id))
-        except Exception:
-            pass
 
 
 def _strategy_to_dict(s: Strategy) -> dict:
@@ -221,13 +180,22 @@ def delete_strategy(
     )
     if not s:
         return Resp.err("Strategy not found")
-    _mark_stopped(s.id)
     db.delete(s)
     db.commit()
     return Resp.ok(None, "Deleted")
 
 
 # ── Start / stop ──────────────────────────────────────────────────────────
+
+#: The app runs no strategy. Starting one only ever flipped ``status`` to
+#: "running" (plus a Redis set nothing read) while the worker heard nothing:
+#: no signals, no orders, and no ``strategy_runs`` row, so the 4-week
+#: paper-trading clock never started either. Refuse instead of pretending —
+#: see docs/STRATEGY_START_AUDIT.md (option A).
+START_UNAVAILABLE = (
+    "자동 실행은 아직 앱에서 연결되지 않았습니다 — 백테스트와 퀵트레이드는 사용할 수 있습니다"
+)
+
 
 @router.post("/start")
 def start_strategy(
@@ -242,20 +210,7 @@ def start_strategy(
     )
     if not s:
         return Resp.err("Strategy not found")
-    s.status = "running"
-    s.updated_at = datetime.utcnow()
-    db.commit()
-    _mark_running(s.id)
-
-    log = StrategyLog(
-        strategy_id=s.id,
-        message="Strategy started",
-        level="INFO",
-    )
-    db.add(log)
-    db.commit()
-
-    return Resp.ok({"id": s.id, "status": s.status})
+    return Resp.err(START_UNAVAILABLE)
 
 
 @router.post("/stop")
@@ -274,7 +229,6 @@ def stop_strategy(
     s.status = "stopped"
     s.updated_at = datetime.utcnow()
     db.commit()
-    _mark_stopped(s.id)
 
     log = StrategyLog(
         strategy_id=s.id,

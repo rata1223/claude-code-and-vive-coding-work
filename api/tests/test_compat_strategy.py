@@ -332,9 +332,11 @@ class TestRegressionExistingEndpoints:
         user, _ = seed_user
         s = _create_strategy(db_session, user)
 
+        # The app runs no strategy, so start is refused (test_strategy_start_refused);
+        # the route still answers in the compat envelope.
         start_res = client.post(f"/api/strategies/start?id={s.id}", headers=auth_headers)
         assert start_res.status_code == 200
-        assert start_res.json()["data"]["status"] == "running"
+        assert start_res.json()["code"] == -1
 
         stop_res = client.post(f"/api/strategies/stop?id={s.id}", headers=auth_headers)
         assert stop_res.status_code == 200

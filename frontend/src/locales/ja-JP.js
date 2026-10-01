@@ -239,7 +239,7 @@ export default {
     avg_loss: '平均損失',
     sharpe_ratio: 'シャープレシオ',
     delete_success: '戦略を削除しました',
-    start_success: '戦略を開始しました',
+    start_unavailable: 'アプリからの自動実行はまだ接続されていません。バックテストとクイックトレードは利用できます。',
     stop_success: '戦略を停止しました',
     ref_price: '参考価格',
     enabled: '有効',
