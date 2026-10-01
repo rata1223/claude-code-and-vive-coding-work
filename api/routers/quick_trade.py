@@ -1,6 +1,6 @@
 """Quick-trade endpoints: balance, positions, order placement, history."""
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Header, Query
@@ -933,8 +933,18 @@ def serialize_order(r) -> dict:
         "exchange": r.exchange,
         "broker_order_id": r.broker_order_id,
         "status": r.status,
-        "created_at": r.created_at.isoformat() if r.created_at else None,
+        "created_at": _utc_iso(r.created_at),
     }
+
+
+def _utc_iso(ts) -> Optional[str]:
+    """``created_at`` is stored naive (``datetime.utcnow``); say it is UTC, or a
+    browser reads the bare timestamp as local time and shows the wrong hour."""
+    if ts is None:
+        return None
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return ts.isoformat()
 
 
 @router.get("/history")

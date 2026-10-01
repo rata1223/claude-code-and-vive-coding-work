@@ -63,7 +63,8 @@ def test_an_order_in_any_status_is_listed_with_that_status(db, user, status):
     (item,) = data["items"]
     assert item["status"] == status
     assert (item["symbol"], item["side"], item["qty"], item["price"]) == ("AAPL", "buy", 1, 101.0)
-    assert item["created_at"] == (_T0 + timedelta(minutes=1)).isoformat()
+    # stored naive UTC; the offset keeps a browser from reading it as local time
+    assert item["created_at"] == "2026-09-01T12:01:00+00:00"
 
 
 def test_it_is_an_order_list_not_a_fill_list(db, user):
