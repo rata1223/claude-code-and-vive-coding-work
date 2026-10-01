@@ -26,7 +26,7 @@ from api.services.quick_trade_service import (
 from backend.brokers.semantic_mapper import KIS_DOMESTIC_MAPPER, KIS_OVERSEAS_MAPPER
 from strategy.risk import RiskManager
 from backend.risk.halt_policy import HaltCause, OperationClass, is_allowed
-from backend.market.symbols import KR_EXCHANGE, resolve_exchange, to_quote_excd
+from backend.market.symbols import KR_EXCHANGE, is_mapped, resolve_exchange, to_quote_excd
 from backend.risk.sellable_qty import resolve_sellable, validate_sell_qty
 
 logger = logging.getLogger(__name__)
@@ -201,6 +201,11 @@ def _resolve_exchange(symbol: str, requested: Optional[str],
     its yfinance fallback — so a symbol like ``KO`` (NYSE) still routes as NASD
     and is still rejected by KIS. Closing that needs a real symbol master
     (KIS publishes ``nasmst``/``nysmst``/``amsmst``), which is its own task.
+    Until then the response says so: ``exchange_assumed`` on success, a note on
+    a rejection (``_venue_assumed``). The worker's ``KISBroker`` sells holdings
+    on the venue the balance row reports; this path cannot, because the
+    exchange is part of the idempotency fingerprint derived before any broker
+    call.
     What this function fixes is the far larger hole underneath it: that the
     exchange was not derived *at all*.
 
@@ -249,6 +254,32 @@ def _resolve_exchange(symbol: str, requested: Optional[str],
             f"{market.upper()} market"
         )
     return resolved
+
+
+#: Appended to a failed US order whose venue was the NASD assumption.
+_ASSUMED_VENUE_NOTE = (" — 이 종목의 거래소는 확인되지 않아 NASD로 추정해 보냈습니다."
+                       " 거래소가 다르면 KIS가 거부합니다")
+
+
+def _venue_assumed(symbol: str, market: str) -> bool:
+    """Whether the order's exchange was the NASD guess for an unmapped US ticker.
+
+    Routing is unchanged — the guess is right for most Nasdaq names, and a
+    wrong venue makes KIS reject rather than fill the wrong security (tickers
+    are unique across US venues). What changes is that the caller is told, so
+    a rejection reads as "venue unconfirmed" instead of an opaque broker error.
+    """
+    return market != "kr" and not is_mapped(symbol)
+
+
+def _with_venue_flag(payload: dict, symbol: str, market: str) -> dict:
+    if _venue_assumed(symbol, market):
+        payload["exchange_assumed"] = True
+    return payload
+
+
+def _venue_note(symbol: str, market: str) -> str:
+    return _ASSUMED_VENUE_NOTE if _venue_assumed(symbol, market) else ""
 
 
 def _live_held_qty(portfolio, symbol: str, market: str) -> int:
@@ -630,10 +661,11 @@ def place_order(
             "status": order.status,  # submitted / reserved / rejected / failed
         }
         if order.status == QT_SUBMITTED:
-            return Resp.ok(payload)
+            return Resp.ok(_with_venue_flag(payload, body.symbol, market))
         # Rejected / reserved(indeterminate) / failed → error envelope so clients
         # that branch on Resp.err keep detecting failed orders (prior behaviour).
-        return Resp.err(f"Order {order.status}: {order.error or 'no broker order id'}")
+        return Resp.err(f"Order {order.status}: {order.error or 'no broker order id'}"
+                        f"{_venue_note(body.symbol, market)}")
     except IdempotencyConflict:
         return Resp.err("Duplicate idempotency key with different parameters")
     except Exception as e:
@@ -732,9 +764,10 @@ def close_position(
                 "status": replay.status,
             }
             if replay.status == QT_SUBMITTED:
-                return Resp.ok(payload)
+                return Resp.ok(_with_venue_flag(payload, body.symbol, market))
             return Resp.err(
                 f"Close position {replay.status}: {replay.error or 'no broker order id'}"
+                f"{_venue_note(body.symbol, market)}"
             )
         except Exception as e:  # noqa: BLE001 - an unusable body must not 500
             logger.warning("close replay comparison failed: %s", e)
@@ -868,11 +901,12 @@ def close_position(
             "status": order.status,
         }
         if order.status == QT_SUBMITTED:
-            return Resp.ok(payload)
+            return Resp.ok(_with_venue_flag(payload, body.symbol, market))
         # Blocked / rejected / reserved(indeterminate) / failed — report the real
         # runtime status instead of asserting a submission that never happened.
         return Resp.err(
             f"Close position {order.status}: {order.error or 'no broker order id'}"
+            f"{_venue_note(body.symbol, market)}"
         )
     except IdempotencyConflict:
         return Resp.err("Duplicate idempotency key with different parameters")

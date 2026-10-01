@@ -119,6 +119,35 @@ def resolve_exchange(raw_symbol) -> Optional[str]:
     return EXCD_MAP.get(symbol, _US_DEFAULT)
 
 
+def is_mapped(raw_symbol) -> bool:
+    """Whether ``resolve_exchange`` knows ``raw_symbol``'s venue rather than guessing.
+
+    True for a KR symbol or an ``EXCD_MAP`` member. False for a US ticker means
+    the exchange ``resolve_exchange`` returned is the ``NASD`` assumption: right
+    for most Nasdaq names, wrong (and rejected by KIS) for an NYSE or AMEX one.
+    """
+    symbol = _clean(raw_symbol)
+    return bool(symbol) and (is_kr(symbol) or symbol in EXCD_MAP)
+
+
+#: Venue codes as KIS reports them on a US balance row (``ovrs_excg_cd``),
+#: in either of its two spellings, mapped to the order code set.
+_BROKER_VENUES = {"NASD": "NASD", "NAS": "NASD", "NYSE": "NYSE", "NYS": "NYSE",
+                  "AMEX": "AMEX", "AMS": "AMEX"}
+
+
+def broker_exchange(code) -> Optional[str]:
+    """The order exchange code for a venue the broker reported, or ``None``.
+
+    A holding's venue as KIS reports it is the authority for selling it — it is
+    where the shares are. ``None`` (blank, missing, unrecognised) tells the
+    caller to keep deriving the venue as before.
+    """
+    if not isinstance(code, str):
+        return None
+    return _BROKER_VENUES.get(code.strip().upper())
+
+
 def provider_symbol_candidates(raw_symbol) -> List[str]:
     """Market-data vendor spellings to try, best first.
 
