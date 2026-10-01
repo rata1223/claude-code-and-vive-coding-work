@@ -7,6 +7,9 @@ refused as unauthenticated. Verification now lives in
 ``backend/security/jwt_tokens.py``; PyJWT is in ``requirements.txt``; compose
 passes the API's ``JWT_SECRET_KEY`` to kis-ws; and a missing secret stops the
 server at start instead of failing every connection.
+
+A valid token alone is not enough: the relayed data is the operator's single
+``.env`` account and signup is open, so only ``WS_OPERATOR_EMAILS`` may connect.
 """
 import os
 import re
@@ -22,16 +25,21 @@ from backend.security import jwt_tokens
 
 ROOT = Path(__file__).resolve().parents[2]
 SECRET = "ws-test-secret-ws-test-secret-ws-test-secret-0123"
+OPERATOR = "ops@example.com"
 
 
-def _token(secret=SECRET, alg="HS256", minutes=30, **extra):
+def _token(secret=SECRET, alg="HS256", minutes=30, email=OPERATOR):
     exp = datetime.now(timezone.utc) + timedelta(minutes=minutes)
-    return jwt.encode({"sub": "7", "exp": exp, **extra}, secret, algorithm=alg)
+    claims = {"sub": "7", "exp": exp}
+    if email is not None:
+        claims["email"] = email
+    return jwt.encode(claims, secret, algorithm=alg)
 
 
 @pytest.fixture()
 def secret(monkeypatch):
     monkeypatch.setenv("JWT_SECRET_KEY", SECRET)
+    monkeypatch.setenv("WS_OPERATOR_EMAILS", f"admin@example.com, {OPERATOR.upper()}")
     return SECRET
 
 
@@ -73,6 +81,22 @@ class TestWsServer:
         assert _ws_check(_token(minutes=-1)) is False
         assert _ws_check("") is False
 
+    def test_a_valid_token_from_a_non_operator_is_refused(self, secret):
+        """Signup is open: any account can mint a valid token."""
+        assert _ws_check(_token(email="someone@example.com")) is False
+        assert _ws_check(_token(email=None)) is False
+
+    def test_operator_emails_match_case_insensitively(self, secret):
+        assert _ws_check(_token(email="Admin@Example.com")) is True
+
+    def test_no_operators_configured_refuses_everyone(self, secret, monkeypatch, caplog):
+        from backend.websocket import server
+        monkeypatch.setenv("WS_OPERATOR_EMAILS", " , ")
+        assert _ws_check(_token()) is False
+        with caplog.at_level("WARNING"):
+            server._require_token_verifier()          # starts, but says why
+        assert "WS_OPERATOR_EMAILS" in caplog.text
+
     def test_a_missing_secret_raises_instead_of_refusing_everyone(self, monkeypatch):
         """The old path turned a deployment error into "unauthenticated"."""
         monkeypatch.delenv("JWT_SECRET_KEY", raising=False)
@@ -107,6 +131,11 @@ def test_kis_ws_gets_the_same_secret_the_api_signs_with():
     assert jwt_line.search(_service("kis-ws"))
 
 
+def test_kis_ws_reads_the_operator_list_and_defaults_to_nobody():
+    assert re.search(r"^\s+WS_OPERATOR_EMAILS:\s*\$\{WS_OPERATOR_EMAILS:-\}\s*$",
+                     _service("kis-ws"), re.M)
+
+
 def test_requirements_pin_pyjwt_like_the_api():
     pin = re.compile(r"^PyJWT==([\d.]+)$", re.M)
     ws = pin.search((ROOT / "requirements.txt").read_text())
@@ -123,7 +152,7 @@ def test_the_ws_image_verifies_tokens_from_only_what_it_copies(tmp_path):
     for name in dirs:
         (tmp_path / name).symlink_to(ROOT / name, target_is_directory=True)
     env = {k: v for k, v in os.environ.items() if k not in ("PYTHONPATH", "PYTHONHOME")}
-    env.update(JWT_SECRET_KEY=SECRET, PYTHONDONTWRITEBYTECODE="1")
+    env.update(JWT_SECRET_KEY=SECRET, WS_OPERATOR_EMAILS=OPERATOR, PYTHONDONTWRITEBYTECODE="1")
     code = (
         "import sys, importlib.util; sys.path.insert(0, '.');"
         "assert not any(p.startswith(%r) for p in sys.path if p), sys.path;"
@@ -132,10 +161,10 @@ def test_the_ws_image_verifies_tokens_from_only_what_it_copies(tmp_path):
         "server._require_token_verifier();"
         # minted here, on the child's real clock (the kst_* plugins freeze ours)
         "import jwt, time;"
-        "token = jwt.encode({'sub': '7', 'exp': int(time.time()) + 600}, %r, algorithm='HS256');"
+        "token = jwt.encode({'sub': '7', 'email': %r, 'exp': int(time.time()) + 600}, %r, algorithm='HS256');"
         "ctx = server.app.test_request_context('/?token=' + token);"
         "ctx.push(); assert server._verify_ws_token() is True"
-    ) % (str(ROOT), SECRET)
+    ) % (str(ROOT), OPERATOR, SECRET)
     proc = subprocess.run([sys.executable, "-P", "-c", code],
                           cwd=tmp_path, env=env, capture_output=True, text=True, timeout=120)
     assert proc.returncode == 0, proc.stderr[-2000:]

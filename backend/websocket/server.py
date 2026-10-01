@@ -32,19 +32,36 @@ socketio = SocketIO(app, cors_allowed_origins=_ws_cors, async_mode="threading")
 _r = redis.from_url(_REDIS_URL)
 
 
-def _verify_ws_token() -> bool:
-    """Validate the JWT passed as query param ?token=<jwt> (issued by api/auth.py).
+def _operator_emails() -> frozenset:
+    """``WS_OPERATOR_EMAILS`` (comma-separated, case-insensitive).
 
-    An invalid token is False. A missing JWT library or JWT_SECRET_KEY is a
-    deployment error and raises: it used to be swallowed here, so the container
-    rejected every client as "unauthenticated" (#189). start_ws_server() checks
-    both before accepting connections.
+    Every channel this server relays — orders, positions, equity, alerts — is the
+    worker's single ``.env`` account, and app signup is open. A valid app token
+    therefore proves nothing about who may see it; only listed operators may.
+    Empty means nobody (every connection refused). Removing an address revokes
+    its tokens without waiting for them to expire.
+    """
+    raw = os.environ.get("WS_OPERATOR_EMAILS", "")
+    return frozenset(e.strip().lower() for e in raw.split(",") if e.strip())
+
+
+def _verify_ws_token() -> bool:
+    """True only for a valid app token (api/auth.py) whose email is a listed operator.
+
+    A missing JWT library or JWT_SECRET_KEY is a deployment error and raises: it
+    used to be swallowed here, so the container rejected every client as
+    "unauthenticated" (#189). start_ws_server() checks both before accepting
+    connections.
     """
     token = request.args.get("token", "")
     if not token:
         return False
     from backend.security.jwt_tokens import decode_access_token
-    return decode_access_token(token) is not None
+    payload = decode_access_token(token)
+    if payload is None:
+        return False
+    email = str(payload.get("email") or "").strip().lower()
+    return bool(email) and email in _operator_emails()
 
 
 # ── 클라이언트 이벤트 ─────────────────────────────────────────────────────
@@ -132,6 +149,9 @@ def _require_token_verifier() -> None:
     Without this the server starts and refuses every connection (#189)."""
     from backend.security.jwt_tokens import jwt_secret
     jwt_secret()
+    if not _operator_emails():
+        logger.warning("WS_OPERATOR_EMAILS가 비어 있음 — 모든 WS 연결을 거부한다 "
+                       "(이 서버는 운영 계좌 데이터만 중계한다)")
 
 
 def start_ws_server() -> None:
