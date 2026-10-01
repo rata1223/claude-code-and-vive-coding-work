@@ -137,8 +137,8 @@ export default {
       return this.userStore.userInfo
     },
     credentialCount() {
-      // `cryptoItems` is not a getter on this store in the mobile client — it
-      // has `kisItems`/`kiwoomItems` only — so this threw on `undefined.length`
+      // `cryptoItems` was never a getter on this store in the mobile client —
+      // it had `kisItems`/`kiwoomItems` only — so this threw on `undefined.length`
       // and took the whole Profile page down there. It survived in the web
       // client only because its own `cryptoItems` is defined as "not ibkr, not
       // mt5", which happens to count the KIS and Kiwoom rows. Neither spelling
