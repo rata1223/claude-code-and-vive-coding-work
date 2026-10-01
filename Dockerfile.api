@@ -9,6 +9,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements-api.txt .
 RUN pip install --no-cache-dir -r requirements-api.txt
 
+# api/ imports backend/ (symbols, risk, brokers.semantic_mapper, …). Without it
+# `import api.main` fails and the container cannot start — api/tests/
+# test_api_image_layout.py imports the app from exactly these COPY lines.
+COPY backend/ ./backend/
 COPY kis_adapter/ ./kis_adapter/
 COPY kiwoom_adapter/ ./kiwoom_adapter/
 COPY strategy/ ./strategy/

@@ -15,6 +15,10 @@ bcrypt==4.1.3
 python-multipart==0.0.31
 cryptography==50.0.0
 redis==5.0.4
+# strategy/ (imported by api/) runs user scripts under RestrictedPython; it was
+# only in requirements.txt, so the API image could not import `strategy`.
+# Keep in step with requirements.txt.
+RestrictedPython==8.4
 yfinance==0.2.38
 pandas==2.2.2
 requests==2.33.0
