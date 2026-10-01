@@ -389,6 +389,7 @@ export default {
   methods: {
     async loadData() {
       this.loading = true
+      const token = this.userStore.token
       try {
         const [summaryRes, strategyRes, credentialsRes, unreadRes, watchlistRes] = await Promise.allSettled([
           dashboardApi.getSummary(),
@@ -397,6 +398,9 @@ export default {
           strategyApi.getUnreadNotificationCount(),
           watchlistApi.getList()
         ])
+        // A response for a session that has since logged out (or switched
+        // account) must not refill the stores logout() just cleared.
+        if (this.userStore.token !== token) return
         this.dashboardStore.setSummary(summaryRes.status === 'fulfilled' ? (summaryRes.value.data || {}) : {})
         this.strategyStore.setStrategies(strategyRes.status === 'fulfilled' ? (strategyRes.value.data || []) : [])
         this.credentialsStore.setItems(credentialsRes.status === 'fulfilled' ? (credentialsRes.value.data || []) : [])

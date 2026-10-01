@@ -198,7 +198,7 @@
 <script>
 import { showConfirmDialog, showToast } from 'vant'
 import { credentialsApi, quickTradeApi, watchlistApi } from '@/api'
-import { useCredentialsStore, useQuickTradeStore, useWatchlistStore } from '@/stores'
+import { useCredentialsStore, useQuickTradeStore, useUserStore, useWatchlistStore } from '@/stores'
 import KlineChart from '@/components/KlineChart.vue'
 import SymbolPicker from '@/components/SymbolPicker.vue'
 
@@ -254,6 +254,9 @@ export default {
     },
     watchlistStore() {
       return useWatchlistStore()
+    },
+    userStore() {
+      return useUserStore()
     },
     chartMarket() {
       // The chart must describe the instrument on screen, not a leftover
@@ -327,12 +330,16 @@ export default {
 
   methods: {
     async bootstrap() {
+      const token = this.userStore.token
       try {
         const [credentialsRes, historyRes, wlRes] = await Promise.allSettled([
           credentialsApi.list(),
           quickTradeApi.getHistory(),
           watchlistApi.getList()
         ])
+        // A response for a session that has since logged out (or switched
+        // account) must not refill the stores logout() just cleared.
+        if (this.userStore.token !== token) return
         this.credentialsStore.setItems(credentialsRes.status === 'fulfilled' ? (credentialsRes.value.data || []) : [])
         this.quickTradeStore.setHistory(historyRes.status === 'fulfilled' ? (historyRes.value.data || []) : [])
         if (wlRes.status === 'fulfilled') {
@@ -413,6 +420,7 @@ export default {
 
     async refreshTradeData() {
       if (!this.selectedCredentialId) return
+      const token = this.userStore.token
       try {
         const tasks = [
           quickTradeApi.getBalance(this.selectedCredentialId, this.marketType),
@@ -428,6 +436,9 @@ export default {
         }
         // Order matters: this destructuring must stay aligned with `tasks`.
         const [balanceRes, historyRes, openRes, positionRes] = await Promise.allSettled(tasks)
+        // A response for a session that has since logged out (or switched
+        // account) must not refill the stores logout() just cleared.
+        if (this.userStore.token !== token) return
         this.quickTradeStore.setBalance(balanceRes.status === 'fulfilled' ? (balanceRes.value.data || null) : null)
         this.quickTradeStore.setHistory(historyRes.status === 'fulfilled' ? (historyRes.value.data || []) : [])
         this.openOrders = openRes?.status === 'fulfilled' ? (openRes.value.data || []) : []
