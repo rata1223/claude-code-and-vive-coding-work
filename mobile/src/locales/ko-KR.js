@@ -239,7 +239,7 @@ export default {
     avg_loss: '평균 손실',
     sharpe_ratio: '샤프 비율',
     delete_success: '전략이 삭제되었습니다',
-    start_success: '전략이 시작되었습니다',
+    start_unavailable: '앱에서는 아직 자동 실행이 연결되지 않았습니다. 백테스트와 퀵트레이드는 사용할 수 있습니다.',
     stop_success: '전략이 중지되었습니다',
     ref_price: '참고 가격',
     enabled: '활성화',

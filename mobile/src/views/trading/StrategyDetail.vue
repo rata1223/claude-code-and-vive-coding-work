@@ -65,9 +65,8 @@
           v-else
           class="action-btn start"
           block
-          type="primary"
-          :loading="actionLoading"
-          @click="startStrategy"
+          plain
+          @click="explainStartUnavailable"
         >
           <van-icon name="play-circle-o" />
           {{ $t('trading.action_start') }}
@@ -81,6 +80,7 @@
           <van-icon name="delete-o" />
         </van-button>
       </div>
+      <p v-if="strategy.status !== 'running'" class="start-note">{{ $t('trading.start_unavailable') }}</p>
 
       <!-- Tabs -->
       <van-tabs
@@ -849,17 +849,10 @@ export default {
       showToast({ message: 'OK', type: 'success', duration: 600 })
     },
 
-    async startStrategy() {
-      this.actionLoading = true
-      try {
-        await strategyApi.start(this.strategyId)
-        showToast({ message: this.$t('trading.start_success'), type: 'success' })
-        await this.loadData()
-      } catch (error) {
-        console.error('Start strategy failed:', error)
-      } finally {
-        this.actionLoading = false
-      }
+    // The app runs no strategy yet (docs/STRATEGY_START_AUDIT.md): say so
+    // instead of calling a start that would only be refused.
+    explainStartUnavailable() {
+      showToast(this.$t('trading.start_unavailable'))
     },
     async stopStrategy() {
       try {
@@ -1205,6 +1198,12 @@ export default {
 .action-bar .action-btn.ghost { flex: 0 0 56px; }
 .action-bar :deep(.van-button) { border-radius: 14px; font-weight: 700; }
 .action-bar :deep(.van-button .van-icon) { margin-right: 4px; }
+.start-note {
+  margin: -6px 2px 14px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-3);
+}
 
 .detail-page :deep(.van-tabs__wrap) { border-bottom: 1px solid var(--hairline); }
 .detail-page :deep(.van-tab) { font-size: 13px; color: var(--text-2); }

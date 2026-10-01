@@ -462,9 +462,6 @@ export const strategyApi = {
       data: res.data ? normalizeStrategy(res.data) : null
     }
   },
-  start: (id) => http.post('/api/strategies/start', null, {
-    params: { id }
-  }),
   stop: (id) => http.post('/api/strategies/stop', null, {
     params: { id }
   }),

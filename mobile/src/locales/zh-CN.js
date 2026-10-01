@@ -239,7 +239,7 @@ export default {
     avg_loss: '平均亏损',
     sharpe_ratio: '夏普比率',
     delete_success: '删除成功',
-    start_success: '策略已启动',
+    start_unavailable: '应用内的自动运行尚未接通。回测和快速交易仍可使用。',
     stop_success: '策略已停止',
     ref_price: '参考价格',
     enabled: '开启',
