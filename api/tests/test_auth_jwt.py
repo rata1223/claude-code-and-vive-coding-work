@@ -75,3 +75,20 @@ class TestEverythingElseIsNone:
     @pytest.mark.parametrize("garbage", ["", "not-a-token", "a.b.c"])
     def test_malformed(self, garbage):
         assert auth.decode_access_token(garbage) is None
+
+
+class TestSharedWithTheWsServer:
+    """kis-ws verifies with backend/security/jwt_tokens.py (#189); it must accept
+    exactly the tokens this API issues."""
+
+    def test_an_api_token_verifies_in_the_ws_verifier(self):
+        from backend.security import jwt_tokens
+
+        token = auth.create_access_token(7, "a@example.com")
+        assert jwt_tokens.decode_access_token(token, auth.SECRET_KEY)["sub"] == "7"
+
+    def test_api_decoding_is_the_shared_verifier(self, monkeypatch):
+        seen = []
+        monkeypatch.setattr(auth, "_decode", lambda t, k: seen.append((t, k)) or {"sub": "x"})
+        assert auth.decode_access_token("t") == {"sub": "x"}
+        assert seen == [("t", auth.SECRET_KEY)]

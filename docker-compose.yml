@@ -192,6 +192,8 @@ services:
     environment:
       REDIS_URL: ${REDIS_URL:-redis://redis:6379}
       QUANTDINGER_SECRET_KEY: ${QUANTDINGER_SECRET_KEY:?QUANTDINGER_SECRET_KEY must be set (see .env.example)}
+      # Same secret the app API signs tokens with — WS clients present those tokens (#189).
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:?JWT_SECRET_KEY must be set to a secure random value (see .env.example)}
       WS_PORT: "5002"
     depends_on:
       redis:

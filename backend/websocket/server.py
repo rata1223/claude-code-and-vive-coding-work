@@ -33,24 +33,18 @@ _r = redis.from_url(_REDIS_URL)
 
 
 def _verify_ws_token() -> bool:
-    """Validate JWT token passed as query param ?token=<jwt>.
-    Returns True if valid, False otherwise.
-    Configuration/bootstrap errors (e.g. missing JWT_SECRET_KEY) are NOT caught
-    here — they propagate so the WS process surfaces misconfiguration rather than
-    silently rejecting every client as unauthenticated.
+    """Validate the JWT passed as query param ?token=<jwt> (issued by api/auth.py).
+
+    An invalid token is False. A missing JWT library or JWT_SECRET_KEY is a
+    deployment error and raises: it used to be swallowed here, so the container
+    rejected every client as "unauthenticated" (#189). start_ws_server() checks
+    both before accepting connections.
     """
     token = request.args.get("token", "")
     if not token:
         return False
-    import importlib
-    for mod_name in ("api.auth", "backend.api.auth"):
-        try:
-            mod = importlib.import_module(mod_name)
-            payload = mod.decode_access_token(token)
-            return payload is not None
-        except (ImportError, AttributeError):
-            continue
-    return False
+    from backend.security.jwt_tokens import decode_access_token
+    return decode_access_token(token) is not None
 
 
 # ── 클라이언트 이벤트 ─────────────────────────────────────────────────────
@@ -133,12 +127,20 @@ def _require_ws_secret() -> None:
         )
 
 
+def _require_token_verifier() -> None:
+    """Fail fast if client tokens cannot be verified (no PyJWT or JWT_SECRET_KEY).
+    Without this the server starts and refuses every connection (#189)."""
+    from backend.security.jwt_tokens import jwt_secret
+    jwt_secret()
+
+
 def start_ws_server() -> None:
     """Bootstrap and run the WS server.
     Call this from any entrypoint (gunicorn WSGI app factory, __main__, etc.)
     so the secret check is never bypassed by non-__main__ launch paths.
     """
     _require_ws_secret()
+    _require_token_verifier()
     start_redis_listener()
     port = int(os.environ.get("WS_PORT", 5002))
     socketio.run(app, host="0.0.0.0", port=port, debug=False)

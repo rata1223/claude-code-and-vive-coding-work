@@ -5,6 +5,8 @@ from typing import Optional
 import bcrypt
 import jwt
 
+from backend.security.jwt_tokens import ALGORITHM, decode_access_token as _decode
+
 _raw_secret = os.environ.get("JWT_SECRET_KEY", "")
 if not _raw_secret:
     raise RuntimeError(
@@ -12,7 +14,6 @@ if not _raw_secret:
         "Generate one with: python -c \"import secrets; print(secrets.token_hex(32))\""
     )
 SECRET_KEY = _raw_secret
-ALGORITHM = "HS256"
 # Preserve main's short-secret warning as an extra safeguard. main's "refuse to start if
 # SECRET_KEY == default placeholder in production" branch is intentionally dropped: it is
 # unreachable here because the unconditional raise above already blocks startup when the
@@ -43,8 +44,5 @@ def create_access_token(user_id: int, email: str, expires_delta: Optional[timede
 
 
 def decode_access_token(token: str) -> Optional[dict]:
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        return payload
-    except jwt.PyJWTError:   # bad signature, expired, malformed, wrong algorithm
-        return None
+    # One verifier for the API and the WS server (backend/security/jwt_tokens.py).
+    return _decode(token, SECRET_KEY)
