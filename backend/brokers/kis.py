@@ -12,7 +12,7 @@ from kis_adapter import KISClient, KISMarketData, KISOrders, KISPortfolio
 from kis_adapter.dates import inquiry_date_range
 from kis_adapter.pagination import find_row
 from backend.execution.circuit_breaker import ConsecutiveFailureBreaker
-from backend.market.symbols import resolve_exchange, to_quote_excd
+from backend.market.symbols import broker_exchange, is_mapped, resolve_exchange, to_quote_excd
 from backend.quant.data.universe import KR_ETF
 
 logger = logging.getLogger(__name__)
@@ -62,16 +62,6 @@ def _order_excd(symbol: str) -> str:
         logger.warning("거래소 미확인 심볼 %s — NASD로 폴백", symbol)
         return "NASD"
     return exchange
-
-
-def _quote_excd(symbol: str) -> str:
-    """``EXCD`` for a US quote — a different code set from the order one.
-
-    KIS's own examples: ``order(ovrs_excg_cd="NASD")`` but
-    ``price(excd="NAS")``. Passing the order code to the quote endpoint names
-    an exchange it does not know.
-    """
-    return to_quote_excd(_order_excd(symbol)) or "NAS"
 
 
 _FX_CACHE_LOCK = threading.Lock()
@@ -169,6 +159,52 @@ class KISBroker(BrokerAdapter):
             self._breaker.record_failure()
             raise
 
+    # ── US venue: the broker's word for a holding, derived otherwise ─────────
+
+    def _remember_venue(self, symbol: str, reported) -> None:
+        """Record where the broker says an unmapped US holding trades.
+
+        ``EXCD_MAP`` knows the universe; a holding outside it (bought by hand,
+        say) would otherwise be sold as ``NASD`` and rejected if it is an NYSE
+        name — and emergency flatten sells every holding. The balance row's
+        ``ovrs_excg_cd`` says where the shares are.
+        """
+        code = broker_exchange(reported)
+        if code is None:
+            return
+        if is_mapped(symbol):
+            # A mapped symbol keeps routing by EXCD_MAP: every order, inquiry and
+            # cancel for it has used that venue, and switching mid-flight could
+            # look up or cancel an order on a venue other than the one it was
+            # sent to. A disagreement is logged once — that is the evidence
+            # known issue 4 (SPY/XL* on Arca) is waiting for.
+            derived = resolve_exchange(symbol)
+            warned = self.__dict__.setdefault("_venue_warned", set())
+            if derived != code and symbol not in warned:
+                warned.add(symbol)
+                logger.warning("거래소 불일치 %s: EXCD_MAP=%s, 브로커 잔고=%s — EXCD_MAP 유지",
+                               symbol, derived, code)
+            return
+        # Unmapped: the derived venue is only the NASD guess, so the broker's
+        # word is strictly better — and nothing was routed by the guess before
+        # it, since unmapped symbols reach the worker only as holdings.
+        self.__dict__.setdefault("_held_venue", {})[symbol] = code
+
+    def _us_order_excd(self, symbol: str) -> str:
+        """``OVRS_EXCG_CD`` for ``symbol``: the broker-reported venue of a holding,
+        else the derived one (``_order_excd``)."""
+        held = (getattr(self, "_held_venue", None) or {}).get(symbol)
+        return held or _order_excd(symbol)
+
+    def _us_quote_excd(self, symbol: str) -> str:
+        """``EXCD`` for a US quote — a different code set from the order one.
+
+        KIS's own examples: ``order(ovrs_excg_cd="NASD")`` but
+        ``price(excd="NAS")``. Passing the order code to the quote endpoint
+        names an exchange it does not know.
+        """
+        return to_quote_excd(self._us_order_excd(symbol)) or "NAS"
+
     def get_positions(self) -> list[Position]:
         positions: list[Position] = []
         try:
@@ -194,9 +230,10 @@ class KISBroker(BrokerAdapter):
                 qty = int(p.get("ovrs_cblc_qty", 0))
                 if qty > 0:
                     sym = p["ovrs_pdno"]
+                    self._remember_venue(sym, p.get("ovrs_excg_cd"))
                     avg = float(p.get("pchs_avg_pric", 0))
                     try:
-                        quote_excd = _quote_excd(sym)
+                        quote_excd = self._us_quote_excd(sym)
                         cur = self._market.get_price_us(sym, quote_excd)
                     except Exception:
                         cur = avg
@@ -235,7 +272,7 @@ class KISBroker(BrokerAdapter):
             if is_kr:
                 raw = (self._orders.buy_kr if side == "buy" else self._orders.sell_kr)(symbol, qty, int(price))
             else:
-                excd = _order_excd(symbol)
+                excd = self._us_order_excd(symbol)
                 raw = (self._orders.buy_us if side == "buy" else self._orders.sell_us)(symbol, excd, qty, price)
             mapper = KIS_DOMESTIC_MAPPER if is_kr else KIS_OVERSEAS_MAPPER
             order_id = mapper.extract_broker_order_id(raw)
@@ -271,7 +308,7 @@ class KISBroker(BrokerAdapter):
         """주문 취소. US 종목은 cancel_us() 라우팅. KR: TTTC0803U/VTTC0803U."""
         is_us = bool(symbol) and not self._is_kr(symbol)
         if is_us:
-            excd = _order_excd(symbol)
+            excd = self._us_order_excd(symbol)
             try:
                 resp = self._orders.cancel_us(order_id, symbol, excd, qty, price)
                 rt_cd = resp.get("rt_cd", "1")
@@ -375,7 +412,7 @@ class KISBroker(BrokerAdapter):
         """KIS 해외주식 주문 조회. TR: TTTS3035R (실전) / VTTS3035R (모의)."""
         try:
             tr_id = "VTTS3035R" if self._paper else "TTTS3035R"
-            excd = _order_excd(symbol)
+            excd = self._us_order_excd(symbol)
             strt_dt, end_dt = inquiry_date_range()
             params = {
                 "CANO": self._account[:8],
@@ -423,7 +460,7 @@ class KISBroker(BrokerAdapter):
             if self._is_kr(symbol):
                 result = float(self._market.get_price_kr(symbol))
             else:
-                quote_excd = _quote_excd(symbol)
+                quote_excd = self._us_quote_excd(symbol)
                 result = self._market.get_price_us(symbol, quote_excd)
             self._breaker.record_success()
             return result
