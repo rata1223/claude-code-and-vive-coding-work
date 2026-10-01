@@ -162,22 +162,33 @@ class KISBroker(BrokerAdapter):
     # ── US venue: the broker's word for a holding, derived otherwise ─────────
 
     def _remember_venue(self, symbol: str, reported) -> None:
-        """Record where the broker says a held US position trades.
+        """Record where the broker says an unmapped US holding trades.
 
         ``EXCD_MAP`` knows the universe; a holding outside it (bought by hand,
         say) would otherwise be sold as ``NASD`` and rejected if it is an NYSE
         name — and emergency flatten sells every holding. The balance row's
-        ``ovrs_excg_cd`` is the authority on where the shares are.
+        ``ovrs_excg_cd`` says where the shares are.
         """
         code = broker_exchange(reported)
         if code is None:
             return
-        venues = self.__dict__.setdefault("_held_venue", {})
-        derived = resolve_exchange(symbol)
-        if is_mapped(symbol) and derived != code and venues.get(symbol) != code:
-            logger.warning("거래소 불일치 %s: EXCD_MAP=%s, 브로커 잔고=%s — 브로커 값 사용",
-                           symbol, derived, code)
-        venues[symbol] = code
+        if is_mapped(symbol):
+            # A mapped symbol keeps routing by EXCD_MAP: every order, inquiry and
+            # cancel for it has used that venue, and switching mid-flight could
+            # look up or cancel an order on a venue other than the one it was
+            # sent to. A disagreement is logged once — that is the evidence
+            # known issue 4 (SPY/XL* on Arca) is waiting for.
+            derived = resolve_exchange(symbol)
+            warned = self.__dict__.setdefault("_venue_warned", set())
+            if derived != code and symbol not in warned:
+                warned.add(symbol)
+                logger.warning("거래소 불일치 %s: EXCD_MAP=%s, 브로커 잔고=%s — EXCD_MAP 유지",
+                               symbol, derived, code)
+            return
+        # Unmapped: the derived venue is only the NASD guess, so the broker's
+        # word is strictly better — and nothing was routed by the guess before
+        # it, since unmapped symbols reach the worker only as holdings.
+        self.__dict__.setdefault("_held_venue", {})[symbol] = code
 
     def _us_order_excd(self, symbol: str) -> str:
         """``OVRS_EXCG_CD`` for ``symbol``: the broker-reported venue of a holding,

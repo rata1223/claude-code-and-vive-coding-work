@@ -66,6 +66,18 @@ def test_a_rejection_says_the_venue_was_assumed(monkeypatch, db, user):
     assert "NASD로 추정" in resp.msg
 
 
+def test_no_note_when_the_order_never_reached_the_broker(monkeypatch, db, user):
+    """Code review: "sent as NASD and rejected" is false for a blocked order."""
+    _wire(monkeypatch, _Orders())
+
+    def deny():
+        raise RuntimeError("risk gate: halted")
+
+    resp = quick_trade.place_order(_buy("KO"), None, user, db, deny)
+    assert resp.code != 1
+    assert "추정" not in resp.msg
+
+
 def test_a_mapped_ticker_carries_no_flag_or_note(monkeypatch, db, user):
     _wire(monkeypatch, _Orders())
     ok = quick_trade.place_order(_buy("AAPL"), None, user, db, _allow())

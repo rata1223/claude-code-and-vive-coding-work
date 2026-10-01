@@ -10,7 +10,7 @@ from api.crypto import CredentialUnreadable, kis_credential_fields
 from api.database import get_db
 from api.deps import get_current_user
 from api.models import (
-    Credential, QT_CANCELED, QT_SUBMITTED, Strategy, Trade, User, qt_transition,
+    Credential, QT_CANCELED, QT_REJECTED, QT_SUBMITTED, Strategy, Trade, User, qt_transition,
 )
 from api.schemas import (
     CancelOrderRequest, ClosePositionRequest, EmergencyFlattenRequest,
@@ -278,8 +278,14 @@ def _with_venue_flag(payload: dict, symbol: str, market: str) -> dict:
     return payload
 
 
-def _venue_note(symbol: str, market: str) -> str:
-    return _ASSUMED_VENUE_NOTE if _venue_assumed(symbol, market) else ""
+def _venue_note(symbol: str, market: str, status: str) -> str:
+    """The note, only on a broker rejection — the one outcome a wrong venue
+    explains. ``blocked`` never reached KIS, ``failed`` means KIS never got it,
+    and ``reserved`` may be live: claiming "sent and rejected for its venue"
+    there would be false."""
+    if status == QT_REJECTED and _venue_assumed(symbol, market):
+        return _ASSUMED_VENUE_NOTE
+    return ""
 
 
 def _live_held_qty(portfolio, symbol: str, market: str) -> int:
@@ -665,7 +671,7 @@ def place_order(
         # Rejected / reserved(indeterminate) / failed → error envelope so clients
         # that branch on Resp.err keep detecting failed orders (prior behaviour).
         return Resp.err(f"Order {order.status}: {order.error or 'no broker order id'}"
-                        f"{_venue_note(body.symbol, market)}")
+                        f"{_venue_note(body.symbol, market, order.status)}")
     except IdempotencyConflict:
         return Resp.err("Duplicate idempotency key with different parameters")
     except Exception as e:
@@ -767,7 +773,7 @@ def close_position(
                 return Resp.ok(_with_venue_flag(payload, body.symbol, market))
             return Resp.err(
                 f"Close position {replay.status}: {replay.error or 'no broker order id'}"
-                f"{_venue_note(body.symbol, market)}"
+                f"{_venue_note(body.symbol, market, replay.status)}"
             )
         except Exception as e:  # noqa: BLE001 - an unusable body must not 500
             logger.warning("close replay comparison failed: %s", e)
@@ -906,7 +912,7 @@ def close_position(
         # runtime status instead of asserting a submission that never happened.
         return Resp.err(
             f"Close position {order.status}: {order.error or 'no broker order id'}"
-            f"{_venue_note(body.symbol, market)}"
+            f"{_venue_note(body.symbol, market, order.status)}"
         )
     except IdempotencyConflict:
         return Resp.err("Duplicate idempotency key with different parameters")

@@ -109,12 +109,14 @@ def test_an_unmapped_nyse_holding_sells_on_nyse():
     assert ("KO", "NYS") in b._market.quotes   # the quote uses the row's venue too
 
 
-def test_the_broker_wins_over_the_map_and_says_so(caplog):
+def test_a_mapped_symbol_keeps_its_venue_and_logs_the_disagreement(caplog):
+    """Code review: switching a mapped symbol's venue mid-flight could look up
+    or cancel an order on a venue other than the one it was sent to."""
     b = _broker([_row("SPY", "AMEX")])
     with caplog.at_level(logging.WARNING, logger="backend.brokers.kis"):
         b.get_positions()
         b.get_positions()                       # warned once, not every refresh
-    assert _sell(b, "SPY") == "AMEX"
+    assert _sell(b, "SPY") == "NYSE"            # EXCD_MAP routing unchanged
     assert sum("거래소 불일치 SPY" in r.message for r in caplog.records) == 1
 
 
