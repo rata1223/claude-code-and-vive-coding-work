@@ -2,6 +2,7 @@
 Flask REST API — 포트 5000
 실행: python -m backend.api.server
 """
+import hmac
 import json
 import logging
 import os
@@ -22,21 +23,28 @@ app = Flask(__name__)
 _redis = redis.from_url(os.environ.get("REDIS_URL", "redis://redis:6379"))
 _db_factory = None
 
-# API key auth — set KIS_API_KEY env var to enable. Unset = open (dev mode, logged warning).
+# API key auth (X-API-Key). Required: this API can flatten the operator account,
+# start/stop strategies and reconcile. There is no unauthenticated mode — with no
+# key every non-open route answers 503, and gunicorn refuses to start
+# (gunicorn_conf.on_starting -> require_api_key). It used to switch auth off
+# entirely when the key was empty, with port 5001 published on every interface.
 _API_KEY = os.environ.get("KIS_API_KEY", "")
 _OPEN_ROUTES = {"/api/health", "/api/status", "/api/metrics"}
 
 if not _API_KEY:
-    _live_trading = os.environ.get("ENABLE_LIVE_TRADING", "false").lower() == "true"
-    _flask_prod = os.environ.get("FLASK_ENV", "").lower() == "production"
-    if _live_trading or _flask_prod:
-        import sys as _sys
-        logger.critical(
-            "KIS_API_KEY is not set while ENABLE_LIVE_TRADING=true or FLASK_ENV=production "
-            "— refusing to start. Set KIS_API_KEY to a cryptographically random value."
+    logger.critical("KIS_API_KEY is not set — every route except %s answers 503",
+                    sorted(_OPEN_ROUTES))
+
+
+def require_api_key() -> None:
+    """Refuse to serve without KIS_API_KEY. Called at gunicorn start; importing
+    this module stays possible (tests, workers using the publish helpers)."""
+    if not _API_KEY:
+        raise RuntimeError(
+            "KIS_API_KEY environment variable is not set — kis-api will not run "
+            "without authentication. Generate one with: "
+            "python -c \"import secrets; print(secrets.token_hex(32))\""
         )
-        _sys.exit(1)
-    logger.warning("KIS_API_KEY not set — API running without authentication (dev mode)")
 
 
 @app.before_request
@@ -44,9 +52,9 @@ def _check_api_key():
     if request.path in _OPEN_ROUTES or request.method == "OPTIONS":
         return None
     if not _API_KEY:
-        return None  # auth disabled
+        return jsonify({"error": "KIS_API_KEY 미설정 — 인증 없이는 열지 않는다"}), 503
     provided = request.headers.get("X-API-Key", "")
-    if provided != _API_KEY:
+    if not hmac.compare_digest(provided.encode(), _API_KEY.encode()):
         return jsonify({"error": "인증 실패"}), 401
 
 

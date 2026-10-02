@@ -1137,17 +1137,11 @@ def cancel_order(
 #: absent, which is why the URL below falls back with ``or`` rather than an
 #: ``os.environ.get`` default — the latter never fires and yields a relative URL.
 #:
-#: ⚠️ ``KIS_API_KEY`` is not an independent knob. While it is empty the proxy
-#: sends an empty ``X-API-Key``, and that only reaches the upstream because
-#: Flask's own guard is *also* disabled when its key is empty
-#: (``backend/api/server.py``) — two failures cancelling out, not a working
-#: configuration. Setting it turns the ops API's guard on for **every** caller,
-#: so it must be set on ``api`` and ``kis-api`` together or this proxy 401s.
-#:
-#: Still open, and still gating the UI: port ``5001`` is published, so
-#: ``/api/admin/flatten`` is reachable directly and bypasses the allowlist
-#: entirely. No code in this router can close that. Do not expose the flatten
-#: button until the port is restricted and the key is set.
+#: ``KIS_API_KEY`` is the same variable kis-api requires: it refuses to start
+#: without it and answers 503 on admin routes if it somehow runs keyless
+#: (``backend/api/server.py``), and compose only publishes :5001 on the host's
+#: loopback. So the allowlist here is no longer bypassable from outside; an
+#: empty key on this side just means the upstream answers 401/503.
 _ADMIN_API_BASE = "http://kis-api:5001"
 
 
@@ -1212,9 +1206,8 @@ def emergency_flatten(
     operator being throttled needs to know the control is intact but rate
     limited, not see a generic failure.
 
-    ⚠️ This is a convenience and an audit point, not a security boundary: while
-    ``KIS_API_KEY`` is unset, Flask's own guard is disabled and :5001 is
-    reachable directly. See docs and the plan's blocker note.
+    The ops API requires ``KIS_API_KEY`` and listens on the host loopback only,
+    so this allowlist is the way in from the product.
     """
     import os
 

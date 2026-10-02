@@ -12,10 +12,9 @@ This is a **thin proxy**, deliberately. The Flask side already enforces
 exception text can leak. Re-implementing any of that here would fork the safety
 rules; the proxy's whole job is authentication and reachability.
 
-⚠️ Recorded, not fixed here: with ``KIS_API_KEY`` empty — the compose default —
-Flask's ``_check_api_key`` returns ``None`` and the admin route is open. The
-proxy adds a JWT gate but is not a security boundary while :5001 is directly
-reachable. See the plan's §8 blocker.
+The ops API no longer has an open mode: it requires ``KIS_API_KEY`` (503
+without it, no start under gunicorn) and is published on the host loopback
+only — tests/integration/test_kis_api_exposure.py.
 """
 import pytest
 
