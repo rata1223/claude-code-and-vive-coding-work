@@ -182,3 +182,59 @@ def test_the_ws_image_verifies_tokens_from_only_what_it_copies(tmp_path):
     proc = subprocess.run([sys.executable, "-P", "-c", code],
                           cwd=tmp_path, env=env, capture_output=True, text=True, timeout=120)
     assert proc.returncode == 0, proc.stderr[-2000:]
+
+
+# ── a socket does not outlive its token ────────────────────────────────────
+
+class TestSessionExpiry:
+    """CodeRabbit: an accepted socket stayed authorized after its token expired."""
+
+    @staticmethod
+    def _client(token):
+        from backend.websocket import server
+        return server.socketio.test_client(server.app, query_string=f"token={token}")
+
+    def test_a_real_connect_is_accepted_and_tracked(self, secret):
+        """Also the Flask/flask-socketio compatibility check: 5.3.6 raised on
+        every event under Flask 3.1."""
+        from backend.websocket import server
+        client = self._client(_token(minutes=5))
+        try:
+            assert client.is_connected()
+            assert client.eio_sid in server.socketio.server.environ  # sanity: live socket
+            with server._session_lock:
+                assert len(server._session_expiry) >= 1
+        finally:
+            client.disconnect()
+
+    def test_a_non_operator_connect_is_refused(self, secret):
+        client = self._client(_token(sub="7"))
+        assert not client.is_connected()
+
+    def test_the_sweep_drops_a_socket_whose_token_expired(self, secret):
+        import time as _time
+        from backend.websocket import server
+        client = self._client(_token(minutes=5))
+        assert client.is_connected()
+        with server._session_lock:
+            tracked = dict(server._session_expiry)
+        assert tracked
+        server._expire_sessions(_time.time())          # nothing expired yet
+        assert client.is_connected()
+        dropped = server._expire_sessions(max(tracked.values()) + 1)
+        assert set(tracked) <= set(dropped)
+        assert not client.is_connected()
+
+    def test_disconnect_forgets_the_socket(self, secret):
+        from backend.websocket import server
+        client = self._client(_token(minutes=5))
+        with server._session_lock:
+            before = set(server._session_expiry)
+        client.disconnect()
+        with server._session_lock:
+            assert len(server._session_expiry) == len(before) - 1
+
+    def test_start_runs_the_sweeper(self):
+        import inspect
+        from backend.websocket import server
+        assert "_session_sweeper" in inspect.getsource(server.start_ws_server)

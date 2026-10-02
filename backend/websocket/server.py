@@ -40,15 +40,17 @@ def _operator_user_ids() -> frozenset:
     therefore proves nothing about who may see it; only listed operators may.
     Ids, not emails: signup does not verify mailboxes, so anyone could register
     a listed address that has no account yet; an id is assigned by the database
-    and never reused. Empty means nobody (every connection refused). Removing an
-    id revokes its tokens without waiting for them to expire.
+    and never reused. Empty means nobody (every connection refused). The list is
+    read from the environment, so changing it means restarting kis-ws — which
+    also drops every open connection.
     """
     raw = os.environ.get("WS_OPERATOR_USER_IDS", "")
     return frozenset(i.strip() for i in raw.split(",") if i.strip())
 
 
-def _verify_ws_token() -> bool:
-    """True only for a valid app token (api/auth.py) whose user is a listed operator.
+def _authorized_payload():
+    """The token's payload when it is a valid app token (api/auth.py) whose user
+    is a listed operator; otherwise ``None``.
 
     A missing JWT library or JWT_SECRET_KEY is a deployment error and raises: it
     used to be swallowed here, so the container rejected every client as
@@ -57,28 +59,72 @@ def _verify_ws_token() -> bool:
     """
     token = request.args.get("token", "")
     if not token:
-        return False
+        return None
     from backend.security.jwt_tokens import decode_access_token
     payload = decode_access_token(token)
     if payload is None:
-        return False
+        return None
     user_id = str(payload.get("sub") or "").strip()
-    return bool(user_id) and user_id in _operator_user_ids()
+    if not user_id or user_id not in _operator_user_ids():
+        return None
+    return payload
+
+
+def _verify_ws_token() -> bool:
+    return _authorized_payload() is not None
+
+
+# A socket outlives the token it connected with; without this an operator
+# whose token expired would keep receiving the feed for as long as the socket
+# stayed open. sid -> token expiry (epoch seconds); swept by _session_sweeper.
+_SESSION_SWEEP_SEC = 30
+_session_expiry: dict = {}
+_session_lock = threading.Lock()
+
+
+def _expire_sessions(now: float) -> list:
+    """Disconnect every socket whose token has expired; returns their sids."""
+    with _session_lock:
+        expired = [sid for sid, exp in _session_expiry.items() if exp <= now]
+        for sid in expired:
+            del _session_expiry[sid]
+    for sid in expired:
+        try:
+            socketio.server.disconnect(sid, namespace="/")
+        except Exception as e:  # already gone
+            logger.debug("만료 세션 끊기 실패 %s: %s", sid, e)
+    if expired:
+        logger.info("토큰 만료로 WS 연결 %d개 종료", len(expired))
+    return expired
+
+
+def _session_sweeper():
+    while True:
+        time.sleep(_SESSION_SWEEP_SEC)
+        try:
+            _expire_sessions(time.time())
+        except Exception as e:
+            logger.error("WS 세션 만료 점검 실패: %s", e)
 
 
 # ── 클라이언트 이벤트 ─────────────────────────────────────────────────────
 @socketio.on("connect")
 def on_connect():
-    if not _verify_ws_token():
+    payload = _authorized_payload()
+    if payload is None:
         logger.warning("WS 인증 실패 — 연결 거부: %s", request.remote_addr)
         disconnect()
         return False
+    with _session_lock:
+        _session_expiry[request.sid] = float(payload["exp"])
     logger.info("WS 클라이언트 연결: %s", request.remote_addr)
     emit("connected", {"status": "ok"})
 
 
 @socketio.on("disconnect")
 def on_disconnect():
+    with _session_lock:
+        _session_expiry.pop(getattr(request, "sid", None), None)
     logger.info("WS 클라이언트 연결 해제")
 
 
@@ -164,6 +210,7 @@ def start_ws_server() -> None:
     _require_ws_secret()
     _require_token_verifier()
     start_redis_listener()
+    threading.Thread(target=_session_sweeper, daemon=True, name="ws-session-sweeper").start()
     port = int(os.environ.get("WS_PORT", 5002))
     socketio.run(app, host="0.0.0.0", port=port, debug=False)
 
