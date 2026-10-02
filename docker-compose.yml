@@ -194,9 +194,10 @@ services:
       QUANTDINGER_SECRET_KEY: ${QUANTDINGER_SECRET_KEY:?QUANTDINGER_SECRET_KEY must be set (see .env.example)}
       # Same secret the app API signs tokens with — WS clients present those tokens (#189).
       JWT_SECRET_KEY: ${JWT_SECRET_KEY:?JWT_SECRET_KEY must be set to a secure random value (see .env.example)}
-      # Only these app accounts may connect: the relayed data is the operator's
-      # single .env account. Empty = every connection refused.
-      WS_OPERATOR_EMAILS: ${WS_OPERATOR_EMAILS:-}
+      # Only these app user ids may connect: the relayed data is the operator's
+      # single .env account. Ids, not emails (signup does not verify mailboxes).
+      # Empty = every connection refused.
+      WS_OPERATOR_USER_IDS: ${WS_OPERATOR_USER_IDS:-}
       WS_PORT: "5002"
     depends_on:
       redis:

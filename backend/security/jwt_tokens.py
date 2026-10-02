@@ -27,10 +27,12 @@ def jwt_secret() -> str:
 def decode_access_token(token: str, secret: Optional[str] = None) -> Optional[dict]:
     """The token's payload, or ``None`` for any invalid token.
 
-    Only HS256 is accepted; a bad signature, an expired token, a malformed token
-    and any other algorithm (``none``, HS512, RS256, …) all return ``None``.
+    Only HS256 is accepted, and ``exp`` is required: a bad signature, an expired
+    token, a token with no expiry, a malformed token and any other algorithm
+    (``none``, HS512, RS256, …) all return ``None``.
     """
     try:
-        return jwt.decode(token, secret or jwt_secret(), algorithms=[ALGORITHM])
+        return jwt.decode(token, secret or jwt_secret(), algorithms=[ALGORITHM],
+                          options={"require": ["exp"]})
     except jwt.PyJWTError:
         return None
