@@ -32,40 +32,99 @@ socketio = SocketIO(app, cors_allowed_origins=_ws_cors, async_mode="threading")
 _r = redis.from_url(_REDIS_URL)
 
 
-def _verify_ws_token() -> bool:
-    """Validate JWT token passed as query param ?token=<jwt>.
-    Returns True if valid, False otherwise.
-    Configuration/bootstrap errors (e.g. missing JWT_SECRET_KEY) are NOT caught
-    here — they propagate so the WS process surfaces misconfiguration rather than
-    silently rejecting every client as unauthenticated.
+def _operator_user_ids() -> frozenset:
+    """``WS_OPERATOR_USER_IDS`` — app user ids (the token's ``sub``), comma-separated.
+
+    Every channel this server relays — orders, positions, equity, alerts — is the
+    worker's single ``.env`` account, and app signup is open. A valid app token
+    therefore proves nothing about who may see it; only listed operators may.
+    Ids, not emails: signup does not verify mailboxes, so anyone could register
+    a listed address that has no account yet; an id is assigned by the database
+    and never reused. Empty means nobody (every connection refused). The list is
+    read from the environment, so changing it means restarting kis-ws — which
+    also drops every open connection.
+    """
+    raw = os.environ.get("WS_OPERATOR_USER_IDS", "")
+    return frozenset(i.strip() for i in raw.split(",") if i.strip())
+
+
+def _authorized_payload():
+    """The token's payload when it is a valid app token (api/auth.py) whose user
+    is a listed operator; otherwise ``None``.
+
+    A missing JWT library or JWT_SECRET_KEY is a deployment error and raises: it
+    used to be swallowed here, so the container rejected every client as
+    "unauthenticated" (#189). start_ws_server() checks both before accepting
+    connections.
     """
     token = request.args.get("token", "")
     if not token:
-        return False
-    import importlib
-    for mod_name in ("api.auth", "backend.api.auth"):
+        return None
+    from backend.security.jwt_tokens import decode_access_token
+    payload = decode_access_token(token)
+    if payload is None:
+        return None
+    user_id = str(payload.get("sub") or "").strip()
+    if not user_id or user_id not in _operator_user_ids():
+        return None
+    return payload
+
+
+def _verify_ws_token() -> bool:
+    return _authorized_payload() is not None
+
+
+# A socket outlives the token it connected with; without this an operator
+# whose token expired would keep receiving the feed for as long as the socket
+# stayed open. sid -> token expiry (epoch seconds); swept by _session_sweeper.
+_SESSION_SWEEP_SEC = 30
+_session_expiry: dict = {}
+_session_lock = threading.Lock()
+
+
+def _expire_sessions(now: float) -> list:
+    """Disconnect every socket whose token has expired; returns their sids."""
+    with _session_lock:
+        expired = [sid for sid, exp in _session_expiry.items() if exp <= now]
+        for sid in expired:
+            del _session_expiry[sid]
+    for sid in expired:
         try:
-            mod = importlib.import_module(mod_name)
-            payload = mod.decode_access_token(token)
-            return payload is not None
-        except (ImportError, AttributeError):
-            continue
-    return False
+            socketio.server.disconnect(sid, namespace="/")
+        except Exception as e:  # already gone
+            logger.debug("만료 세션 끊기 실패 %s: %s", sid, e)
+    if expired:
+        logger.info("토큰 만료로 WS 연결 %d개 종료", len(expired))
+    return expired
+
+
+def _session_sweeper():
+    while True:
+        time.sleep(_SESSION_SWEEP_SEC)
+        try:
+            _expire_sessions(time.time())
+        except Exception as e:
+            logger.error("WS 세션 만료 점검 실패: %s", e)
 
 
 # ── 클라이언트 이벤트 ─────────────────────────────────────────────────────
 @socketio.on("connect")
 def on_connect():
-    if not _verify_ws_token():
+    payload = _authorized_payload()
+    if payload is None:
         logger.warning("WS 인증 실패 — 연결 거부: %s", request.remote_addr)
         disconnect()
         return False
+    with _session_lock:
+        _session_expiry[request.sid] = float(payload["exp"])
     logger.info("WS 클라이언트 연결: %s", request.remote_addr)
     emit("connected", {"status": "ok"})
 
 
 @socketio.on("disconnect")
 def on_disconnect():
+    with _session_lock:
+        _session_expiry.pop(getattr(request, "sid", None), None)
     logger.info("WS 클라이언트 연결 해제")
 
 
@@ -133,13 +192,25 @@ def _require_ws_secret() -> None:
         )
 
 
+def _require_token_verifier() -> None:
+    """Fail fast if client tokens cannot be verified (no PyJWT or JWT_SECRET_KEY).
+    Without this the server starts and refuses every connection (#189)."""
+    from backend.security.jwt_tokens import jwt_secret
+    jwt_secret()
+    if not _operator_user_ids():
+        logger.warning("WS_OPERATOR_USER_IDS가 비어 있음 — 모든 WS 연결을 거부한다 "
+                       "(이 서버는 운영 계좌 데이터만 중계한다)")
+
+
 def start_ws_server() -> None:
     """Bootstrap and run the WS server.
     Call this from any entrypoint (gunicorn WSGI app factory, __main__, etc.)
     so the secret check is never bypassed by non-__main__ launch paths.
     """
     _require_ws_secret()
+    _require_token_verifier()
     start_redis_listener()
+    threading.Thread(target=_session_sweeper, daemon=True, name="ws-session-sweeper").start()
     port = int(os.environ.get("WS_PORT", 5002))
     socketio.run(app, host="0.0.0.0", port=port, debug=False)
 

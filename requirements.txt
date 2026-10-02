@@ -42,7 +42,9 @@ python-dotenv==1.2.2
 # Stage 4+: Backend API & Real-time
 flask==3.1.3
 flask-cors==6.0.0
-flask-socketio==5.3.6
+# 5.6.1 (was 5.3.6): 5.3.6 assigns RequestContext.session, read-only since Flask 3.1, so
+# every Socket.IO event raised AttributeError with the pinned flask==3.1.3 (#189 follow-up).
+flask-socketio==5.6.1
 python-socketio==5.16.2
 # 4.12.2 (was 4.8.0): python-socketio 5.14.0 requires python-engineio>=4.11.0.
 python-engineio==4.13.2
@@ -51,11 +53,9 @@ python-engineio==4.13.2
 gunicorn==22.0.0
 
 # Security & Authentication
-# JWT lives in requirements-api.txt (PyJWT 2.15.1): api/auth.py moved off
-# python-jose. Not pinned here yet. kis-ws runs from this image and should verify
-# tokens, but it lacks api/, a JWT library and JWT_SECRET_KEY, so every WS client
-# is refused (fail-closed) — tracked in #189. (The old PyJWT pin here carried
-# PYSEC-2025-183 / GHSA-752w-5fwx-jx9f; 2.15.1 is clean.)
+# kis-ws (this image) verifies the app's access tokens with
+# backend/security/jwt_tokens.py (#189). Same pin as requirements-api.txt.
+PyJWT==2.15.1
 cryptography==50.0.0
 
 # Monitoring & Logging

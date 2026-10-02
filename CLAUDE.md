@@ -12,7 +12,7 @@
 
 ---
 
-## 프로젝트 진행 현황 (2026-10-01 기준, main `21ec808` = PR #200)
+## 프로젝트 진행 현황 (2026-10-01 기준, main `86c8ca7` = PR #201)
 
 > **이 섹션이 최신 상태의 단일 진실 공급원(SoT).** 아래 "다음 작업 목록(Stage 1~9)"은 초기 설계 로드맵으로,
 > 대부분 이미 구현 완료됐다. 실제 진행은 `AUDIT.md` → `ROADMAP.md` 기반 하드닝 트랙으로 이어지고 있다.
@@ -67,6 +67,7 @@
 | 앱 전략 시작 | #199 | 앱 `/api/strategies/start`는 `status="running"`과 아무도 읽지 않는 Redis 집합만 바꾸고 워커엔 아무것도 보내지 않았다 — 화면은 "실행 중", 실제론 신호·주문·`strategy_runs` 없음(4주 시계도 안 감). 시작을 거부하고 이유 표시(선택지 A), 죽은 Redis 집합 제거, 시작 버튼은 API 호출 없이 안내. 감사·선택지 B/C는 `docs/STRATEGY_START_AUDIT.md` |
 | Pinia 스토어 분리 | #200 | **P3-04** — `stores/index.js` 한 파일(웹 307줄·모바일 360줄)을 스토어별 모듈 8개 + `pinia.js` + 배럴 `index.js`로(가져오는 쪽 16곳씩 그대로). 웹·모바일 사본이 갈라져 버그가 났었다(#150 키움 자격증명, 모바일 프로필 크래시) → 두 앱이 **동일한** 스토어 파일. 모바일에만 있던 미사용 `useBrokerStore`·`useWebSocketStore`·`kiwoomItems` 제거. 정적 가드 `tests/integration/test_frontend_store_parity.py`(두 앱 동일·스토어 id 1회·로그아웃이 계정 스토어 전부 리셋) |
 | API CI·이미지 | #201 | **#127** — `api/tests/`(627건)가 어느 CI에서도 돌지 않았다 → `tests.yml`에 `pytest-api` 잡(Postgres, **`requirements-api.txt`만 설치** — API 이미지와 같은 의존성). 그러다 발견: **API 이미지(`Dockerfile.api`)가 기동 불가**였다 — `backend/`를 COPY하지 않는데 `api/`가 import(`No module named 'backend'`), `requirements-api.txt`에 RestrictedPython 없음(`strategy/`). 둘 다 추가 + 이미지의 COPY 줄만으로 `import api.main`을 하는 테스트(`api/tests/test_api_image_layout.py`). 배포는 이 워크플로 성공에 게이팅되므로 API 테스트 실패도 배포를 막는다 |
+| WS 토큰 검증 | #202 | **#189** — `kis-ws`(`Dockerfile.kis-bot`)는 `api.auth`를 import해 토큰을 검증했는데 이미지에 `api/`·JWT 라이브러리·`JWT_SECRET_KEY`가 없었고, `ImportError`를 삼켜 **모든 WS 클라이언트를 인증 실패로 거부**했다. 검증을 `backend/security/jwt_tokens.py`로 옮기고 `api.auth.decode_access_token`이 그것을 쓴다(검증기 하나). `requirements.txt`에 PyJWT(API와 같은 버전), compose `kis-ws`에 API와 같은 `JWT_SECRET_KEY`. 설정 누락은 이제 연결마다 거부가 아니라 **기동 실패**(`_require_token_verifier`). **유효한 토큰만으로는 안 된다** — 중계 데이터(주문·포지션·자산·경보)는 `.env` 단일 운영 계좌이고 가입은 열려 있어서 `WS_OPERATOR_USER_IDS`(compose·`.env`, 비우면 전원 거부)에 있는 사용자 id(토큰 `sub`)만 연결 — 이메일이 아닌 이유: 가입이 메일 소유를 확인하지 않아 등록 안 된 운영자 주소를 남이 가입할 수 있다(코드 리뷰·CodeRabbit 지적). 토큰에 `exp` 필수, 소켓은 토큰 만료 시 끊긴다(30초 주기 점검). **별건 수정**: 고정된 flask-socketio 5.3.6이 Flask 3.1과 비호환이라 모든 Socket.IO 이벤트가 `AttributeError`로 실패했다 → 5.6.1. **주의: 웹·모바일 앱에는 WS 클라이언트가 아직 없다** — 서버는 동작하지만 붙는 곳이 없다 |
 
 **열린 PR 0건.** 다음 작업은 `origin/main`에서 새로 분기하면 된다.
 
@@ -502,7 +503,7 @@ KR_ETF   = ["069500", "360750", "091160"]  # KODEX200, TIGER S&P500, KODEX반도
 - **PR #79** (`claude/update-MW7LQ`): 실패 시나리오 통합테스트 (TASK 4-1C) — **머지됨** (2026-06-16)
 - 하드닝 트랙 PR #85~#156: 위 "프로젝트 진행 현황" 표 참조 — **모두 머지됨**
 - **PR #116**은 미머지 종료(2026-07-05). 같은 작업을 **#119**가 대체 구현해 머지했다
-- **현재 열린 PR 0건.** main = `21ec808` (PR #200)
+- **현재 열린 PR 0건.** main = `86c8ca7` (PR #201)
 
 > 작업 방식: 기능별 새 브랜치에서 작업 → `main`으로 드래프트 PR → CodeRabbit/CodeQL 리뷰 → 머지.
 > 브랜치 보호 룰셋(PR 필수 + 코드 스캐닝)이 적용돼 `main` 직접 푸시 불가.
@@ -528,10 +529,9 @@ git checkout -B <새-작업-브랜치> origin/main
    - **#173** 브로커 조회가 30일 창에서 첫 `odno` 일치 행 반환(#168의 브로커 쪽 절반). KIS가 같은
      번호를 여러 날짜로 돌려주는지 라이브 없이 확인 불가 — 모의투자 관측 필요
    - **#178** MDD 총자산(`get_balance().total_eval_krw`)이 낮게 읽힐 수 있음 — 자동 청산 활성화 전제. `equity_verified` + 진단 로그 + 미검증 시 청산 보류는 완료(PR #181). **남은 것**: 필드명·`NASD` 조회 범위 확정은 모의투자 로그로
-   - **#189** `kis-ws` 이미지가 JWT를 검증할 수 없어 모든 WS 연결 거부(fail-closed) — 이미지/compose 변경 필요
    - **#166** `daily_pnl`의 날 경계를 어디에 둘 것인가 — 미국 세션이 서울 자정을 가로지르므로
      한 야간 세션의 손익이 두 거래일로 쪼개진다. 리스크 정책 판단
-   - ~~#127~~ 완료(PR #201) · ~~#188~~ 완료(PR #191) · ~~#185~~ 완료(PR #186) · ~~#182~~ 완료(PR #184) · ~~#176~~ 완료(PR #180) · ~~#164~~ 완료(PR #177) · ~~#172~~ 완료(PR #175) · ~~#168~~ 완료(PR #174) · ~~#170~~ 완료(PR #171) · ~~#161~~ 완료(PR #169) · ~~#160~~ 완료(PR #165) · ~~#158~~ 완료(PR #163) · ~~#167~~ 완료(PR #165)
+   - ~~#189~~ 완료(PR #202) · ~~#127~~ 완료(PR #201) · ~~#188~~ 완료(PR #191) · ~~#185~~ 완료(PR #186) · ~~#182~~ 완료(PR #184) · ~~#176~~ 완료(PR #180) · ~~#164~~ 완료(PR #177) · ~~#172~~ 완료(PR #175) · ~~#168~~ 완료(PR #174) · ~~#170~~ 완료(PR #171) · ~~#161~~ 완료(PR #169) · ~~#160~~ 완료(PR #165) · ~~#158~~ 완료(PR #163) · ~~#167~~ 완료(PR #165)
 
 > ~~`P0-10` SIGTERM 핸들러~~ — 완료(PR #159, `install_signal_handlers` +
 > `StrategyWorker.shutdown`, 종료 예산 8초).
