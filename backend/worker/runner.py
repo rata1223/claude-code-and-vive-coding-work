@@ -335,18 +335,14 @@ class WorkerSession:
             # Order matters. ``is_active = False`` is the durable record that the
             # operator switched this strategy off, and ``_restore_active()``
             # reads it on the next boot — it must not be held hostage by user
-            # cleanup that may never return. ``stopped_at`` is different: kis-api
-            # counts a run without it as holding the single strategy slot, so it
-            # is written only once no on_market_open is still in flight.
+            # cleanup that may never return, so it is written first.
+            # ``stopped_at`` is different: kis-api counts a run without it as
+            # holding the single strategy slot, so it is written last — once no
+            # on_market_open is still in flight and ``strategy.stop()`` has
+            # returned. A hung callback or stop hook keeps the slot (fail-closed).
             if self._deactivate_on_exit:
-                if not started and self._new_start:
-                    self._drain_callbacks()
-                    _record_never_ran(self.run_id, self._strategy_type,
-                                      "strategy.start() 실패")
-                else:
-                    self._mark_stopped(release_slot=False)
-                    self._drain_callbacks()
-                    self._mark_stopped()
+                self._mark_stopped(release_slot=False)
+                self._drain_callbacks()
 
             # ``StrategyBase.stop()`` calls the overridable ``on_stop()``;
             # ``ScriptStrategy`` runs a sandboxed *user script* there. Running it
@@ -358,6 +354,13 @@ class WorkerSession:
                 self.strategy.stop()
             except Exception as e:
                 logger.exception("전략 on_stop 오류 run_id=%d: %s", self.run_id, e)
+
+            if self._deactivate_on_exit:
+                if not started and self._new_start:
+                    _record_never_ran(self.run_id, self._strategy_type,
+                                      "strategy.start() 실패")
+                else:
+                    self._mark_stopped()
 
     def _mark_stopped(self, release_slot: bool = True):
         """``is_active = False`` (not restored on the next boot); with

@@ -80,3 +80,12 @@ def test_start_and_stop_are_claimed_before_the_confirm_dialog():
     for method, flag in (("startRun()", "this.starting = true"), ("stopRun(run)", "this.stopping = run.id")):
         body = src.split(f"async {method} {{", 1)[1]
         assert body.index(flag) < body.index("showConfirmDialog"), method
+
+
+def test_only_the_latest_list_response_updates_the_screen():
+    """Overlapping loads can finish out of order; a stale "slot free" answer
+    must not replace a newer "occupied" one and re-enable Start."""
+    src = _read("frontend/src/views/profile/OperatorStrategy.vue")
+    body = src.split("async load() {", 1)[1].split("\n    },", 1)[0]
+    assert "const seq = ++this.loadSeq" in body
+    assert body.index("if (seq !== this.loadSeq) return") < body.index("this.runs = res")

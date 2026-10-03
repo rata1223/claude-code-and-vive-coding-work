@@ -570,3 +570,37 @@ def test_a_stop_after_the_session_ended_keeps_the_recorded_end(factory, monkeypa
 
     assert _row(factory, run_id).stopped_at == ended
     assert run_id not in w._stopping
+
+
+class _BlockingStopStrategy(_BlockingOpenStrategy):
+    """stop() (on_stop) blocks until released."""
+
+    def __init__(self):
+        super().__init__()
+        self.stopping = threading.Event()
+        self.stop_release = threading.Event()
+
+    def stop(self):
+        self.stopping.set()
+        assert self.stop_release.wait(10)
+
+
+def test_the_slot_is_held_until_the_stop_hook_returns(factory, monkeypatch):
+    from backend.api import server as srv
+    w = _worker()
+    strategy = _BlockingStopStrategy()
+    run_id, session = _running_session(w, factory, monkeypatch, strategy)
+    _kis_api_stop(factory, run_id)
+    w._handle_stop({"run_id": run_id})
+    assert strategy.stopping.wait(5)
+
+    row = _row(factory, run_id)
+    assert row.is_active is False, "never restored, even while on_stop runs"
+    assert row.stopped_at is None
+    with factory() as db:
+        assert srv._occupying_run(db) == run_id
+
+    strategy.stop_release.set()
+    assert session.join(5) is True
+    with factory() as db:
+        assert srv._occupying_run(db) is None

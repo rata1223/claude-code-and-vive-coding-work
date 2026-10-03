@@ -102,6 +102,7 @@ export default {
       runs: [],
       loading: false,
       loadError: '',
+      loadSeq: 0,
       starting: false,
       stopping: null,
       form: { name: 'house', sizePct: 5, stopPct: 7, universe: ['SPY', 'QQQ'] }
@@ -130,18 +131,24 @@ export default {
   },
   methods: {
     async load() {
+      // Loads can overlap (refresh during the reload after a stop) and finish
+      // out of order; only the latest may update the list, or an older "slot
+      // free" answer could re-enable Start over a newer "occupied" one.
+      const seq = ++this.loadSeq
       this.loading = true
       this.loadError = ''
       try {
         const res = await operatorApi.list()
+        if (seq !== this.loadSeq) return
         this.runs = res?.data?.runs || []
       } catch (e) {
+        if (seq !== this.loadSeq) return
         // The interceptor already toasted the server's message. Keep start
         // disabled: without the list we cannot tell whether the slot is free.
         this.runs = []
         this.loadError = e?.message || this.$t('operator.load_failed')
       } finally {
-        this.loading = false
+        if (seq === this.loadSeq) this.loading = false
       }
     },
     gateText(run) {
