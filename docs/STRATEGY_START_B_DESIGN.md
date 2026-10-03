@@ -2,7 +2,7 @@
 
 작성: 2026-10-03 · 기준 main `294d6af` (PR #203) · 선행 문서 `docs/STRATEGY_START_AUDIT.md`(선택지 A는 PR #199에서 구현)
 
-**이 문서는 설계만 담는다. 코드는 바꾸지 않는다.** 구현은 아래 "결정할 것"이 정해진 뒤 단계별 PR로 진행한다.
+**이 문서는 설계만 담는다.** 구현은 아래 "결정"에 따라 단계별 PR로 진행한다.
 
 ## 요약
 
@@ -47,13 +47,15 @@
 - 28일 전에 시작해 1분 뒤 중지한 행도 통과한다. 실제로 계속 돌았는지, 주문을 하나라도 냈는지는 보지 않는다.
 - B1로 앱에서 쉽게 시작·중지할 수 있게 되면 이 허점이 더 쉽게 밟힌다.
 - 강화 방향: "활성이면서 28일 이상" 또는 "`stopped_at - started_at >= 28일`".
-- 이것은 실전 전환 정책의 변경이므로 B1과 분리해 **따로 결정**한다(아래 "결정할 것" 3).
+- 이것은 실전 전환 정책의 변경이므로 B1과 분리해 **따로 결정**한다(아래 "결정" 3).
 
 ## B1 설계
 
-### 0단계 — 운영자 판별 통일 (F1)
+### 0단계 — 운영자 판별 통일 (F1) — ✅ PR #205
 
-- `api/operators.py`를 신설한다: `operator_user_ids()`와 `is_operator(user)`.
+> 구현 결과: `backend/security/operators.py`(kis-ws 이미지에 `api/`가 없어 `backend/`에 둔다). 결정 4에 따라 `WS_OPERATOR_USER_IDS`도 합쳤다 — api와 kis-ws가 같은 `OPERATOR_USER_IDS`를 읽는다. 옛 변수 셋은 읽지 않고 기동 시 경고한다.
+
+- `backend/security/operators.py`를 신설한다: `operator_user_ids()`와 `is_operator(user)`.
   - `OPERATOR_USER_IDS`(쉼표로 구분한 정수 id)를 읽는다. 비어 있으면 아무도 허용하지 않는다(fail-closed).
   - 형식이 틀린 항목은 무시하고 경고한다.
   - `kis-ws`의 `WS_OPERATOR_USER_IDS` 파싱(`backend/websocket/server.py:_operator_user_ids`)과 같은 규칙을 쓴다.
@@ -61,7 +63,7 @@
 - `EMERGENCY_FLATTEN_ADMINS`·`KILL_SWITCH_ADMINS`를 지운다. 지우기 전에 읽는 곳을 전부 확인하고, `.env.example`·compose·문서·테스트의 흔적도 함께 정리한다.
   - 운영 중인 `.env`에 이메일 목록이 남아 있으면 배포 후 해당 제어가 꺼진다(fail-closed). 기능이 조용히 바뀌지 않도록, 옛 변수가 설정돼 있으면 **기동 시 경고**를 한 줄 남긴다.
 - **compose 변경(승인 필요)**: `api` 서비스는 명시적인 `environment:` 블록만 받는다. `OPERATOR_USER_IDS: ${OPERATOR_USER_IDS:-}`를 추가하고 `EMERGENCY_FLATTEN_ADMINS`를 지운다.
-- `kis-ws`의 `WS_OPERATOR_USER_IDS`는 그대로 둔다. 소켓을 받을 사람과 매매를 제어할 사람을 따로 둘 수 있게 하기 위해서다. 합칠지는 결정할 것 4.
+- `kis-ws`의 `WS_OPERATOR_USER_IDS`도 `OPERATOR_USER_IDS`로 합친다(결정 4). compose `kis-ws`를 함께 바꾼다.
 
 ### 1단계 — 프록시 엔드포인트 (`api/`)
 
@@ -135,18 +137,18 @@
 - **`kis-api` 시작 레이트 리밋(분당 5회)이 앱 요청에도 적용된다.** 429는 그대로 전달한다.
 - **F1을 건너뛰면** 운영자 제어 세 개가 이메일 판별에 기대게 된다. 0단계를 먼저 하는 이유다.
 
-## 결정할 것
+## 결정 (2026-10-03)
 
-1. **B1으로 좁힐 것인가.** 대안은 사용자 조건으로 라이브 매매하는 새 전략 클래스(B2)다. 권장: B1. B2는 신호 로직과 백테스트 동등성 증명이 필요하고, 크기가 C에 가깝다.
-2. **0단계(운영자 id 통일)와 compose `api` 블록 변경**: `OPERATOR_USER_IDS` 추가와 `EMERGENCY_FLATTEN_ADMINS` 제거. compose 변경이라 승인이 필요하다. F1 때문에 **B1과 상관없이 먼저** 하는 것을 권장한다.
-3. **F2(4주 관문 강화)를 할 것인가, 언제 할 것인가.** 실전 전환 정책이다. 권장: B1 다음, 모의투자 시작 전.
-4. `WS_OPERATOR_USER_IDS`를 `OPERATOR_USER_IDS`로 합칠 것인가. 권장: 지금은 분리한다(용도가 다르다). 합치면 compose `kis-ws`도 바꿔야 한다.
+1. **B1으로 좁힌다.** B2(사용자 조건 라이브 매매)는 하지 않는다.
+2. **0단계를 먼저 하고, compose `api` 변경을 승인했다.** → PR #205.
+3. **F2(4주 관문 강화)는 바로 한다.** B1보다 먼저, 별도 PR로.
+4. **`WS_OPERATOR_USER_IDS`를 `OPERATOR_USER_IDS`로 합친다.** compose `kis-ws`도 바꾼다. → PR #205에 포함.
 
 ## 단계별 PR과 검증
 
 | PR | 범위 | 검증 |
 |---|---|---|
-| 1 | 0단계: `api/operators.py`, 비상청산·킬스위치 판별 교체, 옛 변수 제거 + 기동 경고, compose `api` env | 운영자 id만 통과, 목록이 비면 전원 거부, 같은 이메일(대소문자만 다른 주소 포함)의 다른 id 거부(#202와 같은 회귀 테스트), 옛 변수만 있으면 경고 + 거부, compose 선언 정적 검사 |
+| 1 (#205) | 0단계: `backend/security/operators.py`, 비상청산·킬스위치 판별 교체, 옛 변수 제거 + 기동 경고, compose `api` env | 운영자 id만 통과, 목록이 비면 전원 거부, 같은 이메일(대소문자만 다른 주소 포함)의 다른 id 거부(#202와 같은 회귀 테스트), 옛 변수만 있으면 경고 + 거부, compose 선언 정적 검사 |
 | 2 | 1단계: `api/routers/operator.py` + `kis-api` `start_strategy` 활성 실행 1개 강제 + 사용자 정보 응답의 `is_operator` | 비운영자 거부(상위 호출 0회), 입력 제한(script·범위 밖·모르는 키·유니버스 밖 종목), 키가 응답·로그에 없음, 429 전달(`_admin_post` 바꿔치기로 네트워크 없이). `kis-api`: 점유 중(`is_active` 또는 `stopped_at` 없음)이면 409와 `run_id`(50개보다 오래된 행, 중지 요청 후 워커 종료 전 행 포함), 동시 시작 두 건 중 하나만 성공(Postgres). `is_operator`가 info·profile(조회·수정) 응답 모두에 있음 |
 | 3 | 2단계: 화면·스토어·로케일 | 빌드, 스토어 동일성 가드, playwright로 운영자/비운영자 메뉴 노출 확인 |
 | (별도) | F2 4주 관문 | 짧게 돈 행은 불통과, 활성 28일 행은 통과, 닫힌 28일 행은 통과 |

@@ -57,6 +57,11 @@ async def lifespan(app: FastAPI):
     from api import crypto
     crypto.validate_key()
 
+    # Operator controls (emergency flatten, kill-switch reset) read
+    # OPERATOR_USER_IDS; say at startup if only the retired email lists are set.
+    from backend.security.operators import warn_legacy_operator_env
+    warn_legacy_operator_env()
+
     logger.info("Creating database tables…")
     tables_ready = False
     try:

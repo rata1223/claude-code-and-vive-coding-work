@@ -9,7 +9,7 @@ passes the API's ``JWT_SECRET_KEY`` to kis-ws; and a missing secret stops the
 server at start instead of failing every connection.
 
 A valid token alone is not enough: the relayed data is the operator's single
-``.env`` account and signup is open, so only ``WS_OPERATOR_USER_IDS`` may connect
+``.env`` account and signup is open, so only ``OPERATOR_USER_IDS`` may connect
 — user ids, because signup does not verify mailboxes and an operator's email
 could be registered by someone else.
 """
@@ -41,7 +41,7 @@ def _token(secret=SECRET, alg="HS256", minutes=30, sub=OPERATOR_ID, email="ops@e
 @pytest.fixture()
 def secret(monkeypatch):
     monkeypatch.setenv("JWT_SECRET_KEY", SECRET)
-    monkeypatch.setenv("WS_OPERATOR_USER_IDS", f"1, {OPERATOR_ID} ")
+    monkeypatch.setenv("OPERATOR_USER_IDS", f"1, {OPERATOR_ID} ")
     return SECRET
 
 
@@ -96,7 +96,7 @@ class TestWsServer:
     def test_registering_an_operators_email_gains_nothing(self, secret, monkeypatch):
         """Signup does not verify mailboxes: a newcomer may hold the operator's
         address, but not the operator's id."""
-        monkeypatch.setenv("WS_OPERATOR_USER_IDS", OPERATOR_ID)
+        monkeypatch.setenv("OPERATOR_USER_IDS", OPERATOR_ID)
         assert _ws_check(_token(sub="999", email="ops@example.com")) is False
         assert _ws_check(_token(sub=OPERATOR_ID, email="anything@else.com")) is True
 
@@ -105,11 +105,11 @@ class TestWsServer:
 
     def test_no_operators_configured_refuses_everyone(self, secret, monkeypatch, caplog):
         from backend.websocket import server
-        monkeypatch.setenv("WS_OPERATOR_USER_IDS", " , ")
+        monkeypatch.setenv("OPERATOR_USER_IDS", " , ")
         assert _ws_check(_token()) is False
         with caplog.at_level("WARNING"):
             server._require_token_verifier()          # starts, but says why
-        assert "WS_OPERATOR_USER_IDS" in caplog.text
+        assert "OPERATOR_USER_IDS" in caplog.text
 
     def test_a_missing_secret_raises_instead_of_refusing_everyone(self, monkeypatch):
         """The old path turned a deployment error into "unauthenticated"."""
@@ -146,8 +146,10 @@ def test_kis_ws_gets_the_same_secret_the_api_signs_with():
 
 
 def test_kis_ws_reads_the_operator_list_and_defaults_to_nobody():
-    assert re.search(r"^\s+WS_OPERATOR_USER_IDS:\s*\$\{WS_OPERATOR_USER_IDS:-\}\s*$",
-                     _service("kis-ws"), re.M)
+    line = re.compile(r"^\s+OPERATOR_USER_IDS:\s*\$\{OPERATOR_USER_IDS:-\}\s*$", re.M)
+    assert line.search(_service("kis-ws"))
+    assert line.search(_service("api")), "one operator list for the api controls and the feed"
+    assert "WS_OPERATOR_USER_IDS" not in (ROOT / "docker-compose.yml").read_text()
 
 
 def test_requirements_pin_pyjwt_like_the_api():
@@ -166,7 +168,7 @@ def test_the_ws_image_verifies_tokens_from_only_what_it_copies(tmp_path):
     for name in dirs:
         (tmp_path / name).symlink_to(ROOT / name, target_is_directory=True)
     env = {k: v for k, v in os.environ.items() if k not in ("PYTHONPATH", "PYTHONHOME")}
-    env.update(JWT_SECRET_KEY=SECRET, WS_OPERATOR_USER_IDS=OPERATOR_ID, PYTHONDONTWRITEBYTECODE="1")
+    env.update(JWT_SECRET_KEY=SECRET, OPERATOR_USER_IDS=OPERATOR_ID, PYTHONDONTWRITEBYTECODE="1")
     code = (
         "import sys, importlib.util; sys.path.insert(0, '.');"
         "assert not any(p.startswith(%r) for p in sys.path if p), sys.path;"
