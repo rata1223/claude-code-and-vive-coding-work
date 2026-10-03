@@ -173,9 +173,40 @@ def list_strategies():
     rows = get_db().query(StrategyRun).order_by(StrategyRun.started_at.desc()).limit(50).all()
     return jsonify([
         {"id": r.id, "name": r.name, "type": r.strategy_type,
-         "is_active": r.is_active, "started_at": r.started_at.isoformat()}
+         "is_active": r.is_active, "started_at": r.started_at.isoformat(),
+         "stopped_at": r.stopped_at.isoformat() if r.stopped_at else None}
         for r in rows
     ])
+
+
+#: Advisory-lock key serialising strategy starts (any constant unique to this use).
+_START_LOCK_KEY = 0x5354_5254  # "STRT"
+
+
+def _occupying_run(db):
+    """The id of a run that still occupies the single strategy slot, or ``None``.
+
+    The worker builds a tracker per run, so two runs would buy and sell the same
+    account's symbols independently. One run at a time. A run occupies the slot
+    while it is active **or** its stop is not yet recorded: ``stop_strategy``
+    only clears ``is_active``, and the worker writes ``stopped_at`` when the
+    session thread actually ends — until then the old run may still be placing
+    or cancelling orders.
+
+    On Postgres the check and the insert that follows are serialised with a
+    transaction-scoped advisory lock, so two concurrent starts cannot both see an
+    empty slot. A row left occupied by a worker that died before recording its
+    stop blocks new starts (fail-closed); release it by filling ``stopped_at``
+    once the worker is confirmed not to run it.
+    """
+    from sqlalchemy import or_, text
+    if db.get_bind().dialect.name == "postgresql":
+        db.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": _START_LOCK_KEY})
+    row = (db.query(StrategyRun.id)
+           .filter(or_(StrategyRun.is_active.is_(True), StrategyRun.stopped_at.is_(None)))
+           .order_by(StrategyRun.started_at)
+           .first())
+    return row[0] if row else None
 
 
 _strategy_start_calls: list[float] = []
@@ -216,6 +247,11 @@ def start_strategy():
                                  f"(가능: {sorted(_STARTABLE_STRATEGY_TYPES)})"}), 400
 
     db = get_db()
+    busy = _occupying_run(db)
+    if busy is not None:
+        db.rollback()   # release the start lock
+        return jsonify({"error": "이미 점유 중인 실행이 있다 — 중지하고 워커가 종료를 기록한 뒤 시작할 것",
+                        "run_id": busy}), 409
     run = StrategyRun(
         name=body["name"],
         strategy_type=body["strategy_type"],

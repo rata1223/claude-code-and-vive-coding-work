@@ -20,6 +20,7 @@ from api.routers import (
     dashboard,
     global_market,
     indicators,
+    operator,
     quick_trade,
     risk,
     strategies,
@@ -219,3 +220,4 @@ app.include_router(global_market.router)
 app.include_router(users.router)
 app.include_router(quick_trade.router)
 app.include_router(risk.router)
+app.include_router(operator.router)

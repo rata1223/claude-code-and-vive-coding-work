@@ -79,7 +79,14 @@
 - **compose 변경(승인 필요)**: `api` 서비스는 명시적인 `environment:` 블록만 받는다. `OPERATOR_USER_IDS: ${OPERATOR_USER_IDS:-}`를 추가하고 `EMERGENCY_FLATTEN_ADMINS`를 지운다.
 - `kis-ws`의 `WS_OPERATOR_USER_IDS`도 `OPERATOR_USER_IDS`로 합친다(결정 4). compose `kis-ws`를 함께 바꾼다.
 
-### 1단계 — 프록시 엔드포인트 (`api/`)
+### 1단계 — 프록시 엔드포인트 (`api/`) — ✅ PR #207
+
+> 구현 결과:
+> - `api/routers/operator.py`(`GET /api/operator/strategies`·`POST …/start`·`POST …/stop`)와 입력 모델 `OperatorStrategyStart`·`OperatorStrategyStop`(`api/schemas.py`)을 추가했다.
+> - kis-api `_occupying_run`(Postgres advisory xact lock)이 점유 중이면 409를 돌려준다.
+> - kis-api 목록 응답에 `stopped_at`을 추가했다.
+> - `/api/auth/info`와 `/api/users/profile`(조회·수정) 응답에 `is_operator`를 추가했다.
+> - 화면(2단계)은 아직 없다.
 
 `api/routers/operator.py`를 신설한다. 모든 경로는 `is_operator`를 확인한 뒤에만 진행하고, 아니면 비상청산과 같은 방식으로 아무것도 알려주지 않고 거부한다.
 

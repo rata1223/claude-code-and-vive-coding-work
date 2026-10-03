@@ -8,6 +8,7 @@ from api.compat import CompatLoginRequest
 from api.database import get_db
 from api.deps import get_current_user
 from api.models import User
+from backend.security.operators import is_operator
 from api.schemas import (
     ChangePasswordRequest,
     RegisterRequest,
@@ -60,6 +61,8 @@ def get_info(current_user: User = Depends(get_current_user)):
             "email": current_user.email,
             "nickname": current_user.nickname,
             "avatar": current_user.avatar,
+            # Display only (menu); every operator route re-checks on the server.
+            "is_operator": is_operator(current_user),
             "created_at": current_user.created_at.isoformat() if current_user.created_at else None,
         }
     )
