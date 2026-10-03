@@ -179,6 +179,7 @@ def list_strategies():
 
 
 _strategy_start_calls: list[float] = []
+_STARTABLE_STRATEGY_TYPES = frozenset({"indicator", "script"})
 _admin_calls: dict[str, list] = {"flatten": [], "reconcile": []}
 
 
@@ -207,6 +208,12 @@ def start_strategy():
     missing = required - body.keys()
     if missing:
         return jsonify({"error": f"필수 필드 누락: {missing}"}), 400
+    # The worker builds only these (runner._build_strategy). Anything else used
+    # to become an active strategy_runs row that never ran — and still counted
+    # toward the 4-week paper gate.
+    if body["strategy_type"] not in _STARTABLE_STRATEGY_TYPES:
+        return jsonify({"error": f"알 수 없는 전략 유형: {body['strategy_type']!r} "
+                                 f"(가능: {sorted(_STARTABLE_STRATEGY_TYPES)})"}), 400
 
     db = get_db()
     run = StrategyRun(

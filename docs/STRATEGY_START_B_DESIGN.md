@@ -41,13 +41,27 @@
 - B1은 세 번째 운영자 제어가 된다. 그 전에 **운영자 판별을 사용자 id 하나로 통일**하는 것이 맞다.
 - 참고: `KILL_SWITCH_ADMINS`는 compose `api` 블록에 선언돼 있지 않다. 그래서 `.env`에 넣어도 앱 프로세스에 닿지 않고, 앱에서의 해제는 항상 비활성(fail-closed)이다.
 
-### F2. 4주 관문이 "28일 전에 시작한 행이 하나라도 있는가"만 본다 (별도 결정)
+### F2. 4주 관문이 "28일 전에 시작한 행이 하나라도 있는가"만 본다 — ✅ PR #206
 
-- `LivePromotionGuard._check_paper_run`(`backend/worker/promotion_guard.py`)은 `started_at <= now-28d`인 `strategy_runs` 행의 **개수**만 센다.
-- 28일 전에 시작해 1분 뒤 중지한 행도 통과한다. 실제로 계속 돌았는지, 주문을 하나라도 냈는지는 보지 않는다.
+> 구현 결과: `paper_run_qualifies`. 28일 동안 **중지되지 않은** 실행만 센다. 두 경우가 있다.
+> - 활성이고 `stopped_at`이 없으면, 시작부터 지금까지 28일 이상.
+> - `stopped_at`이 있으면, `stopped_at - started_at`이 28일 이상.
+>
+> 중지 요청은 됐는데 종료 기록이 없는 행은 언제 멈췄는지 알 수 없으므로 불통과다.
+>
+> 시작조차 못 한 실행도 센 적이 있었다. 워커가 전략을 만들지 못하면 행이 활성으로 남았기 때문이다. 이제 새 시작이 실패하면 `stopped_at = started_at`(0일)으로 기록한다. 전략을 만들지 못한 경우와 `strategy.start()`가 실패한 경우 모두 해당한다. 기록 쓰기는 최대 3회 시도하고, 그래도 실패하면 긴급 경보와 수동 조치 SQL을 남긴다. kis-api는 워커가 만들 수 없는 유형을 400으로 거부한다.
+>
+> **남은 한계**(스키마 변경이 필요해 미뤘다): `strategy_runs`에 열을 더하면 `create_all`로 만든 기존 DB에서 쿼리가 깨진다(#194와 같은 문제).
+> - 실행 환경(모의/실전)을 기록하지 않는다.
+> - 실제로 매매했는지 보지 않는다. 워커가 `orders.strategy_run_id`를 채우지 않기 때문이다.
+> - 워커가 내려가 있던 시간을 구분하지 못한다. 재시작해도 실행은 활성으로 남는다.
+
+변경 전(설계 당시 기록):
+
+- `LivePromotionGuard._check_paper_run`(`backend/worker/promotion_guard.py`)은 `started_at <= now-28d`인 `strategy_runs` 행의 **개수**만 셌다.
+- 28일 전에 시작해 1분 뒤 중지한 행도 통과했다. 실제로 계속 돌았는지, 주문을 하나라도 냈는지는 보지 않았다.
 - B1로 앱에서 쉽게 시작·중지할 수 있게 되면 이 허점이 더 쉽게 밟힌다.
-- 강화 방향: "활성이면서 28일 이상" 또는 "`stopped_at - started_at >= 28일`".
-- 이것은 실전 전환 정책의 변경이므로 B1과 분리해 **따로 결정**한다(아래 "결정" 3).
+- 강화 방향으로 "활성이면서 28일 이상" 또는 "`stopped_at - started_at >= 28일`"을 제안했고, 결정 3에 따라 #206에서 구현했다.
 
 ## B1 설계
 
@@ -116,7 +130,7 @@
 
 - 워커(`backend/worker/runner.py`), `backend/execution/*`, 하우스 전략 로직.
 - `kis-api`는 바꾸지 않는다. 예외는 `start_strategy`의 활성 실행 1개 강제 하나다.
-- `LivePromotionGuard`(F2는 별도 결정).
+- `LivePromotionGuard`의 나머지 관문(F2는 #206에서 따로 고쳤다).
 - 킬스위치, 일손실·MDD, `SAFE_MODE`. 앱에서 시작한 실행도 이 장치들의 적용을 그대로 받는다.
 - 사용자 전략의 백테스트(레거시 `strategy/indicator_strategy.py`).
 
@@ -151,7 +165,7 @@
 | 1 (#205) | 0단계: `backend/security/operators.py`, 비상청산·킬스위치 판별 교체, 옛 변수 제거 + 기동 경고, compose `api` env | 운영자 id만 통과, 목록이 비면 전원 거부, 같은 이메일(대소문자만 다른 주소 포함)의 다른 id 거부(#202와 같은 회귀 테스트), 옛 변수만 있으면 경고 + 거부, compose 선언 정적 검사 |
 | 2 | 1단계: `api/routers/operator.py` + `kis-api` `start_strategy` 활성 실행 1개 강제 + 사용자 정보 응답의 `is_operator` | 비운영자 거부(상위 호출 0회), 입력 제한(script·범위 밖·모르는 키·유니버스 밖 종목), 키가 응답·로그에 없음, 429 전달(`_admin_post` 바꿔치기로 네트워크 없이). `kis-api`: 점유 중(`is_active` 또는 `stopped_at` 없음)이면 409와 `run_id`(50개보다 오래된 행, 중지 요청 후 워커 종료 전 행 포함), 동시 시작 두 건 중 하나만 성공(Postgres). `is_operator`가 info·profile(조회·수정) 응답 모두에 있음 |
 | 3 | 2단계: 화면·스토어·로케일 | 빌드, 스토어 동일성 가드, playwright로 운영자/비운영자 메뉴 노출 확인 |
-| (별도) | F2 4주 관문 | 짧게 돈 행은 불통과, 활성 28일 행은 통과, 닫힌 28일 행은 통과 |
+| (별도, #206) | F2 4주 관문 | 짧게 돈 행은 불통과, 활성 28일 행은 통과, 닫힌 28일 행은 통과 |
 
 각 PR은 기존 흐름을 따른다: 전체 스위트(kst_noon·kst_night·nosock) + Postgres 세트 + API 단독 venv, `/code-review`, CodeRabbit.
 

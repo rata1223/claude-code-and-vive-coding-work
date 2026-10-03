@@ -168,12 +168,77 @@ def _audit(event_type: str, symbol: str = None, order_id: str = None,
         logger.warning("감사 로그 실패 (event=%s): %s", event_type, e)
 
 
+#: Waits between attempts to record a start that never ran. Short: the row is
+#: written once, on the start path, and the alert below covers a lasting outage.
+_NEVER_RAN_RETRY_DELAYS = (0.5, 1.0)
+
+
+def _record_never_ran(run_id: int, strategy_type, reason: str) -> bool:
+    """Record a run that never ran: ``is_active=False`` and ``stopped_at`` equal
+    to its own ``started_at`` (zero duration), unless a stop is already recorded.
+
+    Left active with no ``stopped_at`` the row reads as a run going since
+    ``started_at`` and passes the 4-week paper gate
+    (``promotion_guard.paper_run_qualifies``) without trading. Not "now": a start
+    command can be handled days late (worker down, picked up from ``commands``)
+    and now − started_at would count those days.
+
+    The write is retried. If it still fails the row would be restored on the
+    next boot and keep aging, and making it ineligible without a write would
+    need a schema change (``create_all`` databases, #194) — so a lasting failure
+    is a critical log plus an emergency alert naming the manual fix.
+    """
+    attempts = len(_NEVER_RAN_RETRY_DELAYS) + 1
+    last_error = None
+    for attempt in range(attempts):
+        try:
+            with _session() as db:
+                run = db.get(StrategyRun, run_id)
+                if run is not None and run.stopped_at is None:
+                    run.is_active = False
+                    run.stopped_at = run.started_at or datetime.utcnow()
+                    db.commit()
+            last_error = None
+            break
+        except Exception as e:
+            last_error = e
+            if attempt < attempts - 1:
+                time.sleep(_NEVER_RAN_RETRY_DELAYS[attempt])
+
+    if last_error is None:
+        logger.error("전략 시작 실패 — 실행으로 치지 않음(0일 기록): run_id=%s type=%s 사유=%s",
+                     run_id, strategy_type, reason)
+        _audit("strategy_start_failed",
+               detail={"run_id": run_id, "strategy_type": strategy_type, "reason": reason})
+        return True
+
+    fix = (f"UPDATE strategy_runs SET is_active = false, stopped_at = started_at "
+           f"WHERE id = {int(run_id)} AND stopped_at IS NULL;")
+    logger.critical("전략 시작 실패를 기록하지 못함 run_id=%s (%d회 시도): %s — 다음 기동에 복원돼 "
+                    "4주 관문 기간으로 세질 수 있다. 수동 조치: %s",
+                    run_id, attempts, last_error, fix)
+    _audit("strategy_start_failed_unrecorded",
+           detail={"run_id": run_id, "strategy_type": strategy_type, "reason": reason})
+    try:
+        from bot.notifier import alert_emergency
+        alert_emergency(f"[전략 시작 실패 기록 불가] run_id={run_id}\n"
+                        f"다음 기동에 복원돼 4주 관문 기간으로 세질 수 있다.\n수동 조치: {fix}")
+    except Exception as e:  # the alert is best effort; the log above is the record
+        logger.warning("시작 실패 경보 전송 실패: %s", e)
+    return False
+
+
 class WorkerSession:
     """하나의 전략 실행 세션."""
 
-    def __init__(self, run_id: int, strategy: StrategyBase):
+    def __init__(self, run_id: int, strategy: StrategyBase, new_start: bool = False):
         self.run_id = run_id
         self.strategy = strategy
+        #: A start command (not a boot restore). If ``strategy.start()`` raises,
+        #: such a run never ran and is recorded with zero duration
+        #: (``_record_never_ran``); a restore keeps ``_mark_stopped``.
+        self._new_start = new_start
+        self._strategy_type = None
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
         #: Whether ``_run``'s exit should mark ``strategy_runs.is_active = False``.
@@ -225,8 +290,10 @@ class WorkerSession:
             logger.exception("on_market_open 오류 run_id=%d: %s", self.run_id, e)
 
     def _run(self):
+        started = False
         try:
             self.strategy.start()
+            started = True
             while not self._stop_event.is_set():
                 time.sleep(1)
         except Exception as e:
@@ -237,7 +304,11 @@ class WorkerSession:
             # reads it on the next boot — it must not be held hostage by user
             # cleanup that may never return.
             if self._deactivate_on_exit:
-                self._mark_stopped()
+                if not started and self._new_start:
+                    _record_never_ran(self.run_id, self._strategy_type,
+                                      "strategy.start() 실패")
+                else:
+                    self._mark_stopped()
 
             # ``StrategyBase.stop()`` calls the overridable ``on_stop()``;
             # ``ScriptStrategy`` runs a sandboxed *user script* there. Running it
@@ -874,7 +945,7 @@ class StrategyWorker:
             self._shutdown.wait(30)
 
     # ── 이벤트 핸들러 ─────────────────────────────────────────────────────
-    def _handle_start(self, data: dict):
+    def _handle_start(self, data: dict, restoring: bool = False):
         run_id = data["run_id"]
         with self._lock:
             if run_id in self._sessions:
@@ -883,17 +954,58 @@ class StrategyWorker:
             # Reserve slot under lock to prevent a concurrent duplicate start
             self._sessions[run_id] = None
 
+        if not self._run_still_wanted(run_id):
+            with self._lock:
+                self._sessions.pop(run_id, None)
+            return
+
         strategy = self._build_strategy(data)
         if strategy is None:
             with self._lock:
                 self._sessions.pop(run_id, None)  # release reservation
+            if not restoring:
+                self._mark_start_failed(run_id, data.get("strategy_type"))
             return
 
-        session = WorkerSession(run_id, strategy)
+        session = WorkerSession(run_id, strategy, new_start=not restoring)
+        session._strategy_type = data.get("strategy_type")
         with self._lock:
             self._sessions[run_id] = session
         session.start()
         _audit("strategy_start", detail={"run_id": run_id, "strategy_type": data.get("strategy_type")})
+
+    def _run_still_wanted(self, run_id) -> bool:
+        """Start only a run whose row is still active with no recorded stop.
+
+        A start command can arrive twice: Redis delivers it, and its
+        ``commands`` row stays ``pending`` until the DB-polling fallback
+        replays it. By then the run may have been stopped by the operator or
+        recorded as never having run (``_record_never_ran``); starting it again
+        would trade under a row that says it is off — and the next boot would
+        not restore it. Unreadable state is treated as "do not start".
+        """
+        try:
+            with _session() as db:
+                run = db.get(StrategyRun, run_id)
+                if run is None:
+                    logger.warning("시작 요청 무시 — 실행 행 없음: run_id=%s", run_id)
+                    return False
+                if not run.is_active or run.stopped_at is not None:
+                    logger.warning("시작 요청 무시 — 이미 중지된 실행: run_id=%s", run_id)
+                    return False
+                return True
+        except Exception as e:
+            logger.warning("시작 요청 보류 — 실행 상태를 읽지 못함 run_id=%s: %s", run_id, e)
+            return False
+
+    def _mark_start_failed(self, run_id: int, strategy_type):
+        """The strategy for a start command could not be built, so it never ran.
+
+        Only for new starts. A restore at boot that fails (e.g. the broker is
+        briefly unreachable) keeps the row active so the next boot retries it,
+        rather than ending a running strategy over a transient outage.
+        """
+        _record_never_ran(run_id, strategy_type, "전략 생성 실패")
 
     def _handle_stop(self, data: dict):
         run_id = data["run_id"]
@@ -944,7 +1056,7 @@ class StrategyWorker:
                             "config": config,
                             "broker": row.broker,
                         }
-                        self._handle_start(data)
+                        self._handle_start(data, restoring=True)
                     except Exception as e:
                         logger.warning("복원 실패 run_id=%d: %s", row.id, e)
         except Exception as e:
