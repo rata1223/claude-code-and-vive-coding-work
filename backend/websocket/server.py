@@ -32,25 +32,16 @@ socketio = SocketIO(app, cors_allowed_origins=_ws_cors, async_mode="threading")
 _r = redis.from_url(_REDIS_URL)
 
 
-def _operator_user_ids() -> frozenset:
-    """``WS_OPERATOR_USER_IDS`` — app user ids (the token's ``sub``), comma-separated.
-
-    Every channel this server relays — orders, positions, equity, alerts — is the
-    worker's single ``.env`` account, and app signup is open. A valid app token
-    therefore proves nothing about who may see it; only listed operators may.
-    Ids, not emails: signup does not verify mailboxes, so anyone could register
-    a listed address that has no account yet; an id is assigned by the database
-    and never reused. Empty means nobody (every connection refused). The list is
-    read from the environment, so changing it means restarting kis-ws — which
-    also drops every open connection.
-    """
-    raw = os.environ.get("WS_OPERATOR_USER_IDS", "")
-    return frozenset(i.strip() for i in raw.split(",") if i.strip())
-
-
 def _authorized_payload():
     """The token's payload when it is a valid app token (api/auth.py) whose user
     is a listed operator; otherwise ``None``.
+
+    Every channel this server relays — orders, positions, equity, alerts — is the
+    worker's single ``.env`` account, and app signup is open, so a valid token
+    proves nothing about who may see it. Only ``OPERATOR_USER_IDS``
+    (``backend/security/operators.py``) may; empty means every connection is
+    refused. The list is read from the environment, so changing it means
+    restarting kis-ws — which also drops every open connection.
 
     A missing JWT library or JWT_SECRET_KEY is a deployment error and raises: it
     used to be swallowed here, so the container rejected every client as
@@ -64,8 +55,8 @@ def _authorized_payload():
     payload = decode_access_token(token)
     if payload is None:
         return None
-    user_id = str(payload.get("sub") or "").strip()
-    if not user_id or user_id not in _operator_user_ids():
+    from backend.security.operators import is_operator_id
+    if not is_operator_id(payload.get("sub")):
         return None
     return payload
 
@@ -197,9 +188,8 @@ def _require_token_verifier() -> None:
     Without this the server starts and refuses every connection (#189)."""
     from backend.security.jwt_tokens import jwt_secret
     jwt_secret()
-    if not _operator_user_ids():
-        logger.warning("WS_OPERATOR_USER_IDS가 비어 있음 — 모든 WS 연결을 거부한다 "
-                       "(이 서버는 운영 계좌 데이터만 중계한다)")
+    from backend.security.operators import warn_legacy_operator_env
+    warn_legacy_operator_env()
 
 
 def start_ws_server() -> None:

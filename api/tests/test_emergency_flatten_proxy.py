@@ -54,10 +54,11 @@ class _FakePoster:
         return self.response
 
 
-def _wire(monkeypatch, poster, api_key="secret-key", admins="a@example.com"):
+def _wire(monkeypatch, user, poster, api_key="secret-key", operators=None):
+    """``operators`` defaults to the ``user`` fixture's id (an authorized caller)."""
     monkeypatch.setattr(quick_trade, "_admin_post", poster)
     monkeypatch.setenv("KIS_API_KEY", api_key)
-    monkeypatch.setenv("EMERGENCY_FLATTEN_ADMINS", admins)
+    monkeypatch.setenv("OPERATOR_USER_IDS", str(user.id) if operators is None else operators)
     return poster
 
 
@@ -71,7 +72,7 @@ def test_nobody_is_authorized_by_default(monkeypatch, db, user):
     """Fail closed. The upstream manager liquidates the *deployment's* book via
     the worker's process-level broker, not the caller's positions, so an
     unconfigured allowlist must mean nobody — never everybody."""
-    poster = _wire(monkeypatch, _FakePoster(), admins="")
+    poster = _wire(monkeypatch, user, _FakePoster(), operators="")
 
     resp = quick_trade.emergency_flatten(_body(), user, db)
 
@@ -81,7 +82,7 @@ def test_nobody_is_authorized_by_default(monkeypatch, db, user):
 
 
 def test_a_user_outside_the_allowlist_is_refused(monkeypatch, db, user):
-    poster = _wire(monkeypatch, _FakePoster(), admins="someone-else@example.com")
+    poster = _wire(monkeypatch, user, _FakePoster(), operators=str(user.id + 1000))
 
     resp = quick_trade.emergency_flatten(_body(), user, db)
 
@@ -89,17 +90,36 @@ def test_a_user_outside_the_allowlist_is_refused(monkeypatch, db, user):
     assert poster.calls == []
 
 
-def test_the_allowlist_is_case_insensitive(monkeypatch, db, user):
-    """Emails are not case sensitive; a capitalised entry must not lock out the
-    one operator who is supposed to have the break-glass."""
-    _wire(monkeypatch, _FakePoster(), admins="  A@Example.COM , other@x.com ")
+def test_the_allowlist_tolerates_spacing_and_other_ids(monkeypatch, db, user):
+    """Whitespace and other listed ids must not lock out the operator."""
+    _wire(monkeypatch, user, _FakePoster(), operators=f"  {user.id + 1000} , {user.id} ")
 
     assert quick_trade.emergency_flatten(_body(), user, db).code == 1
 
 
+def test_a_listed_email_authorizes_nobody(monkeypatch, db, user):
+    """The list holds ids. The old email allowlist matched case-insensitively
+    while signup's duplicate check does not, so a listed address protected
+    nothing; an address in the list now matches no one — its owner included."""
+    poster = _wire(monkeypatch, user, _FakePoster(), operators=user.email)
+
+    assert quick_trade.emergency_flatten(_body(), user, db).code == -1
+    assert poster.calls == []
+
+
+def test_the_retired_email_list_grants_nothing(monkeypatch, db, user):
+    """A deployment that still sets EMERGENCY_FLATTEN_ADMINS gets a dormant
+    control (and a startup warning), never the old email match."""
+    poster = _wire(monkeypatch, user, _FakePoster(), operators="")
+    monkeypatch.setenv("EMERGENCY_FLATTEN_ADMINS", user.email)
+
+    assert quick_trade.emergency_flatten(_body(), user, db).code == -1
+    assert poster.calls == []
+
+
 def test_authorization_is_checked_before_confirmation(monkeypatch, db, user):
     """An unauthorized caller should not be able to probe the control's shape."""
-    poster = _wire(monkeypatch, _FakePoster(), admins="")
+    poster = _wire(monkeypatch, user, _FakePoster(), operators="")
 
     resp = quick_trade.emergency_flatten(_body(confirm=False), user, db)
 
@@ -110,7 +130,7 @@ def test_authorization_is_checked_before_confirmation(monkeypatch, db, user):
 # ── the control works and reports the truth ───────────────────────────────────
 
 def test_a_confirmed_flatten_is_forwarded(monkeypatch, db, user):
-    poster = _wire(monkeypatch, _FakePoster())
+    poster = _wire(monkeypatch, user, _FakePoster())
 
     resp = quick_trade.emergency_flatten(_body(), user, db)
 
@@ -120,7 +140,7 @@ def test_a_confirmed_flatten_is_forwarded(monkeypatch, db, user):
 
 
 def test_an_unset_admin_base_falls_back_to_the_compose_default(monkeypatch, db, user):
-    poster = _wire(monkeypatch, _FakePoster())
+    poster = _wire(monkeypatch, user, _FakePoster())
     monkeypatch.delenv("KIS_ADMIN_API_BASE", raising=False)
 
     quick_trade.emergency_flatten(_body(), user, db)
@@ -139,7 +159,7 @@ def test_an_empty_admin_base_falls_back_rather_than_building_a_relative_url(
     did not override the base.
 
     Treat empty as unset."""
-    poster = _wire(monkeypatch, _FakePoster())
+    poster = _wire(monkeypatch, user, _FakePoster())
     monkeypatch.setenv("KIS_ADMIN_API_BASE", "")
 
     resp = quick_trade.emergency_flatten(_body(), user, db)
@@ -150,7 +170,7 @@ def test_an_empty_admin_base_falls_back_rather_than_building_a_relative_url(
 
 def test_an_explicit_admin_base_still_wins(monkeypatch, db, user):
     """The https escape hatch for a multi-host deployment must keep working."""
-    poster = _wire(monkeypatch, _FakePoster())
+    poster = _wire(monkeypatch, user, _FakePoster())
     monkeypatch.setenv("KIS_ADMIN_API_BASE", "https://ops.internal:5001")
 
     quick_trade.emergency_flatten(_body(), user, db)
@@ -162,7 +182,7 @@ def test_the_upstream_counters_are_passed_through_verbatim(monkeypatch, db, user
     """The operator must see what actually happened, not our summary of it."""
     payload = {"attempted": 5, "success": 3, "submitted": 3,
                "dry_run": False, "failed_count": 2, "status": "partial"}
-    _wire(monkeypatch, _FakePoster(_FakeResponse(payload=payload)))
+    _wire(monkeypatch, user, _FakePoster(_FakeResponse(payload=payload)))
 
     resp = quick_trade.emergency_flatten(_body(), user, db)
 
@@ -172,7 +192,7 @@ def test_the_upstream_counters_are_passed_through_verbatim(monkeypatch, db, user
 def test_dry_run_is_surfaced(monkeypatch, db, user):
     """The worst outcome is telling an operator they are flat when nothing was
     sent. ``dry_run`` must survive the hop."""
-    _wire(monkeypatch, _FakePoster())
+    _wire(monkeypatch, user, _FakePoster())
 
     resp = quick_trade.emergency_flatten(_body(), user, db)
 
@@ -182,7 +202,7 @@ def test_dry_run_is_surfaced(monkeypatch, db, user):
 # ── guards ────────────────────────────────────────────────────────────────────
 
 def test_an_unconfirmed_request_never_reaches_the_upstream(monkeypatch, db, user):
-    poster = _wire(monkeypatch, _FakePoster())
+    poster = _wire(monkeypatch, user, _FakePoster())
 
     resp = quick_trade.emergency_flatten(_body(confirm=False), user, db)
 
@@ -195,7 +215,7 @@ def test_the_rate_limit_is_passed_through_not_masked(monkeypatch, db, user):
     generic failure would hide that the control is intact but throttled."""
     limited = _FakeResponse(status_code=429,
                             payload={"error": "비상청산 요청 과다 (5분 내 3회 제한)"})
-    _wire(monkeypatch, _FakePoster(limited))
+    _wire(monkeypatch, user, _FakePoster(limited))
 
     resp = quick_trade.emergency_flatten(_body(), user, db)
 
@@ -204,7 +224,7 @@ def test_the_rate_limit_is_passed_through_not_masked(monkeypatch, db, user):
 
 
 def test_an_upstream_error_is_an_envelope_not_a_500(monkeypatch, db, user):
-    _wire(monkeypatch, _FakePoster(exc=RuntimeError("connection refused")))
+    _wire(monkeypatch, user, _FakePoster(exc=RuntimeError("connection refused")))
 
     resp = quick_trade.emergency_flatten(_body(), user, db)
 
@@ -215,7 +235,7 @@ def test_an_upstream_error_is_an_envelope_not_a_500(monkeypatch, db, user):
 # ── the key never crosses to the client ───────────────────────────────────────
 
 def test_the_api_key_is_sent_upstream_not_returned(monkeypatch, db, user):
-    poster = _wire(monkeypatch, _FakePoster(), api_key="super-secret")
+    poster = _wire(monkeypatch, user, _FakePoster(), api_key="super-secret")
 
     resp = quick_trade.emergency_flatten(_body(), user, db)
 
@@ -225,7 +245,7 @@ def test_the_api_key_is_sent_upstream_not_returned(monkeypatch, db, user):
 
 def test_no_secret_leaks_when_the_upstream_fails(monkeypatch, db, user):
     """An exception string is the classic accidental disclosure channel."""
-    _wire(monkeypatch, _FakePoster(exc=RuntimeError("auth failed for super-secret")),
+    _wire(monkeypatch, user, _FakePoster(exc=RuntimeError("auth failed for super-secret")),
           api_key="super-secret")
 
     resp = quick_trade.emergency_flatten(_body(), user, db)
@@ -244,7 +264,7 @@ def test_no_secret_leaks_when_the_upstream_fails(monkeypatch, db, user):
 def test_unauthenticated_requests_are_rejected(client, monkeypatch):
     called = []
     monkeypatch.setattr(quick_trade, "_admin_post", lambda *a, **k: called.append(1))
-    monkeypatch.setenv("EMERGENCY_FLATTEN_ADMINS", "rider@example.com")
+    monkeypatch.setenv("OPERATOR_USER_IDS", "1")
 
     resp = client.post("/api/quick-trade/emergency-flatten", json={"confirm": True})
 
@@ -252,11 +272,11 @@ def test_unauthenticated_requests_are_rejected(client, monkeypatch):
     assert called == [], "no token must never reach the liquidation control"
 
 
-def test_an_authenticated_admin_reaches_the_control(client, auth_headers, monkeypatch):
+def test_an_authenticated_admin_reaches_the_control(client, seed_user, auth_headers, monkeypatch):
     poster = _FakePoster()
     monkeypatch.setattr(quick_trade, "_admin_post", poster)
     monkeypatch.setenv("KIS_API_KEY", "secret-key")
-    monkeypatch.setenv("EMERGENCY_FLATTEN_ADMINS", "rider@example.com")
+    monkeypatch.setenv("OPERATOR_USER_IDS", str(seed_user[0].id))
 
     resp = client.post("/api/quick-trade/emergency-flatten",
                        json={"confirm": True}, headers=auth_headers)
@@ -266,10 +286,10 @@ def test_an_authenticated_admin_reaches_the_control(client, auth_headers, monkey
     assert len(poster.calls) == 1
 
 
-def test_an_authenticated_non_admin_is_refused_over_http(client, auth_headers, monkeypatch):
+def test_an_authenticated_non_admin_is_refused_over_http(client, seed_user, auth_headers, monkeypatch):
     poster = _FakePoster()
     monkeypatch.setattr(quick_trade, "_admin_post", poster)
-    monkeypatch.setenv("EMERGENCY_FLATTEN_ADMINS", "someone-else@example.com")
+    monkeypatch.setenv("OPERATOR_USER_IDS", str(seed_user[0].id + 1000))
 
     resp = client.post("/api/quick-trade/emergency-flatten",
                        json={"confirm": True}, headers=auth_headers)

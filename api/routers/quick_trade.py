@@ -1128,7 +1128,7 @@ def cancel_order(
 #: DEPLOYMENT WIRING. The ``api`` service declares an explicit ``environment:``
 #: block and no ``env_file``, so a variable absent from that block never reaches
 #: this process no matter what ``.env`` holds. The three variables this module
-#: reads — ``EMERGENCY_FLATTEN_ADMINS``, ``KIS_ADMIN_API_BASE``, ``KIS_API_KEY``
+#: reads — ``OPERATOR_USER_IDS``, ``KIS_ADMIN_API_BASE``, ``KIS_API_KEY``
 #: — are now declared there, each defaulting to empty, so the feature can be
 #: enabled from ``.env`` without another compose change. Empty is fail-closed:
 #: an unset allowlist authorizes nobody.
@@ -1153,25 +1153,16 @@ def _flatten_authorized(user) -> bool:
     positions — not the caller's. Exposing it to every authenticated account
     would let any registered user flatten a book that is not theirs.
 
-    This app has no role or admin column (``api/models.py:User``), and inventing
-    an authorization model is well beyond a UI safety fix. So the gate is a
-    fail-closed break-glass allowlist: ``EMERGENCY_FLATTEN_ADMINS`` holds
-    comma-separated emails, and while it is unset — the default — **nobody** is
-    authorized and the control is dormant.
-
-    That is deliberate. A dormant control is recoverable by setting one env var;
-    a control every user can fire is not recoverable at all.
+    This app has no role or admin column (``api/models.py:User``), so the gate
+    is the deployment's operator allow-list, ``OPERATOR_USER_IDS``
+    (``backend/security/operators.py``). It used to be an email list; signup
+    does not verify mailboxes and that list compared case-insensitively while
+    signup's duplicate check does not, so a listed address protected nothing.
+    Unset — the default — authorizes **nobody** and the control is dormant.
     """
-    import os
+    from backend.security.operators import is_operator
 
-    allowed = {
-        e.strip().lower()
-        for e in os.environ.get("EMERGENCY_FLATTEN_ADMINS", "").split(",")
-        if e.strip()
-    }
-    if not allowed:
-        return False
-    return (getattr(user, "email", "") or "").lower() in allowed
+    return is_operator(user)
 
 
 def _admin_post(url, json=None, headers=None, timeout=None):

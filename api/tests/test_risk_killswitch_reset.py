@@ -66,13 +66,13 @@ def engine():
 
 
 @pytest.fixture(autouse=True)
-def _authorized(monkeypatch):
+def _authorized(monkeypatch, user):
     """Most tests exercise the happy path, so put the caller on the allowlist.
 
     The gate itself is covered by the authorization tests below, which clear
-    this. ``a@example.com`` is the ``user`` fixture's address.
+    this. The list holds user ids (backend/security/operators.py).
     """
-    monkeypatch.setenv("KILL_SWITCH_ADMINS", "a@example.com")
+    monkeypatch.setenv("OPERATOR_USER_IDS", str(user.id))
 
 
 @pytest.fixture(autouse=True)
@@ -288,7 +288,7 @@ def test_reset_is_refused_when_the_allowlist_is_unset(db, user, monkeypatch):
     column — so the control stays dormant until an operator is named."""
     from api.routers import risk
 
-    monkeypatch.delenv("KILL_SWITCH_ADMINS", raising=False)
+    monkeypatch.delenv("OPERATOR_USER_IDS", raising=False)
     _risk_row(db, kill_switch=True, reason="MDD")
 
     resp = risk.reset_kill_switch(
@@ -301,7 +301,22 @@ def test_reset_is_refused_when_the_allowlist_is_unset(db, user, monkeypatch):
 def test_reset_is_refused_for_a_user_not_on_the_allowlist(db, user, monkeypatch):
     from api.routers import risk
 
-    monkeypatch.setenv("KILL_SWITCH_ADMINS", "someone-else@example.com")
+    monkeypatch.setenv("OPERATOR_USER_IDS", str(user.id + 1000))
+    _risk_row(db, kill_switch=True, reason="MDD")
+
+    resp = risk.reset_kill_switch(
+        risk.KillSwitchResetRequest(reason="해제 시도"), user, db)
+
+    assert resp.code == -1
+
+
+def test_the_retired_email_list_grants_nothing(db, user, monkeypatch):
+    """KILL_SWITCH_ADMINS is no longer read: listing the caller's email there
+    leaves the control dormant rather than restoring the old email match."""
+    from api.routers import risk
+
+    monkeypatch.delenv("OPERATOR_USER_IDS", raising=False)
+    monkeypatch.setenv("KILL_SWITCH_ADMINS", user.email)
     _risk_row(db, kill_switch=True, reason="MDD")
 
     resp = risk.reset_kill_switch(
@@ -316,7 +331,7 @@ def test_an_unauthorized_reset_does_not_clear_the_flag(db, user, monkeypatch):
     from backend.database.models import DailyRiskState
     from api.routers import risk
 
-    monkeypatch.delenv("KILL_SWITCH_ADMINS", raising=False)
+    monkeypatch.delenv("OPERATOR_USER_IDS", raising=False)
     _risk_row(db, kill_switch=True, reason="MDD")
 
     risk.reset_kill_switch(risk.KillSwitchResetRequest(reason="시도"), user, db)

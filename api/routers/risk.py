@@ -53,7 +53,6 @@ replaying over somebody else's halt — is explicitly dropped instead.
 """
 import json
 import logging
-import os
 from datetime import datetime
 
 from fastapi import APIRouter, Depends
@@ -105,27 +104,18 @@ class KillSwitchResetRequest(BaseModel):
 
 
 def _is_risk_admin(user: User) -> bool:
-    """Fail-closed break-glass allowlist, mirroring ``EMERGENCY_FLATTEN_ADMINS``
-    in ``api/routers/quick_trade.py``.
+    """Whether ``user`` may clear the kill switch.
 
     Clearing a kill switch re-enables trading for the **whole deployment**, not
     for the caller's own book, and this app has no role or admin column
-    (``api/models.py:User``). So the same shape is used here: while
-    ``KILL_SWITCH_ADMINS`` is unset — the default — **nobody** is authorized and
-    the control is dormant. A dormant control is recoverable by setting one env
-    var; a control every registered user can fire is not.
-
-    A separate list from the flatten one on purpose: liquidating a book and
-    releasing a risk halt are different powers and should be grantable apart.
+    (``api/models.py:User``). So the gate is the deployment's operator
+    allow-list, ``OPERATOR_USER_IDS`` (``backend/security/operators.py``) — the
+    same list as emergency flatten and the live feed. Unset — the default —
+    authorizes **nobody** and the control is dormant.
     """
-    allowed = {
-        e.strip().lower()
-        for e in os.environ.get("KILL_SWITCH_ADMINS", "").split(",")
-        if e.strip()
-    }
-    if not allowed:
-        return False
-    return (getattr(user, "email", "") or "").lower() in allowed
+    from backend.security.operators import is_operator
+
+    return is_operator(user)
 
 
 def _halt_rows(db: Session):
@@ -191,7 +181,7 @@ def reset_kill_switch(
 
     if not _is_risk_admin(current_user):
         # Fail closed, and say nothing about who is on the list.
-        return Resp.err("권한이 없습니다 — KILL_SWITCH_ADMINS에 등록된 운영자만 해제할 수 있습니다.")
+        return Resp.err("권한이 없습니다 — OPERATOR_USER_IDS에 등록된 운영자만 해제할 수 있습니다.")
 
     halted = _lock_halted_rows(db)
     if not halted:

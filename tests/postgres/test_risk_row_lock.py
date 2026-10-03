@@ -153,7 +153,7 @@ def test_reset_endpoint_does_not_erase_a_halt_committed_after_its_read(factory, 
         monkeypatch.setenv("JWT_SECRET_KEY", "test-only-secret")
     from api.routers.risk import KillSwitchResetRequest, reset_kill_switch
 
-    monkeypatch.setenv("KILL_SWITCH_ADMINS", "ops@example.com")
+    monkeypatch.setenv("OPERATOR_USER_IDS", "7")
     day = trading_day()
     _seed(factory, day, kill_switch=True, reason="일손실 3% 초과")
 

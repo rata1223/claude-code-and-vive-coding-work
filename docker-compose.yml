@@ -66,15 +66,15 @@ services:
       JWT_EXPIRE_MINUTES: ${JWT_EXPIRE_MINUTES:-1440}
       KIS_CREDENTIAL_KEY: '${KIS_CREDENTIAL_KEY:?KIS_CREDENTIAL_KEY must be set. Generate: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"}'
       CORS_ORIGINS: ${CORS_ORIGINS:-}
-      # Emergency-flatten proxy (api/routers/quick_trade.py). This service has no
-      # env_file, so anything not listed here never reaches the process — these
-      # three were read by the code but never declared.
+      # This service has no env_file, so anything not listed here never reaches
+      # the process.
       #
-      # All default to empty, which is fail-closed: an unset allowlist authorizes
-      # nobody and the control ships dormant. Declaring them changes no behaviour
-      # on a deployment that sets nothing; it only makes the feature reachable by
-      # editing .env instead of requiring another compose change.
-      EMERGENCY_FLATTEN_ADMINS: ${EMERGENCY_FLATTEN_ADMINS:-}
+      # Operator allow-list (backend/security/operators.py): app user ids that may
+      # use the controls acting on the .env account — emergency flatten and
+      # kill-switch reset here, the live feed in kis-ws (same variable). Ids, not
+      # emails: signup does not verify mailboxes. Empty = nobody (fail-closed).
+      OPERATOR_USER_IDS: ${OPERATOR_USER_IDS:-}
+      # Emergency-flatten proxy (api/routers/quick_trade.py) target.
       KIS_ADMIN_API_BASE: ${KIS_ADMIN_API_BASE:-}
       # The emergency-flatten proxy sends this as X-API-Key to kis-api, which
       # requires the same variable (compose refuses to start without it).
@@ -202,10 +202,10 @@ services:
       QUANTDINGER_SECRET_KEY: ${QUANTDINGER_SECRET_KEY:?QUANTDINGER_SECRET_KEY must be set (see .env.example)}
       # Same secret the app API signs tokens with — WS clients present those tokens (#189).
       JWT_SECRET_KEY: ${JWT_SECRET_KEY:?JWT_SECRET_KEY must be set to a secure random value (see .env.example)}
-      # Only these app user ids may connect: the relayed data is the operator's
-      # single .env account. Ids, not emails (signup does not verify mailboxes).
+      # Only operators may connect: the relayed data is the .env account. Same
+      # list as the api service's operator controls (backend/security/operators.py).
       # Empty = every connection refused.
-      WS_OPERATOR_USER_IDS: ${WS_OPERATOR_USER_IDS:-}
+      OPERATOR_USER_IDS: ${OPERATOR_USER_IDS:-}
       WS_PORT: "5002"
     depends_on:
       redis:
