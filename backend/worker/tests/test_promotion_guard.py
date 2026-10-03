@@ -453,3 +453,154 @@ def test_a_stop_during_the_build_cancels_the_start(factory, monkeypatch):
 
     assert run_id not in w._sessions
     assert _row(factory, run_id).stopped_at is not None
+
+
+# ── a stop that is still ending must not free the slot ────────────────────
+#
+# The first stop removes the session and returns at once; the session's thread
+# and any on_market_open already running (on its own thread) can still act on
+# the account. A second stop used to find no session, record a zero-day end and
+# free the slot — letting a new run start beside the old one. The slot
+# (stopped_at) is now released only once the old run has quiesced.
+
+class _BlockingOpenStrategy:
+    """on_market_open blocks until released, like a slow broker call."""
+
+    def __init__(self):
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.opens = 0
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def on_market_open(self):
+        self.opens += 1
+        self.entered.set()
+        assert self.release.wait(10)
+
+
+def _running_session(w, factory, monkeypatch, strategy):
+    monkeypatch.setattr(runner, "_SessionFactory", factory)
+    monkeypatch.setattr(runner, "_audit", lambda *a, **k: None)
+    run_id = _active_row(factory, DAY)
+    session = runner.WorkerSession(run_id, strategy)
+    w._sessions[run_id] = session
+    session.start()
+    return run_id, session
+
+
+def _kis_api_stop(factory, run_id):
+    with factory() as db:                      # kis-api's stop: is_active only
+        db.get(StrategyRun, run_id).is_active = False
+        db.commit()
+
+
+def test_a_stop_waits_for_an_in_flight_market_open_before_freeing_the_slot(factory, monkeypatch):
+    from backend.api import server as srv
+    w = _worker()
+    strategy = _BlockingOpenStrategy()
+    run_id, session = _running_session(w, factory, monkeypatch, strategy)
+    opener = threading.Thread(target=session.trigger_market_open, args=("US",))
+    opener.start()
+    assert strategy.entered.wait(5)
+
+    _kis_api_stop(factory, run_id)
+    w._handle_stop({"run_id": run_id})
+    assert session.join(1.5) is False, "the session waits for the callback"
+    row = _row(factory, run_id)
+    assert row.is_active is False and row.stopped_at is None
+    with factory() as db:
+        assert srv._occupying_run(db) == run_id
+
+    strategy.release.set()
+    opener.join(5)
+    assert session.join(5) is True
+    row = _row(factory, run_id)
+    assert row.stopped_at is not None and row.stopped_at > row.started_at
+    with factory() as db:
+        assert srv._occupying_run(db) is None
+
+
+def test_a_repeated_stop_while_still_stopping_does_not_free_the_slot(factory, monkeypatch):
+    w = _worker()
+    strategy = _BlockingOpenStrategy()
+    run_id, session = _running_session(w, factory, monkeypatch, strategy)
+    opener = threading.Thread(target=session.trigger_market_open, args=("US",))
+    opener.start()
+    assert strategy.entered.wait(5)
+    _kis_api_stop(factory, run_id)
+    w._handle_stop({"run_id": run_id})
+
+    w._handle_stop({"run_id": run_id})         # the screen's "stop again"
+
+    assert _row(factory, run_id).stopped_at is None
+    strategy.release.set()
+    opener.join(5)
+    assert session.join(5) is True
+    row = _row(factory, run_id)
+    assert row.stopped_at > row.started_at, "the real end, not a zero-day record"
+
+
+def test_no_market_open_starts_once_the_session_is_stopping(factory, monkeypatch):
+    w = _worker()
+    strategy = _BlockingOpenStrategy()
+    strategy.release.set()
+    run_id, session = _running_session(w, factory, monkeypatch, strategy)
+    w._handle_stop({"run_id": run_id})
+
+    session.trigger_market_open("US")
+
+    assert strategy.opens == 0
+
+
+def test_a_stop_after_the_session_ended_keeps_the_recorded_end(factory, monkeypatch):
+    w = _worker()
+    strategy = _BlockingOpenStrategy()
+    run_id, session = _running_session(w, factory, monkeypatch, strategy)
+    _kis_api_stop(factory, run_id)
+    w._handle_stop({"run_id": run_id})
+    assert session.join(5) is True
+    ended = _row(factory, run_id).stopped_at
+
+    w._handle_stop({"run_id": run_id})
+
+    assert _row(factory, run_id).stopped_at == ended
+    assert run_id not in w._stopping
+
+
+class _BlockingStopStrategy(_BlockingOpenStrategy):
+    """stop() (on_stop) blocks until released."""
+
+    def __init__(self):
+        super().__init__()
+        self.stopping = threading.Event()
+        self.stop_release = threading.Event()
+
+    def stop(self):
+        self.stopping.set()
+        assert self.stop_release.wait(10)
+
+
+def test_the_slot_is_held_until_the_stop_hook_returns(factory, monkeypatch):
+    from backend.api import server as srv
+    w = _worker()
+    strategy = _BlockingStopStrategy()
+    run_id, session = _running_session(w, factory, monkeypatch, strategy)
+    _kis_api_stop(factory, run_id)
+    w._handle_stop({"run_id": run_id})
+    assert strategy.stopping.wait(5)
+
+    row = _row(factory, run_id)
+    assert row.is_active is False, "never restored, even while on_stop runs"
+    assert row.stopped_at is None
+    with factory() as db:
+        assert srv._occupying_run(db) == run_id
+
+    strategy.stop_release.set()
+    assert session.join(5) is True
+    with factory() as db:
+        assert srv._occupying_run(db) is None

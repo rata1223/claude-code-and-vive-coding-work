@@ -12,7 +12,7 @@
 
 ---
 
-## 프로젝트 진행 현황 (2026-10-03 기준, main `29bbd68` = PR #206)
+## 프로젝트 진행 현황 (2026-10-03 기준, main `af45481` = PR #207)
 
 > **이 섹션이 최신 상태의 단일 진실 공급원(SoT).** 아래 "다음 작업 목록(Stage 1~9)"은 초기 설계 로드맵으로,
 > 대부분 이미 구현 완료됐다. 실제 진행은 `AUDIT.md` → `ROADMAP.md` 기반 하드닝 트랙으로 이어지고 있다.
@@ -72,7 +72,8 @@
 | 전략 시작 B 설계 | #204 | **설계 문서만**(`docs/STRATEGY_START_B_DESIGN.md`). 워커 지표 전략은 설정의 조건을 읽지 않고 하우스 신호(`default_fusion`)만 쓴다(설정은 `universe`·`position_size_pct`·`stop_loss_pct`만) → "앱 조건 번역" 대신 **운영자 전용 하우스 전략 제어판(B1)**: `kis-api` 프록시(비상청산과 같은 방식), 입력 제한(지표 고정·유니버스 부분집합·비중 ≤5%), 활성 실행 1개. 발견: 비상청산·킬스위치 해제 허용 목록이 **이메일**이다. 가입이 메일을 확인하지 않고, 목록 비교는 대소문자를 무시하는데 가입 중복 검사는 구분한다 — **운영자가 이미 가입했어도 안전하지 않다**(CodeRabbit). 0단계(사용자 id `OPERATOR_USER_IDS` 통일)를 B1과 상관없이 먼저, 그때까지 `EMERGENCY_FLATTEN_ADMINS`는 비워 둘 것. 활성 실행 1개는 프록시가 아니라 `kis-api` `start_strategy`가 원자적으로 강제. 4주 관문은 "28일 전에 시작한 행이 있는가"만 본다(1분 만에 중지해도 통과) — 별도 결정 |
 | 운영자 id 통일 | #205 | **B 설계 0단계(F1)** — 운영 계좌에 작용하는 제어 셋(비상청산·킬스위치 해제·kis-ws 피드)이 목록 셋을 읽었고 둘은 **이메일**이었다: 가입이 메일을 확인하지 않고, 목록 비교는 대소문자를 무시하는데 가입 중복 검사는 구분해 **운영자가 이미 가입했어도** 대소문자만 다른 주소로 일치할 수 있었다. 이제 하나의 `OPERATOR_USER_IDS`(사용자 id, `backend/security/operators.py`, 비우면 아무도 허용 안 함). `EMERGENCY_FLATTEN_ADMINS`·`KILL_SWITCH_ADMINS`·`WS_OPERATOR_USER_IDS`는 읽지 않고 기동 시 경고(api lifespan·kis-ws). compose `api`·`kis-ws` 모두 `OPERATOR_USER_IDS`. **동작 변화**: 킬스위치 해제는 `KILL_SWITCH_ADMINS`가 compose에 없어 늘 비활성이었는데, 이제 운영자 id가 있으면 앱에서 동작한다. **배포 시**: 옛 이메일 값은 옮겨지지 않는다 — 서버 `.env`에 운영자의 사용자 id로 `OPERATOR_USER_IDS`를 넣을 것(비어 있으면 세 제어 모두 꺼지고 기동 로그가 옛 변수명과 함께 알린다) |
 | 4주 관문 | #206 | **B 설계 F2** — `LivePromotionGuard._check_paper_run`이 `started_at <= now-28d`인 행의 **개수**만 셌다. 28일 전에 시작해 1분 뒤 중지한 실행도 통과했다. 이제 `paper_run_qualifies`: 28일 동안 중지되지 않은 실행만 센다(활성이면 시작부터 지금까지, 종료가 기록됐으면 종료까지). 중지 요청 후 종료 기록이 없는 행은 불통과(fail-closed). **시작조차 못 한 실행도 막는다**(code-review): 워커가 전략을 못 만들면(알 수 없는 유형·브로커 없음) 행을 활성인 채 두어 28일 뒤 통과했다 → 새 시작이 실패하면 `stopped_at = started_at`(0일, 늦게 처리돼도 그 날수를 세지 않게). 기동 직후 `strategy.start()`가 실패해도 같다. 기록 쓰기는 최대 3회 시도 후 실패하면 긴급 경보(수동 조치 SQL 포함)(CodeRabbit). 다시 전달된 시작 명령(Redis 전달 뒤 `commands`에 `pending`으로 남아 DB 폴링이 재생)은 행이 활성이고 종료 기록이 없을 때만 시작한다 — 0일로 기록된 실행이나 운영자가 중지한 실행이 되살아나지 않게. 기동 복원 중 전략 생성 실패는 다음 기동에 재시도하도록 그대로 둔다. kis-api는 워커가 만들 수 없는 `strategy_type`을 400으로 거부. **스키마 변경 없음**: `strategy_runs`에 열을 더하면 `create_all` DB가 깨진다(#194). 그래서 환경(모의/실전)·실제 매매 여부(워커가 `orders.strategy_run_id`를 안 채움)·워커 다운타임은 후속으로 남겼다 |
-| 운영 전략 프록시 | #207 | **B1 1단계** — 운영자(`OPERATOR_USER_IDS`)가 앱 API로 워커 하우스 전략을 시작·중지·조회한다: `api/routers/operator.py`가 kis-api를 서버 측에서 호출(비상청산 프록시와 같은 방식, 브라우저는 키를 모른다, 재시도 없음). 권한 확인이 입력 검증보다 먼저(비운영자는 형태를 알 수 없다). 입력은 `indicator` 고정·유니버스는 `UNIVERSE` 부분집합·비중 ≤5%·손절 1~15%·모르는 키 거부. **활성 실행 1개를 kis-api `start_strategy`가 강제**(`_occupying_run`: `is_active` 또는 `stopped_at` 없음이면 409+`run_id`, Postgres advisory lock으로 동시 시작 직렬화) — 프록시의 목록 확인(최근 50개)은 빠른 거부용. 중지 요청이 실행 중인 세션을 못 찾으면(생성 전에 중지, 재기동 뒤 재생된 중지) 워커가 `stopped_at = started_at`(0일)으로 기록해 슬롯을 푼다(code-review) — 그 실행이 실제로 돌았는지 알 수 없으니 4주 관문에 날수를 주지 않는다. 생성 중에 온 중지는 시작을 취소한다. 워커가 종료를 기록하지 못하고 죽은 행은 여전히 점유(fail-closed) — 워커가 그 실행을 돌리지 않음을 확인한 뒤 `stopped_at`을 채워 해제. 목록은 점유 여부·4주 관문 충족(`paper_run_qualifies`)·실행 일수를 붙인다. `/api/auth/info`·`/api/users/profile`(조회·수정)에 `is_operator`(표시용). **화면은 아직**(2단계) |
+| 운영 전략 프록시 | #207 | **B1 1단계** — 운영자(`OPERATOR_USER_IDS`)가 앱 API로 워커 하우스 전략을 시작·중지·조회한다: `api/routers/operator.py`가 kis-api를 서버 측에서 호출(비상청산 프록시와 같은 방식, 브라우저는 키를 모른다, 재시도 없음). 권한 확인이 입력 검증보다 먼저(비운영자는 형태를 알 수 없다). 입력은 `indicator` 고정·유니버스는 `UNIVERSE` 부분집합·비중 ≤5%·손절 1~15%·모르는 키 거부. **활성 실행 1개를 kis-api `start_strategy`가 강제**(`_occupying_run`: `is_active` 또는 `stopped_at` 없음이면 409+`run_id`, Postgres advisory lock으로 동시 시작 직렬화) — 프록시의 목록 확인(최근 50개)은 빠른 거부용. 중지 요청이 실행 중인 세션을 못 찾으면(생성 전에 중지, 재기동 뒤 재생된 중지) 워커가 `stopped_at = started_at`(0일)으로 기록해 슬롯을 푼다(code-review) — 그 실행이 실제로 돌았는지 알 수 없으니 4주 관문에 날수를 주지 않는다. 생성 중에 온 중지는 시작을 취소한다. 워커가 종료를 기록하지 못하고 죽은 행은 여전히 점유(fail-closed) — 워커가 그 실행을 돌리지 않음을 확인한 뒤 `stopped_at`을 채워 해제. 목록은 점유 여부·4주 관문 충족(`paper_run_qualifies`)·실행 일수를 붙인다. `/api/auth/info`·`/api/users/profile`(조회·수정)에 `is_operator`(표시용). 화면은 #208 |
+| 운영 전략 화면 | #208 | **B1 2단계** — 웹·모바일 `views/profile/OperatorStrategy.vue`(`/profile/operator-strategy`): 실행 목록(점유 배지·실행 일수·4주 관문 충족/예정일, 중지된 미충족 실행은 "미충족"), 점유 실행 중지(확인 대화상자), 시작 폼(이름·종목당 비중 %·손절 %·유니버스 체크박스, 확인 대화상자에 "운영 계좌로 실제 주문"). 슬롯이 점유 중이거나 목록을 못 읽으면 시작 버튼 비활성, 시작·중지 뒤 목록 재조회(재전송 없음), 비율은 %로 편집하고 분수로 전송. 메뉴는 `userInfo.is_operator`일 때만(표시용). 시작·중지는 확인 대화상자 전에 잠근다(두 번 탭해도 요청 1회). 목록 조회가 겹치면 가장 최근 응답만 반영한다. **다시 보낸 중지가 슬롯을 일찍 풀지 않는다**(CodeRabbit 보안 리뷰). 워커는 먼저 `is_active=False`를 쓰고, 진행 중인 `on_market_open`과 `strategy.stop()`이 끝난 뒤에 `stopped_at`을 쓴다. 끝나는 중인 세션은 `_stopping`에 두어, 그 사이에 다시 온 중지가 0일로 기록되지 않는다. 0일 기록은 세션이 아예 없을 때만 한다. `operatorApi`, 유니버스 선택지 `constants/tradingUniverse.js`(서버 `UNIVERSE`와 동일 — 정적 가드 `tests/integration/test_frontend_operator_screen.py`, 두 앱 동일·로케일 키·메뉴 게이트·경로). 5개 로케일 × 2앱 |
 
 **열린 PR 0건.** 다음 작업은 `origin/main`에서 새로 분기하면 된다.
 
@@ -516,7 +517,7 @@ KR_ETF   = ["069500", "360750", "091160"]  # KODEX200, TIGER S&P500, KODEX반도
 - **PR #79** (`claude/update-MW7LQ`): 실패 시나리오 통합테스트 (TASK 4-1C) — **머지됨** (2026-06-16)
 - 하드닝 트랙 PR #85~#156: 위 "프로젝트 진행 현황" 표 참조 — **모두 머지됨**
 - **PR #116**은 미머지 종료(2026-07-05). 같은 작업을 **#119**가 대체 구현해 머지했다
-- **현재 열린 PR 0건.** main = `29bbd68` (PR #206)
+- **현재 열린 PR 0건.** main = `af45481` (PR #207)
 
 > 작업 방식: 기능별 새 브랜치에서 작업 → `main`으로 드래프트 PR → CodeRabbit/CodeQL 리뷰 → 머지.
 > 브랜치 보호 룰셋(PR 필수 + 코드 스캐닝)이 적용돼 `main` 직접 푸시 불가.

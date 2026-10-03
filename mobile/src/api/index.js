@@ -661,6 +661,14 @@ export const indicatorApi = {
   }
 }
 
+// Operator-only (OPERATOR_USER_IDS): the worker's house strategy via kis-api.
+// Never retried — after a lost response, list() again (kis-api refuses a second start).
+export const operatorApi = {
+  list: () => http.get('/api/operator/strategies'),
+  start: (data) => http.post('/api/operator/strategies/start', data),
+  stop: (runId) => http.post('/api/operator/strategies/stop', { run_id: runId })
+}
+
 export const userApi = {
   getProfile: () => http.get('/api/users/profile'),
   updateProfile: (data) => http.put('/api/users/profile/update', data),
