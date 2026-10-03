@@ -394,3 +394,62 @@ def test_an_active_run_still_starts(factory, monkeypatch):
     w._handle_start({"run_id": run_id, "strategy_type": "indicator"})
 
     assert built == [1] and w._sessions.get(run_id) is not None
+
+
+# ── a stop with no session must still free the slot (code-review) ─────────
+#
+# kis-api counts a row without stopped_at as holding the single strategy slot,
+# and only a running session used to write stopped_at. A stop that found no
+# session (stopped before it was built, or replayed after a boot that skipped
+# the inactive row) left the slot taken for good.
+
+def test_a_stop_with_no_session_records_a_zero_length_end(factory, monkeypatch):
+    monkeypatch.setattr(runner, "_SessionFactory", factory)
+    monkeypatch.setattr(runner, "_audit", lambda *a, **k: None)
+    w = _worker()
+    run_id = _active_row(factory, 40 * DAY)
+    with factory() as db:                      # kis-api's stop: is_active only
+        db.get(StrategyRun, run_id).is_active = False
+        db.commit()
+
+    w._handle_stop({"run_id": run_id})
+
+    row = _row(factory, run_id)
+    assert row.stopped_at == row.started_at, "frees the slot, credits no days"
+    assert LivePromotionGuard(factory)._check_paper_run() is False
+
+
+def test_a_stop_with_no_session_frees_the_kis_api_slot(factory, monkeypatch):
+    from backend.api import server as srv
+    monkeypatch.setattr(runner, "_SessionFactory", factory)
+    monkeypatch.setattr(runner, "_audit", lambda *a, **k: None)
+    run_id = _active_row(factory, DAY)
+    with factory() as db:
+        db.get(StrategyRun, run_id).is_active = False
+        db.commit()
+    with factory() as db:
+        assert srv._occupying_run(db) == run_id
+
+    _worker()._handle_stop({"run_id": run_id})
+
+    with factory() as db:
+        assert srv._occupying_run(db) is None
+
+
+def test_a_stop_during_the_build_cancels_the_start(factory, monkeypatch):
+    monkeypatch.setattr(runner, "_SessionFactory", factory)
+    monkeypatch.setattr(runner, "_audit", lambda *a, **k: None)
+    monkeypatch.setattr(runner.WorkerSession, "start",
+                        lambda self: pytest.fail("a stopped run must not start"))
+    w = _worker()
+    run_id = _active_row(factory, DAY)
+
+    def build_then_get_stopped(data):
+        w._handle_stop({"run_id": run_id})    # arrives while building
+        return _FailingStrategy()
+
+    monkeypatch.setattr(w, "_build_strategy", build_then_get_stopped)
+    w._handle_start({"run_id": run_id, "strategy_type": "indicator"})
+
+    assert run_id not in w._sessions
+    assert _row(factory, run_id).stopped_at is not None

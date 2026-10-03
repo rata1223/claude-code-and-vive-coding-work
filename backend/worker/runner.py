@@ -206,7 +206,7 @@ def _record_never_ran(run_id: int, strategy_type, reason: str) -> bool:
                 time.sleep(_NEVER_RAN_RETRY_DELAYS[attempt])
 
     if last_error is None:
-        logger.error("전략 시작 실패 — 실행으로 치지 않음(0일 기록): run_id=%s type=%s 사유=%s",
+        logger.error("실행으로 치지 않음(0일 기록): run_id=%s type=%s 사유=%s",
                      run_id, strategy_type, reason)
         _audit("strategy_start_failed",
                detail={"run_id": run_id, "strategy_type": strategy_type, "reason": reason})
@@ -214,17 +214,17 @@ def _record_never_ran(run_id: int, strategy_type, reason: str) -> bool:
 
     fix = (f"UPDATE strategy_runs SET is_active = false, stopped_at = started_at "
            f"WHERE id = {int(run_id)} AND stopped_at IS NULL;")
-    logger.critical("전략 시작 실패를 기록하지 못함 run_id=%s (%d회 시도): %s — 다음 기동에 복원돼 "
-                    "4주 관문 기간으로 세질 수 있다. 수동 조치: %s",
-                    run_id, attempts, last_error, fix)
+    logger.critical("0일 종료를 기록하지 못함 run_id=%s (%d회 시도, 사유: %s): %s — 행이 실행 슬롯을 "
+                    "계속 점유하거나, 다음 기동에 복원돼 4주 관문 기간으로 세질 수 있다. 수동 조치: %s",
+                    run_id, attempts, reason, last_error, fix)
     _audit("strategy_start_failed_unrecorded",
            detail={"run_id": run_id, "strategy_type": strategy_type, "reason": reason})
     try:
         from bot.notifier import alert_emergency
-        alert_emergency(f"[전략 시작 실패 기록 불가] run_id={run_id}\n"
-                        f"다음 기동에 복원돼 4주 관문 기간으로 세질 수 있다.\n수동 조치: {fix}")
+        alert_emergency(f"[실행 종료 기록 불가] run_id={run_id} ({reason})\n"
+                        f"실행 슬롯을 계속 점유하거나 4주 관문 기간으로 세질 수 있다.\n수동 조치: {fix}")
     except Exception as e:  # the alert is best effort; the log above is the record
-        logger.warning("시작 실패 경보 전송 실패: %s", e)
+        logger.warning("종료 기록 경보 전송 실패: %s", e)
     return False
 
 
@@ -970,6 +970,12 @@ class StrategyWorker:
         session = WorkerSession(run_id, strategy, new_start=not restoring)
         session._strategy_type = data.get("strategy_type")
         with self._lock:
+            # A stop handled while the strategy was being built popped the
+            # reservation (``_handle_stop``) and recorded the run as stopped;
+            # starting it now would trade under a row that says it is off.
+            if run_id not in self._sessions:
+                logger.warning("시작 취소 — 생성 중에 중지 요청: run_id=%s", run_id)
+                return
             self._sessions[run_id] = session
         session.start()
         _audit("strategy_start", detail={"run_id": run_id, "strategy_type": data.get("strategy_type")})
@@ -1015,7 +1021,15 @@ class StrategyWorker:
             session.stop()
             _audit("strategy_stop", detail={"run_id": run_id})
         else:
-            logger.warning("중단할 세션 없음: run_id=%d", run_id)
+            # Nothing runs here for this run (stopped before it was built, or the
+            # stop is replayed after a boot that did not restore the inactive
+            # row), so no session will ever write ``stopped_at`` — and kis-api
+            # counts a row without it as still holding the single strategy slot.
+            # Record the end now. Zero duration: how long it actually ran, if at
+            # all, is not known here, and the 4-week paper gate must not credit
+            # days nobody saw it run.
+            logger.warning("중단할 세션 없음 — 종료를 0일로 기록: run_id=%s", run_id)
+            _record_never_ran(run_id, None, "중지 요청 시 실행 중인 세션 없음")
 
     def _handle_market_open(self, market: str):
         """Broadcast on_market_open() to all active strategy sessions with dedup."""
