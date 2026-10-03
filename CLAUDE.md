@@ -12,7 +12,7 @@
 
 ---
 
-## 프로젝트 진행 현황 (2026-10-03 기준, main `294d6af` = PR #203)
+## 프로젝트 진행 현황 (2026-10-03 기준, main `4e3f07b` = PR #205)
 
 > **이 섹션이 최신 상태의 단일 진실 공급원(SoT).** 아래 "다음 작업 목록(Stage 1~9)"은 초기 설계 로드맵으로,
 > 대부분 이미 구현 완료됐다. 실제 진행은 `AUDIT.md` → `ROADMAP.md` 기반 하드닝 트랙으로 이어지고 있다.
@@ -71,6 +71,7 @@
 | 운영 API 노출·경보 | #203 | 이미지 감사(#201·#202 후속). 이미지 구성·의존성은 문제없음(kis-api·kis-worker·kis-ws 진입점이 각자 COPY한 것만으로 import). 대신 compose에서: **kis-api(:5001)가 열려 있었다** — `KIS_API_KEY` 기본값이 빈 값이면 `_check_api_key`가 인증을 통째로 껐고 포트는 모든 인터페이스에 게시돼, 접근 가능한 누구나 `POST /api/admin/flatten {"confirm":true}`(운영 계좌 전량 매도)·전략 시작/중지·조정·잔고를 인증 없이 호출할 수 있었다. 이제 키가 없으면 열린 경로(`/api/health`·`status`·`metrics`) 외 503, gunicorn 기동 거부(`on_starting`→`require_api_key`), compose는 `KIS_API_KEY:?`로 시작 거부·포트는 `127.0.0.1:5001`만, 키 비교는 `hmac.compare_digest`. **워커 경보 유실**: kis-worker·kis-api에 `TELEGRAM_TOKEN`/`TELEGRAM_CHAT_ID`가 전달되지 않아 킬스위치·MDD 청산·워치독·복구 경보가 전부 사라졌다 → 전달 |
 | 전략 시작 B 설계 | #204 | **설계 문서만**(`docs/STRATEGY_START_B_DESIGN.md`). 워커 지표 전략은 설정의 조건을 읽지 않고 하우스 신호(`default_fusion`)만 쓴다(설정은 `universe`·`position_size_pct`·`stop_loss_pct`만) → "앱 조건 번역" 대신 **운영자 전용 하우스 전략 제어판(B1)**: `kis-api` 프록시(비상청산과 같은 방식), 입력 제한(지표 고정·유니버스 부분집합·비중 ≤5%), 활성 실행 1개. 발견: 비상청산·킬스위치 해제 허용 목록이 **이메일**이다. 가입이 메일을 확인하지 않고, 목록 비교는 대소문자를 무시하는데 가입 중복 검사는 구분한다 — **운영자가 이미 가입했어도 안전하지 않다**(CodeRabbit). 0단계(사용자 id `OPERATOR_USER_IDS` 통일)를 B1과 상관없이 먼저, 그때까지 `EMERGENCY_FLATTEN_ADMINS`는 비워 둘 것. 활성 실행 1개는 프록시가 아니라 `kis-api` `start_strategy`가 원자적으로 강제. 4주 관문은 "28일 전에 시작한 행이 있는가"만 본다(1분 만에 중지해도 통과) — 별도 결정 |
 | 운영자 id 통일 | #205 | **B 설계 0단계(F1)** — 운영 계좌에 작용하는 제어 셋(비상청산·킬스위치 해제·kis-ws 피드)이 목록 셋을 읽었고 둘은 **이메일**이었다: 가입이 메일을 확인하지 않고, 목록 비교는 대소문자를 무시하는데 가입 중복 검사는 구분해 **운영자가 이미 가입했어도** 대소문자만 다른 주소로 일치할 수 있었다. 이제 하나의 `OPERATOR_USER_IDS`(사용자 id, `backend/security/operators.py`, 비우면 아무도 허용 안 함). `EMERGENCY_FLATTEN_ADMINS`·`KILL_SWITCH_ADMINS`·`WS_OPERATOR_USER_IDS`는 읽지 않고 기동 시 경고(api lifespan·kis-ws). compose `api`·`kis-ws` 모두 `OPERATOR_USER_IDS`. **동작 변화**: 킬스위치 해제는 `KILL_SWITCH_ADMINS`가 compose에 없어 늘 비활성이었는데, 이제 운영자 id가 있으면 앱에서 동작한다. **배포 시**: 옛 이메일 값은 옮겨지지 않는다 — 서버 `.env`에 운영자의 사용자 id로 `OPERATOR_USER_IDS`를 넣을 것(비어 있으면 세 제어 모두 꺼지고 기동 로그가 옛 변수명과 함께 알린다) |
+| 4주 관문 | #206 | **B 설계 F2** — `LivePromotionGuard._check_paper_run`이 `started_at <= now-28d`인 행의 **개수**만 셌다. 28일 전에 시작해 1분 뒤 중지한 실행도 통과했다. 이제 `paper_run_qualifies`: 28일 동안 중지되지 않은 실행만 센다(활성이면 시작부터 지금까지, 종료가 기록됐으면 종료까지). 중지 요청 후 종료 기록이 없는 행은 불통과(fail-closed). **스키마 변경 없음**: `strategy_runs`에 열을 더하면 `create_all` DB가 깨진다(#194). 그래서 환경(모의/실전)·실제 매매 여부(워커가 `orders.strategy_run_id`를 안 채움)·워커 다운타임은 후속으로 남겼다 |
 
 **열린 PR 0건.** 다음 작업은 `origin/main`에서 새로 분기하면 된다.
 
@@ -126,7 +127,10 @@
 2. **키움증권**: `kiwoom_adapter/`(client·market_data·orders·portfolio) + `backend/brokers/kiwoom.py` 존재하나 완성도·실거래 검증 미완. 세부 이슈는 `docs/KIWOOM_AUDIT_REPORT.md`·`ROADMAP.md`(P1-01 등) 참고
 3. **모의→실전**: `.env`에서 `KIS_ENV=paper` → `KIS_ENV=real`만 변경. **4주 모의 전 절대 금지**
    — 강제 장치는 `backend/worker/promotion_guard.py`의 `LivePromotionGuard`다. 6개 관문 중
-   **"4주 모의투자 완료"**는 `strategy_runs`에 `started_at <= now-28d`인 행이 있는지로 판정한다.
+   **"4주 모의투자 완료"**는 28일 동안 **중지되지 않은** `strategy_runs` 행이 있는지로 판정한다(PR #206).
+   기준은 두 가지다. 활성이고 `stopped_at`이 없으면 시작부터 지금까지, `stopped_at`이 있으면 시작부터 종료까지가 28일 이상이어야 한다.
+   예전에는 28일 전에 **시작만** 했으면 1분 만에 중지해도 통과했다.
+   남은 한계: 실행 환경(모의/실전)과 실제 매매 여부, 워커 다운타임은 보지 않는다(기록이 없다).
    **코드로 줄일 수 없는 유일한 항목이고, 실전 전환일 = 모의투자를 켜는 날 + 28일로 고정된다.**
 4. ⚠️ **SPY·XL\* 섹터 ETF의 거래소 코드 미검증**: 이들은 NYSE Arca 상장인데 KIS 주문 코드에
    ARCA가 없다. KIS가 Arca를 NYSE로 두는지 AMEX로 두는지 **확인하지 못했다**(종목 마스터
@@ -511,7 +515,7 @@ KR_ETF   = ["069500", "360750", "091160"]  # KODEX200, TIGER S&P500, KODEX반도
 - **PR #79** (`claude/update-MW7LQ`): 실패 시나리오 통합테스트 (TASK 4-1C) — **머지됨** (2026-06-16)
 - 하드닝 트랙 PR #85~#156: 위 "프로젝트 진행 현황" 표 참조 — **모두 머지됨**
 - **PR #116**은 미머지 종료(2026-07-05). 같은 작업을 **#119**가 대체 구현해 머지했다
-- **현재 열린 PR 0건.** main = `294d6af` (PR #203)
+- **현재 열린 PR 0건.** main = `4e3f07b` (PR #205)
 
 > 작업 방식: 기능별 새 브랜치에서 작업 → `main`으로 드래프트 PR → CodeRabbit/CodeQL 리뷰 → 머지.
 > 브랜치 보호 룰셋(PR 필수 + 코드 스캐닝)이 적용돼 `main` 직접 푸시 불가.
