@@ -37,6 +37,12 @@
           <span class="value">{{ credentialCount }}</span>
           <van-icon name="arrow" class="arrow" />
         </div>
+        <!-- Display only: every operator route re-checks OPERATOR_USER_IDS. -->
+        <div v-if="userInfo?.is_operator" class="menu-item" @click="$router.push('/profile/operator-strategy')">
+          <div class="menu-icon c-indigo"><van-icon name="play-circle-o" /></div>
+          <span class="label">{{ $t('operator.title') }}</span>
+          <van-icon name="arrow" class="arrow" />
+        </div>
       </div>
     </div>
 

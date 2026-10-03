@@ -104,6 +104,14 @@ const routes = [
     meta: { titleKey: 'profile.change_password', showTabbar: false }
   },
   {
+    // Operator-only screen (OPERATOR_USER_IDS). The menu entry is hidden for
+    // everyone else; the API refuses them regardless.
+    path: '/profile/operator-strategy',
+    name: 'ProfileOperatorStrategy',
+    component: () => import('@/views/profile/OperatorStrategy.vue'),
+    meta: { titleKey: 'operator.title', showTabbar: false }
+  },
+  {
     path: '/profile/notification-settings',
     name: 'ProfileNotificationSettings',
     component: () => import('@/views/profile/NotificationSettings.vue'),
