@@ -25,6 +25,8 @@ OPERATOR_ENV = "OPERATOR_USER_IDS"
 
 #: Variables this list replaced. Still set means the deployment expects a
 #: control that now ignores them — say so at startup rather than go quiet.
+#: Under compose they never reach the container (only declared variables do),
+#: so the empty-list warning names them as well.
 LEGACY_OPERATOR_ENVS = (
     "EMERGENCY_FLATTEN_ADMINS",
     "KILL_SWITCH_ADMINS",
@@ -80,6 +82,11 @@ def warn_legacy_operator_env() -> list:
         # Count only: an entry that is not an id is often an email address.
         logger.warning("%s: 사용자 id가 아닌 항목 %d개 무시", OPERATOR_ENV, len(rejected))
     if not ids:
+        # Name the retired lists here too: compose passes only declared
+        # variables, so in a container the per-variable warning above never
+        # fires — a deployment upgraded with only the old email lists in .env
+        # lands on this line.
         logger.warning("%s가 비어 있음 — 운영자 제어(비상청산·킬스위치 해제·실시간 피드)는 "
-                       "아무에게도 열리지 않는다", OPERATOR_ENV)
+                       "아무에게도 열리지 않는다. 예전 %s를 쓰고 있었다면 운영자의 사용자 id를 "
+                       "%s에 넣을 것", OPERATOR_ENV, "·".join(LEGACY_OPERATOR_ENVS), OPERATOR_ENV)
     return found

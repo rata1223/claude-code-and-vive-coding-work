@@ -85,9 +85,14 @@ def test_startup_report_counts_rejected_entries_without_echoing_them(monkeypatch
 
 
 def test_startup_report_says_when_nobody_is_an_operator(caplog):
+    """In a container the retired variables are never set (compose passes only
+    declared ones), so this warning is the one an upgraded deployment sees: it
+    must name them and point at the new list."""
     with caplog.at_level(logging.WARNING, logger=operators.__name__):
         operators.warn_legacy_operator_env()
     assert "비어 있음" in caplog.text
+    for legacy in operators.LEGACY_OPERATOR_ENVS:
+        assert legacy in caplog.text, legacy
 
 
 # ── wiring ─────────────────────────────────────────────────────────────────
