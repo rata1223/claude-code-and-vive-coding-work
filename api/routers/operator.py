@@ -85,17 +85,29 @@ def _parse_ts(value):
 
 def _describe(run: dict, now: datetime) -> dict:
     """kis-api's row plus what the screen needs: whether it holds the slot and
-    where it stands on the 4-week paper gate (same rule as the worker's
-    ``promotion_guard.paper_run_qualifies``)."""
-    from backend.worker.promotion_guard import PAPER_RUN_MIN, paper_run_qualifies
+    where it stands on the 4-week paper gate — the same rule the worker's gate
+    applies (``promotion_guard.paper_gate_status``: paper environment, 28 days
+    unstopped, at least one fill)."""
+    from backend.worker.promotion_guard import PAPER_RUN_MIN, RUN_ENV_KEY, paper_gate_status
 
     started = _parse_ts(run.get("started_at"))
     stopped = _parse_ts(run.get("stopped_at"))
     is_active = bool(run.get("is_active"))
+    kis_env = run.get("kis_env") if isinstance(run.get("kis_env"), str) else None
+    try:
+        filled = max(int(run.get("filled_orders") or 0), 0)
+    except (TypeError, ValueError):
+        filled = 0
     row = dict(run)
     row["occupying"] = is_active or stopped is None
-    row["paper_gate_met"] = paper_run_qualifies(
-        SimpleNamespace(started_at=started, stopped_at=stopped, is_active=is_active), now)
+    row["kis_env"] = kis_env
+    row["filled_orders"] = filled
+    met, reason = paper_gate_status(
+        SimpleNamespace(started_at=started, stopped_at=stopped, is_active=is_active,
+                        config={RUN_ENV_KEY: kis_env} if kis_env else {}),
+        filled, now)
+    row["paper_gate_met"] = met
+    row["paper_gate_reason"] = reason
     if started is not None:
         end = stopped or now
         row["run_days"] = round(max((end - started).total_seconds(), 0) / 86400, 1)

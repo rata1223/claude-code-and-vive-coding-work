@@ -184,17 +184,39 @@ def test_the_list_marks_the_occupying_run_and_the_paper_gate(monkeypatch, db, us
     now = datetime.utcnow()
     runs = [
         {"id": 2, "name": "a", "type": "indicator", "is_active": True,
-         "started_at": _iso(now - timedelta(days=30)), "stopped_at": None},
+         "started_at": _iso(now - timedelta(days=30)), "stopped_at": None,
+         "kis_env": "paper", "filled_orders": 3},
         {"id": 1, "name": "b", "type": "indicator", "is_active": False,
          "started_at": _iso(now - timedelta(days=60)),
-         "stopped_at": _iso(now - timedelta(days=59))},
+         "stopped_at": _iso(now - timedelta(days=59)),
+         "kis_env": "paper", "filled_orders": 3},
     ]
     _wire(monkeypatch, user, _Upstream(runs=runs))
     resp = operator.list_runs(user)
     assert resp.code == 1
     a, b = resp.data["runs"]
     assert a["occupying"] is True and a["paper_gate_met"] is True and a["run_days"] >= 30
+    assert a["paper_gate_reason"] is None and a["filled_orders"] == 3
     assert b["occupying"] is False and b["paper_gate_met"] is False and b["run_days"] == 1.0
+    assert b["paper_gate_reason"] == "duration"
+
+
+@pytest.mark.parametrize("kis_env, filled, reason", [
+    ("real", 3, "env_not_paper"),
+    (None, 3, "env_unknown"),
+    ("paper", 0, "no_fills"),
+    ("paper", "garbage", "no_fills"),
+])
+def test_the_list_explains_why_a_long_run_misses_the_gate(monkeypatch, db, user,
+                                                         kis_env, filled, reason):
+    """Same rule as the worker's gate: paper environment and a fill, not only 28 days."""
+    now = datetime.utcnow()
+    run = {"id": 3, "name": "c", "type": "indicator", "is_active": True,
+           "started_at": _iso(now - timedelta(days=40)), "stopped_at": None,
+           "kis_env": kis_env, "filled_orders": filled}
+    _wire(monkeypatch, user, _Upstream(runs=[run]))
+    (row,) = operator.list_runs(user).data["runs"]
+    assert row["paper_gate_met"] is False and row["paper_gate_reason"] == reason
 
 
 def test_an_unreachable_kis_api_is_an_error_not_an_empty_list(monkeypatch, db, user):

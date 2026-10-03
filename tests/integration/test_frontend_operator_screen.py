@@ -89,3 +89,17 @@ def test_only_the_latest_list_response_updates_the_screen():
     body = src.split("async load() {", 1)[1].split("\n    },", 1)[0]
     assert "const seq = ++this.loadSeq" in body
     assert body.index("if (seq !== this.loadSeq) return") < body.index("this.runs = res")
+
+
+def test_the_screen_explains_every_gate_reason():
+    """Each reason the gate can give (promotion_guard.paper_gate_status) has its
+    own text; ``duration`` falls through to the date / "not met" lines."""
+    import inspect
+    from backend.worker import promotion_guard
+    reasons = set(re.findall(r'return False, "([a-z_]+)"',
+                             inspect.getsource(promotion_guard.paper_gate_status)))
+    assert reasons == {"env_unknown", "env_not_paper", "duration", "no_fills"}
+    src = _read("frontend/src/views/profile/OperatorStrategy.vue")
+    for reason in reasons - {"duration"}:
+        assert f"reason === '{reason}'" in src, reason
+    assert "operator.env_fills" in src

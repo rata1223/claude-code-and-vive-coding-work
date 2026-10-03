@@ -4,6 +4,7 @@ It used to pass on any strategy_runs row started 28+ days ago — including one
 stopped a minute after it began. It now needs a run that was not stopped for
 28 days: still active with no recorded stop, or stopped after 28 days.
 """
+import json
 import re
 from datetime import datetime, timedelta
 from types import SimpleNamespace
@@ -13,9 +14,9 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from backend.database.models import Base, StrategyRun
+from backend.database.models import Base, Order, StrategyRun
 from backend.worker.promotion_guard import (
-    PAPER_RUN_MIN, LivePromotionGuard, paper_run_qualifies,
+    PAPER_RUN_MIN, LivePromotionGuard, paper_gate_status, paper_run_qualifies, run_kis_env,
 )
 
 NOW = datetime(2026, 10, 3, 12, 0, 0)
@@ -67,14 +68,27 @@ def factory():
     eng.dispose()
 
 
-def _add(factory, started_ago, stopped_after=None, is_active=True):
+def _add(factory, started_ago, stopped_after=None, is_active=True, env="paper", fills=1):
+    """A run stamped ``env`` (None: no stamp) with ``fills`` filled orders."""
     now = datetime.utcnow()
     with factory() as db:
         started = now - started_ago
-        db.add(StrategyRun(name="r", strategy_type="indicator", config="{}",
-                           is_active=is_active, started_at=started,
-                           stopped_at=started + stopped_after if stopped_after else None))
+        run = StrategyRun(name="r", strategy_type="indicator",
+                          config=json.dumps({"kis_env": env} if env else {}),
+                          is_active=is_active, started_at=started,
+                          stopped_at=started + stopped_after if stopped_after else None)
+        db.add(run)
+        db.flush()
+        for i in range(fills):
+            _order(db, run.id, filled_qty=1, n=i)
         db.commit()
+        return run.id
+
+
+def _order(db, run_id, filled_qty, n=0):
+    db.add(Order(broker_order_id=f"o{run_id}-{n}-{filled_qty}", symbol="SPY", side="buy",
+                 qty=1, price=1.0, filled_qty=filled_qty, status="filled" if filled_qty else "submitted",
+                 market="US", strategy_run_id=run_id))
 
 
 def test_no_runs_fails(factory):
@@ -85,7 +99,7 @@ def test_an_old_row_stopped_at_once_no_longer_passes(factory, caplog):
     _add(factory, 60 * DAY, stopped_after=timedelta(minutes=1), is_active=False)
     with caplog.at_level("WARNING"):
         assert LivePromotionGuard(factory)._check_paper_run() is False
-    assert "중지되지 않은 실행 없음" in caplog.text
+    assert "'duration'" in caplog.text
 
 
 def test_a_run_active_for_four_weeks_passes(factory):
@@ -108,6 +122,64 @@ def test_one_qualifying_run_among_short_ones_passes(factory):
     _add(factory, 50 * DAY, is_active=False)                # stop never recorded
     _add(factory, 30 * DAY)
     assert LivePromotionGuard(factory)._check_paper_run() is True
+
+
+# ── environment and fills ─────────────────────────────────────────────────
+#
+# Duration alone was not enough: a run started under real (trading held off by
+# SAFE_MODE) or one that never traded could sit out the 28 days and pass.
+
+def test_a_run_stamped_real_does_not_pass(factory):
+    _add(factory, 40 * DAY, env="real")
+    assert LivePromotionGuard(factory)._check_paper_run() is False
+
+
+def test_a_run_without_an_environment_stamp_does_not_pass(factory):
+    _add(factory, 40 * DAY, env=None)
+    assert LivePromotionGuard(factory)._check_paper_run() is False
+
+
+def test_a_run_with_no_fills_does_not_pass(factory, caplog):
+    _add(factory, 40 * DAY, fills=0)
+    with caplog.at_level("WARNING"):
+        assert LivePromotionGuard(factory)._check_paper_run() is False
+    assert "'no_fills'" in caplog.text
+
+
+def test_an_unfilled_order_is_not_a_fill(factory):
+    run_id = _add(factory, 40 * DAY, fills=0)
+    with factory() as db:
+        _order(db, run_id, filled_qty=0)
+        db.commit()
+    assert LivePromotionGuard(factory)._check_paper_run() is False
+
+
+def test_another_runs_fill_does_not_count(factory):
+    _add(factory, 40 * DAY, fills=0)
+    _add(factory, 1 * DAY)                    # young run with a fill
+    assert LivePromotionGuard(factory)._check_paper_run() is False
+
+
+@pytest.mark.parametrize("config, expected", [
+    ('{"kis_env": "paper"}', "paper"), ('{"kis_env": "real"}', "real"),
+    ("{}", None), ("not json", None), ("[1]", None), (None, None),
+    ('{"kis_env": ""}', None), ({"kis_env": "paper"}, "paper"),
+])
+def test_run_kis_env(config, expected):
+    assert run_kis_env(SimpleNamespace(config=config)) == expected
+
+
+def test_gate_reasons_put_the_environment_first():
+    young_real = SimpleNamespace(started_at=NOW - DAY, stopped_at=None, is_active=True,
+                                 config='{"kis_env": "real"}')
+    assert paper_gate_status(young_real, 0, NOW) == (False, "env_not_paper")
+    young = SimpleNamespace(started_at=NOW - DAY, stopped_at=None, is_active=True,
+                            config='{"kis_env": "paper"}')
+    assert paper_gate_status(young, 0, NOW) == (False, "duration")
+    old = SimpleNamespace(started_at=NOW - 30 * DAY, stopped_at=None, is_active=True,
+                          config='{"kis_env": "paper"}')
+    assert paper_gate_status(old, 0, NOW) == (False, "no_fills")
+    assert paper_gate_status(old, 3, NOW) == (True, None)
 
 
 def test_a_database_error_fails_closed():
@@ -604,3 +676,121 @@ def test_the_slot_is_held_until_the_stop_hook_returns(factory, monkeypatch):
     assert session.join(5) is True
     with factory() as db:
         assert srv._occupying_run(db) is None
+
+
+# ── orders are attributed to their run; runs stay in their environment ─────
+
+from backend.brokers.models import Order as BOrder, OrderStatus  # noqa: E402
+
+
+def _border(**kw):
+    base = dict(id="A1", symbol="SPY", side="buy", qty=1, price=1.0,
+                status=OrderStatus.SUBMITTED)
+    base.update(kw)
+    return BOrder(**base)
+
+
+def test_a_new_order_row_is_attributed_to_its_run(factory, monkeypatch):
+    monkeypatch.setattr(runner, "_SessionFactory", factory)
+    w = _worker()
+
+    w._persist_order(_border(), run_id=7)
+    w._persist_order(_border(status=OrderStatus.FILLED, filled_qty=1), run_id=9)
+
+    with factory() as db:
+        rows = db.query(Order).all()
+    assert [(r.strategy_run_id, r.filled_qty) for r in rows] == [(7, 1)], \
+        "set on insert, never re-attributed by an update"
+
+
+def test_the_runs_machine_records_orders_under_its_run_id(monkeypatch):
+    captured = {}
+
+    class _Machine:
+        def __init__(self, on_state_change):
+            captured["cb"] = on_state_change
+
+    monkeypatch.setattr(runner, "get_kis_broker", lambda: object())
+    monkeypatch.setattr(runner, "OrderStateMachine", _Machine)
+    monkeypatch.setattr(runner, "PositionTracker", lambda *a, **k: object())
+    monkeypatch.setattr(runner, "IndicatorStrategy", lambda **k: "built")
+    w = _worker()
+    w._ca_runtime = None
+    w._poller = None
+    monkeypatch.setattr(w, "_restore_positions", lambda *a, **k: None)
+    monkeypatch.setattr(w, "_restore_pending_to_tracker", lambda *a, **k: None)
+    seen = []
+    monkeypatch.setattr(w, "_persist_order", lambda o, run_id=None: seen.append(run_id))
+
+    assert w._build_strategy({"run_id": 11, "strategy_type": "indicator"}) == "built"
+    captured["cb"](_border())
+    assert seen == [11]
+
+
+def _stamped_row(factory, env, started_ago=DAY):
+    with factory() as db:
+        run = StrategyRun(name="r", strategy_type="indicator",
+                          config=json.dumps({"kis_env": env} if env else {}),
+                          is_active=True, started_at=datetime.utcnow() - started_ago)
+        db.add(run)
+        db.commit()
+        return run.id
+
+
+def _start(w, run_id, env, restoring=False):
+    w._handle_start({"run_id": run_id, "strategy_type": "indicator",
+                     "config": {"kis_env": env} if env else {}}, restoring=restoring)
+
+
+def test_a_new_start_stamped_for_another_environment_never_runs(factory, monkeypatch):
+    monkeypatch.setenv("KIS_ENV", "paper")
+    w = _built_worker(monkeypatch, factory)
+    run_id = _stamped_row(factory, "real")
+
+    _start(w, run_id, "real")
+
+    row = _row(factory, run_id)
+    assert run_id not in w._sessions
+    assert row.is_active is False and row.stopped_at == row.started_at
+
+
+def test_a_restore_after_the_environment_changed_ends_the_run_now(factory, monkeypatch):
+    monkeypatch.setenv("KIS_ENV", "real")
+    w = _built_worker(monkeypatch, factory)
+    run_id = _stamped_row(factory, "paper", started_ago=30 * DAY)
+
+    _start(w, run_id, "paper", restoring=True)
+
+    row = _row(factory, run_id)
+    assert run_id not in w._sessions
+    assert row.is_active is False
+    assert row.stopped_at - row.started_at >= 30 * DAY - timedelta(minutes=1), \
+        "the days it ran in paper still count"
+
+
+def _counting_worker(monkeypatch, factory):
+    monkeypatch.setattr(runner, "_SessionFactory", factory)
+    monkeypatch.setattr(runner, "_audit", lambda *a, **k: None)
+    monkeypatch.setattr(runner.WorkerSession, "start", lambda self: None)
+    w = _worker()
+    built = []
+    monkeypatch.setattr(w, "_build_strategy", lambda data: built.append(1) or _FailingStrategy())
+    return w, built
+
+
+@pytest.mark.parametrize("restoring", [False, True])
+def test_a_matching_stamp_starts(factory, monkeypatch, restoring):
+    monkeypatch.setenv("KIS_ENV", "paper")
+    w, built = _counting_worker(monkeypatch, factory)
+    run_id = _stamped_row(factory, "paper")
+    _start(w, run_id, "paper", restoring=restoring)
+    assert built == [1] and w._sessions.get(run_id) is not None
+
+
+def test_a_row_from_before_stamping_still_restores(factory, monkeypatch):
+    monkeypatch.setenv("KIS_ENV", "paper")
+    w, built = _counting_worker(monkeypatch, factory)
+    run_id = _stamped_row(factory, None)
+    _start(w, run_id, None, restoring=True)
+    assert built == [1]
+    assert LivePromotionGuard(factory)._check_paper_run() is False, "never counted"
