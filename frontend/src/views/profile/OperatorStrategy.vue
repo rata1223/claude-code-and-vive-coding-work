@@ -159,6 +159,10 @@ export default {
       return Number.isNaN(d.getTime()) ? value : d.toLocaleString()
     },
     async startRun() {
+      // Claimed before the dialog: a double tap must not open two dialogs and
+      // send two starts.
+      if (this.starting) return
+      this.starting = true
       try {
         await showConfirmDialog({
           title: this.$t('operator.start_confirm_title'),
@@ -169,9 +173,9 @@ export default {
           })
         })
       } catch (e) {
+        this.starting = false
         return
       }
-      this.starting = true
       try {
         await operatorApi.start({
           name: this.form.name.trim(),
@@ -189,15 +193,17 @@ export default {
       }
     },
     async stopRun(run) {
+      if (this.stopping !== null) return
+      this.stopping = run.id
       try {
         await showConfirmDialog({
           title: this.$t('operator.stop_confirm_title'),
           message: this.$t('operator.stop_confirm_msg', { id: run.id })
         })
       } catch (e) {
+        this.stopping = null
         return
       }
-      this.stopping = run.id
       try {
         await operatorApi.stop(run.id)
         showToast({ message: this.$t('operator.stop_requested'), type: 'success' })

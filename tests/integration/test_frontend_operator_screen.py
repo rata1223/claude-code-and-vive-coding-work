@@ -71,3 +71,12 @@ def test_a_run_stuck_in_stopping_can_be_stopped_again():
     src = _read("frontend/src/views/profile/OperatorStrategy.vue")
     m = re.search(r'<van-button\s+v-if="([^"]+)"[^>]*@click="stopRun\(run\)"', src, re.S)
     assert m and m.group(1).strip() == "run.occupying"
+
+
+def test_start_and_stop_are_claimed_before_the_confirm_dialog():
+    """A double tap must not open two dialogs and send two requests: the busy
+    flag is set before the dialog is awaited and released if it is cancelled."""
+    src = _read("frontend/src/views/profile/OperatorStrategy.vue")
+    for method, flag in (("startRun()", "this.starting = true"), ("stopRun(run)", "this.stopping = run.id")):
+        body = src.split(f"async {method} {{", 1)[1]
+        assert body.index(flag) < body.index("showConfirmDialog"), method
