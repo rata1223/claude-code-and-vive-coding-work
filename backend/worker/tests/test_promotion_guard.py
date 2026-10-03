@@ -234,3 +234,108 @@ def test_kis_api_startable_types_match_what_the_worker_builds():
     src = inspect.getsource(runner.StrategyWorker._build_strategy)
     built = set(re.findall(r'stype == "(\w+)"', src))
     assert built == set(srv._STARTABLE_STRATEGY_TYPES)
+
+
+# ── strategy.start() itself fails (CodeRabbit) ────────────────────────────
+
+class _FailingStrategy:
+    def __init__(self):
+        self.stopped = False
+
+    def start(self):
+        raise RuntimeError("start failed")
+
+    def stop(self):
+        self.stopped = True
+
+
+def test_a_new_session_whose_start_raises_is_recorded_as_never_ran(factory, monkeypatch):
+    """Handled 40 days late and failing at once must not become a 40-day run."""
+    monkeypatch.setattr(runner, "_SessionFactory", factory)
+    monkeypatch.setattr(runner, "_audit", lambda *a, **k: None)
+    run_id = _active_row(factory, 40 * DAY)
+
+    strat = _FailingStrategy()
+    runner.WorkerSession(run_id, strat, new_start=True)._run()
+
+    row = _row(factory, run_id)
+    assert row.is_active is False and row.stopped_at == row.started_at
+    assert strat.stopped is True, "cleanup still runs"
+    assert LivePromotionGuard(factory)._check_paper_run() is False
+
+
+def test_a_restored_session_whose_start_raises_keeps_the_old_stop_record(factory, monkeypatch):
+    monkeypatch.setattr(runner, "_SessionFactory", factory)
+    monkeypatch.setattr(runner, "_audit", lambda *a, **k: None)
+    run_id = _active_row(factory, 3 * DAY)
+    before = datetime.utcnow()
+
+    runner.WorkerSession(run_id, _FailingStrategy(), new_start=False)._run()
+
+    row = _row(factory, run_id)
+    assert row.is_active is False and row.stopped_at >= before
+
+
+def test_handle_start_marks_a_command_session_as_a_new_start(monkeypatch):
+    w = _worker()
+    built = object()
+    monkeypatch.setattr(w, "_build_strategy", lambda data: built)
+    monkeypatch.setattr(runner, "_audit", lambda *a, **k: None)
+    made = []
+
+    class _Session:
+        def __init__(self, run_id, strategy, new_start=False):
+            made.append(new_start)
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(runner, "WorkerSession", _Session)
+    w._handle_start({"run_id": 1})
+    w._handle_start({"run_id": 2}, restoring=True)
+    assert made == [True, False]
+
+
+# ── the record is retried, then escalated ─────────────────────────────────
+
+def _flaky_session(factory, failures):
+    from contextlib import contextmanager
+    state = {"left": failures}
+
+    @contextmanager
+    def session():
+        if state["left"] > 0:
+            state["left"] -= 1
+            raise RuntimeError("db down")
+        db = factory()
+        try:
+            yield db
+        finally:
+            db.close()
+    return session
+
+
+def test_a_transient_db_error_is_retried(factory, monkeypatch):
+    monkeypatch.setattr(runner, "_audit", lambda *a, **k: None)
+    monkeypatch.setattr(runner.time, "sleep", lambda s: None)
+    run_id = _active_row(factory, 40 * DAY)
+    monkeypatch.setattr(runner, "_session", _flaky_session(factory, failures=2))
+
+    assert runner._record_never_ran(run_id, "nope", "test") is True
+    row = _row(factory, run_id)
+    assert row.stopped_at == row.started_at
+
+
+def test_a_lasting_db_error_raises_an_emergency_alert(factory, monkeypatch, caplog):
+    import sys
+    monkeypatch.setattr(runner, "_audit", lambda *a, **k: None)
+    monkeypatch.setattr(runner.time, "sleep", lambda s: None)
+    monkeypatch.setattr(runner, "_session", _flaky_session(factory, failures=99))
+    alerts = []
+    notifier = SimpleNamespace(alert_emergency=lambda msg: alerts.append(msg))
+    monkeypatch.setitem(sys.modules, "bot.notifier", notifier)
+
+    with caplog.at_level("CRITICAL"):
+        assert runner._record_never_ran(77, "nope", "test") is False
+    assert alerts and "run_id=77" in alerts[0] and "stopped_at = started_at" in alerts[0]
+    assert "77" in caplog.text
