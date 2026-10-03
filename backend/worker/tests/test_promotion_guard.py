@@ -794,3 +794,19 @@ def test_a_row_from_before_stamping_still_restores(factory, monkeypatch):
     _start(w, run_id, None, restoring=True)
     assert built == [1]
     assert LivePromotionGuard(factory)._check_paper_run() is False, "never counted"
+
+
+@pytest.mark.parametrize("flag, expected", [("true", True), ("false", False), (None, False)])
+def test_a_start_records_whether_orders_are_submitted(factory, monkeypatch, flag, expected):
+    monkeypatch.setenv("KIS_ENV", "paper")
+    if flag is None:
+        monkeypatch.delenv("ENABLE_LIVE_TRADING", raising=False)
+    else:
+        monkeypatch.setenv("ENABLE_LIVE_TRADING", flag)
+    w, _ = _counting_worker(monkeypatch, factory)
+    run_id = _stamped_row(factory, "paper")
+
+    _start(w, run_id, "paper")
+
+    cfg = json.loads(_row(factory, run_id).config)
+    assert cfg == {"kis_env": "paper", "orders_enabled": expected}, "the env stamp is kept"

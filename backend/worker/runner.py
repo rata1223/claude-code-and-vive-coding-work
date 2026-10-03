@@ -1015,6 +1015,7 @@ class StrategyWorker:
             with self._lock:
                 self._sessions.pop(run_id, None)
             return
+        self._stamp_order_mode(run_id)
 
         strategy = self._build_strategy(data)
         if strategy is None:
@@ -1104,6 +1105,29 @@ class StrategyWorker:
         else:
             _record_never_ran(run_id, data.get("strategy_type"), reason)
         return False
+
+    def _stamp_order_mode(self, run_id) -> None:
+        """Record on the run whether this worker submits orders
+        (``ENABLE_LIVE_TRADING``), as of this start or restore. A shadow run
+        never fills; the operator screen says so instead of only "no fills".
+        Best effort: the gate looks at fills, not at this."""
+        from backend.worker.promotion_guard import RUN_ORDERS_KEY, orders_enabled
+        try:
+            with _session() as db:
+                run = db.get(StrategyRun, run_id)
+                if run is None:
+                    return
+                try:
+                    cfg = json.loads(run.config or "{}")
+                except (TypeError, ValueError):
+                    cfg = {}
+                if not isinstance(cfg, dict):
+                    cfg = {}
+                cfg[RUN_ORDERS_KEY] = orders_enabled()
+                run.config = json.dumps(cfg)
+                db.commit()
+        except Exception as e:
+            logger.warning("주문 제출 여부 기록 실패 run_id=%s: %s", run_id, e)
 
     def _mark_start_failed(self, run_id: int, strategy_type):
         """The strategy for a start command could not be built, so it never ran.
@@ -1835,9 +1859,15 @@ def main():
         )
         _sys.exit(1)
     if _kis_env == "paper" and _live_enabled:
+        # The 4-week paper run: orders go to the KIS paper account. The paper gate
+        # (promotion_guard.paper_gate_status) needs a fill, so this is the setting
+        # that can pass it.
+        logger.info("KIS_ENV=paper + ENABLE_LIVE_TRADING=true — 모의투자 계좌로 주문을 보낸다")
+    if _kis_env == "paper" and not _live_enabled:
         logger.warning(
-            "KIS_ENV=paper이지만 ENABLE_LIVE_TRADING=true — "
-            "모의투자 TR_ID로 주문이 전송됩니다. 의도한 설정인지 확인하세요."
+            "섀도 모드(KIS_ENV=paper, ENABLE_LIVE_TRADING=false) — 주문이 나가지 않는다. "
+            "체결이 없으므로 이 실행은 4주 모의투자 관문에 세지 않는다. "
+            "모의투자는 ENABLE_LIVE_TRADING=true로."
         )
 
     # Create Worker first so its single poller can be shared with recovery

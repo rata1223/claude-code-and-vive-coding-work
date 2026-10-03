@@ -101,6 +101,8 @@ def _describe(run: dict, now: datetime) -> dict:
     row = dict(run)
     row["occupying"] = is_active or stopped is None
     row["kis_env"] = kis_env
+    row["orders_enabled"] = (run.get("orders_enabled")
+                             if isinstance(run.get("orders_enabled"), bool) else None)
     row["filled_orders"] = filled
     met, reason = paper_gate_status(
         SimpleNamespace(started_at=started, stopped_at=stopped, is_active=is_active,

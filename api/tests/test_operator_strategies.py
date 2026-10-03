@@ -261,3 +261,14 @@ def test_user_info_responses_carry_is_operator(client, seed_user, auth_headers, 
     monkeypatch.setenv("OPERATOR_USER_IDS", "")
     data = getattr(client, method)(path, headers=auth_headers, **kwargs).json()["data"]
     assert data["is_operator"] is False
+
+
+@pytest.mark.parametrize("value, expected", [(False, False), (True, True), ("false", None), (None, None)])
+def test_the_list_passes_the_order_mode_through(monkeypatch, db, user, value, expected):
+    now = datetime.utcnow()
+    run = {"id": 4, "name": "d", "type": "indicator", "is_active": True,
+           "started_at": _iso(now - timedelta(days=2)), "stopped_at": None,
+           "kis_env": "paper", "filled_orders": 0, "orders_enabled": value}
+    _wire(monkeypatch, user, _Upstream(runs=[run]))
+    (row,) = operator.list_runs(user).data["runs"]
+    assert row["orders_enabled"] is expected

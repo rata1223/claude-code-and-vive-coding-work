@@ -21,7 +21,11 @@
         <div class="run-line">{{ $t('operator.started_at') }}: {{ formatTime(run.started_at) }}</div>
         <div v-if="run.stopped_at" class="run-line">{{ $t('operator.stopped_at') }}: {{ formatTime(run.stopped_at) }}</div>
         <div class="run-line">{{ $t('operator.run_days', { days: run.run_days ?? '—' }) }}</div>
-        <div class="run-line">{{ $t('operator.env_fills', { env: envLabel(run.kis_env), n: run.filled_orders ?? 0 }) }}</div>
+        <div class="run-line">
+          {{ $t('operator.env_fills', { env: envLabel(run.kis_env), n: run.filled_orders ?? 0 }) }}
+          <!-- The worker's ENABLE_LIVE_TRADING at its last start: shadow submits nothing, so it never fills. -->
+          <span v-if="run.orders_enabled === false" class="shadow">· {{ $t('operator.shadow') }}</span>
+        </div>
         <div class="run-line gate" :class="{ met: run.paper_gate_met }">
           {{ gateText(run) }}
         </div>
@@ -302,6 +306,7 @@ export default {
 .run-name { font-size: 14px; font-weight: 600; color: var(--text); }
 .run-line { font-size: 12px; color: var(--text-2); line-height: 1.7; }
 .run-line.gate.met { color: var(--c-green, #07c160); }
+.run-line .shadow { color: var(--c-orange, #ff976a); }
 .run-stop { margin-top: 10px; }
 
 .form-card {

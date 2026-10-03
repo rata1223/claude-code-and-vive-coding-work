@@ -45,25 +45,43 @@ def paper_run_qualifies(run, now: datetime) -> bool:
 RUN_ENV_KEY = "kis_env"
 
 
+#: 워커가 실행을 시작·복원할 때 찍는 주문 제출 여부(``ENABLE_LIVE_TRADING``).
+#: ``False``면 섀도(신호만, 주문 없음)라 체결이 생기지 않는다 — 화면 설명용이고,
+#: 관문은 체결 자체를 본다.
+RUN_ORDERS_KEY = "orders_enabled"
+
+
+def orders_enabled() -> bool:
+    """이 프로세스가 주문을 실제로 제출하는가(``backend/strategy/base.py``의 섀도 게이트와 같은 규칙)."""
+    return os.environ.get("ENABLE_LIVE_TRADING", "false").lower() == "true"
+
+
 def current_kis_env() -> str:
     """이 프로세스의 KIS 환경. compose 기본값과 같이 없으면 ``paper``."""
     return os.environ.get("KIS_ENV", "paper")
 
 
-def run_kis_env(run) -> str | None:
-    """실행에 찍힌 환경. 찍히지 않았거나(이 기록 이전의 행) 읽을 수 없으면 ``None``."""
+def _run_config(run) -> dict:
     raw = getattr(run, "config", None)
     if isinstance(raw, dict):
-        cfg = raw
-    else:
-        try:
-            cfg = json.loads(raw or "{}")
-        except (TypeError, ValueError):
-            return None
-    if not isinstance(cfg, dict):
-        return None
-    env = cfg.get(RUN_ENV_KEY)
+        return raw
+    try:
+        cfg = json.loads(raw or "{}")
+    except (TypeError, ValueError):
+        return {}
+    return cfg if isinstance(cfg, dict) else {}
+
+
+def run_kis_env(run) -> str | None:
+    """실행에 찍힌 환경. 찍히지 않았거나(이 기록 이전의 행) 읽을 수 없으면 ``None``."""
+    env = _run_config(run).get(RUN_ENV_KEY)
     return env if isinstance(env, str) and env else None
+
+
+def run_orders_enabled(run) -> bool | None:
+    """워커가 마지막으로 찍은 주문 제출 여부. 기록이 없으면 ``None``."""
+    value = _run_config(run).get(RUN_ORDERS_KEY)
+    return value if isinstance(value, bool) else None
 
 
 def paper_gate_status(run, filled_orders: int, now: datetime) -> tuple[bool, str | None]:

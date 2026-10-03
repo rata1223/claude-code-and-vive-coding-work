@@ -170,7 +170,9 @@ def get_orders():
 # ── 전략 ─────────────────────────────────────────────────────────────────
 @app.get("/api/strategies")
 def list_strategies():
-    from backend.worker.promotion_guard import filled_order_counts, run_kis_env
+    from backend.worker.promotion_guard import (
+        filled_order_counts, run_kis_env, run_orders_enabled,
+    )
     db = get_db()
     rows = db.query(StrategyRun).order_by(StrategyRun.started_at.desc()).limit(50).all()
     # What the 4-week gate needs besides the dates: the environment the run was
@@ -180,7 +182,8 @@ def list_strategies():
         {"id": r.id, "name": r.name, "type": r.strategy_type,
          "is_active": r.is_active, "started_at": r.started_at.isoformat(),
          "stopped_at": r.stopped_at.isoformat() if r.stopped_at else None,
-         "kis_env": run_kis_env(r), "filled_orders": fills.get(r.id, 0)}
+         "kis_env": run_kis_env(r), "orders_enabled": run_orders_enabled(r),
+         "filled_orders": fills.get(r.id, 0)}
         for r in rows
     ])
 
@@ -253,6 +256,8 @@ def start_strategy():
                                  f"(가능: {sorted(_STARTABLE_STRATEGY_TYPES)})"}), 400
 
     config = body.get("config")
+    if config is None:          # an explicit null meant "no settings" before stamping
+        config = {}
     if not isinstance(config, dict):
         return jsonify({"error": "config는 객체여야 한다"}), 400
     # The environment this run trades in, stamped by the server — never the

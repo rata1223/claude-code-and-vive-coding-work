@@ -813,6 +813,7 @@ export default {
     gate_env_real: 'Does not count toward the 4-week paper gate (ran in the real environment)',
     gate_env_unknown: 'Does not count toward the 4-week paper gate (environment not recorded)',
     gate_no_fills: '4-week paper gate not met (no filled orders)',
+    shadow: 'shadow mode — no orders submitted',
     gate_at: '4-week paper gate: {at}',
     stop: 'Stop',
     start_title: 'Start a run',

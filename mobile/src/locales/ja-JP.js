@@ -813,6 +813,7 @@ export default {
     gate_env_real: '4週間の模擬取引条件の対象外(実取引環境で実行)',
     gate_env_unknown: '4週間の模擬取引条件の対象外(環境の記録なし)',
     gate_no_fills: '4週間の模擬取引条件は未達(約定済み注文なし)',
+    shadow: 'シャドーモード — 注文未送信',
     gate_at: '4週間の模擬取引条件: {at}',
     stop: '停止',
     start_title: '実行を開始',

@@ -812,6 +812,7 @@ export default {
     gate_env_real: '不計入4週模擬交易條件（在實盤環境執行）',
     gate_env_unknown: '不計入4週模擬交易條件（未記錄環境）',
     gate_no_fills: '未滿足4週模擬交易條件（無已成交訂單）',
+    shadow: '影子模式 — 不送出訂單',
     gate_at: '4週模擬交易條件：{at}',
     stop: '停止',
     start_title: '啟動執行',

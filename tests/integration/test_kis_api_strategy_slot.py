@@ -156,3 +156,26 @@ def test_the_list_reports_environment_and_filled_orders(factory):
         "/api/strategies", headers={"X-API-Key": KEY}).get_json()}
     assert (rows[ids[0]]["kis_env"], rows[ids[0]]["filled_orders"]) == ("paper", 2)
     assert (rows[ids[1]]["kis_env"], rows[ids[1]]["filled_orders"]) == (None, 0)
+
+
+def test_a_null_config_still_starts_with_the_stamp(factory, monkeypatch):
+    monkeypatch.setenv("KIS_ENV", "paper")
+    res = srv.app.test_client().post(
+        "/api/strategies/start", headers={"X-API-Key": KEY},
+        json={"name": "house", "strategy_type": "indicator", "config": None})
+    assert res.status_code == 201
+    with factory() as db:
+        assert json.loads(db.query(StrategyRun).one().config) == {"kis_env": "paper"}
+
+
+def test_the_list_reports_the_order_mode_the_worker_recorded(factory):
+    with factory() as db:
+        for cfg in ('{"kis_env": "paper", "orders_enabled": false}',
+                    '{"kis_env": "paper", "orders_enabled": true}',
+                    '{"kis_env": "paper", "orders_enabled": "yes"}', "{}"):
+            db.add(StrategyRun(name="r", strategy_type="indicator", config=cfg, is_active=False,
+                               stopped_at=datetime.utcnow()))
+        db.commit()
+    rows = srv.app.test_client().get("/api/strategies", headers={"X-API-Key": KEY}).get_json()
+    assert sorted((r["id"], r["orders_enabled"]) for r in rows) == [
+        (1, False), (2, True), (3, None), (4, None)]

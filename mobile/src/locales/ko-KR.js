@@ -813,6 +813,7 @@ export default {
     gate_env_real: '4주 모의투자 관문에 세지 않음(실전 환경 실행)',
     gate_env_unknown: '4주 모의투자 관문에 세지 않음(환경 기록 없음)',
     gate_no_fills: '4주 모의투자 관문 미충족(체결된 주문 없음)',
+    shadow: '섀도 모드 — 주문 미제출',
     gate_at: '4주 모의투자 관문: {at}',
     stop: '중지',
     start_title: '실행 시작',

@@ -103,3 +103,4 @@ def test_the_screen_explains_every_gate_reason():
     for reason in reasons - {"duration"}:
         assert f"reason === '{reason}'" in src, reason
     assert "operator.env_fills" in src
+    assert 'v-if="run.orders_enabled === false"' in src, "a shadow run is labelled"
