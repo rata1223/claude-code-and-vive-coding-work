@@ -21,6 +21,12 @@ errorlog = "-"
 loglevel = "info"
 
 
+def on_starting(server):
+    """Refuse to start without KIS_API_KEY — this API can flatten the account."""
+    from backend.api.server import require_api_key
+    require_api_key()
+
+
 def post_fork(server, worker):
     """각 worker 프로세스 fork 후 WorkerWatchdog 시작."""
     log = logging.getLogger("gunicorn.error")

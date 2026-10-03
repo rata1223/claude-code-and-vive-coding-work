@@ -12,7 +12,7 @@
 
 ---
 
-## 프로젝트 진행 현황 (2026-10-01 기준, main `86c8ca7` = PR #201)
+## 프로젝트 진행 현황 (2026-10-02 기준, main `79230e8` = PR #202)
 
 > **이 섹션이 최신 상태의 단일 진실 공급원(SoT).** 아래 "다음 작업 목록(Stage 1~9)"은 초기 설계 로드맵으로,
 > 대부분 이미 구현 완료됐다. 실제 진행은 `AUDIT.md` → `ROADMAP.md` 기반 하드닝 트랙으로 이어지고 있다.
@@ -68,6 +68,7 @@
 | Pinia 스토어 분리 | #200 | **P3-04** — `stores/index.js` 한 파일(웹 307줄·모바일 360줄)을 스토어별 모듈 8개 + `pinia.js` + 배럴 `index.js`로(가져오는 쪽 16곳씩 그대로). 웹·모바일 사본이 갈라져 버그가 났었다(#150 키움 자격증명, 모바일 프로필 크래시) → 두 앱이 **동일한** 스토어 파일. 모바일에만 있던 미사용 `useBrokerStore`·`useWebSocketStore`·`kiwoomItems` 제거. 정적 가드 `tests/integration/test_frontend_store_parity.py`(두 앱 동일·스토어 id 1회·로그아웃이 계정 스토어 전부 리셋) |
 | API CI·이미지 | #201 | **#127** — `api/tests/`(627건)가 어느 CI에서도 돌지 않았다 → `tests.yml`에 `pytest-api` 잡(Postgres, **`requirements-api.txt`만 설치** — API 이미지와 같은 의존성). 그러다 발견: **API 이미지(`Dockerfile.api`)가 기동 불가**였다 — `backend/`를 COPY하지 않는데 `api/`가 import(`No module named 'backend'`), `requirements-api.txt`에 RestrictedPython 없음(`strategy/`). 둘 다 추가 + 이미지의 COPY 줄만으로 `import api.main`을 하는 테스트(`api/tests/test_api_image_layout.py`). 배포는 이 워크플로 성공에 게이팅되므로 API 테스트 실패도 배포를 막는다 |
 | WS 토큰 검증 | #202 | **#189** — `kis-ws`(`Dockerfile.kis-bot`)는 `api.auth`를 import해 토큰을 검증했는데 이미지에 `api/`·JWT 라이브러리·`JWT_SECRET_KEY`가 없었고, `ImportError`를 삼켜 **모든 WS 클라이언트를 인증 실패로 거부**했다. 검증을 `backend/security/jwt_tokens.py`로 옮기고 `api.auth.decode_access_token`이 그것을 쓴다(검증기 하나). `requirements.txt`에 PyJWT(API와 같은 버전), compose `kis-ws`에 API와 같은 `JWT_SECRET_KEY`. 설정 누락은 이제 연결마다 거부가 아니라 **기동 실패**(`_require_token_verifier`). **유효한 토큰만으로는 안 된다** — 중계 데이터(주문·포지션·자산·경보)는 `.env` 단일 운영 계좌이고 가입은 열려 있어서 `WS_OPERATOR_USER_IDS`(compose·`.env`, 비우면 전원 거부)에 있는 사용자 id(토큰 `sub`)만 연결 — 이메일이 아닌 이유: 가입이 메일 소유를 확인하지 않아 등록 안 된 운영자 주소를 남이 가입할 수 있다(코드 리뷰·CodeRabbit 지적). 토큰에 `exp` 필수, 소켓은 토큰 만료 시 끊긴다(30초 주기 점검). **별건 수정**: 고정된 flask-socketio 5.3.6이 Flask 3.1과 비호환이라 모든 Socket.IO 이벤트가 `AttributeError`로 실패했다 → 5.6.1. **주의: 웹·모바일 앱에는 WS 클라이언트가 아직 없다** — 서버는 동작하지만 붙는 곳이 없다 |
+| 운영 API 노출·경보 | #203 | 이미지 감사(#201·#202 후속). 이미지 구성·의존성은 문제없음(kis-api·kis-worker·kis-ws 진입점이 각자 COPY한 것만으로 import). 대신 compose에서: **kis-api(:5001)가 열려 있었다** — `KIS_API_KEY` 기본값이 빈 값이면 `_check_api_key`가 인증을 통째로 껐고 포트는 모든 인터페이스에 게시돼, 접근 가능한 누구나 `POST /api/admin/flatten {"confirm":true}`(운영 계좌 전량 매도)·전략 시작/중지·조정·잔고를 인증 없이 호출할 수 있었다. 이제 키가 없으면 열린 경로(`/api/health`·`status`·`metrics`) 외 503, gunicorn 기동 거부(`on_starting`→`require_api_key`), compose는 `KIS_API_KEY:?`로 시작 거부·포트는 `127.0.0.1:5001`만, 키 비교는 `hmac.compare_digest`. **워커 경보 유실**: kis-worker·kis-api에 `TELEGRAM_TOKEN`/`TELEGRAM_CHAT_ID`가 전달되지 않아 킬스위치·MDD 청산·워치독·복구 경보가 전부 사라졌다 → 전달 |
 
 **열린 PR 0건.** 다음 작업은 `origin/main`에서 새로 분기하면 된다.
 
@@ -179,6 +180,11 @@
    정상이다. 만약 행이 있으면(코드 밖에서 넣은 경우) 버리지 말고 먼저 옮긴다:
    `INSERT INTO strategy_trades (strategy_id, symbol, side, qty, price, filled_at, pnl, fee) SELECT strategy_id, symbol, side, qty, price, filled_at, pnl, fee FROM trades;`
    API 테이블은 Alembic이 아니라 `create_all`로 관리되므로(`alembic/env.py`의 target은 backend `Base`) 자동 마이그레이션을 두지 않았다
+
+12. **배포 전 `KIS_API_KEY` 필수**(PR #203): 서버 `.env`에 없으면 `docker compose up`이 시작을 거부한다(kis-api는 인증 없는 모드가 없다).
+   `python -c "import secrets; print(secrets.token_hex(32))"`로 만들어 넣을 것. kis-api는 호스트 루프백(`127.0.0.1:5001`)에만 노출된다.
+   **기록만 한 것**: `statsmodels`가 `requirements.txt`에 없다 — 쓰는 곳은 `PairsSignal`(`backend/quant/signals/mean_reversion.py`)의
+   공적분 검정뿐이고 아무도 쓰지 않는다. 쓰게 되면 kis-bot 이미지에서 `ImportError`가 삼켜져 "공적분 없음"으로 **조용히 신호를 내지 않는다**
 
 ---
 
@@ -503,7 +509,7 @@ KR_ETF   = ["069500", "360750", "091160"]  # KODEX200, TIGER S&P500, KODEX반도
 - **PR #79** (`claude/update-MW7LQ`): 실패 시나리오 통합테스트 (TASK 4-1C) — **머지됨** (2026-06-16)
 - 하드닝 트랙 PR #85~#156: 위 "프로젝트 진행 현황" 표 참조 — **모두 머지됨**
 - **PR #116**은 미머지 종료(2026-07-05). 같은 작업을 **#119**가 대체 구현해 머지했다
-- **현재 열린 PR 0건.** main = `86c8ca7` (PR #201)
+- **현재 열린 PR 0건.** main = `79230e8` (PR #202)
 
 > 작업 방식: 기능별 새 브랜치에서 작업 → `main`으로 드래프트 PR → CodeRabbit/CodeQL 리뷰 → 머지.
 > 브랜치 보호 룰셋(PR 필수 + 코드 스캐닝)이 적용돼 `main` 직접 푸시 불가.
