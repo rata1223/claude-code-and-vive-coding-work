@@ -291,6 +291,7 @@ def test_handle_start_marks_a_command_session_as_a_new_start(monkeypatch):
             pass
 
     monkeypatch.setattr(runner, "WorkerSession", _Session)
+    monkeypatch.setattr(w, "_run_still_wanted", lambda run_id: True)
     w._handle_start({"run_id": 1})
     w._handle_start({"run_id": 2}, restoring=True)
     assert made == [True, False]
@@ -339,3 +340,57 @@ def test_a_lasting_db_error_raises_an_emergency_alert(factory, monkeypatch, capl
         assert runner._record_never_ran(77, "nope", "test") is False
     assert alerts and "run_id=77" in alerts[0] and "stopped_at = started_at" in alerts[0]
     assert "77" in caplog.text
+
+
+# ── a replayed start command must not revive a stopped run (CodeRabbit) ───
+
+def _built_worker(monkeypatch, factory):
+    monkeypatch.setattr(runner, "_SessionFactory", factory)
+    monkeypatch.setattr(runner, "_audit", lambda *a, **k: None)
+    w = _worker()
+    monkeypatch.setattr(w, "_build_strategy", lambda data: pytest.fail("must not build"))
+    return w
+
+
+def test_a_replayed_start_of_a_never_ran_run_is_ignored(factory, monkeypatch):
+    w = _built_worker(monkeypatch, factory)
+    run_id = _active_row(factory, 2 * DAY)
+    runner._record_never_ran(run_id, "nope", "test")
+
+    w._handle_start({"run_id": run_id, "strategy_type": "indicator"})
+
+    assert run_id not in w._sessions
+
+
+def test_a_replayed_start_of_an_operator_stopped_run_is_ignored(factory, monkeypatch):
+    w = _built_worker(monkeypatch, factory)
+    with factory() as db:
+        run = StrategyRun(name="r", strategy_type="indicator", config="{}", is_active=False,
+                          started_at=datetime.utcnow() - DAY)
+        db.add(run)
+        db.commit()
+        run_id = run.id
+
+    w._handle_start({"run_id": run_id, "strategy_type": "indicator"})
+
+    assert run_id not in w._sessions
+
+
+def test_a_start_for_a_missing_row_is_ignored(factory, monkeypatch):
+    w = _built_worker(monkeypatch, factory)
+    w._handle_start({"run_id": 4242, "strategy_type": "indicator"})
+    assert 4242 not in w._sessions
+
+
+def test_an_active_run_still_starts(factory, monkeypatch):
+    monkeypatch.setattr(runner, "_SessionFactory", factory)
+    monkeypatch.setattr(runner, "_audit", lambda *a, **k: None)
+    w = _worker()
+    built = []
+    monkeypatch.setattr(w, "_build_strategy", lambda data: built.append(1) or _FailingStrategy())
+    monkeypatch.setattr(runner.WorkerSession, "start", lambda self: None)
+    run_id = _active_row(factory, DAY)
+
+    w._handle_start({"run_id": run_id, "strategy_type": "indicator"})
+
+    assert built == [1] and w._sessions.get(run_id) is not None

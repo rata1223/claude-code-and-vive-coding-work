@@ -954,6 +954,11 @@ class StrategyWorker:
             # Reserve slot under lock to prevent a concurrent duplicate start
             self._sessions[run_id] = None
 
+        if not self._run_still_wanted(run_id):
+            with self._lock:
+                self._sessions.pop(run_id, None)
+            return
+
         strategy = self._build_strategy(data)
         if strategy is None:
             with self._lock:
@@ -968,6 +973,30 @@ class StrategyWorker:
             self._sessions[run_id] = session
         session.start()
         _audit("strategy_start", detail={"run_id": run_id, "strategy_type": data.get("strategy_type")})
+
+    def _run_still_wanted(self, run_id) -> bool:
+        """Start only a run whose row is still active with no recorded stop.
+
+        A start command can arrive twice: Redis delivers it, and its
+        ``commands`` row stays ``pending`` until the DB-polling fallback
+        replays it. By then the run may have been stopped by the operator or
+        recorded as never having run (``_record_never_ran``); starting it again
+        would trade under a row that says it is off — and the next boot would
+        not restore it. Unreadable state is treated as "do not start".
+        """
+        try:
+            with _session() as db:
+                run = db.get(StrategyRun, run_id)
+                if run is None:
+                    logger.warning("시작 요청 무시 — 실행 행 없음: run_id=%s", run_id)
+                    return False
+                if not run.is_active or run.stopped_at is not None:
+                    logger.warning("시작 요청 무시 — 이미 중지된 실행: run_id=%s", run_id)
+                    return False
+                return True
+        except Exception as e:
+            logger.warning("시작 요청 보류 — 실행 상태를 읽지 못함 run_id=%s: %s", run_id, e)
+            return False
 
     def _mark_start_failed(self, run_id: int, strategy_type):
         """The strategy for a start command could not be built, so it never ran.
