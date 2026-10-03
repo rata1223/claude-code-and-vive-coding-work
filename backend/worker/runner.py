@@ -244,6 +244,13 @@ class WorkerSession:
         #: Whether ``_run``'s exit should mark ``strategy_runs.is_active = False``.
         #: See ``stop()``.
         self._deactivate_on_exit = True
+        #: ``on_market_open`` calls in flight. They run on their own threads, so
+        #: the session thread ending does not mean the strategy has stopped
+        #: acting; ``_run`` waits for this to reach 0 before it releases the
+        #: slot (``stopped_at``). Checked together with ``_stop_event`` under the
+        #: condition, so none can start once the drain has begun.
+        self._callbacks = 0
+        self._callbacks_cv = threading.Condition()
 
     def start(self):
         self._thread = threading.Thread(target=self._run, daemon=True, name=f"strategy-{self.run_id}")
@@ -278,16 +285,38 @@ class WorkerSession:
         self._thread.join(timeout)
         return not self._thread.is_alive()
 
+    def is_alive(self) -> bool:
+        """Whether the session thread is still running (its exit writes the
+        run's end, see ``_run``)."""
+        return self._thread is not None and self._thread.is_alive()
+
     def trigger_market_open(self, market: str):
         """Scheduler calls this when a market session opens."""
-        if self._stop_event.is_set():
-            logger.info("[run_id=%d] 세션 중단 — on_market_open 스킵 (market=%s)", self.run_id, market)
-            return
+        with self._callbacks_cv:
+            if self._stop_event.is_set():
+                logger.info("[run_id=%d] 세션 중단 — on_market_open 스킵 (market=%s)", self.run_id, market)
+                return
+            self._callbacks += 1
         try:
             self.strategy.on_market_open()
             logger.info("[run_id=%d] on_market_open 호출 완료 (market=%s)", self.run_id, market)
         except Exception as e:
             logger.exception("on_market_open 오류 run_id=%d: %s", self.run_id, e)
+        finally:
+            with self._callbacks_cv:
+                self._callbacks -= 1
+                self._callbacks_cv.notify_all()
+
+    def _drain_callbacks(self):
+        """Wait for in-flight ``on_market_open`` calls. No timeout: until they
+        return the old run can still be acting on the account, and releasing the
+        slot would let a new run start beside it. A hung one keeps the slot
+        occupied (fail-closed) and is logged."""
+        with self._callbacks_cv:
+            while self._callbacks:
+                logger.warning("[run_id=%d] 진행 중인 on_market_open %d건 대기 — 끝나야 슬롯을 푼다",
+                               self.run_id, self._callbacks)
+                self._callbacks_cv.wait(30)
 
     def _run(self):
         started = False
@@ -299,15 +328,24 @@ class WorkerSession:
         except Exception as e:
             logger.exception("전략 실행 오류 run_id=%d: %s", self.run_id, e)
         finally:
-            # Order matters. ``_mark_stopped()`` is the durable record that the
+            # No new on_market_open from here on (also when start() raised and
+            # nobody called stop()).
+            with self._callbacks_cv:
+                self._stop_event.set()
+            # Order matters. ``is_active = False`` is the durable record that the
             # operator switched this strategy off, and ``_restore_active()``
             # reads it on the next boot — it must not be held hostage by user
-            # cleanup that may never return.
+            # cleanup that may never return. ``stopped_at`` is different: kis-api
+            # counts a run without it as holding the single strategy slot, so it
+            # is written only once no on_market_open is still in flight.
             if self._deactivate_on_exit:
                 if not started and self._new_start:
+                    self._drain_callbacks()
                     _record_never_ran(self.run_id, self._strategy_type,
                                       "strategy.start() 실패")
                 else:
+                    self._mark_stopped(release_slot=False)
+                    self._drain_callbacks()
                     self._mark_stopped()
 
             # ``StrategyBase.stop()`` calls the overridable ``on_stop()``;
@@ -321,13 +359,16 @@ class WorkerSession:
             except Exception as e:
                 logger.exception("전략 on_stop 오류 run_id=%d: %s", self.run_id, e)
 
-    def _mark_stopped(self):
+    def _mark_stopped(self, release_slot: bool = True):
+        """``is_active = False`` (not restored on the next boot); with
+        ``release_slot`` also ``stopped_at`` (frees kis-api's strategy slot)."""
         try:
             with _session() as db:
                 run = db.get(StrategyRun, self.run_id)
                 if run:
                     run.is_active = False
-                    run.stopped_at = datetime.utcnow()
+                    if release_slot:
+                        run.stopped_at = datetime.utcnow()
                     db.commit()
         except Exception as e:
             logger.warning("run 상태 업데이트 실패: %s", e)
@@ -339,6 +380,10 @@ class StrategyWorker:
     def __init__(self):
         self._redis = redis.from_url(_REDIS_URL)
         self._sessions: dict[int, WorkerSession] = {}
+        #: Sessions a stop has removed from ``_sessions`` whose thread has not
+        #: ended yet (it writes the run's end, see ``WorkerSession._run``). A
+        #: repeated stop for one of them must not record the run as ended.
+        self._stopping: dict[int, WorkerSession] = {}
         self._lock = threading.Lock()
         self._last_market_open: dict[str, float] = {}  # market → monotonic ts; dedup gate
 
@@ -621,12 +666,15 @@ class StrategyWorker:
         deadline = time.monotonic() + budget
         with self._lock:
             sessions = [s for s in self._sessions.values() if s is not None]
+            # Already stopping (an operator stop): joined, but not stopped again —
+            # deactivate=False would undo that stop.
+            stopping = list(getattr(self, "_stopping", {}).values())
         for session in sessions:
             try:
                 session.stop(deactivate=False)
             except Exception as e:
                 logger.warning("전략 중단 실패 run_id=%s: %s", session.run_id, e)
-        stuck = [s.run_id for s in sessions
+        stuck = [s.run_id for s in sessions + stopping
                  if not s.join(max(0.0, deadline - time.monotonic()))]
         if stuck:
             logger.warning("전략 스레드 미종료 run_id=%s — 데몬이라 프로세스와 함께 끝난다",
@@ -1016,10 +1064,22 @@ class StrategyWorker:
     def _handle_stop(self, data: dict):
         run_id = data["run_id"]
         with self._lock:
+            # getattr: workers built with ``__new__`` (the test suites) have none yet.
+            self._stopping = {k: s for k, s in getattr(self, "_stopping", {}).items()
+                              if s.is_alive()}
             session = self._sessions.pop(run_id, None)
+            still_stopping = self._stopping.get(run_id) if session is None else None
+            if session is not None:
+                self._stopping[run_id] = session
         if session:
             session.stop()
             _audit("strategy_stop", detail={"run_id": run_id})
+        elif still_stopping is not None:
+            # Stopped already and still ending: its thread writes the end once
+            # in-flight callbacks are done. Recording it here would free the slot
+            # while the old run may still be acting on the account.
+            logger.warning("이미 중단 중인 세션 — 종료되면 기록된다: run_id=%s", run_id)
+            still_stopping.stop()
         else:
             # Nothing runs here for this run (stopped before it was built, or the
             # stop is replayed after a boot that did not restore the inactive

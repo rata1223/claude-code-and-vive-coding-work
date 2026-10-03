@@ -24,9 +24,10 @@
         <div class="run-line gate" :class="{ met: run.paper_gate_met }">
           {{ gateText(run) }}
         </div>
-        <!-- Any run holding the slot, "Stopping" included: if the worker never
-             recorded the stop (down when it arrived, write failed), sending it
-             again makes the worker record a zero-day end and frees the slot. -->
+        <!-- Any run holding the slot, "Stopping" included. If the worker has
+             no session for it (down when the stop arrived, write failed),
+             sending it again records a zero-day end and frees the slot; if the
+             run is still ending, the worker frees the slot only once it has. -->
         <van-button
           v-if="run.occupying"
           type="danger"
