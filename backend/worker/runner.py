@@ -874,7 +874,7 @@ class StrategyWorker:
             self._shutdown.wait(30)
 
     # ── 이벤트 핸들러 ─────────────────────────────────────────────────────
-    def _handle_start(self, data: dict):
+    def _handle_start(self, data: dict, restoring: bool = False):
         run_id = data["run_id"]
         with self._lock:
             if run_id in self._sessions:
@@ -887,6 +887,8 @@ class StrategyWorker:
         if strategy is None:
             with self._lock:
                 self._sessions.pop(run_id, None)  # release reservation
+            if not restoring:
+                self._mark_start_failed(run_id, data.get("strategy_type"))
             return
 
         session = WorkerSession(run_id, strategy)
@@ -894,6 +896,33 @@ class StrategyWorker:
             self._sessions[run_id] = session
         session.start()
         _audit("strategy_start", detail={"run_id": run_id, "strategy_type": data.get("strategy_type")})
+
+    def _mark_start_failed(self, run_id: int, strategy_type):
+        """A start command whose strategy could not be built never ran: record it
+        as stopped at its own start (zero duration). Left active with no
+        ``stopped_at`` it would read as a run that has been going since
+        ``started_at`` — and pass the 4-week paper gate
+        (``promotion_guard.paper_run_qualifies``) without trading at all. Not
+        "now": a start command can be handled days late (worker down, picked up
+        from ``commands``), and now − started_at would count those days.
+
+        Only for new starts. A restore at boot that fails (e.g. the broker is
+        briefly unreachable) keeps the row active so the next boot retries it,
+        rather than ending a running strategy over a transient outage.
+        """
+        try:
+            with _session() as db:
+                run = db.get(StrategyRun, run_id)
+                if run is not None and run.stopped_at is None:
+                    run.is_active = False
+                    run.stopped_at = run.started_at or datetime.utcnow()
+                    db.commit()
+        except Exception as e:
+            logger.warning("시작 실패 기록 실패 run_id=%s: %s", run_id, e)
+        logger.error("전략 시작 실패 — 실행으로 치지 않음(중지 기록): run_id=%s type=%s",
+                     run_id, strategy_type)
+        _audit("strategy_start_failed",
+               detail={"run_id": run_id, "strategy_type": strategy_type})
 
     def _handle_stop(self, data: dict):
         run_id = data["run_id"]
@@ -944,7 +973,7 @@ class StrategyWorker:
                             "config": config,
                             "broker": row.broker,
                         }
-                        self._handle_start(data)
+                        self._handle_start(data, restoring=True)
                     except Exception as e:
                         logger.warning("복원 실패 run_id=%d: %s", row.id, e)
         except Exception as e:
