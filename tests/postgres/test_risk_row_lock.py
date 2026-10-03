@@ -332,3 +332,50 @@ def _lock_and_commit(factory, days):
         order = [r.trade_date for r in lock_risk_rows(s, days)]
         s.commit()
         return order
+
+
+# ── kis-api: two concurrent strategy starts, one slot ────────────────────────
+
+def test_concurrent_strategy_starts_take_the_slot_once(pg_trading_engine):
+    """B1: without the advisory lock both transactions read an empty slot and
+    both insert an active run."""
+    import threading
+    import time
+    from sqlalchemy.orm import Session
+    from backend.api import server as srv
+    from backend.database.models import StrategyRun
+
+    with Session(pg_trading_engine) as db:
+        db.query(StrategyRun).delete()
+        db.commit()
+
+    a_has_lock = threading.Event()
+    results = {}
+
+    def first():
+        with Session(pg_trading_engine) as db:
+            results["a"] = srv._occupying_run(db)
+            db.add(StrategyRun(name="a", strategy_type="indicator", config="{}", is_active=True))
+            db.flush()
+            a_has_lock.set()
+            time.sleep(0.5)          # hold the lock while the second start arrives
+            db.commit()
+
+    def second():
+        a_has_lock.wait(5)
+        with Session(pg_trading_engine) as db:
+            results["b"] = srv._occupying_run(db)
+            if results["b"] is None:
+                db.add(StrategyRun(name="b", strategy_type="indicator", config="{}",
+                                   is_active=True))
+            db.commit()
+
+    ta, tb = threading.Thread(target=first), threading.Thread(target=second)
+    ta.start(); tb.start(); ta.join(10); tb.join(10)
+
+    assert results["a"] is None
+    assert results["b"] is not None, "the second start must see the first run"
+    with Session(pg_trading_engine) as db:
+        assert db.query(StrategyRun).count() == 1
+        db.query(StrategyRun).delete()
+        db.commit()

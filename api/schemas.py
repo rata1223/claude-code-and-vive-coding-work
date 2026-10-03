@@ -1,6 +1,6 @@
 from datetime import datetime
 from typing import Any, Optional, List
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
 
 # ─────────────────────────────────────────────
@@ -245,3 +245,43 @@ class ClosePositionRequest(BaseModel):
 class ProfileUpdate(BaseModel):
     nickname: Optional[str] = None
     avatar: Optional[str] = None
+
+
+# ─────────────────────────────────────────────
+# Operator: the worker's house strategy (docs/STRATEGY_START_B_DESIGN.md, B1)
+# ─────────────────────────────────────────────
+class OperatorStrategyStart(BaseModel):
+    """What the app may ask kis-api to start. Narrower than kis-api accepts:
+    always the indicator (house) strategy, a universe drawn from the canonical
+    list, at most 5% per position, a bounded stop. Unknown keys are refused —
+    nothing is passed through unseen."""
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(..., min_length=1, max_length=100)
+    universe: list[str] = Field(..., min_length=1)
+    position_size_pct: float = Field(..., gt=0, le=0.05)
+    stop_loss_pct: float = Field(0.07, ge=0.01, le=0.15)
+
+    @field_validator("name")
+    @classmethod
+    def _name_not_blank(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("name must not be blank")
+        return v
+
+    @field_validator("universe")
+    @classmethod
+    def _universe_from_canonical_list(cls, v: list[str]) -> list[str]:
+        from backend.quant.data.universe import UNIVERSE
+        allowed = set(UNIVERSE)
+        unknown = [s for s in v if s not in allowed]
+        if unknown:
+            raise ValueError(f"not in the trading universe: {unknown}")
+        return list(dict.fromkeys(v))
+
+
+class OperatorStrategyStop(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: int = Field(..., gt=0)
