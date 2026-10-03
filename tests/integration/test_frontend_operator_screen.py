@@ -63,3 +63,11 @@ def test_the_screen_sends_fractions_not_percentages():
     src = _read("frontend/src/views/profile/OperatorStrategy.vue")
     assert "position_size_pct: Number(this.form.sizePct) / 100" in src
     assert "stop_loss_pct: Number(this.form.stopPct) / 100" in src
+
+
+def test_a_run_stuck_in_stopping_can_be_stopped_again():
+    """A stop the worker never recorded keeps the slot; the screen must offer
+    stop for every occupying run, not only active ones (re-sending is safe)."""
+    src = _read("frontend/src/views/profile/OperatorStrategy.vue")
+    m = re.search(r'<van-button\s+v-if="([^"]+)"[^>]*@click="stopRun\(run\)"', src, re.S)
+    assert m and m.group(1).strip() == "run.occupying"
