@@ -139,3 +139,20 @@ def test_the_screen_closes_the_feed_when_it_leaves():
     src = _read("frontend/src/views/profile/OperatorStrategy.vue")
     unmount = src.split("beforeUnmount() {", 1)[1].split("},", 1)[0]
     assert "this.feed.close()" in unmount
+
+
+def test_every_alert_level_the_backend_sends_is_styled():
+    """``info`` is plain text; every other level any ``publish_alert`` caller
+    uses must stand out (a failed reconcile sends ``error``)."""
+    levels = set()
+    for path in (ROOT / "backend").rglob("*.py"):
+        if "/tests/" in str(path):
+            continue
+        src = path.read_text(encoding="utf-8")
+        if "publish_alert" not in src:
+            continue
+        levels |= set(re.findall(r'level\s*=\s*"([a-z]+)"', src))
+    assert {"critical", "error", "warning"} <= levels
+    css = _read("frontend/src/views/profile/OperatorStrategy.vue").split("<style", 1)[1]
+    for level in levels - {"info"}:
+        assert f".live-row.alert-{level}" in css, level

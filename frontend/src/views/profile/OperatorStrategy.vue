@@ -417,6 +417,7 @@ export default {
   border-bottom: 1px solid var(--border);
 }
 .live-time { color: var(--text-2); flex: none; }
-.live-row.alert-critical { color: var(--c-red, #ee0a24); }
+.live-row.alert-critical,
+.live-row.alert-error { color: var(--c-red, #ee0a24); }
 .live-row.alert-warning { color: var(--c-orange, #ff976a); }
 </style>
