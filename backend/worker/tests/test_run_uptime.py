@@ -13,7 +13,6 @@ from types import SimpleNamespace
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-from sqlalchemy.pool import StaticPool
 
 from backend.database.models import Base, Order, RunUptime, StrategyRun
 from backend.worker import runner
@@ -29,9 +28,14 @@ M = timedelta(minutes=1)
 
 
 @pytest.fixture()
-def factory():
-    eng = create_engine("sqlite://", connect_args={"check_same_thread": False},
-                        poolclass=StaticPool)
+def factory(tmp_path):
+    # A file, not one shared in-memory connection: the recorder writes from its
+    # own threads while the test reads, and SQLite connections are not safe to
+    # share across threads (a colliding write fails and is swallowed by design,
+    # which made the threaded tests flaky). Each thread gets its own connection,
+    # as each session does in the worker.
+    eng = create_engine(f"sqlite:///{tmp_path / 'uptime.db'}",
+                        connect_args={"check_same_thread": False, "timeout": 10})
     Base.metadata.create_all(eng)
     yield sessionmaker(bind=eng, expire_on_commit=False)
     eng.dispose()
