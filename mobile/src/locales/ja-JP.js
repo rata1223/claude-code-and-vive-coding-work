@@ -553,11 +553,7 @@ export default {
   about: {
     title: 'アプリについて',
     intro:
-      'QuantDinger は戦略ツール、マーケットデータ、ポートフォリオ運用をまとめたプラットフォームです。透明性の高い取引支援を目指します。暗号資産取引は高リスクのため、機能と取引所ルールを理解したうえでご利用ください。',
-    contact_title: 'お問い合わせ',
-    contact_email_label: 'サポートメール',
-    website_label: '公式サイト',
-    website_value: 'www.quantdinger.com',
+      'KIS Tradingは、韓国投資証券の口座でルールベースの株式・ETF戦略を自動運用するプラットフォームです。リスク上限と運用者パネルを備えています。株式・ETFの取引には損失のリスクがあります。戦略と安全装置の仕組みを十分に理解したうえでご利用ください。',
     app_version_label: 'アプリのバージョン',
     server_version_label: 'サーバー側の最新版',
     check_update: '更新を確認',
@@ -565,7 +561,8 @@ export default {
     up_to_date: '最新バージョンです',
     update_available: '新しいバージョン {version} があります',
     update_now: 'ダウンロードしてインストール',
-    update_hint: '公式のダウンロード URL を開きます。Android の場合は APK を取得してインストールしてください。',
+    update_hint: 'サーバーが提供したダウンロード先を開きます。AndroidではAPKをインストールしてください。',
+    update_no_url: '新しいバージョンがありますが、サーバーがダウンロード先を提供していません。',
     terms_tab: '利用規約',
     disclaimer_tab: '免責事項',
     fetch_config_fail: 'バージョン情報を取得できませんでした。ネットワークやサーバー設定を確認してください。'

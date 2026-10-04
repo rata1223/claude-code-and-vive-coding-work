@@ -552,11 +552,7 @@ export default {
   about: {
     title: '關於我們',
     intro:
-      'QuantDinger 整合策略交易、市場資料與資產管理流程，致力提供透明、可理解的輔助工具。數位資產交易具高風險，請在充分理解產品與交易所規則後謹慎使用。',
-    contact_title: '聯絡我們',
-    contact_email_label: '客服信箱',
-    website_label: '官方網站',
-    website_value: 'www.quantdinger.com',
+      'KIS Trading 在韓國投資證券帳戶上自動執行以規則為基礎的股票與 ETF 策略，具備風險上限與營運者面板。股票與 ETF 交易存在虧損風險，請在充分了解策略及其保護機制後使用。',
     app_version_label: '目前應用程式版本',
     server_version_label: '伺服端發布版本',
     check_update: '檢查更新',
@@ -564,7 +560,8 @@ export default {
     up_to_date: '目前已是最新版本',
     update_available: '發現新版本 {version}',
     update_now: '立即下載安裝',
-    update_hint: '將開啟官方下載連結，請下載 APK 後完成安裝（Android）。',
+    update_hint: '將開啟伺服器提供的下載位址。Android 請下載並安裝 APK。',
+    update_no_url: '有新版本，但伺服器未提供下載位址。',
     terms_tab: '使用者協議',
     disclaimer_tab: '免責聲明',
     fetch_config_fail: '無法取得版本資訊，請檢查網路或伺服器設定'

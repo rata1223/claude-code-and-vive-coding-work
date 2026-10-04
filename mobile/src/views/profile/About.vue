@@ -8,19 +8,6 @@
     </div>
 
     <van-cell-group inset class="group">
-      <van-cell :title="$t('about.contact_title')" is-link @click="copyEmail">
-        <template #label>
-          <span class="muted">{{ contactEmail }}</span>
-        </template>
-        <template #right-icon>
-          <van-icon name="description" class="cell-icon" />
-        </template>
-      </van-cell>
-      <van-cell :title="$t('about.website_label')" is-link @click="openWebsite">
-        <template #label>
-          <span class="muted">{{ websiteDisplay }}</span>
-        </template>
-      </van-cell>
       <van-cell :title="$t('about.app_version_label')" :value="localVersion" />
       <van-cell
         v-if="serverLatestVersion"
@@ -55,9 +42,16 @@ import { Browser } from '@capacitor/browser'
 import { authApi } from '@/api'
 import { APP_BUILD_VERSION, isRemoteVersionNewer } from '@/constants/appVersion'
 
-const DEFAULT_DOWNLOAD = 'https://www.quantdinger.com/download/app.apk'
-const WEBSITE = 'https://www.quantdinger.com'
-const CONTACT_EMAIL = 'support@quantdinger.com'
+/** Only an https download address the server provides is ever opened — no
+ *  built-in fallback (the upstream project's APK used to be one). */
+const safeDownloadUrl = (value) => {
+  try {
+    const url = new URL(String(value ?? '').trim())
+    return url.protocol === 'https:' && url.hostname ? url.href : ''
+  } catch {
+    return ''
+  }
+}
 
 export default {
   name: 'About',
@@ -66,18 +60,9 @@ export default {
     return {
       localVersion: APP_BUILD_VERSION,
       serverLatestVersion: '',
-      downloadUrl: DEFAULT_DOWNLOAD,
+      downloadUrl: '',
       checking: false,
       updateDialog: false
-    }
-  },
-
-  computed: {
-    contactEmail() {
-      return CONTACT_EMAIL
-    },
-    websiteDisplay() {
-      return 'www.quantdinger.com'
     }
   },
 
@@ -94,33 +79,10 @@ export default {
           this.serverLatestVersion = String(
             d.mobile_app_latest_version ?? d.mobileAppLatestVersion ?? ''
           ).trim()
-          const u = String(d.mobile_app_download_url ?? d.mobileAppDownloadUrl ?? '').trim()
-          if (u) this.downloadUrl = u
+          this.downloadUrl = safeDownloadUrl(d.mobile_app_download_url ?? d.mobileAppDownloadUrl)
         }
       } catch (e) {
         console.warn('About prefetch version:', e)
-      }
-    },
-
-    async copyEmail() {
-      try {
-        await navigator.clipboard.writeText(CONTACT_EMAIL)
-        showToast({ message: this.$t('common.copied'), type: 'success' })
-      } catch {
-        showToast({ message: CONTACT_EMAIL, type: 'success' })
-      }
-    },
-
-    async openWebsite() {
-      try {
-        if (Capacitor.isNativePlatform()) {
-          await Browser.open({ url: WEBSITE, presentationStyle: 'fullscreen' })
-        } else {
-          window.open(WEBSITE, '_blank', 'noopener,noreferrer')
-        }
-      } catch (e) {
-        console.error(e)
-        window.open(WEBSITE, '_blank', 'noopener,noreferrer')
       }
     },
 
@@ -134,8 +96,7 @@ export default {
         }
         const d = res.data
         const latest = String(d.mobile_app_latest_version ?? d.mobileAppLatestVersion ?? '').trim()
-        const u = String(d.mobile_app_download_url ?? d.mobileAppDownloadUrl ?? '').trim()
-        if (u) this.downloadUrl = u || DEFAULT_DOWNLOAD
+        this.downloadUrl = safeDownloadUrl(d.mobile_app_download_url ?? d.mobileAppDownloadUrl)
         this.serverLatestVersion = latest
 
         if (!latest) {
@@ -143,7 +104,11 @@ export default {
           return
         }
         if (isRemoteVersionNewer(latest, this.localVersion)) {
-          this.updateDialog = true
+          if (this.downloadUrl) {
+            this.updateDialog = true
+          } else {
+            showToast({ message: this.$t('about.update_no_url'), type: 'fail' })
+          }
         } else {
           showToast({ message: this.$t('about.up_to_date'), type: 'success' })
         }
@@ -156,7 +121,8 @@ export default {
     },
 
     async onConfirmUpdate() {
-      const url = this.downloadUrl || DEFAULT_DOWNLOAD
+      const url = safeDownloadUrl(this.downloadUrl)
+      if (!url) return
       try {
         if (Capacitor.isNativePlatform()) {
           await Browser.open({ url, presentationStyle: 'fullscreen' })
@@ -202,16 +168,6 @@ export default {
 
 .group {
   margin-top: 8px;
-}
-
-.muted {
-  color: var(--text-3);
-  font-size: 12px;
-}
-
-.cell-icon {
-  color: var(--text-3);
-  font-size: 18px;
 }
 
 .actions {

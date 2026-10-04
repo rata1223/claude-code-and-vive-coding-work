@@ -10,7 +10,9 @@ import { fileURLToPath } from 'node:url'
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const pkgVersion = JSON.parse(readFileSync(resolve(__dirname, 'package.json'), 'utf-8')).version
 
-const apiTarget = 'https://api.quantdinger.com'
+// The app API (dev server only). It used to point at the upstream QuantDinger
+// host, so a dev login went to a third-party server.
+const apiTarget = process.env.VITE_API_TARGET || 'http://localhost:8000'
 // kis-ws (operator live feed), dev server only: the built app reaches /socket.io on
 // the server it is configured with (ServerConfig).
 const wsTarget = process.env.VITE_WS_TARGET || 'http://localhost:5002'
