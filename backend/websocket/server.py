@@ -117,6 +117,7 @@ def on_connect(auth=None):
         _session_expiry[request.sid] = float(payload["exp"])
     logger.info("WS 클라이언트 연결: %s", request.remote_addr)
     emit("connected", {"status": "ok"})
+    _send_snapshot(request.sid)
 
 
 @socketio.on("disconnect")
@@ -168,12 +169,43 @@ def publish_order_update(order_data: dict):
     _r.publish("order:update", json.dumps(order_data))
 
 
-def publish_position_update(positions: list):
-    _r.publish("position:update", json.dumps(positions))
+#: State channels: the latest payload is also kept, so an operator who connects
+#: between publishes sees the account at once (``_send_snapshot``). Events
+#: (orders, alerts) are not replayed.
+_SNAPSHOT_CHANNELS = ("position:update", "equity:update")
+_SNAPSHOT_TTL_SEC = 24 * 3600
+
+
+def _snapshot_key(channel: str) -> str:
+    return f"ws:last:{channel}"
+
+
+def _publish_state(channel: str, payload) -> None:
+    data = json.dumps(payload)
+    _r.publish(channel, data)
+    try:
+        _r.set(_snapshot_key(channel), data, ex=_SNAPSHOT_TTL_SEC)
+    except Exception as e:  # the live publish went out; only the replay is lost
+        logger.warning("WS 스냅샷 저장 실패 (%s): %s", channel, e)
+
+
+def publish_position_update(positions):
+    _publish_state("position:update", positions)
 
 
 def publish_equity_update(equity: dict):
-    _r.publish("equity:update", json.dumps(equity))
+    _publish_state("equity:update", equity)
+
+
+def _send_snapshot(sid: str) -> None:
+    """Send the latest position/equity payloads to one just-accepted socket."""
+    for channel in _SNAPSHOT_CHANNELS:
+        try:
+            raw = _r.get(_snapshot_key(channel))
+            if raw:
+                socketio.emit(channel, json.loads(raw), to=sid)
+        except Exception as e:
+            logger.warning("WS 스냅샷 전송 실패 (%s): %s", channel, e)
 
 
 def publish_alert(message: str, level: str = "info"):

@@ -333,3 +333,70 @@ def test_a_refused_token_is_a_handshake_refusal_not_a_disconnect(secret):
     with server.app.test_request_context("/"):
         with pytest.raises(ConnectionRefusedError):
             server.on_connect({"token": _token(sub="7")})
+
+
+class _FakeRedis:
+    def __init__(self):
+        self.store, self.published = {}, []
+
+    def publish(self, channel, data):
+        self.published.append((channel, data))
+
+    def set(self, key, value, ex=None):
+        self.store[key] = (value, ex)
+
+    def get(self, key):
+        item = self.store.get(key)
+        return item[0].encode() if item else None
+
+
+class TestStateSnapshot:
+    """Positions and equity are state: an operator who connects between
+    publishes gets the latest of each at once. Orders and alerts are not replayed."""
+
+    @pytest.fixture()
+    def fake_redis(self, monkeypatch):
+        from backend.websocket import server
+        fake = _FakeRedis()
+        monkeypatch.setattr(server, "_r", fake)
+        return fake
+
+    def test_state_publishes_are_kept_for_a_day(self, fake_redis):
+        from backend.websocket import server
+        server.publish_equity_update({"total_eval_krw": 1})
+        server.publish_position_update({"positions": []})
+        server.publish_alert("x")
+        assert [c for c, _ in fake_redis.published] == ["equity:update", "position:update", "alert"]
+        assert set(fake_redis.store) == {"ws:last:equity:update", "ws:last:position:update"}
+        assert all(ex == 24 * 3600 for _, ex in fake_redis.store.values())
+
+    def test_a_new_operator_socket_receives_the_latest_state(self, secret, fake_redis):
+        from backend.websocket import server
+        server.publish_equity_update({"total_eval_krw": 2_000_000})
+        server.publish_position_update({"positions": [{"symbol": "SPY"}]})
+        client = server.socketio.test_client(server.app, auth={"token": _token(minutes=5)})
+        try:
+            got = {m["name"]: m["args"][0] for m in client.get_received()}
+            assert got["equity:update"] == {"total_eval_krw": 2_000_000}
+            assert got["position:update"] == {"positions": [{"symbol": "SPY"}]}
+        finally:
+            client.disconnect()
+
+    def test_a_refused_socket_receives_nothing(self, secret, fake_redis):
+        from backend.websocket import server
+        server.publish_equity_update({"total_eval_krw": 1})
+        client = server.socketio.test_client(server.app, auth={"token": _token(sub="7")})
+        assert not client.is_connected()
+
+    def test_an_unreadable_cache_does_not_block_the_connection(self, secret, monkeypatch):
+        from backend.websocket import server
+
+        class _Down(_FakeRedis):
+            def get(self, key):
+                raise ConnectionError("redis down")
+        monkeypatch.setattr(server, "_r", _Down())
+        client = server.socketio.test_client(server.app, auth={"token": _token(minutes=5)})
+        try:
+            assert client.is_connected()
+        finally:
+            client.disconnect()

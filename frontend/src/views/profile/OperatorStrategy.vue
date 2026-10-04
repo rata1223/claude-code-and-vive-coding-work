@@ -57,6 +57,28 @@
         {{ liveStatus === 'refused' ? $t('operator.live_hint_refused') : $t('operator.live_hint_closed') }}
         <van-button size="mini" plain class="live-retry" @click="openFeed">{{ $t('operator.live_retry') }}</van-button>
       </div>
+      <!-- Account state from the worker (positions, equity). Unknown numbers are
+           "—", never 0: a 0 would read as an empty account. -->
+      <div v-if="equity || positions" class="account-card">
+        <div class="account-top">
+          <span>{{ $t('operator.account_total') }}</span>
+          <b>{{ $t('operator.account_krw', { v: num(equity && equity.total_eval_krw) }) }}</b>
+        </div>
+        <van-tag v-if="equity && equity.equity_verified === false" type="warning" plain class="account-unverified">
+          {{ $t('operator.account_unverified') }}
+        </van-tag>
+        <div class="account-line">
+          {{ $t('operator.account_cash', { krw: num(equity && equity.cash_krw), usd: num(equity && equity.cash_usd) }) }}
+        </div>
+        <div v-if="positions && positions.length === 0" class="account-line">{{ $t('operator.account_no_positions') }}</div>
+        <div v-for="p in positions || []" :key="p.symbol + ':' + p.market" class="account-pos">
+          <span class="pos-symbol">{{ p.symbol }}</span>
+          <span>{{ $t('operator.account_qty', { v: num(p.qty) }) }}</span>
+          <span>{{ $t('operator.account_avg', { v: num(p.avg_price) }) }}</span>
+          <span>{{ $t('operator.account_now', { v: num(p.current_price) }) }}</span>
+        </div>
+        <div class="account-line account-at">{{ $t('operator.account_as_of', { at: formatTime(accountAt) }) }}</div>
+      </div>
       <div v-if="events.length === 0" class="empty">{{ $t('operator.live_empty') }}</div>
       <div
         v-for="ev in events"
@@ -134,6 +156,9 @@ export default {
       loadSeq: 0,
       liveStatus: 'connecting',
       liveEverConnected: false,
+      equity: null,
+      positions: null,
+      accountAt: null,
       events: [],
       eventSeq: 0,
       feed: null,
@@ -190,6 +215,10 @@ export default {
       this.reloadTimer = setTimeout(() => this.load(), 1500)
     },
     onFeedEvent(ev) {
+      if (ev.type === 'equity' || ev.type === 'positions') {
+        this.applyAccount(ev)
+        return
+      }
       this.events = [{ ...ev, key: ++this.eventSeq }, ...this.events].slice(0, 30)
       if (ev.type === 'alert' && this.alertLevel(ev.data) === 'critical') {
         showToast({ message: this.alertText(ev.data), type: 'fail' })
@@ -197,6 +226,16 @@ export default {
       // An order moved (submitted, filled, cancelled): fill counts and the gate
       // may have changed. One reload for a burst of updates.
       if (ev.type === 'order') this.scheduleReload()
+    },
+    applyAccount(ev) {
+      const d = ev.data && typeof ev.data === 'object' ? ev.data : null
+      if (!d) return
+      if (ev.type === 'equity') this.equity = d
+      else this.positions = Array.isArray(d.positions) ? d.positions : null
+      this.accountAt = typeof d.at === 'string' ? d.at : null
+    },
+    num(v) {
+      return typeof v === 'number' && Number.isFinite(v) ? v.toLocaleString() : '—'
     },
     liveLabel() {
       switch (this.liveStatus) {
@@ -418,6 +457,21 @@ export default {
 .actions { margin-top: 14px; }
 
 .live-retry { margin-left: 8px; }
+.account-card {
+  padding: 12px 16px;
+  margin-bottom: 8px;
+  border-radius: var(--radius-lg);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  font-size: 12px;
+  color: var(--text-2);
+}
+.account-top { display: flex; justify-content: space-between; color: var(--text); font-size: 13px; }
+.account-unverified { margin-top: 4px; }
+.account-line { line-height: 1.8; }
+.account-pos { display: grid; grid-template-columns: 1.2fr 1fr 1.4fr 1.4fr; gap: 4px; padding: 4px 0; border-top: 1px solid var(--border); }
+.pos-symbol { color: var(--text); font-weight: 600; }
+.account-at { margin-top: 4px; }
 .live-row {
   display: flex;
   gap: 8px;
