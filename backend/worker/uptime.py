@@ -64,11 +64,12 @@ class UptimeRecorder:
         while not self._stop.wait(self._interval):
             self.beat()
 
-    def beat(self, ended: bool = False) -> None:
-        """Move ``last_beat_at`` to now (and ``ended_at`` when ``ended``). Never raises."""
+    def beat(self, ended: bool = False, at: datetime | None = None) -> None:
+        """Move ``last_beat_at`` to now — or to ``at`` — and set ``ended_at`` too
+        when ``ended``. Never raises."""
         from backend.database.models import RunUptime
         with self._lock:
-            now = self._clock()
+            now = at if at is not None else self._clock()
             try:
                 db = self._factory()
                 try:
@@ -95,8 +96,11 @@ class UptimeRecorder:
         """Stop beating and record a clean end, waiting at most ``timeout`` for
         the write. Never raises. ``False`` if the write did not finish in time."""
         self._stop.set()
-        writer = threading.Thread(target=self.beat, kwargs={"ended": True}, daemon=True,
-                                  name=f"run-uptime-{self._run_id}-end")
+        # The stop time, taken now: a write that waits for the lock (a beat stuck
+        # in the DB) must still record when the run stopped, not when it got in.
+        ended_at = self._clock()
+        writer = threading.Thread(target=self.beat, kwargs={"ended": True, "at": ended_at},
+                                  daemon=True, name=f"run-uptime-{self._run_id}-end")
         writer.start()
         writer.join(timeout)
         if writer.is_alive():

@@ -289,6 +289,25 @@ def test_start_beats_at_once_and_on_its_interval(factory):
     assert _rows(factory)[0][3] is not None
 
 
+def test_a_late_final_write_records_the_stop_time_not_the_write_time(factory):
+    """A beat stuck in the DB holds the lock past stop()'s wait; when the final
+    write gets in later it must not stretch the run past when it stopped (CodeRabbit)."""
+    clock = _Clock(NOW)
+    rec = UptimeRecorder(factory, run_id=7, clock=clock)
+    rec.beat()
+    rec._lock.acquire()                            # a beat stuck in the DB
+    try:
+        clock.t = NOW + M                          # stop() is called here
+        assert rec.stop(timeout=0.1) is False
+        clock.t = NOW + M + timedelta(seconds=50)  # the write gets in later
+    finally:
+        rec._lock.release()
+    deadline = time.monotonic() + 5
+    while _rows(factory)[0][3] is None and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert _rows(factory) == [(7, NOW, NOW + M, NOW + M)]
+
+
 def test_a_stalled_db_does_not_hold_up_stop(factory):
     """The worker's shutdown budget is 8 s; the final write gets a bounded wait."""
     release = threading.Event()
