@@ -240,3 +240,96 @@ class TestSessionExpiry:
         import inspect
         from backend.websocket import server
         assert "_session_sweeper" in inspect.getsource(server.start_ws_server)
+
+
+class TestHandshakeAuth:
+    """The app client sends its token in the Socket.IO ``auth`` payload, which
+    stays out of URLs (proxy and access logs); ``?token=`` still works."""
+
+    def test_a_token_in_auth_is_accepted(self, secret):
+        from backend.websocket import server
+        client = server.socketio.test_client(server.app, auth={"token": _token(minutes=5)})
+        try:
+            assert client.is_connected()
+        finally:
+            client.disconnect()
+
+    def test_a_non_operator_token_in_auth_is_refused(self, secret):
+        from backend.websocket import server
+        client = server.socketio.test_client(server.app, auth={"token": _token(sub="7")})
+        assert not client.is_connected()
+
+    @pytest.mark.parametrize("auth", [{}, {"token": ""}, {"token": 5}, ["x"], "x"])
+    def test_a_malformed_auth_falls_back_to_the_query(self, secret, auth):
+        from backend.websocket import server
+        with server.app.test_request_context(f"/?token={_token()}"):
+            assert server._verify_ws_token(auth) is True
+        with server.app.test_request_context("/"):
+            assert server._verify_ws_token(auth) is False
+
+
+def _free_port():
+    import socket
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def test_the_server_starts_without_a_tty():
+    """In a container stdin is not a TTY, and Flask-SocketIO then refused the
+    Werkzeug server: kis-ws exited at startup. Start it the way compose does
+    (no TTY) and wait for the Engine.IO handshake."""
+    import subprocess
+    import sys
+    import time as _time
+    import urllib.request
+    port = _free_port()
+    env = dict(os.environ, QUANTDINGER_SECRET_KEY="ws-start-test", JWT_SECRET_KEY="ws-start-test",
+               OPERATOR_USER_IDS="3", WS_PORT=str(port),
+               REDIS_URL="redis://127.0.0.1:1")      # unreachable: the listener retries, startup must not care
+    proc = subprocess.Popen([sys.executable, "-m", "backend.websocket.server"],
+                            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, env=env, cwd=str(ROOT))
+    try:
+        deadline = _time.monotonic() + 20
+        body = None
+        while _time.monotonic() < deadline and proc.poll() is None:
+            try:
+                with urllib.request.urlopen(
+                        f"http://127.0.0.1:{port}/socket.io/?EIO=4&transport=polling", timeout=2) as r:
+                    body = r.read().decode()
+                break
+            except OSError:
+                _time.sleep(0.3)
+        if body is None:
+            proc.kill()
+            out = proc.communicate(timeout=5)[0].decode(errors="replace")
+            pytest.fail(f"kis-ws did not come up (exit={proc.returncode}):\n{out[-2000:]}")
+        assert '"sid"' in body
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+
+
+def test_kis_ws_is_published_on_loopback_only():
+    """The Werkzeug server must not face the internet; browsers go through the
+    web server's /socket.io proxy."""
+    compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+    block = compose.split("\n  kis-ws:\n", 1)[1].split("\n  volumes:", 1)[0].split("\nvolumes:", 1)[0]
+    ports = re.findall(r'^\s+- "([^"]+)"', block.split("ports:", 1)[1].split("environment:", 1)[0], re.M)
+    assert ports == ["127.0.0.1:5002:5002"]
+
+
+def test_a_refused_token_is_a_handshake_refusal_not_a_disconnect(secret):
+    """The client tells "refused" (connect_error, not retried) from "ended"
+    (the server dropped a live socket — an expired token). Disconnecting inside
+    the connect handler made every refusal look like the latter."""
+    from flask_socketio import ConnectionRefusedError
+    from backend.websocket import server
+    with server.app.test_request_context("/"):
+        with pytest.raises(ConnectionRefusedError):
+            server.on_connect({"token": _token(sub="7")})

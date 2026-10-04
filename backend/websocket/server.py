@@ -11,7 +11,7 @@ import time
 
 import redis
 from flask import Flask, request
-from flask_socketio import SocketIO, emit, disconnect
+from flask_socketio import ConnectionRefusedError, SocketIO, emit
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +32,7 @@ socketio = SocketIO(app, cors_allowed_origins=_ws_cors, async_mode="threading")
 _r = redis.from_url(_REDIS_URL)
 
 
-def _authorized_payload():
+def _authorized_payload(auth=None):
     """The token's payload when it is a valid app token (api/auth.py) whose user
     is a listed operator; otherwise ``None``.
 
@@ -48,7 +48,12 @@ def _authorized_payload():
     "unauthenticated" (#189). start_ws_server() checks both before accepting
     connections.
     """
-    token = request.args.get("token", "")
+    # The Socket.IO ``auth`` payload first: it travels in the handshake body,
+    # not the URL, so it stays out of proxy and access logs. ``?token=`` is
+    # still accepted for clients that cannot send ``auth``.
+    token = auth.get("token") if isinstance(auth, dict) else None
+    if not isinstance(token, str) or not token:
+        token = request.args.get("token", "")
     if not token:
         return None
     from backend.security.jwt_tokens import decode_access_token
@@ -61,8 +66,8 @@ def _authorized_payload():
     return payload
 
 
-def _verify_ws_token() -> bool:
-    return _authorized_payload() is not None
+def _verify_ws_token(auth=None) -> bool:
+    return _authorized_payload(auth) is not None
 
 
 # A socket outlives the token it connected with; without this an operator
@@ -100,12 +105,14 @@ def _session_sweeper():
 
 # ── 클라이언트 이벤트 ─────────────────────────────────────────────────────
 @socketio.on("connect")
-def on_connect():
-    payload = _authorized_payload()
+def on_connect(auth=None):
+    payload = _authorized_payload(auth)
     if payload is None:
         logger.warning("WS 인증 실패 — 연결 거부: %s", request.remote_addr)
-        disconnect()
-        return False
+        # A refused handshake (CONNECT_ERROR), not a disconnect after accepting:
+        # the client then knows it was turned away and does not retry, rather
+        # than reading it as the server ending a live session (expired token).
+        raise ConnectionRefusedError("unauthorized")
     with _session_lock:
         _session_expiry[request.sid] = float(payload["exp"])
     logger.info("WS 클라이언트 연결: %s", request.remote_addr)
@@ -202,7 +209,13 @@ def start_ws_server() -> None:
     start_redis_listener()
     threading.Thread(target=_session_sweeper, daemon=True, name="ws-session-sweeper").start()
     port = int(os.environ.get("WS_PORT", 5002))
-    socketio.run(app, host="0.0.0.0", port=port, debug=False)
+    # Flask-SocketIO refuses the Werkzeug server unless stdin is a TTY — which it
+    # never is in a container — so without this kis-ws exited at startup. One
+    # process with threads (async_mode="threading", WebSocket via
+    # simple-websocket) is enough for the handful of operator sockets this
+    # serves. The port is published on host loopback only (docker-compose.yml);
+    # browsers reach it through the web server's /socket.io proxy.
+    socketio.run(app, host="0.0.0.0", port=port, debug=False, allow_unsafe_werkzeug=True)
 
 
 if __name__ == "__main__":

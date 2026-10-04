@@ -104,3 +104,70 @@ def test_the_screen_explains_every_gate_reason():
         assert f"reason === '{reason}'" in src, reason
     assert "operator.env_fills" in src
     assert 'v-if="run.orders_enabled === false"' in src, "a shadow run is labelled"
+
+
+# ── live feed (kis-ws) ─────────────────────────────────────────────────────
+
+def test_both_apps_carry_the_same_feed_client():
+    assert _read("frontend/src/services/operatorFeed.js") == _read("mobile/src/services/operatorFeed.js")
+
+
+def test_the_feed_sends_the_token_in_auth_not_the_url():
+    src = _read("frontend/src/services/operatorFeed.js")
+    assert "auth: (cb) => cb({ token:" in src
+    assert "?token" not in src and "query:" not in src
+
+
+def test_the_feed_listens_to_channels_kis_ws_relays():
+    """Every event the client listens to is one the server bridges from Redis."""
+    feed = _read("frontend/src/services/operatorFeed.js")
+    server = _read("backend/websocket/server.py")
+    relayed = set(re.findall(r'"([a-z:]+)"', server.split("_CHANNELS = [", 1)[1].split("]", 1)[0]))
+    listened = set(re.findall(r"socket\.on\('([a-z:]+)'", feed)) - {"connect", "disconnect", "connect_error"}
+    assert listened and listened <= relayed, listened - relayed
+
+
+@pytest.mark.parametrize("app", APPS)
+def test_the_dev_server_proxies_the_socket(app):
+    cfg = _read(f"{app}/vite.config.js")
+    block = cfg.split("'/socket.io': {", 1)[1].split("}", 1)[0]
+    assert "target: wsTarget" in block and "ws: true" in block
+    assert '"socket.io-client"' in _read(f"{app}/package.json")
+
+
+def test_the_screen_closes_the_feed_when_it_leaves():
+    src = _read("frontend/src/views/profile/OperatorStrategy.vue")
+    unmount = src.split("beforeUnmount() {", 1)[1].split("},", 1)[0]
+    assert "this.feed.close()" in unmount
+
+
+def test_every_alert_level_the_backend_sends_is_styled():
+    """``info`` is plain text; every other level any ``publish_alert`` caller
+    uses must stand out (a failed reconcile sends ``error``)."""
+    levels = set()
+    for path in (ROOT / "backend").rglob("*.py"):
+        if "/tests/" in str(path):
+            continue
+        src = path.read_text(encoding="utf-8")
+        if "publish_alert" not in src:
+            continue
+        levels |= set(re.findall(r'level\s*=\s*"([a-z]+)"', src))
+    assert {"critical", "error", "warning"} <= levels
+    css = _read("frontend/src/views/profile/OperatorStrategy.vue").split("<style", 1)[1]
+    for level in levels - {"info"}:
+        assert f".live-row.alert-{level}" in css, level
+
+
+def test_the_feed_falls_back_to_polling_when_websocket_fails():
+    """socket.io-client 4.8 does not try the next transport unless told to: a
+    proxy that blocks WebSocket upgrades would leave the feed disconnected."""
+    src = _read("frontend/src/services/operatorFeed.js")
+    assert "transports: ['websocket', 'polling']" in src
+    assert "tryAllTransports: true" in src
+
+
+def test_a_reconnect_reloads_the_list():
+    """Socket.IO does not replay what was published while the socket was down."""
+    src = _read("frontend/src/views/profile/OperatorStrategy.vue")
+    handler = src.split("onFeedStatus(s) {", 1)[1].split("\n    },", 1)[0]
+    assert "this.liveEverConnected) this.scheduleReload()" in handler
