@@ -640,6 +640,8 @@ class StrategyWorker:
                   min(_AUX_JOIN_CAP_SEC, _left(reserve=1.0)), skip=frozenset(seen)))
         # 5. Checkpoint equity to the DB.
         _step("equity-checkpoint", self._checkpoint_equity)
+        # 5b. Close the uptime row: a clean end, not a crash ending at the last beat.
+        _step("uptime", self._shutdown_uptime)
         # 6. Heartbeat LAST, so the API-side watchdog does not see a dead worker
         #    while the teardown is still running.
         _step("heartbeat", self._shutdown_heartbeat)
@@ -770,6 +772,19 @@ class StrategyWorker:
                 row.kill_switch = True
                 row.kill_reason = halt_reason
             db.commit()
+
+    def start_uptime(self, db_factory) -> None:
+        """Start recording uptime for the 4-week paper gate (``uptime.py``)."""
+        from backend.worker.uptime import UptimeRecorder
+        self._uptime = UptimeRecorder(db_factory)
+        self._uptime.start()
+
+    def _shutdown_uptime(self) -> None:
+        # getattr: started from main() only, so a worker that never got there
+        # (or a test worker) has none.
+        uptime = getattr(self, "_uptime", None)
+        if uptime is not None:
+            uptime.stop()
 
     def _shutdown_heartbeat(self) -> None:
         """Stop publishing the liveness beat. Last, and the key is left alone."""
@@ -1927,6 +1942,11 @@ def main():
 
     if not recovered:
         logger.critical("복구 실패 — Worker SafeMode로 계속 실행")
+    else:
+        # The 4-week gate counts uptime from here: a worker that is still
+        # recovering, or stuck in SafeMode because recovery failed, cannot trade,
+        # so its time is not paper-run time.
+        worker.start_uptime(factory)
 
     from backend.worker.scheduler import build_scheduler
     scheduler = build_scheduler()

@@ -242,6 +242,30 @@ class AuditLog(Base):
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
 
 
+class WorkerUptime(Base):
+    """When the worker was alive — one row per unbroken stretch of beats
+    (normally one per worker process lifetime).
+
+    The 4-week paper gate counts uptime, not calendar days
+    (``promotion_guard.run_uptime``): a run whose worker was down for six hours
+    needs six more hours. The Redis heartbeat expires after 90 s and keeps no
+    history, so this is the durable record. ``UptimeRecorder`` inserts the row
+    once the worker has recovered, moves ``last_beat_at`` every minute, and sets
+    ``ended_at`` on a clean shutdown; a crashed process leaves ``ended_at`` empty
+    and its row ends at the last beat. Beats that could not be written for longer
+    than the grace start a new row, so the gap is not counted.
+
+    A new table, not new columns on an existing one: ``create_all`` creates
+    missing tables but never adds columns (#194).
+    """
+    __tablename__ = "worker_uptime"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    worker_id = Column(String(50), nullable=False)
+    boot_at = Column(DateTime, nullable=False)
+    last_beat_at = Column(DateTime, nullable=False, index=True)
+    ended_at = Column(DateTime, nullable=True)
+
+
 class CorporateAction(Base):
     """Persisted corporate-action record (P2-02C runtime integration).
 

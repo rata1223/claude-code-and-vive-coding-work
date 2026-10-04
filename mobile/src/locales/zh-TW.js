@@ -800,6 +800,7 @@ export default {
     started_at: '開始',
     stopped_at: '結束',
     run_days: '已執行 {days} 天',
+    uptime_line: '工作程序運行 {days} 天 · 停機 {hours} 小時',
     gate_met: '已滿足4週模擬交易條件',
     gate_not_met: '未滿足4週模擬交易條件（已停止）',
     env_fills: '環境：{env} · 已成交訂單：{n}',
