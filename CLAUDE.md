@@ -12,7 +12,7 @@
 
 ---
 
-## 프로젝트 진행 현황 (2026-10-03 기준, main `a736dd8` = PR #209)
+## 프로젝트 진행 현황 (2026-10-03 기준, main `09ea64b` = PR #210)
 
 > **이 섹션이 최신 상태의 단일 진실 공급원(SoT).** 아래 "다음 작업 목록(Stage 1~9)"은 초기 설계 로드맵으로,
 > 대부분 이미 구현 완료됐다. 실제 진행은 `AUDIT.md` → `ROADMAP.md` 기반 하드닝 트랙으로 이어지고 있다.
@@ -76,6 +76,7 @@
 | 운영 전략 화면 | #208 | **B1 2단계** — 웹·모바일 `views/profile/OperatorStrategy.vue`(`/profile/operator-strategy`): 실행 목록(점유 배지·실행 일수·4주 관문 충족/예정일, 중지된 미충족 실행은 "미충족"), 점유 실행 중지(확인 대화상자), 시작 폼(이름·종목당 비중 %·손절 %·유니버스 체크박스, 확인 대화상자에 "운영 계좌로 실제 주문"). 슬롯이 점유 중이거나 목록을 못 읽으면 시작 버튼 비활성, 시작·중지 뒤 목록 재조회(재전송 없음), 비율은 %로 편집하고 분수로 전송. 메뉴는 `userInfo.is_operator`일 때만(표시용). 시작·중지는 확인 대화상자 전에 잠근다(두 번 탭해도 요청 1회). 목록 조회가 겹치면 가장 최근 응답만 반영한다. **다시 보낸 중지가 슬롯을 일찍 풀지 않는다**(CodeRabbit 보안 리뷰). 워커는 먼저 `is_active=False`를 쓰고, 진행 중인 `on_market_open`과 `strategy.stop()`이 끝난 뒤에 `stopped_at`을 쓴다. 끝나는 중인 세션은 `_stopping`에 두어, 그 사이에 다시 온 중지가 0일로 기록되지 않는다. 0일 기록은 세션이 아예 없을 때만 한다. `operatorApi`, 유니버스 선택지 `constants/tradingUniverse.js`(서버 `UNIVERSE`와 동일 — 정적 가드 `tests/integration/test_frontend_operator_screen.py`, 두 앱 동일·로케일 키·메뉴 게이트·경로). 5개 로케일 × 2앱 |
 | 4주 관문 환경·체결 | #209 | **#206의 남은 한계 두 가지** — 관문이 실행의 환경(모의/실전)과 실제 매매 여부를 몰랐다. 실전으로 시작한 실행(`SAFE_MODE`로 매매가 막혀도)이나 한 번도 체결되지 않은 실행이 28일만 지나면 통과했다. **스키마 변경 없이**: kis-api `start_strategy`가 `config.kis_env`에 서버의 `KIS_ENV`를 찍는다(클라이언트 값은 덮어씀, `config`가 객체가 아니면 400). 워커는 자기 환경과 다르게 찍힌 실행을 돌리지 않는다 — 새 시작은 0일 기록, 복원은 지금 시각으로 종료 기록. 기록 없는 옛 행은 그대로 돌리되 관문에 세지 않는다. 워커는 실행의 상태머신이 **새로 삽입하는** 주문에 `orders.strategy_run_id`를 채운다(열은 원래 있었다). 관문(`paper_gate_status`)은 모의 환경 + 28일 무중지 + 체결 수량이 있는 귀속 주문 1건 이상. kis-api 목록에 `kis_env`·`filled_orders`·`orders_enabled`, 운영 화면은 같은 함수로 사유(환경·기간·체결)를 보여준다. **4주 모의투자의 정의가 바뀐다**(code-review): 섀도 모드(`ENABLE_LIVE_TRADING=false`)는 주문을 내지 않아 체결이 없으므로 관문에 세지 않는다 — 모의투자는 `KIS_ENV=paper` + `ENABLE_LIVE_TRADING=true`(모의 계좌로 실제 주문). `.env.example`·compose 주석(값은 그대로)·기동 로그를 맞췄다. 워커는 시작·복원할 때 그 값을 `config.orders_enabled`에 찍고 화면이 섀도 실행을 표시한다 |
 | 운영 실시간 피드 | #210 | **#202의 남은 것** — 앱에 WS 클라이언트가 없었다. 운영 전략 화면에 "실시간" 섹션: kis-ws가 Redis에서 중계하는 `order:update`·`alert`(다른 채널은 발행처가 없다), 연결 상태(연결 중·연결됨·재연결 중·거부됨·끊김)와 최근 30건, 치명 경보는 토스트, 주문 갱신이 오면 목록을 한 번 다시 읽는다(체결 수·관문). `src/services/operatorFeed.js`(두 앱 동일, `socket.io-client`). **토큰은 URL이 아니라 핸드셰이크 `auth`로**(프록시·접근 로그에 남지 않게) — kis-ws가 `auth.token`을 먼저 읽고 `?token=`도 계속 받는다. 거부는 연결 뒤 끊기가 아니라 `ConnectionRefusedError`(클라이언트가 "거부됨"과 "만료로 끊김"을 구분). 브라우저는 같은 서버의 `/socket.io`로 붙고 웹 개발 서버가 `http://kis-ws:5002`로 프록시한다(compose 서비스명, `VITE_WS_TARGET`로 바꿀 수 있음). **발견·수정: kis-ws는 컨테이너에서 기동 불가였다** — Flask-SocketIO가 stdin이 TTY가 아니면 Werkzeug 서버를 거부해 시작 즉시 종료(재시작 반복). #202의 테스트는 `test_client`라 못 잡았다. `allow_unsafe_werkzeug=True`(스레드 단일 프로세스, 운영자 몇 명) + compose 포트를 `127.0.0.1:5002`로(개발 서버가 외부에 노출되지 않게). TTY 없이 실제로 띄워 핸드셰이크를 확인하는 테스트 추가. 모바일 앱은 서버 주소를 웹 서버(프록시가 있는 곳)로 둬야 피드가 붙는다 |
+| 업스트림 주소 제거 | #211 | **알려진 이슈 13 + 나머지** — 앱이 QuantDinger에서 와서 그쪽 서버를 기본값으로 갖고 있었다. ① 모바일 개발 서버 `/api` 프록시가 `api.quantdinger.com` — `npm run dev`의 로그인·자격증명 요청이 제3자 서버로 갔다 → `VITE_API_TARGET`(기본 `http://localhost:8000`). ② 모바일 `PUBLIC_WEB_BASE_URL` 기본값 `m.quantdinger.com`(아무도 안 씀) → 두 앱에서 제거. ③ About(두 앱 동일): 업데이트가 **업스트림 APK로 대체 다운로드**하던 경로(지금은 서버가 버전을 안 보내 휴면) 제거 — 서버가 준 `https://` 주소만 열고, 없거나 다른 스킴이면 대화상자 없이 안내. 업스트림 웹사이트·지원 메일 행 숨김(새 연락처는 만들지 않음), 소개 문구를 KIS 주식·ETF 플랫폼으로(디지털 자산 → 주식·ETF 위험 고지), 안 쓰는 로케일 키 4개 제거. 5개 로케일 × 2앱. 정적 가드: 두 앱 `src/**`·`vite.config.js`에 `quantdinger.com` 없음, 복사본 동일, https 전용 |
 
 **열린 PR 0건.** 다음 작업은 `origin/main`에서 새로 분기하면 된다.
 
@@ -198,10 +199,10 @@
    **기록만 한 것**: `statsmodels`가 `requirements.txt`에 없다 — 쓰는 곳은 `PairsSignal`(`backend/quant/signals/mean_reversion.py`)의
    공적분 검정뿐이고 아무도 쓰지 않는다. 쓰게 되면 kis-bot 이미지에서 `ImportError`가 삼켜져 "공적분 없음"으로 **조용히 신호를 내지 않는다**
 
-13. **모바일 개발 서버의 `/api` 프록시가 외부 도메인을 가리킨다**(#210에서 발견, 미수정): `mobile/vite.config.js`의
-   `apiTarget = 'https://api.quantdinger.com'` — QuantDinger 원본의 잔재다. 모바일을 `npm run dev`로 띄우면 로그인·자격증명 요청이
-   **제3자 서버로** 간다. 빌드된 앱(Capacitor)은 설정한 서버 주소를 쓰므로 영향이 없다. 웹처럼 `process.env.VITE_API_TARGET || …`로
-   바꾸는 것이 맞지만 이 PR의 범위가 아니어서 기록만 했다
+13. ~~**모바일 개발 서버의 `/api` 프록시가 외부 도메인을 가리킨다**~~ — PR #211에서 해결. `mobile/vite.config.js`가
+   `process.env.VITE_API_TARGET || 'http://localhost:8000'`을 쓴다. 같은 PR에서 앱에 남은 QuantDinger 주소를 모두 걷어냈다(About의
+   업스트림 APK 대체 다운로드·웹사이트·지원 메일, 모바일 `PUBLIC_WEB_BASE_URL`). 정적 가드 `tests/integration/test_frontend_no_upstream_hosts.py`.
+   **남은 잔재**(네트워크 호스트 아님): OAuth 딥링크 스킴 `com.quantdinger.mobile://login`(`src/utils/oauthRedirect.js`) — Capacitor appId와 다를 수 있다. 앱에 OAuth 로그인이 쓰이게 되면 확인할 것
 
 ---
 
@@ -527,7 +528,7 @@ KR_ETF   = ["069500", "360750", "091160"]  # KODEX200, TIGER S&P500, KODEX반도
 - **PR #79** (`claude/update-MW7LQ`): 실패 시나리오 통합테스트 (TASK 4-1C) — **머지됨** (2026-06-16)
 - 하드닝 트랙 PR #85~#156: 위 "프로젝트 진행 현황" 표 참조 — **모두 머지됨**
 - **PR #116**은 미머지 종료(2026-07-05). 같은 작업을 **#119**가 대체 구현해 머지했다
-- **현재 열린 PR 0건.** main = `a736dd8` (PR #209)
+- **현재 열린 PR 0건.** main = `09ea64b` (PR #210)
 
 > 작업 방식: 기능별 새 브랜치에서 작업 → `main`으로 드래프트 PR → CodeRabbit/CodeQL 리뷰 → 머지.
 > 브랜치 보호 룰셋(PR 필수 + 코드 스캐닝)이 적용돼 `main` 직접 푸시 불가.

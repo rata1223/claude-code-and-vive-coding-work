@@ -553,11 +553,7 @@ export default {
   about: {
     title: 'About',
     intro:
-      'QuantDinger brings together strategy tools, market data and portfolio workflows. We aim to provide transparent trading assistance. Digital asset trading involves substantial risk—please use the product only after you understand the features and exchange rules.',
-    contact_title: 'Contact',
-    contact_email_label: 'Support email',
-    website_label: 'Official website',
-    website_value: 'www.quantdinger.com',
+      'KIS Trading automates a rule-based stock and ETF strategy on a Korea Investment & Securities account, with risk limits and an operator panel. Trading stocks and ETFs carries the risk of loss—use it only after you understand how the strategy and its safeguards work.',
     app_version_label: 'App version',
     server_version_label: 'Latest server release',
     check_update: 'Check for updates',
@@ -565,7 +561,8 @@ export default {
     up_to_date: 'You are on the latest version',
     update_available: 'New version {version} available',
     update_now: 'Download & install',
-    update_hint: 'We will open the official download URL. Please install the APK on Android.',
+    update_hint: 'We will open the download address provided by the server. Please install the APK on Android.',
+    update_no_url: 'A new version is available, but the server did not provide a download address.',
     terms_tab: 'Terms of use',
     disclaimer_tab: 'Disclaimer',
     fetch_config_fail: 'Could not load version info. Check network or server settings.'
