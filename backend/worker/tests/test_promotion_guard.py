@@ -3,7 +3,8 @@
 It used to pass on any strategy_runs row started 28+ days ago — including one
 stopped a minute after it began. It now needs a run that was not stopped for
 28 days: still active with no recorded stop, or stopped after 28 days — and the
-28 days are worker uptime, not calendar days (``worker_uptime``).
+28 days are the time the run was actually running, not calendar days
+(``run_uptime``).
 """
 import json
 import re
@@ -15,7 +16,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from backend.database.models import Base, Order, StrategyRun, WorkerUptime
+from backend.database.models import Base, Order, StrategyRun, RunUptime
 from backend.worker.promotion_guard import (
     PAPER_RUN_MIN, LivePromotionGuard, paper_gate_status, paper_run_qualifies, run_kis_env,
     run_window,
@@ -83,7 +84,7 @@ def factory():
 def _add(factory, started_ago, stopped_after=None, is_active=True, env="paper", fills=1,
          alive=True):
     """A run stamped ``env`` (None: no stamp) with ``fills`` filled orders, and —
-    unless ``alive`` is False — a worker that was up for the whole of it."""
+    unless ``alive`` is False — running for the whole of it (``run_uptime``)."""
     now = datetime.utcnow()
     with factory() as db:
         started = now - started_ago
@@ -96,14 +97,13 @@ def _add(factory, started_ago, stopped_after=None, is_active=True, env="paper", 
         for i in range(fills):
             _order(db, run.id, filled_qty=1, n=i)
         if alive:
-            _uptime(db, started - timedelta(minutes=5), now)
+            _uptime(db, run.id, started, now)
         db.commit()
         return run.id
 
 
-def _uptime(db, boot, last_beat, ended=None):
-    db.add(WorkerUptime(worker_id="kis-worker", boot_at=boot, last_beat_at=last_beat,
-                        ended_at=ended))
+def _uptime(db, run_id, boot, last_beat, ended=None):
+    db.add(RunUptime(run_id=run_id, boot_at=boot, last_beat_at=last_beat, ended_at=ended))
 
 
 def _order(db, run_id, filled_qty, n=0):

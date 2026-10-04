@@ -230,6 +230,33 @@ def _record_never_ran(run_id: int, strategy_type, reason: str) -> bool:
     return False
 
 
+#: Where sessions record run uptime for the 4-week gate (``uptime.py``). Set by
+#: :func:`enable_run_uptime` once startup recovery has succeeded; until then (and
+#: in tests) sessions record nothing.
+_run_uptime_factory = None
+
+
+def enable_run_uptime(db_factory) -> None:
+    global _run_uptime_factory
+    _run_uptime_factory = db_factory
+
+
+def _start_run_uptime(run_id: int):
+    """Start recording that ``run_id`` is running, or ``None`` if recording is
+    off. Never raises — the record is for the gate, not for trading."""
+    factory = _run_uptime_factory
+    if factory is None:
+        return None
+    try:
+        from backend.worker.uptime import UptimeRecorder
+        recorder = UptimeRecorder(factory, run_id)
+        recorder.start()
+        return recorder
+    except Exception as e:
+        logger.warning("[run_id=%d] 가동 기록 시작 실패: %s", run_id, e)
+        return None
+
+
 class WorkerSession:
     """하나의 전략 실행 세션."""
 
@@ -322,9 +349,13 @@ class WorkerSession:
 
     def _run(self):
         started = False
+        uptime = None
         try:
             self.strategy.start()
             started = True
+            # The 4-week gate counts the time this run was running — from here,
+            # not from a restore that never got this far.
+            uptime = _start_run_uptime(self.run_id)
             while not self._stop_event.is_set():
                 time.sleep(1)
         except Exception as e:
@@ -334,6 +365,10 @@ class WorkerSession:
             # nobody called stop()).
             with self._callbacks_cv:
                 self._stop_event.set()
+            # The run stops counting as running now. Bounded: a stalled DB must
+            # not hold up the cleanup below.
+            if uptime is not None:
+                uptime.stop()
             # Order matters. ``is_active = False`` is the durable record that the
             # operator switched this strategy off, and ``_restore_active()``
             # reads it on the next boot — it must not be held hostage by user
@@ -640,8 +675,6 @@ class StrategyWorker:
                   min(_AUX_JOIN_CAP_SEC, _left(reserve=1.0)), skip=frozenset(seen)))
         # 5. Checkpoint equity to the DB.
         _step("equity-checkpoint", self._checkpoint_equity)
-        # 5b. Close the uptime row: a clean end, not a crash ending at the last beat.
-        _step("uptime", self._shutdown_uptime)
         # 6. Heartbeat LAST, so the API-side watchdog does not see a dead worker
         #    while the teardown is still running.
         _step("heartbeat", self._shutdown_heartbeat)
@@ -772,19 +805,6 @@ class StrategyWorker:
                 row.kill_switch = True
                 row.kill_reason = halt_reason
             db.commit()
-
-    def start_uptime(self, db_factory) -> None:
-        """Start recording uptime for the 4-week paper gate (``uptime.py``)."""
-        from backend.worker.uptime import UptimeRecorder
-        self._uptime = UptimeRecorder(db_factory)
-        self._uptime.start()
-
-    def _shutdown_uptime(self) -> None:
-        # getattr: started from main() only, so a worker that never got there
-        # (or a test worker) has none.
-        uptime = getattr(self, "_uptime", None)
-        if uptime is not None:
-            uptime.stop()
 
     def _shutdown_heartbeat(self) -> None:
         """Stop publishing the liveness beat. Last, and the key is left alone."""
@@ -1943,10 +1963,10 @@ def main():
     if not recovered:
         logger.critical("복구 실패 — Worker SafeMode로 계속 실행")
     else:
-        # The 4-week gate counts uptime from here: a worker that is still
+        # The 4-week gate counts run uptime from here: a worker that is still
         # recovering, or stuck in SafeMode because recovery failed, cannot trade,
-        # so its time is not paper-run time.
-        worker.start_uptime(factory)
+        # so its time is not paper-run time. Sessions record their own runs.
+        enable_run_uptime(factory)
 
     from backend.worker.scheduler import build_scheduler
     scheduler = build_scheduler()

@@ -158,20 +158,22 @@ def test_the_list_reports_environment_and_filled_orders(factory):
     assert (rows[ids[1]]["kis_env"], rows[ids[1]]["filled_orders"]) == (None, 0)
 
 
-def test_the_list_reports_worker_uptime_and_downtime(factory):
-    """The 4-week gate counts the worker's uptime inside the run (worker_uptime)."""
-    from backend.database.models import WorkerUptime
+def test_the_list_reports_run_uptime_and_downtime(factory):
+    """The 4-week gate counts the time the run was actually running (run_uptime)."""
+    from backend.database.models import RunUptime
     now = datetime.utcnow()
     with factory() as db:
         run = StrategyRun(name="a", strategy_type="indicator", config='{"kis_env": "paper"}',
                           is_active=False, started_at=now - timedelta(days=10),
                           stopped_at=now - timedelta(days=2))
         db.add(run)
-        # up from before the start, crashed at day 4, back 6 hours later
+        db.flush()
+        # running from the start, crashed at day 4, restored 6 hours later
         crash = now - timedelta(days=6)
         db.add_all([
-            WorkerUptime(worker_id="w", boot_at=now - timedelta(days=11), last_beat_at=crash),
-            WorkerUptime(worker_id="w", boot_at=crash + timedelta(hours=6), last_beat_at=now),
+            RunUptime(run_id=run.id, boot_at=run.started_at, last_beat_at=crash),
+            RunUptime(run_id=run.id, boot_at=crash + timedelta(hours=6), last_beat_at=now),
+            RunUptime(run_id=run.id + 1, boot_at=run.started_at, last_beat_at=now),  # another run
         ])
         db.commit()
         rid = run.id

@@ -801,7 +801,7 @@ export default {
     started_at: '開始',
     stopped_at: '終了',
     run_days: '{days}日間実行',
-    uptime_line: 'ワーカー稼働 {days}日 · 停止 {hours}時間',
+    uptime_line: '稼働 {days}日 · 停止 {hours}時間',
     gate_met: '4週間の模擬取引条件を満たしました',
     gate_not_met: '4週間の模擬取引条件は未達(停止済み)',
     env_fills: '環境: {env} · 約定済み注文: {n}件',

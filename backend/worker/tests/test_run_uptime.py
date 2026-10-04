@@ -1,11 +1,12 @@
-"""The 4-week gate counts worker uptime, not calendar days.
+"""The 4-week gate counts the time a run was actually running, not calendar days.
 
-Before, a run passed after 28 calendar days without a stop, even if the worker
-was down for part of them. ``worker_uptime`` records when the worker was alive
+Before, a run passed after 28 calendar days without a stop, even if no worker
+was running it for part of them. Each run's session records ``run_uptime``
 (``UptimeRecorder``), and ``uptime_by_run`` counts only that time.
 """
 import json
 import threading
+import time
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 
@@ -14,7 +15,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from backend.database.models import Base, Order, StrategyRun, WorkerUptime
+from backend.database.models import Base, Order, RunUptime, StrategyRun
 from backend.worker import runner
 from backend.worker.promotion_guard import (
     PAPER_RUN_MIN, LivePromotionGuard, covered_time, uptime_by_run,
@@ -36,10 +37,9 @@ def factory():
     eng.dispose()
 
 
-def _up(factory, boot, last_beat, ended=None):
+def _up(factory, boot, last_beat, ended=None, run_id=1):
     with factory() as db:
-        db.add(WorkerUptime(worker_id="kis-worker", boot_at=boot, last_beat_at=last_beat,
-                            ended_at=ended))
+        db.add(RunUptime(run_id=run_id, boot_at=boot, last_beat_at=last_beat, ended_at=ended))
         db.commit()
 
 
@@ -73,15 +73,15 @@ def test_no_record_means_no_uptime(factory):
     assert _uptime(factory, _run(NOW - 40 * DAY)) == timedelta(0)
 
 
-def test_a_worker_up_the_whole_time_covers_the_whole_run(factory):
-    _up(factory, NOW - 41 * DAY, NOW)
+def test_running_the_whole_time_covers_the_whole_run(factory):
+    _up(factory, NOW - 40 * DAY, NOW)
     assert _uptime(factory, _run(NOW - 40 * DAY)) == 40 * DAY
 
 
 def test_a_crash_counts_only_to_the_last_beat_plus_grace(factory):
     start = NOW - 10 * DAY
-    _up(factory, start - H, NOW - 5 * DAY)          # crashed five days ago, never ended
-    _up(factory, NOW - 5 * DAY + 6 * H, NOW)        # back six hours later
+    _up(factory, start, NOW - 5 * DAY)              # crashed five days ago, never ended
+    _up(factory, NOW - 5 * DAY + 6 * H, NOW)        # restored six hours later
     got = _uptime(factory, _run(start))
     assert got == 10 * DAY - 6 * H + UPTIME_GRACE
 
@@ -89,16 +89,23 @@ def test_a_crash_counts_only_to_the_last_beat_plus_grace(factory):
 def test_a_restart_costs_only_its_own_seconds(factory):
     start = NOW - 30 * DAY
     t = NOW - 10 * DAY
-    _up(factory, start - H, t, ended=t)             # clean stop
-    _up(factory, t + timedelta(seconds=20), NOW)    # back 20 s later
+    _up(factory, start, t, ended=t)                 # clean stop (deploy)
+    _up(factory, t + timedelta(seconds=20), NOW)    # restored 20 s later
     assert _uptime(factory, _run(start)) == 30 * DAY - timedelta(seconds=20)
 
 
 def test_overlapping_rows_are_not_counted_twice(factory):
     start = NOW - 10 * DAY
     _up(factory, start, NOW)
-    _up(factory, start + DAY, NOW - DAY)            # e.g. two workers, or a stray row
+    _up(factory, start + DAY, NOW - DAY)
     assert _uptime(factory, _run(start)) == 10 * DAY
+
+
+def test_another_runs_rows_do_not_count(factory):
+    """The worker being up is not this run running."""
+    start = NOW - 10 * DAY
+    _up(factory, start, NOW, run_id=2)
+    assert _uptime(factory, _run(start, rid=1)) == timedelta(0)
 
 
 def test_rows_outside_the_run_do_not_count(factory):
@@ -109,13 +116,13 @@ def test_rows_outside_the_run_do_not_count(factory):
 
 def test_a_stopped_run_is_clipped_at_its_stop(factory):
     start = NOW - 40 * DAY
-    _up(factory, start - DAY, NOW)
+    _up(factory, start, NOW)
     assert _uptime(factory, _run(start, stopped=start + 29 * DAY, is_active=False)) == 29 * DAY
 
 
 def test_a_zero_day_run_has_no_uptime(factory):
     start = NOW - 40 * DAY
-    _up(factory, start - DAY, NOW)
+    _up(factory, start, NOW)
     assert _uptime(factory, _run(start, stopped=start, is_active=False)) == timedelta(0)
 
 
@@ -126,11 +133,12 @@ def test_a_live_row_is_not_extended_past_now(factory):
 
 
 def test_many_runs_in_one_call(factory):
-    _up(factory, NOW - 50 * DAY, NOW - 20 * DAY)    # crashed 20 days ago
-    runs = [_run(NOW - 40 * DAY, rid=1), _run(NOW - 10 * DAY, rid=2)]
+    _up(factory, NOW - 40 * DAY, NOW - 20 * DAY, run_id=1)     # crashed 20 days ago
+    _up(factory, NOW - 10 * DAY, NOW, run_id=2)
+    runs = [_run(NOW - 40 * DAY, rid=1), _run(NOW - 10 * DAY, rid=2), _run(NOW - DAY, rid=3)]
     with factory() as db:
         got = uptime_by_run(db, runs, NOW)
-    assert got == {1: 20 * DAY + UPTIME_GRACE, 2: timedelta(0)}
+    assert got == {1: 20 * DAY + UPTIME_GRACE, 2: 10 * DAY, 3: timedelta(0)}
 
 
 # ── the gate, end to end ──────────────────────────────────────────────────
@@ -152,16 +160,16 @@ def _paper_run(factory, started, fills=1):
 def test_six_hours_down_move_the_gate_six_hours(factory, monkeypatch):
     now = datetime.utcnow()
     start = now - 28 * DAY - 3 * H                     # 28 days and 3 hours ago
-    _paper_run(factory, start)
+    rid = _paper_run(factory, start)
     outage_at = start + 10 * DAY
-    _up(factory, start - M, outage_at)                 # crashed
-    _up(factory, outage_at + 6 * H, now)               # down six hours
+    _up(factory, start, outage_at, run_id=rid)         # crashed
+    _up(factory, outage_at + 6 * H, now, run_id=rid)   # down six hours
     assert LivePromotionGuard(factory)._check_paper_run() is False
 
     later = now + 3 * H + 2 * M                        # the six hours made up
     with factory() as db:
-        db.query(WorkerUptime).filter(WorkerUptime.boot_at > outage_at).update(
-            {WorkerUptime.last_beat_at: later})
+        db.query(RunUptime).filter(RunUptime.boot_at > outage_at).update(
+            {RunUptime.last_beat_at: later})
         db.commit()
 
     class _Clock(datetime):
@@ -172,11 +180,11 @@ def test_six_hours_down_move_the_gate_six_hours(factory, monkeypatch):
     assert LivePromotionGuard(factory)._check_paper_run() is True
 
 
-def test_a_full_uptime_run_passes(factory):
+def test_a_run_that_ran_the_whole_time_passes(factory):
     now = datetime.utcnow()
     start = now - 28 * DAY - H
-    _paper_run(factory, start)
-    _up(factory, start - M, now)
+    rid = _paper_run(factory, start)
+    _up(factory, start, now, run_id=rid)
     assert LivePromotionGuard(factory)._check_paper_run() is True
 
 
@@ -205,19 +213,19 @@ class _Clock:
 
 def _rows(factory):
     with factory() as db:
-        return [(r.boot_at, r.last_beat_at, r.ended_at)
-                for r in db.query(WorkerUptime).order_by(WorkerUptime.id)]
+        return [(r.run_id, r.boot_at, r.last_beat_at, r.ended_at)
+                for r in db.query(RunUptime).order_by(RunUptime.id)]
 
 
 def test_beats_extend_one_row_and_stop_records_a_clean_end(factory):
     clock = _Clock(NOW)
-    rec = UptimeRecorder(factory, clock=clock)
+    rec = UptimeRecorder(factory, run_id=7, clock=clock)
     rec.beat()
     clock.t = NOW + M
     rec.beat()
     clock.t = NOW + 2 * M
-    rec.stop()
-    assert _rows(factory) == [(NOW, NOW + 2 * M, NOW + 2 * M)]
+    assert rec.stop() is True
+    assert _rows(factory) == [(7, NOW, NOW + 2 * M, NOW + 2 * M)]
 
 
 def test_a_db_failure_never_raises_and_the_next_beat_recovers(factory, caplog):
@@ -229,21 +237,21 @@ def test_a_db_failure_never_raises_and_the_next_beat_recovers(factory, caplog):
             raise RuntimeError("db down")
         return factory()
 
-    rec = UptimeRecorder(flaky, clock=clock)
+    rec = UptimeRecorder(flaky, run_id=7, clock=clock)
     with caplog.at_level("WARNING"):
-        rec.beat()                                 # the boot insert fails
+        rec.beat()                                 # the first insert fails
     assert "가동 기록 실패" in caplog.text
     assert _rows(factory) == []
     state["down"] = False
     clock.t = NOW + M
     rec.beat()
-    assert _rows(factory) == [(NOW + M, NOW + M, None)], "uptime starts when it was written"
+    assert _rows(factory) == [(7, NOW + M, NOW + M, None)], "counts from when it was written"
 
 
 def test_a_gap_longer_than_the_grace_starts_a_new_row(factory):
     """Beats that could not be written (DB down, process frozen) are not uptime."""
     clock = _Clock(NOW)
-    rec = UptimeRecorder(factory, clock=clock)
+    rec = UptimeRecorder(factory, run_id=7, clock=clock)
     rec.beat()
     clock.t = NOW + M
     rec.beat()
@@ -251,73 +259,132 @@ def test_a_gap_longer_than_the_grace_starts_a_new_row(factory):
     rec.beat()
     rows = _rows(factory)
     assert len(rows) == 2
-    assert rows[0] == (NOW, NOW + M, None)
-    assert rows[1][0] == NOW + M + UPTIME_GRACE + timedelta(seconds=1)
+    assert rows[0] == (7, NOW, NOW + M, None)
+    assert rows[1][1] == NOW + M + UPTIME_GRACE + timedelta(seconds=1)
 
 
 def test_a_gap_within_the_grace_keeps_the_row(factory):
     clock = _Clock(NOW)
-    rec = UptimeRecorder(factory, clock=clock)
+    rec = UptimeRecorder(factory, run_id=7, clock=clock)
     rec.beat()
     clock.t = NOW + UPTIME_GRACE
     rec.beat()
-    assert _rows(factory) == [(NOW, NOW + UPTIME_GRACE, None)]
+    assert _rows(factory) == [(7, NOW, NOW + UPTIME_GRACE, None)]
 
 
 def test_start_beats_at_once_and_on_its_interval(factory):
-    rec = UptimeRecorder(factory, interval_sec=0.05)
+    rec = UptimeRecorder(factory, run_id=7, interval_sec=0.05)
     rec.start()
     try:
         assert len(_rows(factory)) == 1
-        first = _rows(factory)[0][1]
-        deadline = datetime.utcnow() + timedelta(seconds=5)
-        while _rows(factory)[0][1] == first and datetime.utcnow() < deadline:
-            threading.Event().wait(0.02)
-        assert _rows(factory)[0][1] > first
+        first = _rows(factory)[0][2]
+        deadline = time.monotonic() + 5
+        while _rows(factory)[0][2] == first and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert _rows(factory)[0][2] > first
     finally:
         rec.stop()
-    assert rec._thread is not None
     rec._thread.join(2)
     assert not rec._thread.is_alive()
-    assert _rows(factory)[0][2] is not None
+    assert _rows(factory)[0][3] is not None
 
 
-# ── the worker ────────────────────────────────────────────────────────────
+def test_a_stalled_db_does_not_hold_up_stop(factory):
+    """The worker's shutdown budget is 8 s; the final write gets a bounded wait."""
+    release = threading.Event()
 
-def test_shutdown_closes_the_uptime_row():
-    w = runner.StrategyWorker.__new__(runner.StrategyWorker)
-    stopped = []
-    w._uptime = SimpleNamespace(stop=lambda: stopped.append(1))
-    w._shutdown_uptime()
-    assert stopped == [1]
+    def stalled():
+        release.wait(10)
+        return factory()
 
-
-def test_a_worker_without_a_recorder_shuts_down_fine():
-    w = runner.StrategyWorker.__new__(runner.StrategyWorker)
-    w._shutdown_uptime()                           # no AttributeError
-
-
-def test_shutdown_runs_the_uptime_step():
-    import inspect
-    src = inspect.getsource(runner.StrategyWorker.shutdown)
-    assert '_step("uptime", self._shutdown_uptime)' in src
-    # before the heartbeat, which must stay last
-    assert src.index('"uptime"') < src.index('"heartbeat"')
+    rec = UptimeRecorder(stalled, run_id=7)
+    t0 = time.monotonic()
+    assert rec.stop(timeout=0.2) is False
+    assert time.monotonic() - t0 < 2
+    release.set()
 
 
-def test_main_starts_the_recorder_only_after_a_successful_recovery():
+# ── the session records its run ───────────────────────────────────────────
+
+class _Strategy:
+    def __init__(self, fail=False):
+        self.fail = fail
+
+    def start(self):
+        if self.fail:
+            raise RuntimeError("start failed")
+
+    def stop(self):
+        pass
+
+
+@pytest.fixture()
+def recording(factory, monkeypatch):
+    monkeypatch.setattr(runner, "_SessionFactory", factory)
+    monkeypatch.setattr(runner, "_audit", lambda *a, **k: None)
+    monkeypatch.setattr(runner, "_run_uptime_factory", None)
+    runner.enable_run_uptime(factory)
+    return factory
+
+
+def _active_run(factory):
+    with factory() as db:
+        run = StrategyRun(name="r", strategy_type="indicator", config="{}", is_active=True,
+                          started_at=datetime.utcnow() - DAY)
+        db.add(run)
+        db.commit()
+        return run.id
+
+
+def test_a_running_session_records_its_run_until_it_ends(recording):
+    rid = _active_run(recording)
+    session = runner.WorkerSession(rid, _Strategy())
+    session.start()
+    deadline = time.monotonic() + 5
+    while not _rows(recording) and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert [r[0] for r in _rows(recording)] == [rid]
+    assert _rows(recording)[0][3] is None, "still running"
+
+    session.stop(deactivate=False)                 # e.g. the worker shutting down
+    assert session.join(5)
+    assert _rows(recording)[0][3] is not None, "a clean end"
+
+
+def test_a_session_whose_start_fails_records_nothing(recording):
+    rid = _active_run(recording)
+    session = runner.WorkerSession(rid, _Strategy(fail=True))
+    session.start()
+    assert session.join(5)
+    assert _rows(recording) == []
+
+
+def test_nothing_is_recorded_until_recording_is_enabled(factory, monkeypatch):
+    """main() enables it only once startup recovery has succeeded."""
+    monkeypatch.setattr(runner, "_SessionFactory", factory)
+    monkeypatch.setattr(runner, "_audit", lambda *a, **k: None)
+    monkeypatch.setattr(runner, "_run_uptime_factory", None)
+    rid = _active_run(factory)
+    session = runner.WorkerSession(rid, _Strategy())
+    session.start()
+    time.sleep(0.1)
+    session.stop(deactivate=False)
+    assert session.join(5)
+    assert _rows(factory) == []
+
+
+def test_a_recorder_that_cannot_start_does_not_stop_the_run(recording, monkeypatch):
+    import backend.worker.uptime as uptime_mod
+
+    def boom(*a, **k):
+        raise RuntimeError("no recorder")
+    monkeypatch.setattr(uptime_mod, "UptimeRecorder", boom)
+    assert runner._start_run_uptime(5) is None
+
+
+def test_main_enables_recording_only_after_a_successful_recovery():
     import inspect
     src = inspect.getsource(runner.main)
-    i = src.index("worker.start_uptime(factory)")
+    i = src.index("enable_run_uptime(factory)")
     assert src.rindex("if not recovered:", 0, i) < src.rindex("else:", 0, i) < i
     assert src.index("if worker.shutdown_requested:") < i
-
-
-def test_start_uptime_uses_the_given_factory(factory):
-    w = runner.StrategyWorker.__new__(runner.StrategyWorker)
-    w.start_uptime(factory)
-    try:
-        assert len(_rows(factory)) == 1
-    finally:
-        w._shutdown_uptime()
-    assert _rows(factory)[0][2] is not None

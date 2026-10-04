@@ -87,7 +87,7 @@ def _describe(run: dict, now: datetime) -> dict:
     """kis-api's row plus what the screen needs: whether it holds the slot and
     where it stands on the 4-week paper gate — the same rule the worker's gate
     applies (``promotion_guard.paper_gate_status``: paper environment, 28 days
-    unstopped with the worker alive, at least one fill)."""
+    unstopped and actually running, at least one fill)."""
     from backend.worker.promotion_guard import PAPER_RUN_MIN, RUN_ENV_KEY, paper_gate_status
 
     started = _parse_ts(run.get("started_at"))
@@ -104,7 +104,7 @@ def _describe(run: dict, now: datetime) -> dict:
     row["orders_enabled"] = (run.get("orders_enabled")
                              if isinstance(run.get("orders_enabled"), bool) else None)
     row["filled_orders"] = filled
-    # Worker uptime inside the run, measured by kis-api. Missing or malformed
+    # How long the run was actually running, measured by kis-api. Missing or malformed
     # counts as none: the gate must not pass on a number it was not given.
     try:
         uptime = timedelta(seconds=max(float(run.get("uptime_sec") or 0), 0.0))

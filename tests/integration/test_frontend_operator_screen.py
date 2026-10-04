@@ -199,8 +199,9 @@ def test_equity_and_positions_keep_their_own_times():
     assert "this.equityAt = at" in apply and "this.positionsAt = at" in apply
 
 
-def test_the_screen_shows_worker_uptime_and_downtime():
-    """The 4-week gate counts worker uptime, not calendar days; the screen says so."""
+def test_the_screen_shows_run_uptime_and_downtime():
+    """The 4-week gate counts the time the run was actually running, not calendar
+    days; the screen says so."""
     src = _read("frontend/src/views/profile/OperatorStrategy.vue")
     assert "operator.uptime_line" in src
     assert "run.uptime_days" in src and "run.downtime_hours" in src

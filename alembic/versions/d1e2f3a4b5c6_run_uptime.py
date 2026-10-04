@@ -1,11 +1,12 @@
-"""worker_uptime
+"""run_uptime
 
 Revision ID: d1e2f3a4b5c6
 Revises: c0a1b2c3d4e5
 Create Date: 2026-10-04 08:00:00.000000
 
-The 4-week paper gate counts worker uptime, not calendar days: one row per
-worker process lifetime (boot, last beat, clean end).
+The 4-week paper gate counts the time a run was actually running, not calendar
+days: one row per unbroken stretch of a run's session (start, last beat, clean
+end).
 """
 from typing import Sequence, Union
 
@@ -21,17 +22,17 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    op.create_table('worker_uptime',
+    op.create_table('run_uptime',
     sa.Column('id', sa.Integer(), autoincrement=True, nullable=False),
-    sa.Column('worker_id', sa.String(length=50), nullable=False),
+    sa.Column('run_id', sa.Integer(), nullable=False),
     sa.Column('boot_at', sa.DateTime(), nullable=False),
     sa.Column('last_beat_at', sa.DateTime(), nullable=False),
     sa.Column('ended_at', sa.DateTime(), nullable=True),
     sa.PrimaryKeyConstraint('id')
     )
-    op.create_index(op.f('ix_worker_uptime_last_beat_at'), 'worker_uptime', ['last_beat_at'], unique=False)
+    op.create_index(op.f('ix_run_uptime_run_id'), 'run_uptime', ['run_id'], unique=False)
 
 
 def downgrade() -> None:
-    op.drop_index(op.f('ix_worker_uptime_last_beat_at'), table_name='worker_uptime')
-    op.drop_table('worker_uptime')
+    op.drop_index(op.f('ix_run_uptime_run_id'), table_name='run_uptime')
+    op.drop_table('run_uptime')

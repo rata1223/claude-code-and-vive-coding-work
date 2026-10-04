@@ -176,8 +176,8 @@ def list_strategies():
     db = get_db()
     rows = db.query(StrategyRun).order_by(StrategyRun.started_at.desc()).limit(50).all()
     # What the 4-week gate needs besides the dates: the environment the run was
-    # stamped with at start, how many of its orders filled, and how long the
-    # worker was alive during it.
+    # stamped with at start, how many of its orders filled, and how long it
+    # was actually running (run_uptime).
     now = datetime.utcnow()
     fills = filled_order_counts(db, [r.id for r in rows])
     uptime = uptime_by_run(db, rows, now)
