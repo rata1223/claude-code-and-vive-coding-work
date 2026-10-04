@@ -8,8 +8,9 @@ broker and publishes them.
 It is a view, never a decision input: every failure is logged and swallowed,
 and the two reads are independent — a failed balance read still publishes the
 positions, and the other way round. Overlapping triggers (the scheduler, a
-burst of fills) coalesce: a publish already in progress makes the next one a
-no-op rather than queueing more broker reads.
+burst of fills) coalesce: a request that arrives while a publish is running
+marks it to run once more when done, so the last fill is always reflected and
+a burst costs at most one extra read, never a queue of them.
 """
 import logging
 import threading
@@ -17,7 +18,9 @@ from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
-_busy = threading.Lock()
+_state = threading.Lock()
+_running = False
+_pending = False
 
 
 def _now() -> str:
@@ -50,34 +53,57 @@ def _positions_payload(positions) -> dict:
     }
 
 
-def publish_portfolio(broker=None) -> bool:
-    """Publish the account's equity and positions. ``True`` if anything was
-    published; ``False`` when another publish was already running or both
-    reads failed. Never raises."""
-    if not _busy.acquire(blocking=False):
-        logger.debug("포트폴리오 발행 진행 중 — 이번 요청은 건너뛴다")
-        return False
+def _publish_once(broker) -> bool:
     try:
-        try:
-            from backend.websocket.server import publish_equity_update, publish_position_update
-            if broker is None:
-                from backend.brokers.kis import get_kis_broker
-                broker = get_kis_broker()
-        except Exception as e:
-            logger.warning("포트폴리오 발행 준비 실패: %s", e)
-            return False
+        from backend.websocket.server import publish_equity_update, publish_position_update
+        if broker is None:
+            from backend.brokers.kis import get_kis_broker
+            broker = get_kis_broker()
+    except Exception as e:
+        logger.warning("포트폴리오 발행 준비 실패: %s", e)
+        return False
 
-        published = False
-        try:
-            publish_equity_update(_equity_payload(broker.get_balance()))
-            published = True
-        except Exception as e:
-            logger.warning("자산 발행 실패: %s", e)
-        try:
-            publish_position_update(_positions_payload(broker.get_positions()))
-            published = True
-        except Exception as e:
-            logger.warning("포지션 발행 실패: %s", e)
+    published = False
+    try:
+        publish_equity_update(_equity_payload(broker.get_balance()))
+        published = True
+    except Exception as e:
+        logger.warning("자산 발행 실패: %s", e)
+    try:
+        publish_position_update(_positions_payload(broker.get_positions()))
+        published = True
+    except Exception as e:
+        logger.warning("포지션 발행 실패: %s", e)
+    return published
+
+
+def publish_portfolio(broker=None) -> bool:
+    """Publish the account's equity and positions. Never raises.
+
+    If a publish is already running, this marks it to run once more and
+    returns ``False`` at once: the running one then re-reads after it finishes,
+    so a fill that lands mid-publish is still shown. Otherwise returns whether
+    anything was published.
+    """
+    global _running, _pending
+    with _state:
+        if _running:
+            _pending = True
+            return False
+        _running = True
+    published = False
+    try:
+        while True:
+            with _state:
+                _pending = False
+            published = _publish_once(broker) or published
+            with _state:
+                if not _pending:
+                    _running = False
+                    return published
+    except Exception as e:  # defensive: _publish_once does not raise
+        logger.warning("포트폴리오 발행 실패: %s", e)
         return published
     finally:
-        _busy.release()
+        with _state:
+            _running = False

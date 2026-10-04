@@ -188,3 +188,12 @@ def test_unknown_account_numbers_show_a_dash_not_zero():
     assert "Number.isFinite(v) ? v.toLocaleString() : '—'" in body
     card = src.split('class="account-card"', 1)[1].split("</div>\n      <div v-if=\"events.length", 1)[0]
     assert "num(" in card and "|| 0" not in card and "?? 0" not in card
+
+
+def test_equity_and_positions_keep_their_own_times():
+    """They are read and published separately; one can keep failing while the
+    other refreshes, so one shared time would label stale numbers as fresh."""
+    src = _read("frontend/src/views/profile/OperatorStrategy.vue")
+    assert "formatTime(equityAt)" in src and "formatTime(positionsAt)" in src
+    apply = src.split("    applyAccount(ev) {", 1)[1].split("\n    },", 1)[0]
+    assert "this.equityAt = at" in apply and "this.positionsAt = at" in apply

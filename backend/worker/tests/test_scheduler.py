@@ -9,7 +9,7 @@ build_scheduler() only registers CronTrigger callbacks — it does not connect
 to Redis, DB, or KIS — so these tests run fully in isolation.
 
 Covered:
-  1. All 5 expected jobs are registered with correct IDs
+  1. All 6 expected jobs are registered with correct IDs
   2. KR session uses Asia/Seoul timezone (KST — no DST observed)
   3. US session uses America/New_York timezone (APScheduler resolves DST:
      09:30 ET → 22:30 KST summer / 23:30 KST winter)
@@ -21,7 +21,8 @@ import pytest
 from backend.worker.scheduler import build_scheduler
 
 
-_EXPECTED_JOB_IDS = {"kr_session", "us_session", "risk_reset", "equity_snapshot", "periodic_reconcile"}
+_EXPECTED_JOB_IDS = {"kr_session", "us_session", "risk_reset", "equity_snapshot", "periodic_reconcile",
+                     "portfolio_feed"}
 
 
 class TestSchedulerJobRegistration:

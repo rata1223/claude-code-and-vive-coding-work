@@ -79,15 +79,43 @@ def test_a_publish_error_never_escapes(monkeypatch):
     assert portfolio_feed.publish_portfolio(_Broker()) is False
 
 
-def test_overlapping_publishes_coalesce(published):
+def test_a_request_during_a_publish_runs_it_once_more(published):
+    """A fill that lands while a publish is reading the broker must still be
+    reflected: the running publish re-reads once, instead of dropping it."""
     broker = _Broker()
-    assert portfolio_feed._busy.acquire(blocking=False)
-    try:
-        assert portfolio_feed.publish_portfolio(broker) is False
-    finally:
-        portfolio_feed._busy.release()
-    assert broker.calls == [], "no broker reads while another publish runs"
+    inner = []
+    original = broker.get_balance
+
+    def balance_with_a_concurrent_request():
+        if not inner:
+            inner.append(portfolio_feed.publish_portfolio(broker))   # arrives mid-publish
+        return original()
+    broker.get_balance = balance_with_a_concurrent_request
+
     assert portfolio_feed.publish_portfolio(broker) is True
+    assert inner == [False], "the concurrent request returns at once"
+    assert broker.calls.count("balance") == 2 and broker.calls.count("positions") == 2
+
+
+def test_a_burst_costs_at_most_one_extra_read(published):
+    broker = _Broker()
+    original = broker.get_balance
+    burst = []
+
+    def balance_with_a_burst():
+        if not burst:
+            burst.extend(portfolio_feed.publish_portfolio(broker) for _ in range(5))
+        return original()
+    broker.get_balance = balance_with_a_burst
+
+    portfolio_feed.publish_portfolio(broker)
+    assert broker.calls.count("balance") == 2
+
+
+def test_the_running_flag_is_cleared_after_a_failure(published, monkeypatch):
+    monkeypatch.setattr(portfolio_feed, "_publish_once", lambda b: 1 / 0)
+    assert portfolio_feed.publish_portfolio(_Broker()) is False
+    assert portfolio_feed._running is False
 
 
 # ── triggers ───────────────────────────────────────────────────────────────

@@ -77,7 +77,12 @@
           <span>{{ $t('operator.account_avg', { v: num(p.avg_price) }) }}</span>
           <span>{{ $t('operator.account_now', { v: num(p.current_price) }) }}</span>
         </div>
-        <div class="account-line account-at">{{ $t('operator.account_as_of', { at: formatTime(accountAt) }) }}</div>
+        <!-- Two times: equity and positions are read and published separately,
+             and one can keep failing while the other refreshes. -->
+        <div class="account-line account-at">
+          {{ $t('operator.account_equity_as_of', { at: formatTime(equityAt) }) }} ·
+          {{ $t('operator.account_positions_as_of', { at: formatTime(positionsAt) }) }}
+        </div>
       </div>
       <div v-if="events.length === 0" class="empty">{{ $t('operator.live_empty') }}</div>
       <div
@@ -158,7 +163,8 @@ export default {
       liveEverConnected: false,
       equity: null,
       positions: null,
-      accountAt: null,
+      equityAt: null,
+      positionsAt: null,
       events: [],
       eventSeq: 0,
       feed: null,
@@ -230,9 +236,14 @@ export default {
     applyAccount(ev) {
       const d = ev.data && typeof ev.data === 'object' ? ev.data : null
       if (!d) return
-      if (ev.type === 'equity') this.equity = d
-      else this.positions = Array.isArray(d.positions) ? d.positions : null
-      this.accountAt = typeof d.at === 'string' ? d.at : null
+      const at = typeof d.at === 'string' ? d.at : null
+      if (ev.type === 'equity') {
+        this.equity = d
+        this.equityAt = at
+      } else {
+        this.positions = Array.isArray(d.positions) ? d.positions : null
+        this.positionsAt = at
+      }
     },
     num(v) {
       return typeof v === 'number' && Number.isFinite(v) ? v.toLocaleString() : '—'
