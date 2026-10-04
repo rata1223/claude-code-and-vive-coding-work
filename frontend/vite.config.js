@@ -11,6 +11,8 @@ const __dirname = dirname(fileURLToPath(import.meta.url))
 const pkgVersion = JSON.parse(readFileSync(resolve(__dirname, 'package.json'), 'utf-8')).version
 
 const apiTarget = process.env.VITE_API_TARGET || 'http://api-server:8000'
+// kis-ws (operator live feed). The compose service name, so no compose change is needed.
+const wsTarget = process.env.VITE_WS_TARGET || 'http://kis-ws:5002'
 
 // https://vitejs.dev/config/
 export default defineConfig({
@@ -40,6 +42,11 @@ export default defineConfig({
     proxy: {
       '/api': {
         target: apiTarget,
+        changeOrigin: true
+      },
+      '/socket.io': {
+        target: wsTarget,
+        ws: true,
         changeOrigin: true
       }
     }

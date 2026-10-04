@@ -11,6 +11,9 @@ const __dirname = dirname(fileURLToPath(import.meta.url))
 const pkgVersion = JSON.parse(readFileSync(resolve(__dirname, 'package.json'), 'utf-8')).version
 
 const apiTarget = 'https://api.quantdinger.com'
+// kis-ws (operator live feed), dev server only: the built app reaches /socket.io on
+// the server it is configured with (ServerConfig).
+const wsTarget = process.env.VITE_WS_TARGET || 'http://localhost:5002'
 
 // https://vitejs.dev/config/
 export default defineConfig({
@@ -40,6 +43,11 @@ export default defineConfig({
     proxy: {
       '/api': {
         target: apiTarget,
+        changeOrigin: true
+      },
+      '/socket.io': {
+        target: wsTarget,
+        ws: true,
         changeOrigin: true
       }
     }

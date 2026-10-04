@@ -104,3 +104,38 @@ def test_the_screen_explains_every_gate_reason():
         assert f"reason === '{reason}'" in src, reason
     assert "operator.env_fills" in src
     assert 'v-if="run.orders_enabled === false"' in src, "a shadow run is labelled"
+
+
+# ── live feed (kis-ws) ─────────────────────────────────────────────────────
+
+def test_both_apps_carry_the_same_feed_client():
+    assert _read("frontend/src/services/operatorFeed.js") == _read("mobile/src/services/operatorFeed.js")
+
+
+def test_the_feed_sends_the_token_in_auth_not_the_url():
+    src = _read("frontend/src/services/operatorFeed.js")
+    assert "auth: (cb) => cb({ token:" in src
+    assert "?token" not in src and "query:" not in src
+
+
+def test_the_feed_listens_to_channels_kis_ws_relays():
+    """Every event the client listens to is one the server bridges from Redis."""
+    feed = _read("frontend/src/services/operatorFeed.js")
+    server = _read("backend/websocket/server.py")
+    relayed = set(re.findall(r'"([a-z:]+)"', server.split("_CHANNELS = [", 1)[1].split("]", 1)[0]))
+    listened = set(re.findall(r"socket\.on\('([a-z:]+)'", feed)) - {"connect", "disconnect", "connect_error"}
+    assert listened and listened <= relayed, listened - relayed
+
+
+@pytest.mark.parametrize("app", APPS)
+def test_the_dev_server_proxies_the_socket(app):
+    cfg = _read(f"{app}/vite.config.js")
+    block = cfg.split("'/socket.io': {", 1)[1].split("}", 1)[0]
+    assert "target: wsTarget" in block and "ws: true" in block
+    assert '"socket.io-client"' in _read(f"{app}/package.json")
+
+
+def test_the_screen_closes_the_feed_when_it_leaves():
+    src = _read("frontend/src/views/profile/OperatorStrategy.vue")
+    unmount = src.split("beforeUnmount() {", 1)[1].split("},", 1)[0]
+    assert "this.feed.close()" in unmount

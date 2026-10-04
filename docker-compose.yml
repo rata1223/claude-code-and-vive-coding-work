@@ -196,8 +196,11 @@ services:
     restart: unless-stopped
     container_name: kis-ws
     command: python -m backend.websocket.server
+    # Loopback only: the dev server (Werkzeug) must not face the internet.
+    # Browsers reach kis-ws through the web server's /socket.io proxy on the
+    # compose network (frontend/vite.config.js, target http://kis-ws:5002).
     ports:
-      - "5002:5002"
+      - "127.0.0.1:5002:5002"
     environment:
       REDIS_URL: ${REDIS_URL:-redis://redis:6379}
       QUANTDINGER_SECRET_KEY: ${QUANTDINGER_SECRET_KEY:?QUANTDINGER_SECRET_KEY must be set (see .env.example)}

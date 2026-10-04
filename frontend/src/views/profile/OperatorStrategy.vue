@@ -47,6 +47,29 @@
       </div>
     </div>
 
+    <!-- Live feed: kis-ws relays the worker's order updates and alerts (operators only). -->
+    <div class="section">
+      <div class="section-head">
+        <span class="section-title">{{ $t('operator.live') }}</span>
+        <van-tag :type="liveStatus === 'connected' ? 'success' : 'default'" plain>{{ liveLabel() }}</van-tag>
+      </div>
+      <div v-if="liveStatus === 'refused' || liveStatus === 'closed'" class="empty">
+        {{ liveStatus === 'refused' ? $t('operator.live_hint_refused') : $t('operator.live_hint_closed') }}
+        <van-button size="mini" plain class="live-retry" @click="openFeed">{{ $t('operator.live_retry') }}</van-button>
+      </div>
+      <div v-if="events.length === 0" class="empty">{{ $t('operator.live_empty') }}</div>
+      <div
+        v-for="ev in events"
+        :key="ev.key"
+        class="live-row"
+        :class="ev.type === 'alert' ? 'alert-' + alertLevel(ev.data) : ''"
+      >
+        <span class="live-time">{{ formatClock(ev.at) }}</span>
+        <span v-if="ev.type === 'order'">{{ orderLine(ev.data) }}</span>
+        <span v-else>{{ alertText(ev.data) }}</span>
+      </div>
+    </div>
+
     <!-- Start -->
     <div class="section">
       <span class="section-title">{{ $t('operator.start_title') }}</span>
@@ -98,6 +121,7 @@
 import { showConfirmDialog, showToast } from 'vant'
 import { operatorApi } from '@/api'
 import { UNIVERSE_GROUPS } from '@/constants/tradingUniverse'
+import { createOperatorFeed } from '@/services/operatorFeed'
 
 export default {
   name: 'OperatorStrategy',
@@ -108,6 +132,11 @@ export default {
       loading: false,
       loadError: '',
       loadSeq: 0,
+      liveStatus: 'connecting',
+      events: [],
+      eventSeq: 0,
+      feed: null,
+      reloadTimer: null,
       starting: false,
       stopping: null,
       form: { name: 'house', sizePct: 5, stopPct: 7, universe: ['SPY', 'QQQ'] }
@@ -133,8 +162,61 @@ export default {
   },
   mounted() {
     this.load()
+    this.openFeed()
+  },
+  beforeUnmount() {
+    if (this.feed) this.feed.close()
+    clearTimeout(this.reloadTimer)
   },
   methods: {
+    openFeed() {
+      if (this.feed) this.feed.close()
+      this.feed = createOperatorFeed({
+        onStatus: (s) => { this.liveStatus = s },
+        onEvent: (ev) => this.onFeedEvent(ev)
+      })
+    },
+    onFeedEvent(ev) {
+      this.events = [{ ...ev, key: ++this.eventSeq }, ...this.events].slice(0, 30)
+      if (ev.type === 'alert' && this.alertLevel(ev.data) === 'critical') {
+        showToast({ message: this.alertText(ev.data), type: 'fail' })
+      }
+      // An order moved (submitted, filled, cancelled): fill counts and the gate
+      // may have changed. One reload for a burst of updates.
+      if (ev.type === 'order') {
+        clearTimeout(this.reloadTimer)
+        this.reloadTimer = setTimeout(() => this.load(), 1500)
+      }
+    },
+    liveLabel() {
+      switch (this.liveStatus) {
+        case 'connected': return this.$t('operator.live_connected')
+        case 'reconnecting': return this.$t('operator.live_reconnecting')
+        case 'refused': return this.$t('operator.live_refused')
+        case 'closed': return this.$t('operator.live_closed')
+        default: return this.$t('operator.live_connecting')
+      }
+    },
+    orderLine(o) {
+      const d = o && typeof o === 'object' ? o : {}
+      return this.$t('operator.live_order', {
+        symbol: d.symbol || '?',
+        side: d.side || '?',
+        filled: d.filled_qty ?? 0,
+        qty: d.qty ?? '?',
+        status: d.status || '?'
+      })
+    },
+    alertLevel(a) {
+      return a && typeof a === 'object' && typeof a.level === 'string' ? a.level : 'info'
+    },
+    alertText(a) {
+      if (a && typeof a === 'object') return String(a.message ?? a.raw ?? '')
+      return String(a ?? '')
+    },
+    formatClock(ms) {
+      return new Date(ms).toLocaleTimeString()
+    },
     async load() {
       // Loads can overlap (refresh during the reload after a stop) and finish
       // out of order; only the latest may update the list, or an older "slot
@@ -324,4 +406,17 @@ export default {
 .universe-item { font-size: 12px; }
 
 .actions { margin-top: 14px; }
+
+.live-retry { margin-left: 8px; }
+.live-row {
+  display: flex;
+  gap: 8px;
+  padding: 6px 4px;
+  font-size: 12px;
+  color: var(--text);
+  border-bottom: 1px solid var(--border);
+}
+.live-time { color: var(--text-2); flex: none; }
+.live-row.alert-critical { color: var(--c-red, #ee0a24); }
+.live-row.alert-warning { color: var(--c-orange, #ff976a); }
 </style>
