@@ -170,11 +170,20 @@ def get_orders():
 # ── 전략 ─────────────────────────────────────────────────────────────────
 @app.get("/api/strategies")
 def list_strategies():
-    rows = get_db().query(StrategyRun).order_by(StrategyRun.started_at.desc()).limit(50).all()
+    from backend.worker.promotion_guard import (
+        filled_order_counts, run_kis_env, run_orders_enabled,
+    )
+    db = get_db()
+    rows = db.query(StrategyRun).order_by(StrategyRun.started_at.desc()).limit(50).all()
+    # What the 4-week gate needs besides the dates: the environment the run was
+    # stamped with at start, and how many of its orders filled.
+    fills = filled_order_counts(db, [r.id for r in rows])
     return jsonify([
         {"id": r.id, "name": r.name, "type": r.strategy_type,
          "is_active": r.is_active, "started_at": r.started_at.isoformat(),
-         "stopped_at": r.stopped_at.isoformat() if r.stopped_at else None}
+         "stopped_at": r.stopped_at.isoformat() if r.stopped_at else None,
+         "kis_env": run_kis_env(r), "orders_enabled": run_orders_enabled(r),
+         "filled_orders": fills.get(r.id, 0)}
         for r in rows
     ])
 
@@ -246,6 +255,17 @@ def start_strategy():
         return jsonify({"error": f"알 수 없는 전략 유형: {body['strategy_type']!r} "
                                  f"(가능: {sorted(_STARTABLE_STRATEGY_TYPES)})"}), 400
 
+    config = body.get("config")
+    if config is None:          # an explicit null meant "no settings" before stamping
+        config = {}
+    if not isinstance(config, dict):
+        return jsonify({"error": "config는 객체여야 한다"}), 400
+    # The environment this run trades in, stamped by the server — never the
+    # caller's: the 4-week gate counts only runs stamped "paper", and the worker
+    # will not run a row stamped for another environment.
+    from backend.worker.promotion_guard import RUN_ENV_KEY, current_kis_env
+    config = {**config, RUN_ENV_KEY: current_kis_env()}
+
     db = get_db()
     busy = _occupying_run(db)
     if busy is not None:
@@ -255,7 +275,7 @@ def start_strategy():
     run = StrategyRun(
         name=body["name"],
         strategy_type=body["strategy_type"],
-        config=json.dumps(body.get("config", {})),
+        config=json.dumps(config),
         broker=body.get("broker", "kis"),
         is_active=True,
     )
@@ -267,7 +287,7 @@ def start_strategy():
         "run_id": run.id,
         "name": run.name,
         "strategy_type": run.strategy_type,
-        "config": body.get("config", {}),
+        "config": config,
         "broker": run.broker,
     })
     db.add(Command(channel="strategy:start", payload=payload))

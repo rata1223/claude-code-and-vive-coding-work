@@ -21,6 +21,11 @@
         <div class="run-line">{{ $t('operator.started_at') }}: {{ formatTime(run.started_at) }}</div>
         <div v-if="run.stopped_at" class="run-line">{{ $t('operator.stopped_at') }}: {{ formatTime(run.stopped_at) }}</div>
         <div class="run-line">{{ $t('operator.run_days', { days: run.run_days ?? '—' }) }}</div>
+        <div class="run-line">
+          {{ $t('operator.env_fills', { env: envLabel(run.kis_env), n: run.filled_orders ?? 0 }) }}
+          <!-- The worker's ENABLE_LIVE_TRADING at its last start: shadow submits nothing, so it never fills. -->
+          <span v-if="run.orders_enabled === false" class="shadow">· {{ $t('operator.shadow') }}</span>
+        </div>
         <div class="run-line gate" :class="{ met: run.paper_gate_met }">
           {{ gateText(run) }}
         </div>
@@ -151,8 +156,18 @@ export default {
         if (seq === this.loadSeq) this.loading = false
       }
     },
+    envLabel(env) {
+      if (env === 'paper') return this.$t('operator.env_paper')
+      if (env === 'real') return this.$t('operator.env_real')
+      return this.$t('operator.env_unknown')
+    },
     gateText(run) {
       if (run.paper_gate_met) return this.$t('operator.gate_met')
+      // The server's reason (promotion_guard.paper_gate_status), most permanent first.
+      const reason = run.paper_gate_reason
+      if (reason === 'env_not_paper') return this.$t('operator.gate_env_real')
+      if (reason === 'env_unknown') return this.$t('operator.gate_env_unknown')
+      if (reason === 'no_fills') return this.$t('operator.gate_no_fills')
       // Only a run still going can still reach the gate; a stopped one never will.
       if (run.is_active && !run.stopped_at) {
         return this.$t('operator.gate_at', { at: this.formatTime(run.paper_gate_at) })
@@ -291,6 +306,7 @@ export default {
 .run-name { font-size: 14px; font-weight: 600; color: var(--text); }
 .run-line { font-size: 12px; color: var(--text-2); line-height: 1.7; }
 .run-line.gate.met { color: var(--c-green, #07c160); }
+.run-line .shadow { color: var(--c-orange, #ff976a); }
 .run-stop { margin-top: 10px; }
 
 .form-card {

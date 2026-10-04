@@ -169,13 +169,13 @@ No **CRITICAL** items were found — nothing blocks starting the extended paper-
 
 ## 7. Startup checklist (pre-launch, for an operator)
 
-1. `.env` populated: all `KIS_*` credentials, `ENABLE_LIVE_TRADING=false` initially (per `.env.example`'s own guidance — flip only after the validation window), `KIS_ENV=paper`, `POSTGRES_PASSWORD`/`JWT_SECRET_KEY`/`KIS_CREDENTIAL_KEY`/`QUANTDINGER_SECRET_KEY` all set (compose will refuse to start otherwise).
+1. `.env` populated: all `KIS_*` credentials, `ENABLE_LIVE_TRADING=false` initially (shadow) — then `true` with `KIS_ENV=paper` for the 4-week paper run (orders to the KIS paper account; since PR #209 the paper gate needs a fill, which shadow mode never produces), `KIS_ENV=paper`, `POSTGRES_PASSWORD`/`JWT_SECRET_KEY`/`KIS_CREDENTIAL_KEY`/`QUANTDINGER_SECRET_KEY` all set (compose will refuse to start otherwise).
 2. Confirm Alembic is at `head` against the target Postgres instance before first boot (`alembic upgrade head` — not automatic).
 3. `docker compose up -d --build`; confirm `postgres`, `redis`, `api`, `kis-api` report healthy via `docker compose ps` (they have real healthchecks); `kis-worker`/`kis-ws` will only show "running," not "healthy" — check logs directly.
 4. Manually curl `GET /api/metrics` on `kis-api` and confirm `redis_ok: true`, `db_ok: true`, `worker_alive: true`, `kill_switch: false` before considering the deployment live.
 5. Confirm Telegram alerting actually reaches the operator (trigger a test alert path, or wait for the next scheduled heartbeat check) — this is the only channel that will report a hung worker.
 6. Set up ongoing (not just at-deploy) monitoring against `/api/metrics`, not `/api/health` — the latter cannot detect the failure modes that matter here.
-7. Only after the above, and only after the 4-week validation window per `.env.example`, consider `ENABLE_LIVE_TRADING=true` / `KIS_ENV=real` — out of scope for this audit, governed by P3-04's conditions.
+7. Only after the above, and only after the 4-week validation window per `.env.example`, consider `KIS_ENV=real` (with `ENABLE_LIVE_TRADING=true`) — out of scope for this audit, governed by P3-04's conditions.
 
 ---
 

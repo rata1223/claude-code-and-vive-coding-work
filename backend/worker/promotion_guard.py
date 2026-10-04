@@ -4,6 +4,7 @@
 KIS_ENV=real + ENABLE_LIVE_TRADING=true 로 전환하기 전에
 모든 항목이 통과해야 한다. StartupRecovery._step_enable_trading()에서 호출.
 """
+import json
 import logging
 import os
 from datetime import datetime, timedelta
@@ -16,11 +17,11 @@ PAPER_RUN_MIN = timedelta(days=28)
 
 
 def paper_run_qualifies(run, now: datetime) -> bool:
-    """이 실행이 28일 동안 중지되지 않았는가.
+    """이 실행이 28일 동안 중지되지 않았는가 — **기간만** 본다.
 
     워커 재시작은 실행을 멈추지 않는다(``is_active`` 유지, 기동 시 복원) — 그래서
-    워커가 내려가 있던 시간은 여기서 구분하지 못한다. 실행의 환경(모의/실전)과
-    실제 매매 여부도 보지 않는다(``strategy_runs``에 그 기록이 없다).
+    워커가 내려가 있던 시간은 여기서 구분하지 못한다. 환경(모의/실전)과 실제 체결은
+    :func:`paper_gate_status`가 함께 본다.
 
     - 아직 활성(``is_active``)이고 워커가 종료를 기록하지 않았으면(``stopped_at``
       없음) 시작부터 지금까지.
@@ -37,6 +38,91 @@ def paper_run_qualifies(run, now: datetime) -> bool:
     if getattr(run, "is_active", False):
         return now - started >= PAPER_RUN_MIN
     return False
+
+
+#: kis-api가 실행을 만들 때 ``config``에 찍는 환경 키(서버의 ``KIS_ENV``).
+#: 클라이언트가 보낸 값은 덮어쓴다 — 실행이 어느 환경에서 돌았는지의 기록이다.
+RUN_ENV_KEY = "kis_env"
+
+
+#: 워커가 실행을 시작·복원할 때 찍는 주문 제출 여부(``ENABLE_LIVE_TRADING``).
+#: ``False``면 섀도(신호만, 주문 없음)라 체결이 생기지 않는다 — 화면 설명용이고,
+#: 관문은 체결 자체를 본다.
+RUN_ORDERS_KEY = "orders_enabled"
+
+
+def orders_enabled() -> bool:
+    """이 프로세스가 주문을 실제로 제출하는가(``backend/strategy/base.py``의 섀도 게이트와 같은 규칙)."""
+    return os.environ.get("ENABLE_LIVE_TRADING", "false").lower() == "true"
+
+
+def current_kis_env() -> str:
+    """이 프로세스의 KIS 환경. compose 기본값과 같이 없으면 ``paper``."""
+    return os.environ.get("KIS_ENV", "paper")
+
+
+def _run_config(run) -> dict:
+    raw = getattr(run, "config", None)
+    if isinstance(raw, dict):
+        return raw
+    try:
+        cfg = json.loads(raw or "{}")
+    except (TypeError, ValueError):
+        return {}
+    return cfg if isinstance(cfg, dict) else {}
+
+
+def run_kis_env(run) -> str | None:
+    """실행에 찍힌 환경. 찍히지 않았거나(이 기록 이전의 행) 읽을 수 없으면 ``None``."""
+    env = _run_config(run).get(RUN_ENV_KEY)
+    return env if isinstance(env, str) and env else None
+
+
+def run_orders_enabled(run) -> bool | None:
+    """워커가 마지막으로 찍은 주문 제출 여부. 기록이 없으면 ``None``."""
+    value = _run_config(run).get(RUN_ORDERS_KEY)
+    return value if isinstance(value, bool) else None
+
+
+def paper_gate_status(run, filled_orders: int, now: datetime) -> tuple[bool, str | None]:
+    """4주 관문을 이 실행이 채우는가, 아니면 왜 못 채우는가.
+
+    관문(:meth:`LivePromotionGuard._check_paper_run`)과 운영 화면이 같은 규칙을
+    쓰도록 한곳에 둔다. 세 가지가 모두 필요하다.
+
+    - 환경: 모의(``paper``)로 찍힌 실행. 실전으로 찍혔거나 기록이 없으면 불통과.
+    - 기간: :func:`paper_run_qualifies`.
+    - 체결: 이 실행에 귀속된 주문(``orders.strategy_run_id``) 중 체결 수량이 있는
+      것이 하나 이상(``filled_orders``). 시간만 흐르고 아무것도 체결되지 않은
+      실행은 주문→체결→기록 경로를 검증하지 못한다.
+
+    사유는 고칠 수 없는 것(환경)부터: ``env_unknown``, ``env_not_paper``,
+    ``duration``, ``no_fills``.
+    """
+    env = run_kis_env(run)
+    if env is None:
+        return False, "env_unknown"
+    if env != "paper":
+        return False, "env_not_paper"
+    if not paper_run_qualifies(run, now):
+        return False, "duration"
+    if not filled_orders:
+        return False, "no_fills"
+    return True, None
+
+
+def filled_order_counts(db, run_ids) -> dict:
+    """실행별로 체결 수량이 있는 귀속 주문 수. 한 번의 쿼리."""
+    ids = [i for i in run_ids if i is not None]
+    if not ids:
+        return {}
+    from sqlalchemy import func
+    from backend.database.models import Order
+    rows = (db.query(Order.strategy_run_id, func.count(Order.id))
+            .filter(Order.strategy_run_id.in_(ids), Order.filled_qty > 0)
+            .group_by(Order.strategy_run_id)
+            .all())
+    return {rid: n for rid, n in rows}
 
 
 class LivePromotionGuard:
@@ -108,11 +194,11 @@ class LivePromotionGuard:
             return False
 
     def _check_paper_run(self) -> bool:
-        """최소 28일(4주) 동안 중지되지 않은 전략 실행이 있는지 확인.
+        """모의 환경에서 28일(4주) 동안 중지되지 않고 체결이 있었던 실행이 있는지.
 
         예전에는 ``started_at <= now-28d`` 인 행이 **있기만** 하면 통과했다 — 28일
-        전에 시작해 1분 뒤 중지한 실행도. 이제 그 시작 시각부터 28일을 실제로
-        채운 실행만 센다(:func:`paper_run_qualifies`).
+        전에 시작해 1분 뒤 중지한 실행도. 그다음엔 기간만 봤다. 이제 환경과 체결까지
+        :func:`paper_gate_status`로 본다.
         """
         try:
             from backend.database.models import StrategyRun
@@ -123,13 +209,16 @@ class LivePromotionGuard:
                 candidates = (db.query(StrategyRun)
                               .filter(StrategyRun.started_at <= cutoff)
                               .all())
-                qualified = [r.id for r in candidates if paper_run_qualifies(r, now)]
+                fills = filled_order_counts(db, [r.id for r in candidates])
+                statuses = {r.id: paper_gate_status(r, fills.get(r.id, 0), now)
+                            for r in candidates}
             finally:
                 db.close()
+            qualified = [rid for rid, (ok, _) in statuses.items() if ok]
             if not qualified:
-                logger.warning("4주 모의투자 미완료: 28일 동안 중지되지 않은 실행 없음 "
-                               "(28일 전에 시작한 행 %d개 — 중지됐거나 종료 확인 전)",
-                               len(candidates))
+                logger.warning("4주 모의투자 미완료: 조건(모의 환경·28일 무중지·체결 1건 이상)을 "
+                               "채운 실행 없음 — 28일 전에 시작한 행의 사유: %s",
+                               {rid: reason for rid, (_, reason) in statuses.items()} or "없음")
                 return False
             logger.info("4주 모의투자 확인: run_id=%s", qualified)
             return True

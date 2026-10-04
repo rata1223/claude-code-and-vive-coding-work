@@ -17,6 +17,7 @@ import threading
 import time
 from contextlib import contextmanager
 from datetime import datetime
+from types import SimpleNamespace
 
 import redis
 from sqlalchemy.exc import IntegrityError
@@ -1010,6 +1011,12 @@ class StrategyWorker:
                 self._sessions.pop(run_id, None)
             return
 
+        if not self._env_matches(data, restoring):
+            with self._lock:
+                self._sessions.pop(run_id, None)
+            return
+        self._stamp_order_mode(run_id)
+
         strategy = self._build_strategy(data)
         if strategy is None:
             with self._lock:
@@ -1054,6 +1061,73 @@ class StrategyWorker:
         except Exception as e:
             logger.warning("시작 요청 보류 — 실행 상태를 읽지 못함 run_id=%s: %s", run_id, e)
             return False
+
+    def _env_matches(self, data: dict, restoring: bool) -> bool:
+        """Run only a row stamped for this worker's ``KIS_ENV``.
+
+        kis-api stamps each run with the environment it was started in
+        (``config["kis_env"]``). A row stamped for another environment is not run
+        here: its days and fills belong to that environment, and the 4-week gate
+        counts only paper runs.
+
+        - New start: recorded as never having run (zero days).
+        - Restore (``KIS_ENV`` changed and the worker restarted): ended as of now —
+          it did run, in its own environment, until this boot. A run under the
+          new environment is started explicitly.
+        - No stamp (a row from before stamping): runs as before, with a warning;
+          the gate treats its environment as unknown and never counts it.
+        """
+        from backend.worker.promotion_guard import current_kis_env, run_kis_env
+        run_id = data["run_id"]
+        stamped = run_kis_env(SimpleNamespace(config=data.get("config")))
+        here = current_kis_env()
+        if stamped is None:
+            logger.warning("환경 기록 없는 실행 — 그대로 실행하지만 4주 관문에 세지 않는다: run_id=%s",
+                           run_id)
+            return True
+        if stamped == here:
+            return True
+        reason = f"환경 불일치(실행={stamped}, 워커={here})"
+        if restoring:
+            logger.warning("복원하지 않음 — %s, 지금 시각으로 종료 기록: run_id=%s", reason, run_id)
+            try:
+                with _session() as db:
+                    run = db.get(StrategyRun, run_id)
+                    if run is not None and run.stopped_at is None:
+                        run.is_active = False
+                        run.stopped_at = datetime.utcnow()
+                        db.commit()
+            except Exception as e:
+                logger.error("환경 불일치 실행의 종료 기록 실패 run_id=%s: %s — 다음 기동에 다시 시도",
+                             run_id, e)
+            _audit("strategy_env_mismatch",
+                   detail={"run_id": run_id, "stamped": stamped, "worker": here, "restore": True})
+        else:
+            _record_never_ran(run_id, data.get("strategy_type"), reason)
+        return False
+
+    def _stamp_order_mode(self, run_id) -> None:
+        """Record on the run whether this worker submits orders
+        (``ENABLE_LIVE_TRADING``), as of this start or restore. A shadow run
+        never fills; the operator screen says so instead of only "no fills".
+        Best effort: the gate looks at fills, not at this."""
+        from backend.worker.promotion_guard import RUN_ORDERS_KEY, orders_enabled
+        try:
+            with _session() as db:
+                run = db.get(StrategyRun, run_id)
+                if run is None:
+                    return
+                try:
+                    cfg = json.loads(run.config or "{}")
+                except (TypeError, ValueError):
+                    cfg = {}
+                if not isinstance(cfg, dict):
+                    cfg = {}
+                cfg[RUN_ORDERS_KEY] = orders_enabled()
+                run.config = json.dumps(cfg)
+                db.commit()
+        except Exception as e:
+            logger.warning("주문 제출 여부 기록 실패 run_id=%s: %s", run_id, e)
 
     def _mark_start_failed(self, run_id: int, strategy_type):
         """The strategy for a start command could not be built, so it never ran.
@@ -1147,9 +1221,12 @@ class StrategyWorker:
             logger.error("KISBroker 획득 실패: %s", e)
             return None
 
-        machine = OrderStateMachine(on_state_change=lambda o: self._persist_order(o))
-        tracker = PositionTracker(machine, corporate_action_runtime=self._ca_runtime)
         run_id = data.get("run_id", 0)
+        # Orders this run's machine records are attributed to it
+        # (``orders.strategy_run_id``) — the 4-week gate needs a fill from the run.
+        machine = OrderStateMachine(
+            on_state_change=lambda o: self._persist_order(o, run_id=run_id))
+        tracker = PositionTracker(machine, corporate_action_runtime=self._ca_runtime)
 
         on_filled_cb = self._make_fill_callback(tracker, machine, run_id)
 
@@ -1388,7 +1465,7 @@ class StrategyWorker:
         with lock:
             return ids.get(broker_order_id)
 
-    def _persist_order(self, order: Order):
+    def _persist_order(self, order: Order, run_id: int | None = None):
         # Derive a deterministic idempotency key from broker order id + date.
         # KIS ODNO is unique per trading day per account, so this composite key
         # prevents duplicate DB rows when the same order is processed twice.
@@ -1457,6 +1534,9 @@ class StrategyWorker:
                         # this column today, so this is a coherence fix, not a
                         # behaviour change.
                         trade_date=day,
+                        # Set on insert only: an existing row keeps whatever run
+                        # it was first recorded under.
+                        strategy_run_id=run_id or None,
                     )
                     db.add(row)
                     db.flush()
@@ -1779,9 +1859,15 @@ def main():
         )
         _sys.exit(1)
     if _kis_env == "paper" and _live_enabled:
+        # The 4-week paper run: orders go to the KIS paper account. The paper gate
+        # (promotion_guard.paper_gate_status) needs a fill, so this is the setting
+        # that can pass it.
+        logger.info("KIS_ENV=paper + ENABLE_LIVE_TRADING=true — 모의투자 계좌로 주문을 보낸다")
+    if _kis_env == "paper" and not _live_enabled:
         logger.warning(
-            "KIS_ENV=paper이지만 ENABLE_LIVE_TRADING=true — "
-            "모의투자 TR_ID로 주문이 전송됩니다. 의도한 설정인지 확인하세요."
+            "섀도 모드(KIS_ENV=paper, ENABLE_LIVE_TRADING=false) — 주문이 나가지 않는다. "
+            "체결이 없으므로 이 실행은 4주 모의투자 관문에 세지 않는다. "
+            "모의투자는 ENABLE_LIVE_TRADING=true로."
         )
 
     # Create Worker first so its single poller can be shared with recovery

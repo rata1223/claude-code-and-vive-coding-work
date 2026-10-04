@@ -169,8 +169,9 @@ services:
       KIS_APP_SECRET: ${KIS_APP_SECRET}
       KIS_ACCOUNT_NO: ${KIS_ACCOUNT_NO}
       KIS_ENV: ${KIS_ENV:-paper}
-      # Set ENABLE_LIVE_TRADING=true ONLY after completing 4-week paper run.
       # Default false = shadow execution: full signals generated but no orders submitted.
+      # The 4-week paper run is KIS_ENV=paper + ENABLE_LIVE_TRADING=true (orders to the KIS
+      # paper account) — a shadow run never fills and never passes the paper gate.
       ENABLE_LIVE_TRADING: ${ENABLE_LIVE_TRADING:-false}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379}
       DB_URL: postgresql://quantdinger:${POSTGRES_PASSWORD}@postgres:5432/quantdinger
