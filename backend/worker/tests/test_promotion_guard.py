@@ -650,6 +650,10 @@ def test_no_market_open_starts_once_the_session_is_stopping(factory, monkeypatch
     session.trigger_market_open("US")
 
     assert strategy.opens == 0
+    # Let the session thread finish its DB writes before the fixture disposes
+    # the single shared SQLite connection: a write racing the dispose crashed
+    # the interpreter (segfault in CI).
+    assert session.join(5) is True
 
 
 def test_a_stop_after_the_session_ended_keeps_the_recorded_end(factory, monkeypatch):
