@@ -133,6 +133,7 @@ export default {
       loadError: '',
       loadSeq: 0,
       liveStatus: 'connecting',
+      liveEverConnected: false,
       events: [],
       eventSeq: 0,
       feed: null,
@@ -172,9 +173,21 @@ export default {
     openFeed() {
       if (this.feed) this.feed.close()
       this.feed = createOperatorFeed({
-        onStatus: (s) => { this.liveStatus = s },
+        onStatus: (s) => this.onFeedStatus(s),
         onEvent: (ev) => this.onFeedEvent(ev)
       })
+    },
+    onFeedStatus(s) {
+      // Socket.IO does not replay what was published while the socket was down:
+      // after a reconnect, read the list again (the first connect follows the
+      // mount's own load).
+      if (s === 'connected' && this.liveEverConnected) this.scheduleReload()
+      if (s === 'connected') this.liveEverConnected = true
+      this.liveStatus = s
+    },
+    scheduleReload() {
+      clearTimeout(this.reloadTimer)
+      this.reloadTimer = setTimeout(() => this.load(), 1500)
     },
     onFeedEvent(ev) {
       this.events = [{ ...ev, key: ++this.eventSeq }, ...this.events].slice(0, 30)
@@ -183,10 +196,7 @@ export default {
       }
       // An order moved (submitted, filled, cancelled): fill counts and the gate
       // may have changed. One reload for a burst of updates.
-      if (ev.type === 'order') {
-        clearTimeout(this.reloadTimer)
-        this.reloadTimer = setTimeout(() => this.load(), 1500)
-      }
+      if (ev.type === 'order') this.scheduleReload()
     },
     liveLabel() {
       switch (this.liveStatus) {

@@ -156,3 +156,18 @@ def test_every_alert_level_the_backend_sends_is_styled():
     css = _read("frontend/src/views/profile/OperatorStrategy.vue").split("<style", 1)[1]
     for level in levels - {"info"}:
         assert f".live-row.alert-{level}" in css, level
+
+
+def test_the_feed_falls_back_to_polling_when_websocket_fails():
+    """socket.io-client 4.8 does not try the next transport unless told to: a
+    proxy that blocks WebSocket upgrades would leave the feed disconnected."""
+    src = _read("frontend/src/services/operatorFeed.js")
+    assert "transports: ['websocket', 'polling']" in src
+    assert "tryAllTransports: true" in src
+
+
+def test_a_reconnect_reloads_the_list():
+    """Socket.IO does not replay what was published while the socket was down."""
+    src = _read("frontend/src/views/profile/OperatorStrategy.vue")
+    handler = src.split("onFeedStatus(s) {", 1)[1].split("\n    },", 1)[0]
+    assert "this.liveEverConnected) this.scheduleReload()" in handler

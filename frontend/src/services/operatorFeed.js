@@ -19,6 +19,9 @@ export function createOperatorFeed({ onEvent, onStatus }) {
   const socket = io(getBaseUrl() || undefined, {
     path: '/socket.io',
     transports: ['websocket', 'polling'],
+    // WebSocket first; if it cannot open (a proxy that blocks upgrades), fall
+    // back to long-polling instead of staying disconnected.
+    tryAllTransports: true,
     autoConnect: false,
     reconnectionDelayMax: 30000,
     auth: (cb) => cb({ token: localStorage.getItem('token') || '' })
