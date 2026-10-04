@@ -271,4 +271,21 @@ def build_scheduler() -> BackgroundScheduler:
         coalesce=True,
     )
 
+    # 운영 화면 계좌 카드(포지션·자산) 10분 주기 — 한국 장중, 서울 시각 기준 미국 장중.
+    # 체결 직후에도 워커가 따로 발행한다.
+    from backend.worker.portfolio_feed import publish_portfolio
+    scheduler.add_job(
+        publish_portfolio,
+        CronTrigger(
+            day_of_week="mon-sat",
+            hour="0-6,9-15,22-23",
+            minute="*/10",
+            timezone="Asia/Seoul",
+        ),
+        id="portfolio_feed",
+        name="운영 화면 계좌 발행",
+        max_instances=1,
+        coalesce=True,
+    )
+
     return scheduler

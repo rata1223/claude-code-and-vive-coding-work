@@ -3,7 +3,8 @@ import { getBaseUrl } from '@/api'
 
 /**
  * The operator live feed from kis-ws (backend/websocket/server.py): order
- * updates and alerts for the worker's .env account, relayed from Redis.
+ * updates, alerts, positions and equity for the worker's .env account,
+ * relayed from Redis.
  * kis-ws accepts only OPERATOR_USER_IDS; anyone else is refused at connect.
  *
  * The socket goes to the same server as the API, path /socket.io: the web
@@ -38,6 +39,10 @@ export function createOperatorFeed({ onEvent, onStatus }) {
   socket.on('connect_error', () => status(socket.active ? 'reconnecting' : 'refused'))
   socket.on('order:update', (data) => onEvent && onEvent({ type: 'order', data, at: Date.now() }))
   socket.on('alert', (data) => onEvent && onEvent({ type: 'alert', data, at: Date.now() }))
+  // Account state, not events: the latest payload replaces the previous one.
+  // kis-ws also sends the last of each right after connecting.
+  socket.on('position:update', (data) => onEvent && onEvent({ type: 'positions', data, at: Date.now() }))
+  socket.on('equity:update', (data) => onEvent && onEvent({ type: 'equity', data, at: Date.now() }))
 
   status('connecting')
   socket.connect()

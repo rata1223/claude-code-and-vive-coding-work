@@ -34,6 +34,7 @@ from backend.execution.order_poller import OrderFillPoller
 from backend.execution.position_tracker import Fill, PositionTracker
 from backend.execution.reconciler import PositionReconciler
 from backend.worker.heartbeat import WorkerHeartbeat
+from backend.worker.portfolio_feed import publish_portfolio
 from backend.strategy.base import StrategyBase
 from backend.strategy.indicator.strategy import IndicatorStrategy
 
@@ -402,6 +403,9 @@ class StrategyWorker:
         #: broker I/O and DB writes, so they are tracked in order to be joined on
         #: the way out rather than SIGKILLed mid-flight.
         self._aux_threads: list[threading.Thread] = []
+        #: Publish positions/equity for the operator screen after fills (see
+        #: ``_publish_portfolio_soon``).
+        self._portfolio_feed = True
         #: broker order number → DB primary key, for orders this process has seen
         #: open. See `_open_order_row` for why the number alone is not enough.
         self._order_row_ids: dict[str, int] = {}
@@ -1428,8 +1432,10 @@ class StrategyWorker:
             # 5. Upsert position in DB to reflect fill
             self._upsert_position_db(fill.symbol, fill.market, tracker.get_position(fill.symbol))
 
-            # 6. WebSocket push
+            # 6. WebSocket push — the order, then (off this path) the account's
+            # positions and equity, which the fill just changed.
             self._publish_order_update(order)
+            self._publish_portfolio_soon()
             logger.info("체결 파이프라인 완료: %s %s qty=%d @ %.4f",
                         order.id, order.symbol, fill.qty, fill.price)
 
@@ -1790,6 +1796,18 @@ class StrategyWorker:
             logger.warning("포지션 DB 갱신 실패 (%s): %s", symbol, e)
 
     # ── WebSocket 발행 ────────────────────────────────────────────────────
+    def _publish_portfolio_soon(self) -> None:
+        """Publish positions and equity on a tracked aux thread (``shutdown()``
+        joins it), off the fill path. Only a worker built by ``__init__`` does:
+        the publish reads the broker, and workers the test suites build with
+        ``__new__`` must never reach a real one."""
+        if not getattr(self, "_portfolio_feed", False):
+            return
+        try:
+            self._spawn_aux(publish_portfolio, name="portfolio-feed")
+        except Exception as e:  # a view; never let it disturb the fill pipeline
+            logger.warning("포트폴리오 발행 시작 실패: %s", e)
+
     def _publish_order_update(self, order: Order):
         try:
             from backend.websocket.server import publish_order_update
@@ -1915,6 +1933,8 @@ def main():
     scheduler.start()
     logger.info("스케줄러 시작")
     worker.attach_scheduler(scheduler)  # so shutdown() can stop it first
+    # The operator screen's account card; the scheduler refreshes it from here.
+    worker._publish_portfolio_soon()
 
     worker.run()  # blocking until SIGTERM/SIGINT; tears down on the way out
 
