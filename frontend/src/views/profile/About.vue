@@ -45,8 +45,12 @@ import { APP_BUILD_VERSION, isRemoteVersionNewer } from '@/constants/appVersion'
 /** Only an https download address the server provides is ever opened — no
  *  built-in fallback (the upstream project's APK used to be one). */
 const safeDownloadUrl = (value) => {
-  const url = String(value ?? '').trim()
-  return /^https:\/\/[^\s]+$/i.test(url) ? url : ''
+  try {
+    const url = new URL(String(value ?? '').trim())
+    return url.protocol === 'https:' && url.hostname ? url.href : ''
+  } catch {
+    return ''
+  }
 }
 
 export default {

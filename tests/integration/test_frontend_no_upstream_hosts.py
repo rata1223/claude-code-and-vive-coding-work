@@ -38,9 +38,35 @@ def test_both_apps_carry_the_same_copy(rel):
     assert _read(f"frontend/{rel}") == _read(f"mobile/{rel}"), rel
 
 
+def _safe_download_url_source() -> str:
+    src = _read("frontend/src/views/profile/About.vue")
+    start = src.index("const safeDownloadUrl = ")
+    return src[start:src.index("\n}\n", start) + 3]
+
+
+@pytest.mark.parametrize("value, expected", [
+    ("https://downloads.example.test/kis.apk", "https://downloads.example.test/kis.apk"),
+    ("  https://downloads.example.test/a b.apk ", "https://downloads.example.test/a%20b.apk"),
+    ("https://example.com:bad/app.apk", ""),        # not a URL (CodeRabbit)
+    ("http://downloads.example.test/kis.apk", ""),
+    ("javascript:alert(1)", ""),
+    ("https://", ""),
+    ("", ""),
+    (None, ""),
+])
+def test_about_accepts_only_parseable_https_addresses(value, expected):
+    """Run the page's own validator in Node: a hand-written regex accepted
+    `https://example.com:bad`, an address no browser can open."""
+    import json
+    import subprocess
+    script = _safe_download_url_source() + f"\nprocess.stdout.write(JSON.stringify(safeDownloadUrl({json.dumps(value)})))"
+    out = subprocess.run(["node", "-e", script], capture_output=True, text=True, check=True).stdout
+    assert json.loads(out) == expected
+
+
 def test_about_opens_only_an_https_address_from_the_server():
     src = _read("frontend/src/views/profile/About.vue")
-    assert "return /^https:\\/\\/[^\\s]+$/i.test(url) ? url : ''" in src
+    assert "url.protocol === 'https:' && url.hostname" in src
     confirm = src.split("async onConfirmUpdate() {", 1)[1].split("\n    }", 1)[0]
     assert "const url = safeDownloadUrl(this.downloadUrl)" in confirm and "if (!url) return" in confirm
     # no built-in fallback address of any kind
