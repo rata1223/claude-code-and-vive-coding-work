@@ -544,3 +544,89 @@ def test_the_audit_row_names_every_day_it_cleared(db, user):
         AuditLog.event_type == "kill_switch_reset").one().detail
     assert yesterday.isoformat() in detail
     assert trading_day().isoformat() in detail
+
+
+# ── a halt older than yesterday is still in force ────────────────────────────
+#
+# A worker down for two whole risk days writes no newer row, so the halt stays
+# on its old row. Reading only today and yesterday made it invisible here — the
+# status said "not halted" and the reset said "nothing to release" — while
+# nothing could clear it. Every still-halted row counts (`risk_days_in_play`).
+
+def _days_ago(n):
+    from datetime import timedelta
+    from backend.database.models import trading_day
+    return trading_day() - timedelta(days=n)
+
+
+def test_status_sees_a_halt_three_risk_days_old(db, user):
+    from api.routers import risk
+    _risk_row(db, kill_switch=True, reason="3일 전 MDD", day=_days_ago(3))
+
+    body = risk.kill_switch_status(user, db).data
+
+    assert body["active"] is True
+    assert body["reason"] == "3일 전 MDD"
+
+
+def test_reset_clears_a_halt_three_risk_days_old(db, user):
+    from backend.database.models import DailyRiskState
+    from api.routers import risk
+    old = _days_ago(3)
+    _risk_row(db, kill_switch=True, reason="3일 전 MDD", day=old)
+
+    resp = risk.reset_kill_switch(
+        risk.KillSwitchResetRequest(reason="장기 정지 정리"), user, db)
+
+    assert resp.code == 1, resp.msg
+    db.expire_all()
+    assert db.get(DailyRiskState, old).kill_switch is False
+    assert risk.kill_switch_status(user, db).data["active"] is False
+
+
+def test_reset_clears_old_and_recent_halts_together(db, user):
+    from backend.database.models import AuditLog, DailyRiskState, trading_day
+    from api.routers import risk
+    old = _days_ago(5)
+    _risk_row(db, kill_switch=True, reason="5일 전", day=old)
+    _risk_row(db, kill_switch=True, reason="오늘", day=trading_day())
+
+    risk.reset_kill_switch(
+        risk.KillSwitchResetRequest(reason="일괄 정리"), user, db)
+
+    db.expire_all()
+    assert db.get(DailyRiskState, old).kill_switch is False
+    assert db.get(DailyRiskState, trading_day()).kill_switch is False
+    detail = db.query(AuditLog).filter(
+        AuditLog.event_type == "kill_switch_reset").one().detail
+    assert old.isoformat() in detail
+
+
+def test_status_reports_the_newest_halts_reason(db, user):
+    from api.routers import risk
+    _risk_row(db, kill_switch=True, reason="오래된 정지", day=_days_ago(6))
+    _risk_row(db, kill_switch=True, reason="최근 정지", day=_days_ago(3))
+
+    assert risk.kill_switch_status(user, db).data["reason"] == "최근 정지"
+
+
+def test_a_row_dated_ahead_of_today_is_seen_and_cleared(db, user):
+    """Deploy day: the old Seoul-midnight key wrote KST 00–07 halts one day
+    ahead of the 07:00 risk day."""
+    from datetime import timedelta
+    from backend.database.models import DailyRiskState, trading_day
+    from api.routers import risk
+    ahead = trading_day() + timedelta(days=1)
+    _risk_row(db, kill_switch=True, reason="옛 키로 쓴 정지", day=ahead)
+
+    assert risk.kill_switch_status(user, db).data["active"] is True
+    risk.reset_kill_switch(
+        risk.KillSwitchResetRequest(reason="배포일 정리"), user, db)
+    db.expire_all()
+    assert db.get(DailyRiskState, ahead).kill_switch is False
+
+
+def test_an_old_cleared_row_is_not_a_halt(db, user):
+    from api.routers import risk
+    _risk_row(db, kill_switch=False, reason=None, day=_days_ago(9))
+    assert risk.kill_switch_status(user, db).data["active"] is False

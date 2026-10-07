@@ -105,7 +105,7 @@ def _reset_daily_risk():
 
     # Re-arm SAFE_MODE for the new day — skip if a kill switch is still live
     try:
-        from backend.database.models import DailyRiskState, trading_days_in_play
+        from backend.database.models import DailyRiskState, risk_days_in_play
         from backend.worker.recovery import SAFE_MODE
         kill_active = False
         halted_row = None
@@ -113,17 +113,18 @@ def _reset_daily_risk():
         checked = False
         db_check = None
         try:
-            # Both risk days (`trading_days_in_play`). At 07:01 that is the day
-            # that just began and the one that just ended — the Korean session
-            # plus the US session that closed overnight. Reading one row once
-            # resumed trading over a live halt (with the old Seoul-midnight key,
-            # a halt fired before midnight sat on the other row).
+            # Every risk day a halt can be on (`risk_days_in_play`): the day
+            # that just began, the one that just ended, and any older day still
+            # halted — newest first, so the carry below starts from the latest.
+            # Reading one row once resumed trading over a live halt (with the old
+            # Seoul-midnight key, a halt fired before midnight sat on the other
+            # row), and reading two let a halt age out after two quiet days.
             #
             # Yesterday must also be KST-based: on the UTC date it landed a
             # further day back, normally an empty row, so even the pre-midnight
             # halt read as "no halt" (issue #160).
             db_check = _get_db()
-            for key in trading_days_in_play():
+            for key in risk_days_in_play(db_check):
                 row = db_check.get(DailyRiskState, key)
                 if row and row.kill_switch:
                     kill_active = True
@@ -151,12 +152,12 @@ def _reset_daily_risk():
 def _carry_halt_forward(from_day, reason, peak_equity) -> None:
     """Put a live halt on the new risk day's row.
 
-    A halt lasts until someone clears it, but readers only look at today's and
-    yesterday's rows, and the tracker carries the halt forward only when it
-    writes — at a fill or a shutdown, which a halted worker over a weekend may
-    never have. Two quiet days and the halt aged out: this job re-armed
-    SAFE_MODE over it and a restart came up unhalted. Running daily, this keeps
-    it on the newest row.
+    A halt lasts until someone clears it, and readers find it on any still-
+    halted row (``risk_days_in_play``). Keeping it on the newest row as well
+    means today's row says what is in force — the tracker adopts it at its
+    first write, and the daily summary and ``/api/metrics`` PnL read today's
+    row — rather than leaving that to the tracker's next fill or shutdown,
+    which a halted worker over a weekend may never have.
 
     Today's row may already exist unhalted — a tracker write in the minute
     since 07:00 that had not yet adopted an outside halt creates it with its
@@ -172,7 +173,11 @@ def _carry_halt_forward(from_day, reason, peak_equity) -> None:
     """
     from backend.database.models import lock_risk_row, lock_risk_rows, trading_day
     today = trading_day()
-    if from_day == today:
+    if from_day >= today:
+        # Already on today's row, or on a row dated ahead of it (the old
+        # Seoul-midnight key on deploy day). Every reader sees that row as it
+        # is; carrying from it would lock a later date before an earlier one,
+        # against the order every multi-day writer keeps (#164).
         return
     db = None
     try:

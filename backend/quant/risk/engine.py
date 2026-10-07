@@ -598,34 +598,47 @@ class PersistentLossTracker(LossTracker):
         # A live process does not hit this: `_write_db`'s `is_new` path carries
         # the halt onto the new day's row at its first write. Only a restart in
         # the gap before that write does.
-        from backend.database.models import trading_days_in_play
-        for key in trading_days_in_play():
+        #
+        # Every still-halted day counts, not just yesterday: a worker down for
+        # two whole risk days carried nothing forward, and the halt aged out of
+        # a two-day window. If that lookup fails, the two days are still read.
+        from backend.database.models import risk_days_in_play, trading_days_in_play
+        days = (self._query(lambda s: risk_days_in_play(s, today), "정지 날짜")
+                or list(trading_days_in_play()))
+        halted = []
+        for key in days:
             row = db_state if key == today else self._load_db_full(key)
             if row is not None and row.kill_switch:
-                self.kill_switch = True
-                self.kill_reason = row.kill_reason or ""
-                logger.warning("킬스위치 복원 (%s): %s", key, self.kill_reason)
-                if self.kill_reason.startswith(MDD_REASON_PREFIX):
-                    # The process that measured this breach already requested
-                    # the flatten; its sells may still be resting. Requesting
-                    # again on the first fill after boot is the startup
-                    # liquidation R-CRIT-07 forbids. A daily/weekly halt stays
-                    # armed: MDD breaking later still flattens (P0-03).
-                    self._mdd_flatten_requested = True
-                if key != today:
-                    # Restoring from *today's* row is not this process's opinion
-                    # — the row already says it, and counting it would re-break
-                    # issue #158. A halt found on an **earlier** day is different:
-                    # today's row does not carry it yet, so carrying it forward is
-                    # this process's job and has to be recorded as intent.
-                    #
-                    # Without this, `_write_db` sees nothing to assert, reads
-                    # today's row, adopts its `False` as an external clear and
-                    # **wipes the live halt on the very first write** — then the
-                    # old row ages out of `trading_days_in_play()` and the halt is
-                    # gone for good.
-                    self._mark_kill_switch_changed()
-                break
+                halted.append((key, row.kill_reason or ""))
+        if halted:
+            # Today's own halt, when it has one, is what is in force today; a row
+            # dated ahead of today (the old key on deploy day) must not replace
+            # its reason. Otherwise the newest halted day.
+            key, reason = next(((k, r) for k, r in halted if k == today), halted[0])
+            self.kill_switch = True
+            self.kill_reason = reason
+            logger.warning("킬스위치 복원 (%s): %s", key, self.kill_reason)
+            if any(r.startswith(MDD_REASON_PREFIX) for _, r in halted):
+                # The process that measured this breach already requested the
+                # flatten; its sells may still be resting. Requesting again on
+                # the first fill after boot is the startup liquidation
+                # R-CRIT-07 forbids. Any halted row counts, not only the one
+                # whose reason is shown — an older MDD halt is still the same
+                # uncleared breach. A daily/weekly halt stays armed: MDD
+                # breaking later still flattens (P0-03).
+                self._mdd_flatten_requested = True
+            if key != today:
+                # Restoring from *today's* row is not this process's opinion
+                # — the row already says it, and counting it would re-break
+                # issue #158. A halt found on another day is different: today's
+                # row does not carry it yet, so carrying it forward is this
+                # process's job and has to be recorded as intent.
+                #
+                # Without this, `_write_db` sees nothing to assert, reads
+                # today's row, adopts its `False` as an external clear and
+                # **wipes the live halt on the very first write**, and the
+                # halt is then carried by nothing newer than its old row.
+                self._mark_kill_switch_changed()
 
     def record_pnl(self, pnl: float, current_equity: float) -> str:
         """As the base, plus ``"adopted"`` when the write picked up a halt that
@@ -924,6 +937,14 @@ class PersistentLossTracker(LossTracker):
                 return fn(self._db)
         except Exception as e:
             logger.error("리스크 상태 복원 조회 실패(%s) — 이 값 없이 기동: %s", what, e)
+            if sess is None and self._db is not None:
+                # A shared (legacy) session is left in a failed transaction on
+                # Postgres; without this every later read through it fails too,
+                # and the two-day fallback for the halt reads nothing.
+                try:
+                    self._db.rollback()
+                except Exception:
+                    pass
         finally:
             if sess is not None:
                 sess.close()

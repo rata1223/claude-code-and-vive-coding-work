@@ -114,12 +114,12 @@ def get_status():
     pending_orders = -1
 
     try:
-        from backend.database.models import DailyRiskState, trading_days_in_play
+        from backend.database.models import DailyRiskState, risk_days_in_play
         db = get_db()
-        # Both live days: an uncleared halt on the previous risk day is still in
-        # force, so reporting only today's row could say "not halted" during it.
-        # Same reason `api/routers/risk.py` reads both (`trading_days_in_play`).
-        for _key in trading_days_in_play():
+        # Every day a halt can be on: an uncleared halt on an earlier risk day
+        # is still in force, so reporting only today's row could say "not
+        # halted" during it. Same reader as `api/routers/risk.py`.
+        for _key in risk_days_in_play(db):
             row = db.get(DailyRiskState, _key)
             if row and row.kill_switch:
                 kill_switch = True
@@ -486,7 +486,7 @@ def get_metrics():
         ).count()
         metrics["open_positions"] = db.query(Position).count()
         from backend.database.models import (
-            DailyRiskState, trading_day, trading_days_in_play,
+            DailyRiskState, risk_days_in_play, trading_day,
         )
         row = db.get(DailyRiskState, trading_day())
         if row and row.peak_equity and row.peak_equity > 0:
@@ -494,7 +494,7 @@ def get_metrics():
             metrics["daily_pnl_pct"] = round(row.daily_pnl / row.peak_equity * 100, 3)
         metrics["kill_switch"] = any(
             (r is not None and r.kill_switch)
-            for r in (db.get(DailyRiskState, k) for k in trading_days_in_play())
+            for r in (db.get(DailyRiskState, k) for k in risk_days_in_play(db))
         )
     except Exception:
         pass

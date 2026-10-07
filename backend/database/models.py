@@ -64,8 +64,11 @@ def trading_days_in_play() -> tuple[date, date]:
     its first write, and the worker's 07:01 job does so every morning
     (``scheduler._carry_halt_forward``), but a restart before either reads a new
     day with no row yet — so anything asking "is trading halted right now"
-    reads the previous risk day too. A worker that is down for two whole risk
-    days carries nothing, and its halt ages out of this window.
+    reads the previous risk day too.
+
+    This pair is only the base. A worker down for two whole risk days carries
+    nothing, so readers asking about a halt use :func:`risk_days_in_play`,
+    which adds every day whose row is still halted.
 
     Including yesterday unconditionally does not over-block. A halt that was
     cleared has ``kill_switch`` false and does not match; only an *uncleared*
@@ -174,6 +177,28 @@ class DailyRiskState(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
+def risk_days_in_play(sess: Session, today: date | None = None) -> list[date]:
+    """The risk days a live halt can be on: today, yesterday, and every day
+    whose row is still halted — newest first.
+
+    A halt lasts until someone clears it; the date it was written under is
+    where the flag is stored, not when it expires. Reading only today and
+    yesterday let a halt age out whenever nothing wrote a newer row for two
+    risk days — a worker down over a long weekend came back up unhalted, the
+    status endpoints said "not halted", and the reset endpoint could not reach
+    the row to clear it. A row dated ahead of today (written under the old
+    Seoul-midnight key on deploy day) is included for the same reason.
+
+    Newest first, so the latest halt's reason is the one reported. A cleared
+    row (``kill_switch`` false) never matches, whatever its age.
+    """
+    if today is None:
+        today = trading_day()
+    halted = {d for (d,) in sess.query(DailyRiskState.trade_date)
+              .filter(DailyRiskState.kill_switch.is_(True))}
+    return sorted(halted | {today, today - timedelta(days=1)}, reverse=True)
+
+
 def lock_risk_row(sess: Session, day: date) -> tuple["DailyRiskState", bool]:
     """The ``DailyRiskState`` row for ``day``, created if missing and locked.
 
@@ -208,7 +233,7 @@ def lock_risk_rows(sess: Session, days) -> list["DailyRiskState"]:
     """Lock the *existing* rows among ``days``, always in date order.
 
     For writers that act on several risk days at once (a halt can still be
-    sitting on the previous day's row — see :func:`trading_days_in_play`).
+    sitting on an earlier day's row — see :func:`risk_days_in_play`).
     A fixed order is what keeps two such writers
     from deadlocking on each other; a missing day is skipped, not created.
     """
