@@ -28,11 +28,20 @@ def _get_db():
 
 
 def _save_equity_snapshot():
-    """자산 스냅샷을 DB에 저장 + Telegram 일일 결산 발송."""
+    """자산 스냅샷을 DB에 저장 + Telegram 일일 결산 발송.
+
+    Runs at 06:50 KST: after the US close (05:00, winter 06:00) and before the
+    07:00 risk-day boundary, so ``trading_day()`` is still the risk day that
+    just closed — the Korean session plus the US session after it — and the
+    summary covers all of it. At 23:50 it reported the Korean session and only
+    the first ~80 minutes of the US one (#166, CLAUDE.md known issue 15).
+    """
     db = None
     try:
         from backend.brokers.kis import get_kis_broker
-        from backend.database.models import EquitySnapshot, DailyRiskState, trading_day
+        from backend.database.models import (
+            EquitySnapshot, DailyRiskState, risk_days_in_play, trading_day,
+        )
         broker = get_kis_broker()
         bal = broker.get_balance()
         db = _get_db()
@@ -46,14 +55,24 @@ def _save_equity_snapshot():
         logger.info("자산 스냅샷 저장: %.0f원", bal.total_eval_krw)
 
         # Collect daily risk state for Telegram summary
-        risk_row = db.get(DailyRiskState, trading_day())
+        day = trading_day()
+        risk_row = db.get(DailyRiskState, day)
         daily_pnl_pct = 0.0
-        kill_switch = False
-        kill_reason = ""
         if risk_row and risk_row.peak_equity > 0:
             daily_pnl_pct = risk_row.daily_pnl / risk_row.peak_equity * 100
-            kill_switch = risk_row.kill_switch
-            kill_reason = risk_row.kill_reason or ""
+
+        # The halt is read on its own, not behind the peak check — a halted row
+        # with no peak (one carried forward by the 07:01 job) read as "no halt"
+        # — and from every risk day a halt can be on, like `/api/status` and the
+        # tracker's restore (#216). The day's own halt first, else the newest.
+        kill_switch = False
+        kill_reason = ""
+        halted = [r for r in (db.get(DailyRiskState, k) for k in risk_days_in_play(db, day))
+                  if r is not None and r.kill_switch]
+        if halted:
+            shown = next((r for r in halted if r.trade_date == day), halted[0])
+            kill_switch = True
+            kill_reason = shown.kill_reason or ""
 
         try:
             from bot.notifier import alert_daily_summary
@@ -63,6 +82,7 @@ def _save_equity_snapshot():
                 "position_count": len(broker.get_positions()),
                 "kill_switch": kill_switch,
                 "kill_reason": kill_reason,
+                "risk_day": day.isoformat(),
             })
         except Exception as e:
             logger.warning("Telegram 일일 결산 알림 실패: %s", e)
@@ -313,10 +333,11 @@ def build_scheduler() -> BackgroundScheduler:
         id="risk_reset", name="리스크 카운터 리셋",
     )
 
-    # 자산 스냅샷 23:50 KST
+    # 자산 스냅샷 + 일일 결산 06:50 KST — 미국 마감(05:00, 겨울 06:00) 뒤, 리스크 데이가
+    # 바뀌는 07:00 전. 방금 끝난 리스크 데이(한국 세션 + 그날 밤 미국 세션) 전체를 보고한다.
     scheduler.add_job(
         _save_equity_snapshot,
-        CronTrigger(hour=23, minute=50, timezone="Asia/Seoul"),
+        CronTrigger(hour=6, minute=50, timezone="Asia/Seoul"),
         id="equity_snapshot", name="자산 스냅샷",
     )
 

@@ -56,8 +56,12 @@ def alert_daily_summary(summary: dict):
     kill_line = ""
     if summary.get("kill_switch"):
         kill_line = f"\n🚨 킬스위치: {summary.get('kill_reason', '활성')}"
+    day_line = ""
+    if summary.get("risk_day"):
+        day_line = f"리스크 데이: {summary['risk_day']} (07:00~07:00 KST)\n"
     msg = (
         f"📊 <b>일일 결산</b>\n"
+        f"{day_line}"
         f"총 자산: {summary.get('total_equity', 0):,.0f}원\n"
         f"일 수익률: {summary.get('daily_pnl_pct', 0):.2f}%\n"
         f"포지션 수: {summary.get('position_count', 0)}개"
