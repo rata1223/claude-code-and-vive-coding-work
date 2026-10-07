@@ -1,7 +1,7 @@
 /** Long-form legal copy by UI locale. */
 
 const ZH = {
-  terms: `欢迎使用 KIS Trading（以下简称「本服务」）。在使用本服务前，请您仔细阅读以下条款：
+  terms: `欢迎使用 QuantDinger（以下简称「本服务」）。在使用本服务前，请您仔细阅读以下条款：
 
 1. 服务说明
 本服务提供与股票及 ETF 相关的信息展示、策略工具及辅助交易功能。本服务不构成任何投资建议、证券咨询或资产管理要约。
@@ -33,7 +33,7 @@ const ZH = {
 
 /** 繁體中文（台灣用語習慣） */
 const ZH_TW = {
-  terms: `歡迎使用 KIS Trading（以下簡稱「本服務」）。在使用本服務前，請您仔細閱讀以下條款：
+  terms: `歡迎使用 QuantDinger（以下簡稱「本服務」）。在使用本服務前，請您仔細閱讀以下條款：
 
 1. 服務說明
 本服務提供與股票及 ETF 相關的資訊展示、策略工具及輔助交易功能。本服務不構成任何投資建議、證券諮詢或資產管理要約。
@@ -64,7 +64,7 @@ const ZH_TW = {
 }
 
 const EN = {
-  terms: `Welcome to KIS Trading ("the Service"). Please read the following carefully before using the Service:
+  terms: `Welcome to QuantDinger ("the Service"). Please read the following carefully before using the Service:
 
 1. Service description
 The Service provides information display, strategy tools and trading assistance related to stocks and ETFs. Nothing herein constitutes investment advice, securities advice or an offer to manage assets.
@@ -95,7 +95,7 @@ This Agreement shall be interpreted and performed in good faith. If a dispute ar
 }
 
 const JA = {
-  terms: `KIS Trading（以下「本サービス」）をご利用いただきありがとうございます。本サービスをご利用になる前に、次の条項をよくお読みください。
+  terms: `QuantDinger（以下「本サービス」）をご利用いただきありがとうございます。本サービスをご利用になる前に、次の条項をよくお読みください。
 
 1. サービスの内容
 本サービスは、株式および ETF に関する情報の表示、戦略ツール、および取引の補助機能を提供します。本サービスは、投資助言、有価証券に関する助言、または資産管理の申込みを構成するものではありません。
@@ -126,7 +126,7 @@ const JA = {
 }
 
 const KO = {
-  terms: `KIS 자동매매(이하 «서비스»)에 오신 것을 환영합니다. 서비스를 이용하시기 전에 다음 약관을 주의 깊게 읽어 주십시오.
+  terms: `QuantDinger(이하 «서비스»)에 오신 것을 환영합니다. 서비스를 이용하시기 전에 다음 약관을 주의 깊게 읽어 주십시오.
 
 1. 서비스 설명
 본 서비스는 주식 및 ETF와 관련된 정보 표시, 전략 도구 및 거래 보조 기능을 제공합니다. 본 문서의 어떠한 내용도 투자 조언, 증권 관련 조언 또는 자산 관리의 청약을 구성하지 않습니다.

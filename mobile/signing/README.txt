@@ -1,7 +1,7 @@
-KIS Trading Android release signing (NOT tracked in git — see .gitignore)
+QuantDinger Android release signing (NOT tracked in git — see .gitignore)
 
 Files (create locally, never commit):
-  kis-trading-release.jks  — PKCS12 keystore (alias: kis-trading)
+  quantdinger-release.jks  — PKCS12 keystore (alias: quantdinger)
   keystore.properties       — storePassword / keyPassword / keyAlias / storeFile
 
 Security:
@@ -9,14 +9,14 @@ Security:
     to git. Those credentials must be treated as compromised: regenerate the
     keystore and re-enroll with Play App Signing before the app is ever
     published, then rotate any values that were reused elsewhere.
-  - kis-trading-release.jks and keystore.properties are now gitignored. Keep
+  - quantdinger-release.jks and keystore.properties are now gitignored. Keep
     them local only, or inject them in CI from secrets, e.g.:
-      echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > mobile/signing/kis-trading-release.jks
+      echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > mobile/signing/quantdinger-release.jks
       cat > mobile/signing/keystore.properties <<EOF
       storePassword=$ANDROID_STORE_PASSWORD
       keyPassword=$ANDROID_KEY_PASSWORD
-      keyAlias=kis-trading
-      storeFile=kis-trading-release.jks
+      keyAlias=quantdinger
+      storeFile=quantdinger-release.jks
       EOF
 
 Build:

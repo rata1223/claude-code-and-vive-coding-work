@@ -552,7 +552,7 @@ export default {
   about: {
     title: '關於我們',
     intro:
-      'KIS Trading 在韓國投資證券帳戶上自動執行以規則為基礎的股票與 ETF 策略，具備風險上限與營運者面板。股票與 ETF 交易存在虧損風險，請在充分了解策略及其保護機制後使用。',
+      'QuantDinger 整合策略交易、市場資料與資產管理流程，致力提供透明、可理解的輔助工具。股票及 ETF 交易具高風險，請在充分理解產品與交易所規則後謹慎使用。',
     app_version_label: '目前應用程式版本',
     server_version_label: '伺服端發布版本',
     check_update: '檢查更新',

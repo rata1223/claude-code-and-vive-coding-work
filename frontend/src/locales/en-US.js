@@ -553,7 +553,7 @@ export default {
   about: {
     title: 'About',
     intro:
-      'KIS Trading automates a rule-based stock and ETF strategy on a Korea Investment & Securities account, with risk limits and an operator panel. Trading stocks and ETFs carries the risk of loss—use it only after you understand how the strategy and its safeguards work.',
+      'QuantDinger brings together strategy tools, market data and portfolio workflows. We aim to provide transparent trading assistance. Trading stocks and ETFs involves substantial risk—please use the product only after you understand the features and exchange rules.',
     app_version_label: 'App version',
     server_version_label: 'Latest server release',
     check_update: 'Check for updates',

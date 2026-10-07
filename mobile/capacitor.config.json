@@ -1,6 +1,6 @@
 {
   "appId": "com.kistrade.mobile",
-  "appName": "KIS Trading",
+  "appName": "QuantDinger",
   "webDir": "dist",
   "server": {
     "androidScheme": "https",

@@ -419,11 +419,11 @@ export default {
           strategyParams: rec.strategyParams || {},
           riskConfig: rec.riskConfig || {}
         }
-        sessionStorage.setItem('kis_ai_strategy_preset', JSON.stringify(preset))
+        sessionStorage.setItem('qd_ai_strategy_preset', JSON.stringify(preset))
         if (rec.mode === 'script' && rec.strategy_code) {
-          sessionStorage.setItem('kis_ai_strategy_code', rec.strategy_code)
+          sessionStorage.setItem('qd_ai_strategy_code', rec.strategy_code)
         } else {
-          sessionStorage.removeItem('kis_ai_strategy_code')
+          sessionStorage.removeItem('qd_ai_strategy_code')
         }
       } catch {
         showToast({ message: this.$t('bot_create.ai_script_storage_fail'), type: 'fail' })

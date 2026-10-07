@@ -3,9 +3,12 @@ dev server proxied /api (logins, credentials) to api.quantdinger.com, and the
 About page offered the upstream APK, website and support email. Nothing in
 either app may point at the upstream project's hosts.
 
-The name went too (#214): the login terms, titles, app ids and storage keys
-said QuantDinger. What stays is the license (``mobile/LICENSE``) and one
-attribution line in each README, which that license asks for.
+The name stays (#214). The apps are a copy of QuantDinger-Mobile under its
+source-available license, and §3.1 of that license forbids removing or
+altering its branding and attribution notices without the copyright holder's
+written permission. The guards below keep them in place: the license text in
+both apps, the name in the login terms, the About text, the page titles and the
+native app name.
 """
 import re
 from pathlib import Path
@@ -77,40 +80,55 @@ def test_about_opens_only_an_https_address_from_the_server():
     assert not re.search(r"https?://", src.split("<script>", 1)[1].split("const safeDownloadUrl", 1)[0])
 
 
-# ── the upstream name (#214) ──────────────────────────────────────────────
+# ── the upstream branding stays (#214, LICENSE §3.1) ─────────────────────
 
-UPSTREAM_NAME = re.compile(r"quantdinger", re.I)
-
-
-def _app_files(app):
-    root = ROOT / app
-    yield from (root / n for n in ("index.html", "capacitor.config.json", "package.json",
-                                   "vite.config.js") if (root / n).exists())
-    for path in (root / "src").rglob("*"):
-        if path.is_file() and path.suffix in {".js", ".vue", ".ts", ".json", ".html", ".css"}:
-            yield path
+def _node_eval(module_rel, expr):
+    import json
+    import subprocess
+    script = (f"import('file://{ROOT}/{module_rel}')"
+              f".then(m => process.stdout.write(JSON.stringify({expr})))")
+    return json.loads(subprocess.run(["node", "-e", script], capture_output=True, text=True,
+                                     check=True).stdout)
 
 
 @pytest.mark.parametrize("app", APPS)
-def test_no_app_file_carries_the_upstream_name(app):
-    hits = [f"{path.relative_to(ROOT)}:{n}"
-            for path in _app_files(app)
-            for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1)
-            if UPSTREAM_NAME.search(line)]
-    assert not hits, hits
+def test_both_apps_carry_the_license_text(app):
+    assert _read(f"{app}/LICENSE") == _read("mobile/LICENSE")
+    assert "3.1 Attribution and Branding" in _read(f"{app}/LICENSE")
 
 
-@pytest.mark.parametrize("readme", ["mobile/README.md", "mobile/README_CN.md"])
-def test_a_readme_names_the_upstream_once_as_attribution(readme):
-    """The license asks for attribution; the README keeps exactly that, nothing
-    of the upstream product (no hosts, no upstream repository links)."""
-    lines = [line for line in _read(readme).splitlines() if UPSTREAM_NAME.search(line)]
-    assert len(lines) == 1 and "LICENSE" in lines[0], lines
-    assert not re.search(r"brokermr810|quantdinger\.com", _read(readme), re.I)
+@pytest.mark.parametrize("app", APPS)
+def test_the_page_title_and_native_app_name_keep_the_brand(app):
+    assert "<title>QuantDinger</title>" in _read(f"{app}/index.html")
+    assert '"appName": "QuantDinger"' in _read(f"{app}/capacitor.config.json")
 
 
-def test_the_license_is_kept():
-    assert (ROOT / "mobile/LICENSE").is_file()
+LOCALES = ("ko-KR", "en-US", "ja-JP", "zh-CN", "zh-TW")
+
+
+@pytest.mark.parametrize("locale", LOCALES)
+def test_the_terms_keep_the_brand_and_name_the_market(locale):
+    """The brand stays; what changed is the market — the terms described a
+    digital-asset service, and this one trades stocks and ETFs."""
+    legal = _node_eval("frontend/src/constants/legal.js", f"m.getLegal('{locale}')")
+    assert legal["terms"].lstrip().find("QuantDinger") != -1
+    assert "ETF" in legal["terms"]
+    assert not re.search(r"digital asset|数字资产|數位資產|デジタル資産|디지털 자산", legal["terms"])
+
+
+@pytest.mark.parametrize("app", APPS)
+@pytest.mark.parametrize("locale", LOCALES)
+def test_the_about_text_keeps_the_brand_and_names_the_market(app, locale):
+    intro = _node_eval(f"{app}/src/locales/{locale}.js", "m.default.about.intro")
+    assert intro.startswith("QuantDinger")
+    assert "ETF" in intro
+    assert not re.search(r"digital asset|数字资产|數位資產|デジタル資産|暗号資産|디지털 자산", intro, re.I)
+
+
+def test_the_readme_keeps_the_upstream_license_section():
+    readme = _read("mobile/README.md")
+    assert "## License" in readme and "Section 3.1" in readme
+    assert (ROOT / "mobile/banner.png").is_file()
 
 
 @pytest.mark.parametrize("rel", ["src/views/login/index.vue", "src/main.js",
@@ -119,26 +137,8 @@ def test_both_apps_carry_the_same_login_and_terms(rel):
     assert _read(f"frontend/{rel}") == _read(f"mobile/{rel}"), rel
 
 
-def test_both_capacitor_configs_name_the_same_app():
+def test_both_capacitor_configs_are_the_same():
     assert _read("frontend/capacitor.config.json") == _read("mobile/capacitor.config.json")
-    assert '"appId": "com.kistrade.mobile"' in _read("mobile/capacitor.config.json")
-
-
-@pytest.mark.parametrize("locale, name", [
-    ("ko-KR", "KIS 자동매매"), ("en-US", "KIS Trading"), ("ja-JP", "KIS Trading"),
-    ("zh-CN", "KIS Trading"), ("zh-TW", "KIS Trading"),
-])
-def test_the_terms_name_this_service_and_its_market(locale, name):
-    """The terms described a digital-asset service under the upstream name."""
-    import json
-    import subprocess
-    script = (f"import('file://{ROOT}/frontend/src/constants/legal.js')"
-              f".then(m => process.stdout.write(JSON.stringify(m.getLegal({json.dumps(locale)}))))")
-    legal = json.loads(subprocess.run(["node", "-e", script], capture_output=True, text=True,
-                                      check=True).stdout)
-    assert name in legal["terms"]
-    assert "ETF" in legal["terms"]
-    assert not re.search(r"digital asset|数字资产|數位資產|デジタル資産|디지털 자산", legal["terms"])
 
 
 # ── no OAuth login (#214) ─────────────────────────────────────────────────
@@ -157,12 +157,3 @@ def test_no_login_token_is_taken_from_the_url(app):
             if re.search(r"oauth", line, re.I)]
     assert not hits, hits
     assert not (ROOT / app / "src/utils/oauthRedirect.js").exists()
-
-
-@pytest.mark.parametrize("app", APPS)
-def test_no_upstream_storage_keys(app):
-    hits = [f"{path.relative_to(ROOT)}:{n}"
-            for path in (ROOT / app / "src").rglob("*.vue")
-            for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1)
-            if re.search(r"['\"]qd_", line)]
-    assert not hits, hits
