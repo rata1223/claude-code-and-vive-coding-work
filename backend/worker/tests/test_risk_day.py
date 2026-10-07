@@ -531,18 +531,41 @@ class TestTheDailyJobCarriesAHaltForward:
         assert _persistent(factory).kill_switch is True, (
             "a Monday restart came up unhalted")
 
-    def test_an_existing_row_is_not_overwritten(self, clock, factory):
-        """Somebody's decision is on it — an operator's clear included."""
-        _seed(factory, date(2026, 9, 25), kill_switch=True, peak_equity=PEAK)
-        _seed(factory, date(2026, 9, 26), kill_switch=False, daily_pnl=-5.0)
+    def test_an_unhalted_row_created_since_07_00_still_gets_the_halt(
+            self, clock, factory):
+        """A tracker write before 07:01 creates today's row with its own False.
+
+        That is nobody's clear — an operator's release clears every halted
+        in-play row at once, so the earlier row would be clear too. Only the
+        flag is set; the row's equity columns stay as written.
+        """
+        _seed(factory, date(2026, 9, 25), kill_switch=True,
+              kill_reason="외부 halt", peak_equity=PEAK)
+        _seed(factory, date(2026, 9, 26), kill_switch=False,
+              daily_pnl=-5.0, peak_equity=1_100_000.0)
 
         self._run_job(clock, 26)
 
         sess = factory()
         try:
             row = sess.get(DailyRiskState, date(2026, 9, 26))
-            assert row.kill_switch is False
-            assert row.daily_pnl == -5.0
+            assert row.kill_switch is True
+            assert row.kill_reason == "외부 halt"
+            assert (row.daily_pnl, row.peak_equity) == (-5.0, 1_100_000.0)
+        finally:
+            sess.close()
+
+    def test_a_release_after_the_jobs_read_is_not_undone(self, clock, factory):
+        """The earlier row is re-read under its lock before carrying."""
+        from backend.worker.scheduler import _carry_halt_forward
+        _seed(factory, date(2026, 9, 25), kill_switch=False)   # released since
+        clock.kst(2026, 9, 26, 7, 1)
+
+        _carry_halt_forward(date(2026, 9, 25), "일일 손실 한도 초과", PEAK)
+
+        sess = factory()
+        try:
+            assert sess.get(DailyRiskState, date(2026, 9, 26)) is None
         finally:
             sess.close()
 

@@ -149,7 +149,7 @@ def _reset_daily_risk():
 
 
 def _carry_halt_forward(from_day, reason, peak_equity) -> None:
-    """Put a live halt on the new risk day's row, if that row does not exist yet.
+    """Put a live halt on the new risk day's row.
 
     A halt lasts until someone clears it, but readers only look at today's and
     yesterday's rows, and the tracker carries the halt forward only when it
@@ -158,26 +158,41 @@ def _carry_halt_forward(from_day, reason, peak_equity) -> None:
     SAFE_MODE over it and a restart came up unhalted. Running daily, this keeps
     it on the newest row.
 
-    Only a row this call creates is written, and only to *set* the flag — the
-    same rule as the tracker's ``is_new`` path (#158). An existing row holds
-    somebody's decision, an operator's clear included. The peak goes along so
-    the row is not a zero-peak row (the daily summary skips those).
+    Today's row may already exist unhalted — a tracker write in the minute
+    since 07:00 that had not yet adopted an outside halt creates it with its
+    own ``False``. That ``False`` is nobody's clear: an operator's release
+    (``api/routers/risk.py``) clears *every* halted in-play row in one
+    transaction, so while the earlier row is still halted the halt is in force
+    and today's row should say so. Only the flag is set; the equity columns of
+    an existing row are left alone.
+
+    The earlier row is re-read under its lock, in date order like every
+    multi-day writer: a release that committed after this job's first read is
+    seen here, and the halt is not put back over it (#158, #164).
     """
-    from backend.database.models import lock_risk_row, trading_day
+    from backend.database.models import lock_risk_row, lock_risk_rows, trading_day
     today = trading_day()
     if from_day == today:
         return
     db = None
     try:
         db = _get_db()
+        source = lock_risk_rows(db, [from_day])
+        if not source or not source[0].kill_switch:
+            db.rollback()
+            logger.info("킬스위치 이월 생략 — %s 행이 그 사이 해제됨", from_day)
+            return
         row, is_new = lock_risk_row(db, today)
-        if is_new:
+        carried = not row.kill_switch
+        if carried:
             row.kill_switch = True
-            row.kill_reason = reason
-            row.peak_equity = peak_equity or 0.0
+            row.kill_reason = source[0].kill_reason or reason
+            if is_new:
+                # Not a zero-peak row (the daily summary skips those).
+                row.peak_equity = source[0].peak_equity or peak_equity or 0.0
         db.commit()
-        if is_new:
-            logger.warning("킬스위치를 새 리스크 데이(%s)로 이월: %s", today, reason)
+        if carried:
+            logger.warning("킬스위치를 새 리스크 데이(%s)로 이월: %s", today, row.kill_reason)
     except Exception as e:
         logger.warning("킬스위치 이월 실패: %s", e)
         if db is not None:
