@@ -242,6 +242,31 @@ class AuditLog(Base):
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
 
 
+class RunUptime(Base):
+    """When a strategy run was actually running — one row per unbroken stretch.
+
+    The 4-week paper gate counts this, not calendar days
+    (``promotion_guard.uptime_by_run``): a run that sat six hours without a
+    worker running it needs six more hours. The Redis heartbeat expires after
+    90 s and keeps no history, and the worker being up is not enough either — a
+    run whose restore failed stays active for the next boot while nothing runs
+    it. So the run's own session (``WorkerSession``) records it: a row once
+    ``strategy.start()`` has succeeded, ``last_beat_at`` moved every minute,
+    ``ended_at`` when the session ends cleanly. A crash leaves ``ended_at`` empty
+    and the row ends at the last beat. Beats that could not be written for longer
+    than the grace start a new row, so the gap is not counted.
+
+    A new table, not new columns on an existing one: ``create_all`` creates
+    missing tables but never adds columns (#194).
+    """
+    __tablename__ = "run_uptime"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    run_id = Column(Integer, nullable=False, index=True)
+    boot_at = Column(DateTime, nullable=False)
+    last_beat_at = Column(DateTime, nullable=False)
+    ended_at = Column(DateTime, nullable=True)
+
+
 class CorporateAction(Base):
     """Persisted corporate-action record (P2-02C runtime integration).
 

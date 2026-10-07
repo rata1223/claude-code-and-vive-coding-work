@@ -18,7 +18,7 @@ before their input is looked at.
 """
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 from fastapi import APIRouter, Depends
@@ -87,7 +87,7 @@ def _describe(run: dict, now: datetime) -> dict:
     """kis-api's row plus what the screen needs: whether it holds the slot and
     where it stands on the 4-week paper gate — the same rule the worker's gate
     applies (``promotion_guard.paper_gate_status``: paper environment, 28 days
-    unstopped, at least one fill)."""
+    unstopped and actually running, at least one fill)."""
     from backend.worker.promotion_guard import PAPER_RUN_MIN, RUN_ENV_KEY, paper_gate_status
 
     started = _parse_ts(run.get("started_at"))
@@ -104,18 +104,31 @@ def _describe(run: dict, now: datetime) -> dict:
     row["orders_enabled"] = (run.get("orders_enabled")
                              if isinstance(run.get("orders_enabled"), bool) else None)
     row["filled_orders"] = filled
+    # How long the run was actually running, measured by kis-api. Missing or malformed
+    # counts as none: the gate must not pass on a number it was not given.
+    try:
+        uptime = timedelta(seconds=max(float(run.get("uptime_sec") or 0), 0.0))
+    except (TypeError, ValueError, OverflowError):
+        uptime = timedelta(0)
+    span = max((stopped or now) - started, timedelta(0)) if started is not None else timedelta(0)
+    uptime = min(uptime, span)  # never more than the run's own span
     met, reason = paper_gate_status(
         SimpleNamespace(started_at=started, stopped_at=stopped, is_active=is_active,
                         config={RUN_ENV_KEY: kis_env} if kis_env else {}),
-        filled, now)
+        filled, now, uptime)
     row["paper_gate_met"] = met
     row["paper_gate_reason"] = reason
     if started is not None:
-        end = stopped or now
-        row["run_days"] = round(max((end - started).total_seconds(), 0) / 86400, 1)
-        row["paper_gate_at"] = (started + PAPER_RUN_MIN).isoformat()
+        row["run_days"] = round(span.total_seconds() / 86400, 1)
+        row["uptime_days"] = round(uptime.total_seconds() / 86400, 1)
+        row["downtime_hours"] = round((span - uptime).total_seconds() / 3600, 1)
+        # When it gets there if the worker stays up from now on: every hour it
+        # was down moves the date an hour later.
+        row["paper_gate_at"] = (now + max(PAPER_RUN_MIN - uptime, timedelta(0))).isoformat()
     else:
         row["run_days"] = None
+        row["uptime_days"] = None
+        row["downtime_hours"] = None
         row["paper_gate_at"] = None
     return row
 

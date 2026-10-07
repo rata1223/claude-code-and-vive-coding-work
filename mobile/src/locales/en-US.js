@@ -801,6 +801,7 @@ export default {
     started_at: 'Started',
     stopped_at: 'Stopped',
     run_days: 'Ran {days} days',
+    uptime_line: 'Running {days} days · down {hours} h',
     gate_met: '4-week paper gate met',
     gate_not_met: '4-week paper gate not met (stopped)',
     env_fills: 'Environment: {env} · filled orders: {n}',

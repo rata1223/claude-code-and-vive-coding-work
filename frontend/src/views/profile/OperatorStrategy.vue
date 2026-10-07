@@ -21,6 +21,10 @@
         <div class="run-line">{{ $t('operator.started_at') }}: {{ formatTime(run.started_at) }}</div>
         <div v-if="run.stopped_at" class="run-line">{{ $t('operator.stopped_at') }}: {{ formatTime(run.stopped_at) }}</div>
         <div class="run-line">{{ $t('operator.run_days', { days: run.run_days ?? '—' }) }}</div>
+        <!-- The 4-week gate counts the time the run was actually running, not calendar days: downtime moves the gate date later. -->
+        <div v-if="run.uptime_days != null" class="run-line">
+          {{ $t('operator.uptime_line', { days: run.uptime_days, hours: run.downtime_hours ?? '—' }) }}
+        </div>
         <div class="run-line">
           {{ $t('operator.env_fills', { env: envLabel(run.kis_env), n: run.filled_orders ?? 0 }) }}
           <!-- The worker's ENABLE_LIVE_TRADING at its last start: shadow submits nothing, so it never fills. -->

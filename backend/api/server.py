@@ -171,19 +171,28 @@ def get_orders():
 @app.get("/api/strategies")
 def list_strategies():
     from backend.worker.promotion_guard import (
-        filled_order_counts, run_kis_env, run_orders_enabled,
+        filled_order_counts, run_kis_env, run_orders_enabled, run_window, uptime_by_run,
     )
     db = get_db()
     rows = db.query(StrategyRun).order_by(StrategyRun.started_at.desc()).limit(50).all()
     # What the 4-week gate needs besides the dates: the environment the run was
-    # stamped with at start, and how many of its orders filled.
+    # stamped with at start, how many of its orders filled, and how long it
+    # was actually running (run_uptime).
+    now = datetime.utcnow()
     fills = filled_order_counts(db, [r.id for r in rows])
+    uptime = uptime_by_run(db, rows, now)
+
+    def _downtime(r):
+        window = run_window(r, now)
+        return (window[1] - window[0] - uptime[r.id]).total_seconds() if window else None
+
     return jsonify([
         {"id": r.id, "name": r.name, "type": r.strategy_type,
          "is_active": r.is_active, "started_at": r.started_at.isoformat(),
          "stopped_at": r.stopped_at.isoformat() if r.stopped_at else None,
          "kis_env": run_kis_env(r), "orders_enabled": run_orders_enabled(r),
-         "filled_orders": fills.get(r.id, 0)}
+         "filled_orders": fills.get(r.id, 0),
+         "uptime_sec": uptime[r.id].total_seconds(), "downtime_sec": _downtime(r)}
         for r in rows
     ])
 

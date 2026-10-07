@@ -801,6 +801,7 @@ export default {
     started_at: '시작',
     stopped_at: '종료',
     run_days: '{days}일 실행',
+    uptime_line: '가동 {days}일 · 다운타임 {hours}시간',
     gate_met: '4주 모의투자 관문 충족',
     gate_not_met: '4주 모의투자 관문 미충족(중지됨)',
     env_fills: '환경: {env} · 체결된 주문: {n}건',

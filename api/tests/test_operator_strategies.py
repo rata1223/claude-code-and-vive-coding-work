@@ -185,11 +185,11 @@ def test_the_list_marks_the_occupying_run_and_the_paper_gate(monkeypatch, db, us
     runs = [
         {"id": 2, "name": "a", "type": "indicator", "is_active": True,
          "started_at": _iso(now - timedelta(days=30)), "stopped_at": None,
-         "kis_env": "paper", "filled_orders": 3},
+         "kis_env": "paper", "filled_orders": 3, "uptime_sec": 30 * 86400},
         {"id": 1, "name": "b", "type": "indicator", "is_active": False,
          "started_at": _iso(now - timedelta(days=60)),
          "stopped_at": _iso(now - timedelta(days=59)),
-         "kis_env": "paper", "filled_orders": 3},
+         "kis_env": "paper", "filled_orders": 3, "uptime_sec": 86400},
     ]
     _wire(monkeypatch, user, _Upstream(runs=runs))
     resp = operator.list_runs(user)
@@ -213,10 +213,54 @@ def test_the_list_explains_why_a_long_run_misses_the_gate(monkeypatch, db, user,
     now = datetime.utcnow()
     run = {"id": 3, "name": "c", "type": "indicator", "is_active": True,
            "started_at": _iso(now - timedelta(days=40)), "stopped_at": None,
-           "kis_env": kis_env, "filled_orders": filled}
+           "kis_env": kis_env, "filled_orders": filled, "uptime_sec": 40 * 86400}
     _wire(monkeypatch, user, _Upstream(runs=[run]))
     (row,) = operator.list_runs(user).data["runs"]
     assert row["paper_gate_met"] is False and row["paper_gate_reason"] == reason
+
+
+# ── worker uptime, not calendar days ──────────────────────────────────────
+
+def _long_run(now, **kw):
+    run = {"id": 4, "name": "d", "type": "indicator", "is_active": True,
+           "started_at": _iso(now - timedelta(days=40)), "stopped_at": None,
+           "kis_env": "paper", "filled_orders": 2}
+    run.update(kw)
+    return run
+
+
+@pytest.mark.parametrize("uptime", [None, "garbage", -5, float("nan"), "inf"])
+def test_a_missing_or_bad_uptime_fails_closed(monkeypatch, db, user, uptime):
+    """kis-api measures uptime; the proxy must not pass a run on a number it lacks."""
+    now = datetime.utcnow()
+    run = _long_run(now)
+    if uptime is not None:
+        run["uptime_sec"] = uptime
+    _wire(monkeypatch, user, _Upstream(runs=[run]))
+    (row,) = operator.list_runs(user).data["runs"]
+    assert row["paper_gate_met"] is False and row["paper_gate_reason"] == "duration"
+
+
+def test_downtime_is_shown_and_moves_the_gate_date(monkeypatch, db, user):
+    now = datetime.utcnow()
+    # 20 days alive out of 40: 8 more days to go from now
+    run = _long_run(now, uptime_sec=20 * 86400)
+    _wire(monkeypatch, user, _Upstream(runs=[run]))
+    (row,) = operator.list_runs(user).data["runs"]
+    assert row["paper_gate_reason"] == "duration"
+    assert row["run_days"] == 40.0 and row["uptime_days"] == 20.0
+    assert row["downtime_hours"] == 480.0
+    at = datetime.fromisoformat(row["paper_gate_at"])
+    assert abs(at - (now + timedelta(days=8))) < timedelta(minutes=1)
+
+
+def test_uptime_is_capped_at_the_runs_span(monkeypatch, db, user):
+    now = datetime.utcnow()
+    run = _long_run(now, started_at=_iso(now - timedelta(days=2)), uptime_sec=99 * 86400)
+    _wire(monkeypatch, user, _Upstream(runs=[run]))
+    (row,) = operator.list_runs(user).data["runs"]
+    assert row["uptime_days"] == 2.0 and row["downtime_hours"] == 0.0
+    assert row["paper_gate_met"] is False
 
 
 def test_an_unreachable_kis_api_is_an_error_not_an_empty_list(monkeypatch, db, user):

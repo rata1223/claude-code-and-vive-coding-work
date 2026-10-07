@@ -2,7 +2,9 @@
 
 It used to pass on any strategy_runs row started 28+ days ago — including one
 stopped a minute after it began. It now needs a run that was not stopped for
-28 days: still active with no recorded stop, or stopped after 28 days.
+28 days: still active with no recorded stop, or stopped after 28 days — and the
+28 days are the time the run was actually running, not calendar days
+(``run_uptime``).
 """
 import json
 import re
@@ -14,9 +16,10 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from backend.database.models import Base, Order, StrategyRun
+from backend.database.models import Base, Order, StrategyRun, RunUptime
 from backend.worker.promotion_guard import (
     PAPER_RUN_MIN, LivePromotionGuard, paper_gate_status, paper_run_qualifies, run_kis_env,
+    run_window,
 )
 
 NOW = datetime(2026, 10, 3, 12, 0, 0)
@@ -45,12 +48,22 @@ def _run(started_ago, stopped_after=None, is_active=True):
     (_run(40 * DAY, is_active=False), False),
 ])
 def test_paper_run_qualifies(run, expected):
-    assert paper_run_qualifies(run, NOW) is expected
+    """With the worker up the whole time, uptime is the run's calendar span."""
+    a, b = run_window(run, NOW)
+    assert paper_run_qualifies(run, NOW, b - a) is expected
 
 
 def test_a_row_without_a_start_never_qualifies():
     assert paper_run_qualifies(SimpleNamespace(started_at=None, stopped_at=None,
-                                               is_active=True), NOW) is False
+                                               is_active=True), NOW, 40 * DAY) is False
+
+
+@pytest.mark.parametrize("uptime, expected", [
+    (28 * DAY, True), (28 * DAY - timedelta(seconds=1), False), (timedelta(0), False),
+])
+def test_the_bar_is_uptime_not_calendar_days(uptime, expected):
+    """Forty calendar days do not pass if the worker was alive for less than 28."""
+    assert paper_run_qualifies(_run(40 * DAY), NOW, uptime) is expected
 
 
 def test_the_bar_is_four_weeks():
@@ -68,8 +81,10 @@ def factory():
     eng.dispose()
 
 
-def _add(factory, started_ago, stopped_after=None, is_active=True, env="paper", fills=1):
-    """A run stamped ``env`` (None: no stamp) with ``fills`` filled orders."""
+def _add(factory, started_ago, stopped_after=None, is_active=True, env="paper", fills=1,
+         alive=True):
+    """A run stamped ``env`` (None: no stamp) with ``fills`` filled orders, and —
+    unless ``alive`` is False — running for the whole of it (``run_uptime``)."""
     now = datetime.utcnow()
     with factory() as db:
         started = now - started_ago
@@ -81,8 +96,14 @@ def _add(factory, started_ago, stopped_after=None, is_active=True, env="paper", 
         db.flush()
         for i in range(fills):
             _order(db, run.id, filled_qty=1, n=i)
+        if alive:
+            _uptime(db, run.id, started, now)
         db.commit()
         return run.id
+
+
+def _uptime(db, run_id, boot, last_beat, ended=None):
+    db.add(RunUptime(run_id=run_id, boot_at=boot, last_beat_at=last_beat, ended_at=ended))
 
 
 def _order(db, run_id, filled_qty, n=0):
@@ -172,14 +193,16 @@ def test_run_kis_env(config, expected):
 def test_gate_reasons_put_the_environment_first():
     young_real = SimpleNamespace(started_at=NOW - DAY, stopped_at=None, is_active=True,
                                  config='{"kis_env": "real"}')
-    assert paper_gate_status(young_real, 0, NOW) == (False, "env_not_paper")
+    assert paper_gate_status(young_real, 0, NOW, DAY) == (False, "env_not_paper")
     young = SimpleNamespace(started_at=NOW - DAY, stopped_at=None, is_active=True,
                             config='{"kis_env": "paper"}')
-    assert paper_gate_status(young, 0, NOW) == (False, "duration")
+    assert paper_gate_status(young, 0, NOW, DAY) == (False, "duration")
     old = SimpleNamespace(started_at=NOW - 30 * DAY, stopped_at=None, is_active=True,
                           config='{"kis_env": "paper"}')
-    assert paper_gate_status(old, 0, NOW) == (False, "no_fills")
-    assert paper_gate_status(old, 3, NOW) == (True, None)
+    assert paper_gate_status(old, 0, NOW, 30 * DAY) == (False, "no_fills")
+    assert paper_gate_status(old, 3, NOW, 30 * DAY) == (True, None)
+    # downtime is a duration shortfall, not a new reason
+    assert paper_gate_status(old, 3, NOW, 27 * DAY) == (False, "duration")
 
 
 def test_a_database_error_fails_closed():
@@ -627,6 +650,10 @@ def test_no_market_open_starts_once_the_session_is_stopping(factory, monkeypatch
     session.trigger_market_open("US")
 
     assert strategy.opens == 0
+    # Let the session thread finish its DB writes before the fixture disposes
+    # the single shared SQLite connection: a write racing the dispose crashed
+    # the interpreter (segfault in CI).
+    assert session.join(5) is True
 
 
 def test_a_stop_after_the_session_ended_keeps_the_recorded_end(factory, monkeypatch):
