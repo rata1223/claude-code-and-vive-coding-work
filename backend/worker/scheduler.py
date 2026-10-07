@@ -173,7 +173,11 @@ def _carry_halt_forward(from_day, reason, peak_equity) -> None:
     """
     from backend.database.models import lock_risk_row, lock_risk_rows, trading_day
     today = trading_day()
-    if from_day == today:
+    if from_day >= today:
+        # Already on today's row, or on a row dated ahead of it (the old
+        # Seoul-midnight key on deploy day). Every reader sees that row as it
+        # is; carrying from it would lock a later date before an earlier one,
+        # against the order every multi-day writer keeps (#164).
         return
     db = None
     try:

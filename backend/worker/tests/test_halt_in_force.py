@@ -120,6 +120,32 @@ class TestTheTrackerAfterALongOutage:
         _seed(factory, LONG_AGO, kill_switch=True, kill_reason="최근")
         assert _tracker(factory).kill_reason == "최근"
 
+    def test_todays_own_reason_wins_over_a_row_dated_ahead(self, factory):
+        """Deploy day: a halt the old key wrote one day ahead must not replace
+        the reason on today's own halted row."""
+        _seed(factory, TODAY, kill_switch=True, kill_reason="MDD 한도 초과 (-16%)")
+        _seed(factory, TODAY + timedelta(days=1), kill_switch=True,
+              kill_reason="Worker 하트비트 없음")
+
+        t = _tracker(factory)
+        t.record_pnl(0.0, 1.0)
+
+        assert t.kill_reason.startswith("MDD")
+        assert _row(factory, TODAY).kill_reason.startswith("MDD")
+
+    def test_an_older_mdd_halt_still_counts_as_flattened(self, factory):
+        """The newest halt is a daily-loss one; an older uncleared MDD halt is
+        the same breach — the first fill after boot must not flatten again."""
+        _seed(factory, TODAY - timedelta(days=4), kill_switch=True,
+              kill_reason="MDD 한도 초과 (-16%)")
+        _seed(factory, TODAY - timedelta(days=1), kill_switch=True,
+              kill_reason="일일 손실 한도 초과")
+
+        t = _tracker(factory)
+
+        assert t.kill_reason == "일일 손실 한도 초과"
+        assert t._mdd_flatten_requested is True
+
     def test_an_old_cleared_row_does_not_halt(self, factory):
         _seed(factory, LONG_AGO, kill_switch=False)
         assert _tracker(factory).kill_switch is False
@@ -165,6 +191,18 @@ class TestTheDailyJob:
         assert SAFE_MODE.can_trade is False, "re-armed over a three-day-old halt"
         assert _row(factory, TODAY).kill_switch is True
         assert _row(factory, TODAY).kill_reason == "일일 손실 한도 초과"
+
+    def test_a_row_dated_ahead_is_not_carried_and_still_blocks(self, factory):
+        """Carrying from it would lock a later date before an earlier one."""
+        from backend.worker.recovery import SAFE_MODE
+        from backend.worker.scheduler import _reset_daily_risk
+        _seed(factory, TODAY + timedelta(days=1), kill_switch=True, kill_reason="옛 키")
+        SAFE_MODE.disable("옛 키")
+
+        _reset_daily_risk()
+
+        assert SAFE_MODE.can_trade is False
+        assert _row(factory, TODAY) is None
 
     def test_with_no_halt_anywhere_it_still_re_arms(self, factory):
         from backend.worker.recovery import SAFE_MODE
