@@ -779,7 +779,12 @@ class StrategyWorker:
         from backend.database.models import lock_risk_row, trading_day
 
         # The tracker's own mutex (P0-05) — read the four values consistently.
+        # Resolved once and rolled to first: between 07:00 and the day's first
+        # fill the tracker still holds the closed day, and writing that onto the
+        # new day's row made a restart count it twice (#166).
+        day = trading_day()
         with tracker._lock:
+            tracker.roll_over(day)
             daily_pnl = tracker.daily_pnl
             weekly_pnl = tracker.weekly_pnl
             peak_equity = tracker.peak_equity
@@ -788,7 +793,7 @@ class StrategyWorker:
 
         with _session() as db:
             # Locked like every other writer of this row (#164).
-            row, is_new = lock_risk_row(db, trading_day())
+            row, is_new = lock_risk_row(db, day)
             row.daily_pnl = daily_pnl
             row.weekly_pnl = weekly_pnl
             row.peak_equity = peak_equity
@@ -798,7 +803,7 @@ class StrategyWorker:
                 # "Never writes the halt flag" is about not clobbering an external
                 # one, and on a brand-new row there is nothing external to clobber
                 # — while `kill_switch` would otherwise default to False, which is
-                # writing a clear by omission. Shutting down at 00:30 KST while
+                # writing a clear by omission. Shutting down at 07:30 KST while
                 # halted would leave the new day's row reading "not halted".
                 #
                 # Same reasoning as `_write_db`'s `is_new` path (issue #158).

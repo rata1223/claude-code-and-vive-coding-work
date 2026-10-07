@@ -268,8 +268,8 @@ class TestYesterdaysHaltBlocksResume:
         _reset_daily_risk()
 
         assert SAFE_MODE.can_trade is False, (
-            "the 06:01 re-arm resumed trading over a halt fired earlier "
-            "the same Seoul day, during the overnight US session"
+            "the daily re-arm resumed trading over a halt on today's row "
+            "(fired during the overnight US session under the old key)"
         )
 
     def test_with_no_halt_on_either_day_safe_mode_still_re_arms(
@@ -494,12 +494,14 @@ class TestTheTrackerRestoresAcrossSeoulMidnight:
 
 
 class TestTheDailyResetLeavesTheLiveCounterAlone:
-    """06:01 KST is six hours *into* the Seoul day, not the start of it.
+    """The daily job must not touch the live day's counter.
 
-    That day already holds the 00:00–05:00 overnight US session. Zeroing its
-    `daily_pnl` and deleting its Redis key wiped both stores
-    `_restore_state()` reads, so a restart after 06:01 handed the Korean
-    session a fresh 3% budget on top of the overnight loss.
+    When it ran at 06:01 under the Seoul-midnight key, that was six hours into
+    a day already holding the overnight US session: zeroing its `daily_pnl`
+    and deleting its Redis key wiped both stores `_restore_state()` reads, so a
+    restart afterwards handed the Korean session a fresh 3% budget on top of
+    the overnight loss. The tracker owns the rollover (07:00 since #166); the
+    job (now 07:01) still must not zero anything.
     """
 
     @pytest.fixture(autouse=True)

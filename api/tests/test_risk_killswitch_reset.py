@@ -489,7 +489,7 @@ def test_reset_clears_a_halt_fired_before_seoul_midnight(db, user):
 def test_reset_clears_every_halted_day_not_just_one(db, user):
     """Releasing one row and leaving the other is the trap this closes.
 
-    The 06:01 SAFE_MODE re-arm reads both days, so a leftover halt keeps
+    The daily (07:01) SAFE_MODE re-arm reads both days, so a leftover halt keeps
     trading blocked — and no endpoint could reach it.
     """
     from backend.database.models import DailyRiskState, trading_day

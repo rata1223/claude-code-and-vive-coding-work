@@ -348,3 +348,217 @@ class TestOrderKeysStayOnTheSeoulDate:
         m = TrailingStopManager(RiskConfig())
         m.open("AAPL", 1, 100.0)
         assert m._positions["AAPL"].entry_date == "2026-09-22"
+
+
+# ── code-review findings ─────────────────────────────────────────────────────
+
+class TestAWriteBeforeTheDaysFirstFill:
+    """Between 07:00 and the first fill the tracker still holds the closed day.
+
+    A write in that gap — a reset, the shutdown checkpoint — put the closed
+    day's P&L on the new day's row; a restart then read it as today's loss and
+    counted it in the week twice (once from its own row, once from today's).
+    """
+
+    def _closed_day(self, clock, factory):
+        clock.kst(2026, 9, 10, 10, 0)
+        t = _persistent(factory)
+        t.record_pnl(-25_000.0, PEAK)
+        clock.kst(2026, 9, 11, 8, 0)
+        return t
+
+    def _restarted(self, factory):
+        t = _persistent(factory)
+        return t.daily_pnl, t.weekly_pnl
+
+    def test_a_reset_rolls_the_tracker_before_writing(self, clock, factory):
+        t = self._closed_day(clock, factory)
+        t.manual_reset()
+
+        sess = factory()
+        try:
+            assert sess.get(DailyRiskState, date(2026, 9, 11)).daily_pnl == 0.0
+            assert sess.get(DailyRiskState, date(2026, 9, 10)).daily_pnl == -25_000.0
+        finally:
+            sess.close()
+        assert self._restarted(factory) == (0.0, -25_000.0)
+
+    def test_the_shutdown_checkpoint_rolls_the_tracker_before_writing(
+            self, clock, factory, monkeypatch):
+        from contextlib import contextmanager
+        from backend.worker import runner as runner_mod
+
+        t = self._closed_day(clock, factory)
+
+        @contextmanager
+        def _sess():
+            db = factory()
+            try:
+                yield db
+            finally:
+                db.close()
+
+        monkeypatch.setattr(runner_mod, "_session", _sess)
+        w = object.__new__(runner_mod.StrategyWorker)
+        w._loss_tracker = t
+        w._checkpoint_equity()
+
+        assert self._restarted(factory) == (0.0, -25_000.0), (
+            "the checkpoint wrote yesterday's loss onto today's row")
+
+    def test_redis_gets_the_number_under_its_own_day(self, clock, factory):
+        written = {}
+
+        class _Redis:
+            def get(self, key):
+                return written.get(key)
+
+            def setex(self, key, ttl, value):
+                written[key] = value
+
+        clock.kst(2026, 9, 10, 10, 0)
+        t = PersistentLossTracker(config=RiskConfig(), redis_client=_Redis(),
+                                  db_factory=factory)
+        t.record_pnl(-25_000.0, PEAK)
+        clock.kst(2026, 9, 11, 8, 0)
+        t.manual_reset()
+
+        assert written["risk:daily_pnl:2026-09-10"] == "-25000.0"
+        assert written.get("risk:daily_pnl:2026-09-11") in (None, "0.0"), (
+            "the closed day's loss went under the new day's key")
+
+
+class TestTheBootStraddlingSevenOClock:
+    def test_a_boot_across_07_00_does_not_drop_the_closing_day(
+            self, factory, monkeypatch):
+        """The dataclass default reads the clock before `_restore_state` does.
+
+        Booting across 07:00 left `trade_date` on the closed day while the
+        restore had already put that day among the prior days; the first fill
+        then re-pushed it with a zero share and the week lost its loss.
+        """
+        instants = iter([datetime(2026, 9, 11, 6, 59, 59, tzinfo=_KST)])
+        later = datetime(2026, 9, 11, 7, 0, 1, tzinfo=_KST)
+
+        class _Ticking:
+            @staticmethod
+            def now(tz=None):
+                instant = next(instants, later)
+                return instant.astimezone(tz) if tz else instant
+
+        monkeypatch.setattr(models, "datetime", _Ticking)
+        _seed(factory, date(2026, 9, 10), daily_pnl=-20_000.0, peak_equity=PEAK)
+
+        t = _persistent(factory)
+        t.record_pnl(-1_000.0, PEAK)
+
+        assert t.weekly_pnl == -21_000.0
+
+
+class TestThePeakFallbackIsBounded:
+    def test_a_peak_older_than_the_week_is_not_trusted(self, clock, factory):
+        """A worker idle for weeks, or a peak from before a capital change,
+        re-seeds from the balance as it always did."""
+        clock.kst(2026, 9, 30, 10, 0)
+        _seed(factory, date(2026, 9, 1), peak_equity=100_000_000.0)
+        assert _persistent(factory).peak_equity == 0.0
+
+    def test_the_oldest_day_in_the_week_still_counts(self, clock, factory):
+        clock.kst(2026, 9, 10, 10, 0)
+        _seed(factory, date(2026, 9, 4), peak_equity=1_200_000.0)
+        assert _persistent(factory).peak_equity == 1_200_000.0
+
+
+class TestAFailedBootReadIsLogged:
+    def test_a_failed_restore_query_is_an_error_not_silence(
+            self, clock, caplog):
+        class _Broken:
+            def get(self, *a, **k):
+                raise RuntimeError("db down")
+
+            query = get
+
+            def close(self):
+                pass
+
+        clock.kst(2026, 9, 10, 10, 0)
+        with caplog.at_level("ERROR", logger="backend.quant.risk.engine"):
+            t = PersistentLossTracker(config=RiskConfig(), redis_client=None,
+                                      db_factory=_Broken)
+
+        assert t.weekly_pnl == 0.0 and t.peak_equity == 0.0
+        messages = " ".join(r.getMessage() for r in caplog.records)
+        assert "주간 창" in messages and "고점" in messages
+
+
+class TestTheDailyJobCarriesAHaltForward:
+    """A halt has to outlive two quiet risk days (no fills, no shutdown)."""
+
+    @pytest.fixture(autouse=True)
+    def _wire(self, monkeypatch, factory):
+        monkeypatch.setattr("backend.worker.scheduler._get_db", lambda: factory())
+
+        class _Redis:
+            def delete(self, *a):
+                pass
+
+        monkeypatch.setattr("redis.from_url", lambda *a, **k: _Redis())
+
+    def _run_job(self, clock, d):
+        clock.kst(2026, 9, d, 7, 1)
+        from backend.worker.scheduler import _reset_daily_risk
+        _reset_daily_risk()
+
+    def test_a_weekend_halt_still_blocks_on_monday(self, clock, factory):
+        """Halt on Friday's risk day (fired 03:00 Saturday KST)."""
+        from backend.worker.recovery import SAFE_MODE
+        _seed(factory, date(2026, 9, 25), kill_switch=True,
+              kill_reason="일일 손실 한도 초과", peak_equity=PEAK)
+        SAFE_MODE.disable("일일 손실 한도 초과")
+
+        for d in (26, 27, 28):                     # Sat, Sun, Mon 07:01
+            self._run_job(clock, d)
+            assert SAFE_MODE.can_trade is False, f"re-armed on the {d}th"
+
+        sess = factory()
+        try:
+            row = sess.get(DailyRiskState, date(2026, 9, 28))
+            assert row.kill_switch is True
+            assert row.kill_reason == "일일 손실 한도 초과"
+            assert row.peak_equity == PEAK
+        finally:
+            sess.close()
+        assert _persistent(factory).kill_switch is True, (
+            "a Monday restart came up unhalted")
+
+    def test_an_existing_row_is_not_overwritten(self, clock, factory):
+        """Somebody's decision is on it — an operator's clear included."""
+        _seed(factory, date(2026, 9, 25), kill_switch=True, peak_equity=PEAK)
+        _seed(factory, date(2026, 9, 26), kill_switch=False, daily_pnl=-5.0)
+
+        self._run_job(clock, 26)
+
+        sess = factory()
+        try:
+            row = sess.get(DailyRiskState, date(2026, 9, 26))
+            assert row.kill_switch is False
+            assert row.daily_pnl == -5.0
+        finally:
+            sess.close()
+
+    def test_no_halt_no_row(self, clock, factory):
+        from backend.worker.recovery import SAFE_MODE
+        SAFE_MODE.disable("테스트")
+        self._run_job(clock, 26)
+        assert SAFE_MODE.can_trade is True
+        sess = factory()
+        try:
+            assert sess.get(DailyRiskState, date(2026, 9, 26)) is None
+        finally:
+            sess.close()
+
+    def test_the_job_runs_just_after_the_risk_day_turns(self):
+        from backend.worker.scheduler import build_scheduler
+        job = build_scheduler().get_job("risk_reset")
+        fields = {f.name: str(f) for f in job.trigger.fields}
+        assert (fields["hour"], fields["minute"]) == ("7", "1")

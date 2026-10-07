@@ -60,10 +60,12 @@ def trading_days_in_play() -> tuple[date, date]:
     """The risk days a live halt can be sitting on — ``(today, yesterday)``.
 
     A halt is never cleared by the date changing: it blocks until someone
-    clears it. The writers carry an uncleared halt onto the new day's row at
-    their first write, but a restart before that write reads a new day with no
-    row yet — so anything asking "is trading halted right now" reads the
-    previous risk day too.
+    clears it. The tracker carries an uncleared halt onto the new day's row at
+    its first write, and the worker's 07:01 job does so every morning
+    (``scheduler._carry_halt_forward``), but a restart before either reads a new
+    day with no row yet — so anything asking "is trading halted right now"
+    reads the previous risk day too. A worker that is down for two whole risk
+    days carries nothing, and its halt ages out of this window.
 
     Including yesterday unconditionally does not over-block. A halt that was
     cleared has ``kill_switch`` false and does not match; only an *uncleared*

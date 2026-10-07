@@ -265,6 +265,22 @@ class LossTracker:
     #: Risk days in the weekly window, today included.
     WEEK_DAYS = 7
 
+    def roll_over(self, today: date) -> bool:
+        """Start ``today``'s risk day if the tracker is still on an earlier one.
+
+        The day used to roll only inside ``record_pnl``, i.e. at the first fill
+        of a new day. Anything that writes the tracker's numbers before that
+        fill — a reset, the shutdown checkpoint — has to roll first, or it puts
+        the closed day's P&L on the new day's row and a restart counts it twice
+        (in the day and again in the week). Returns True if it rolled.
+        """
+        if today == self.trade_date:
+            return False
+        self._roll_week(today)
+        self.daily_pnl = 0.0
+        self.trade_date = today
+        return True
+
     def _roll_week(self, today: date) -> None:
         """Move the closing day into the window and rebuild the weekly figure.
 
@@ -296,10 +312,7 @@ class LossTracker:
         poller threads at once. ``PersistentLossTracker`` extends the vocabulary
         with ``"adopted"``.
         """
-        today = _seoul_today()
-        if today != self.trade_date:
-            self._roll_week(today)
-            self.reset_daily()
+        self.roll_over(_seoul_today())
 
         self.daily_pnl += pnl
         self.weekly_pnl += pnl
@@ -495,11 +508,10 @@ class PersistentLossTracker(LossTracker):
     def __init__(self, config: RiskConfig, redis_client=None,
                  db_session=None, db_factory=None):
         super().__init__(config=config)
-        # RLock, not Lock: LossTracker.record_pnl() calls reset_daily() when the
-        # risk day rolls over, and this class overrides reset_daily() to take
-        # this same lock. With a plain Lock that is a permanent hang on the first
-        # fill of a new risk day.
-        # (Pre-existing; found while reviewing issue #158.)
+        # RLock, not Lock: methods that take it call others that take it again
+        # (record_pnl → _persist → _write_db). Rollover used to go through the
+        # overridden reset_daily(), and with a plain Lock that was a permanent
+        # hang on the first fill of a new day (found while reviewing #158).
         self._lock = threading.RLock()  # serialises concurrent record_pnl() calls
         # ── kill-switch ownership (issue #158) ───────────────────────────────
         # State alone cannot distinguish "a fresh breach" from "a stale True
@@ -541,6 +553,10 @@ class PersistentLossTracker(LossTracker):
 
     def _restore_state(self) -> None:
         today = _seoul_today()
+        # The dataclass default read the clock earlier; if 07:00 passed in
+        # between, the first rollover would push a day that is already among
+        # the prior days and zero its loss in the week.
+        self.trade_date = today
         redis_val = self._load_redis(today)
         db_val = self._load_db(today)
 
@@ -562,14 +578,16 @@ class PersistentLossTracker(LossTracker):
         self.weekly_pnl = sum(self._prior_days.values()) + self.daily_pnl
 
         # Peak equity is the MDD baseline and belongs to no single day: the
-        # latest recorded peak, wherever it is. Taken from today's row alone, a
-        # restart before the day's first write came up with 0 and the worker
-        # re-seeded it from the current balance — resetting the drawdown it
-        # exists to measure.
+        # latest recorded peak within the weekly window. Taken from today's row
+        # alone, a restart before the day's first write came up with 0 and the
+        # worker re-seeded it from the current balance — resetting the drawdown
+        # it exists to measure. Bounded so a worker idle for weeks, or a peak
+        # from before a capital change, is re-seeded as before rather than
+        # trusted.
         if db_state is not None and db_state.peak_equity:
             self.peak_equity = db_state.peak_equity
         else:
-            self.peak_equity = self._load_latest_peak() or 0.0
+            self.peak_equity = self._load_latest_peak(today) or 0.0
 
         # The halt is read from the previous risk day too: it is never cleared
         # by the date changing, and a restart before the first write of a new
@@ -683,8 +701,14 @@ class PersistentLossTracker(LossTracker):
         if self._redis is None:
             return
         try:
-            key = self._redis_key()
-            self._redis.setex(key, self._REDIS_TTL_SEC, str(self.daily_pnl))
+            # Keyed by the day the number belongs to, read with it — not the
+            # wall clock: until `_write_db` rolls the tracker below, the number
+            # is still the closed day's.
+            with self._lock:
+                key = self._REDIS_KEY_TEMPLATE.format(
+                    date=self.trade_date.isoformat())
+                value = self.daily_pnl
+            self._redis.setex(key, self._REDIS_TTL_SEC, str(value))
         except Exception as e:
             logger.warning("Redis PnL 기록 실패: %s", e)
 
@@ -705,6 +729,8 @@ class PersistentLossTracker(LossTracker):
         from backend.database.models import lock_risk_row, trading_day
         today = trading_day()
         with self._lock:
+            # The numbers must be today's before they go on today's row.
+            self.roll_over(today)
             daily_pnl = self.daily_pnl
             weekly_pnl = self.weekly_pnl
             peak_eq = self.peak_equity
@@ -852,7 +878,8 @@ class PersistentLossTracker(LossTracker):
 
     def _load_db_full(self, today: date):
         from backend.database.models import DailyRiskState
-        return self._query(lambda s: s.get(DailyRiskState, today))
+        return self._query(lambda s: s.get(DailyRiskState, today),
+                           f"{today} 행")
 
     def _load_prior_days(self, today: date) -> dict:
         """``{risk day: daily_pnl}`` for the days before ``today`` in the weekly window."""
@@ -864,35 +891,42 @@ class PersistentLossTracker(LossTracker):
                     for r in s.query(DailyRiskState)
                     .filter(DailyRiskState.trade_date >= first,
                             DailyRiskState.trade_date < today)}
-        return self._query(_rows) or {}
+        return self._query(_rows, "주간 창") or {}
 
-    def _load_latest_peak(self) -> Optional[float]:
-        """The most recent recorded peak equity, from any risk day."""
+    def _load_latest_peak(self, today: date) -> Optional[float]:
+        """The most recent recorded peak equity within the weekly window."""
         from backend.database.models import DailyRiskState
+        first = today - timedelta(days=self.WEEK_DAYS - 1)
 
         def _peak(s):
             row = (s.query(DailyRiskState)
-                   .filter(DailyRiskState.peak_equity > 0)
+                   .filter(DailyRiskState.peak_equity > 0,
+                           DailyRiskState.trade_date >= first,
+                           DailyRiskState.trade_date <= today)
                    .order_by(DailyRiskState.trade_date.desc())
                    .first())
             return row.peak_equity if row is not None else None
-        return self._query(_peak)
+        return self._query(_peak, "고점")
 
-    def _query(self, fn):
-        """Run ``fn(session)``; ``None`` on any error or with no database."""
-        if self._db_factory is not None:
-            sess = self._db_factory()
-            try:
+    def _query(self, fn, what: str):
+        """Run ``fn(session)``; ``None`` on any error or with no database.
+
+        A failed read at boot leaves that piece of risk state empty — the week
+        without its earlier days, the peak re-seeded from the balance — so it
+        is logged rather than passed over in silence.
+        """
+        sess = None
+        try:
+            if self._db_factory is not None:
+                sess = self._db_factory()
                 return fn(sess)
-            except Exception:
-                return None
-            finally:
-                sess.close()
-        elif self._db is not None:
-            try:
+            if self._db is not None:
                 return fn(self._db)
-            except Exception:
-                return None
+        except Exception as e:
+            logger.error("리스크 상태 복원 조회 실패(%s) — 이 값 없이 기동: %s", what, e)
+        finally:
+            if sess is not None:
+                sess.close()
         return None
 
 
