@@ -553,7 +553,7 @@ export default {
   about: {
     title: 'アプリについて',
     intro:
-      'KIS Tradingは、韓国投資証券の口座でルールベースの株式・ETF戦略を自動運用するプラットフォームです。リスク上限と運用者パネルを備えています。株式・ETFの取引には損失のリスクがあります。戦略と安全装置の仕組みを十分に理解したうえでご利用ください。',
+      'QuantDinger は戦略ツール、マーケットデータ、ポートフォリオ運用をまとめたプラットフォームです。本アプリはその上で、韓国投資証券の口座でルールベースの株式・ETF戦略を自動運用し、リスク上限と運用者パネルを備えています。株式・ETFの取引には損失のリスクがあります。戦略と安全装置の仕組みを十分に理解したうえでご利用ください。',
     app_version_label: 'アプリのバージョン',
     server_version_label: 'サーバー側の最新版',
     check_update: '更新を確認',
@@ -677,14 +677,6 @@ export default {
     to_login: 'ログインに戻る',
     to_register: 'アカウントをお持ちでない方は登録',
     footer_tip: 'Cloudflare Turnstile で保護',
-    oauth_divider: 'または',
-    continue_with_google: 'Google で続行',
-    continue_with_github: 'GitHub で続行',
-    oauth_err_missing_params: 'OAuth パラメータが不足しています。再試行してください。',
-    oauth_err_state: 'OAuth セッションが期限切れです。再ログインしてください。',
-    oauth_err_user_failed: 'アカウントを作成できませんでした。サポートにお問い合わせください。',
-    oauth_err_server: 'OAuth ログインに失敗しました。後でもう一度お試しください。',
-    oauth_err_generic: 'OAuth ログインに失敗しました'
   },
   language: {
     label: '言語',

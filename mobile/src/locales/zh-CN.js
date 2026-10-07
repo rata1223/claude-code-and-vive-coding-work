@@ -552,7 +552,7 @@ export default {
   about: {
     title: '关于我们',
     intro:
-      'KIS Trading 在韩国投资证券账户上自动运行基于规则的股票和 ETF 策略，配有风险限额和运营者面板。股票和 ETF 交易存在亏损风险，请在充分了解策略及其保护机制后使用。',
+      'QuantDinger 是集策略交易、市场数据与资产管理于一体的量化工具平台。本应用基于它，在韩国投资证券账户上自动运行基于规则的股票和 ETF 策略，配有风险限额和运营者面板。股票和 ETF 交易存在亏损风险，请在充分了解策略及其保护机制后使用。',
     app_version_label: '当前应用版本',
     server_version_label: '服务端发布版本',
     check_update: '检查更新',
@@ -676,14 +676,6 @@ export default {
     to_login: '返回登录',
     to_register: '还没有账号？立即注册',
     footer_tip: '受 Cloudflare Turnstile 风控保护',
-    oauth_divider: '或使用第三方账号',
-    continue_with_google: '使用 Google 登录',
-    continue_with_github: '使用 GitHub 登录',
-    oauth_err_missing_params: '第三方登录参数缺失，请重试',
-    oauth_err_state: '登录会话已过期，请重新登录',
-    oauth_err_user_failed: '无法创建第三方账号，请联系客服',
-    oauth_err_server: '第三方登录失败，请稍后再试',
-    oauth_err_generic: '第三方登录失败'
   },
   language: {
     label: '语言',

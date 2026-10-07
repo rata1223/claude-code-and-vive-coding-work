@@ -1,5 +1,11 @@
 # QuantDinger Mobile
 
+> **이 저장소의 사본에 대해**: 이 디렉터리(와 `../frontend`)는 KIS 자동매매 플랫폼에서 쓰는 QuantDinger-Mobile 사본이다.
+> 아래는 업스트림 원문이며 라이선스([`LICENSE`](LICENSE))와 표기 의무(§3.1)는 그대로 적용된다 — 앱 안의 QuantDinger 이름·표기를 지우지 않는다.
+> 이 사본에서 달라진 점: OAuth 로그인 제거(백엔드에 없고, URL의 토큰으로 로그인되는 구멍이었다), 약관·소개 문구를 주식·ETF 기준으로 수정,
+> 업스트림 서버 주소 제거. 플랫폼 전체는 저장소 루트 `CLAUDE.md` 참고.
+
+
 <p align="right"><a href="README_CN.md">简体中文</a></p>
 
 ## Preview

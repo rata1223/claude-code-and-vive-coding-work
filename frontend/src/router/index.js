@@ -148,7 +148,8 @@ const router = createRouter({
 
 router.beforeEach((to, from, next) => {
   const title = to.meta.titleKey ? t(to.meta.titleKey) : to.meta.title
-  document.title = title ? `${title} | Mobile` : 'Mobile'
+  // The brand stays in the tab title (LICENSE §3.1 — see CLAUDE.md known issue 14).
+  document.title = title ? `${title} | QuantDinger` : 'QuantDinger'
 
   const userStore = useUserStore()
   if (!to.meta.public && !userStore.isLoggedIn) {
