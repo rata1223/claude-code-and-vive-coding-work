@@ -242,9 +242,12 @@ def test_shutdown_checkpoint_racing_a_new_day_does_not_fail(factory, monkeypatch
     monkeypatch.setattr(runner_mod, "_session", _session)
     day = trading_day()
 
+    # `roll_over` is part of what the checkpoint asks of the tracker (#166):
+    # it moves a tracker still on the closed day before writing. Already on it.
     tracker = SimpleNamespace(
         _lock=threading.Lock(), daily_pnl=-1.0, weekly_pnl=-2.0,
-        peak_equity=1_000_000.0, kill_switch=False, kill_reason="")
+        peak_equity=1_000_000.0, kill_switch=False, kill_reason="",
+        roll_over=lambda day: False)
     worker = SimpleNamespace(_loss_tracker=tracker)
 
     holder = factory()
