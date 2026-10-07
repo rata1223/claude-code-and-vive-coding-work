@@ -119,22 +119,24 @@ def _is_risk_admin(user: User) -> bool:
 
 
 def _halt_rows(db: Session):
-    """Rows that can hold a live halt right now, today's first.
+    """Rows that can hold a live halt right now, newest first.
 
     Not just today's. A halt is not cleared by the risk day changing (07:00
-    KST), so one fired yesterday sits on yesterday's row until someone clears
-    it, while a reset addresses today's. Reading one row let an operator see
+    KST), so one fired earlier sits on its own row until someone clears it,
+    while a reset addresses today's. Reading one row let an operator see
     "not halted" — and be told there was nothing to release — while the halt
-    was still in force. (With the old Seoul-midnight key the US session itself
-    straddled the boundary, which is how this was found.)
+    was still in force; reading two did the same once the worker had been down
+    two whole risk days (``risk_days_in_play``). (With the old Seoul-midnight
+    key the US session itself straddled the boundary, which is how this was
+    found.)
     """
-    from backend.database.models import DailyRiskState, trading_days_in_play
-    rows = [db.get(DailyRiskState, key) for key in trading_days_in_play()]
+    from backend.database.models import DailyRiskState, risk_days_in_play
+    rows = [db.get(DailyRiskState, key) for key in risk_days_in_play(db)]
     return [r for r in rows if r is not None]
 
 
 def _halted_rows(db: Session):
-    """The subset actually halted, today's first."""
+    """The subset actually halted, newest first."""
     return [r for r in _halt_rows(db) if r.kill_switch]
 
 
@@ -147,8 +149,8 @@ def _lock_halted_rows(db: Session):
     the lock is part of what the operator clears (and is named in the audit
     row), and one committed after it waits and survives.
     """
-    from backend.database.models import lock_risk_rows, trading_days_in_play
-    rows = lock_risk_rows(db, trading_days_in_play())
+    from backend.database.models import lock_risk_rows, risk_days_in_play
+    rows = lock_risk_rows(db, risk_days_in_play(db))
     return sorted((r for r in rows if r.kill_switch),
                   key=lambda r: r.trade_date, reverse=True)
 
@@ -158,11 +160,11 @@ def kill_switch_status(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Whether a persistent kill switch is set on either live trading day, and why."""
+    """Whether a persistent kill switch is set on any risk day still halted, and why."""
     halted = _halted_rows(db)
     active = bool(halted)
-    # Today's row first, so the detail shown is the most recent decision when
-    # both days are halted.
+    # Newest row first, so the detail shown is the most recent decision when
+    # several days are halted.
     row = halted[0] if halted else None
     return Resp.ok({
         "active": active,
@@ -195,8 +197,8 @@ def reset_kill_switch(
     # Every halted row, in one transaction. Releasing only one leaves the other
     # blocking the daily (07:01) SAFE_MODE re-arm with no endpoint able to reach it.
     previous_reason = halted[0].kill_reason
-    # Each day's own reason, so the audit row does not drop the older one when
-    # both days are halted for different causes.
+    # Each day's own reason, so the audit row does not drop an older one when
+    # several days are halted for different causes.
     cleared = [
         {"trade_date": r.trade_date.isoformat(), "kill_reason": r.kill_reason}
         for r in halted

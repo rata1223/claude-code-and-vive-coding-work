@@ -503,13 +503,13 @@ class KillSwitch:
             return TradingState.RUNNING, None
         try:
             from backend.database.models import (
-                DailyRiskState, trading_days_in_play,
+                DailyRiskState, risk_days_in_play,
             )
             sess = self._db()
             try:
-                # Both live days: an uncleared halt on the previous risk day
-                # still blocks (issue #167; see `trading_days_in_play`).
-                for key in trading_days_in_play():
+                # Every day a halt can be on: an uncleared halt on an earlier
+                # risk day still blocks (issue #167; see `risk_days_in_play`).
+                for key in risk_days_in_play(sess):
                     row = sess.get(DailyRiskState, key)
                     if row is not None and row.kill_switch:
                         return TradingState.HALTED, now
@@ -632,15 +632,14 @@ class KillSwitch:
             return
         try:
             from backend.database.models import (
-                lock_risk_rows, trading_days_in_play,
+                lock_risk_rows, risk_days_in_play,
             )
             sess = self._db()
             try:
-                # Clear every live day, not just today's. A halt set at 23:10
-                # and resumed at 00:40 addresses two different rows; releasing
-                # one left the other blocking with nothing able to reach it.
+                # Clear every halted day, not just today's: releasing one row
+                # left the other blocking with nothing able to reach it.
                 cleared = False
-                for row in lock_risk_rows(sess, trading_days_in_play()):   # #164
+                for row in lock_risk_rows(sess, risk_days_in_play(sess)):   # #164
                     if row.kill_switch:
                         row.kill_switch = False
                         row.kill_reason = None

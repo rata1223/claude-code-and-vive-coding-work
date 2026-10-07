@@ -598,8 +598,14 @@ class PersistentLossTracker(LossTracker):
         # A live process does not hit this: `_write_db`'s `is_new` path carries
         # the halt onto the new day's row at its first write. Only a restart in
         # the gap before that write does.
-        from backend.database.models import trading_days_in_play
-        for key in trading_days_in_play():
+        #
+        # Every still-halted day counts, not just yesterday: a worker down for
+        # two whole risk days carried nothing forward, and the halt aged out of
+        # a two-day window. If that lookup fails, the two days are still read.
+        from backend.database.models import risk_days_in_play, trading_days_in_play
+        days = (self._query(lambda s: risk_days_in_play(s, today), "정지 날짜")
+                or list(trading_days_in_play()))
+        for key in days:
             row = db_state if key == today else self._load_db_full(key)
             if row is not None and row.kill_switch:
                 self.kill_switch = True
@@ -621,9 +627,8 @@ class PersistentLossTracker(LossTracker):
                     #
                     # Without this, `_write_db` sees nothing to assert, reads
                     # today's row, adopts its `False` as an external clear and
-                    # **wipes the live halt on the very first write** — then the
-                    # old row ages out of `trading_days_in_play()` and the halt is
-                    # gone for good.
+                    # **wipes the live halt on the very first write**, and the
+                    # halt is then carried by nothing newer than its old row.
                     self._mark_kill_switch_changed()
                 break
 
