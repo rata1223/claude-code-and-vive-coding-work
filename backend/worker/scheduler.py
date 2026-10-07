@@ -86,11 +86,11 @@ def _reset_daily_risk():
 
     # `daily_pnl` is deliberately left alone here — it is not this job's to reset.
     #
-    # `LossTracker.record_pnl()` already rolls the day over on the Seoul date,
-    # zeroing `daily_pnl` at KST midnight and persisting it, so the tracker owns
-    # that counter on the same boundary as the row key. This job runs at 06:01,
-    # six hours into the Seoul day it would be zeroing — a day that already
-    # holds the 00:00–05:00 overnight US session's losses.
+    # `LossTracker.record_pnl()` already rolls the day over itself, on the risk
+    # day (`trading_day()`, 07:00 KST since #166) — the same boundary as the row
+    # key — and persists it, so the tracker owns that counter. This job runs at
+    # 06:01, inside a risk day that already holds the Korean session and the
+    # overnight US session's losses.
     #
     # It used to look harmless because it keyed by the UTC date and so touched
     # the *closed* day, missing both the live row and the live
@@ -112,12 +112,14 @@ def _reset_daily_risk():
         checked = False
         db_check = None
         try:
-            # Both days, because the US session straddles Seoul midnight
-            # (22:30–05:00 KST). A halt before midnight is on yesterday's row, a
-            # halt after it is on today's, and this job runs at 06:01 — after
-            # both. Reading one row resumed trading over a live halt.
+            # Both risk days (`trading_days_in_play`). At 06:01 the risk day is
+            # still the one that began at 07:00 yesterday — the Korean session
+            # plus the US session that just closed — and an uncleared halt from
+            # the day before it still blocks. Reading one row once resumed
+            # trading over a live halt (with the old Seoul-midnight key, a halt
+            # fired before midnight sat on the other row).
             #
-            # Yesterday must also be KST-yesterday: on the UTC date it landed a
+            # Yesterday must also be KST-based: on the UTC date it landed a
             # further day back, normally an empty row, so even the pre-midnight
             # halt read as "no halt" (issue #160).
             db_check = _get_db()

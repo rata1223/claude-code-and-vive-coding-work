@@ -116,9 +116,9 @@ def get_status():
     try:
         from backend.database.models import DailyRiskState, trading_days_in_play
         db = get_db()
-        # Both live days: the US session straddles Seoul midnight, so reporting
-        # only today's row said "not halted" while a pre-midnight halt was in
-        # force. Same reason `api/routers/risk.py` reads both.
+        # Both live days: an uncleared halt on the previous risk day is still in
+        # force, so reporting only today's row could say "not halted" during it.
+        # Same reason `api/routers/risk.py` reads both (`trading_days_in_play`).
         for _key in trading_days_in_play():
             row = db.get(DailyRiskState, _key)
             if row and row.kill_switch:

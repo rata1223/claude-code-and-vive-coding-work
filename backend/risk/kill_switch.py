@@ -507,8 +507,8 @@ class KillSwitch:
             )
             sess = self._db()
             try:
-                # Both live days: the US session straddles Seoul midnight, so a
-                # halt fired before it is on yesterday's row (issue #167).
+                # Both live days: an uncleared halt on the previous risk day
+                # still blocks (issue #167; see `trading_days_in_play`).
                 for key in trading_days_in_play():
                     row = sess.get(DailyRiskState, key)
                     if row is not None and row.kill_switch:

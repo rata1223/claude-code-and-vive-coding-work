@@ -7,47 +7,72 @@ from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 _KST = timezone(timedelta(hours=9))
 
+#: When a risk day begins, in Seoul time. After the US close (05:00 KST in
+#: summer, 06:00 in winter) and before the Korean open (09:00), so no session
+#: ever straddles it — see :func:`trading_day`.
+RISK_DAY_START_KST = 7
+
 
 def trading_day() -> date:
-    """This platform's trading day, in Asia/Seoul (UTC+9).
+    """This platform's **risk day**: 07:00 KST to 07:00 KST the next morning.
 
-    The one way to produce a ``DailyRiskState.trade_date`` key. It lives beside
-    the model because the primary key's meaning is the table's contract, not any
-    one caller's choice, and every caller already imports ``DailyRiskState``
-    from here.
+    The one way to produce a ``DailyRiskState.trade_date`` key — the day the 3%
+    daily-loss limit, the kill switch and the daily P&L belong to. It lives
+    beside the model because the primary key's meaning is the table's contract,
+    not any one caller's choice, and every caller already imports
+    ``DailyRiskState`` from here.
 
-    Why it is needed: the rest of the platform already runs on KST — the
-    scheduler is ``BackgroundScheduler(timezone="Asia/Seoul")`` and
-    ``LossTracker`` rolls its day over on the Seoul date — but the containers
-    run on UTC (no ``TZ`` in ``docker-compose.yml``), so the writers that keyed
-    rows with ``date.today()`` were a day behind for the nine hours of
-    **KST 00:00–09:00**. Readers and writers then disagreed about which row was
-    "today", which lost a live halt across a worker restart (issue #160).
+    A risk day is one Korean session (09:00–15:30) plus the US session that
+    follows it that night (22:30–05:00, winter 23:30–06:00). It is labelled by
+    the date it starts on, so 01:00 KST on the 5th is still the 4th's risk day.
+    The boundary used to be Seoul midnight, which cut the overnight US session
+    in two and gave it two 3% budgets (issue #166); 07:00 falls outside every
+    session, so one session is always one day.
+
+    Earlier still the key was the UTC date (boundary 09:00 KST, also outside
+    every session) on some writers and the Seoul date on others — readers and
+    writers disagreed about "today" and lost a live halt across a restart
+    (issue #160). The containers run on UTC (no ``TZ`` in compose), so this is
+    computed from an explicit KST offset, never ``date.today()``.
+
+    Not for order rows: KIS order numbers restart on the Seoul calendar date,
+    so the order idempotency key uses :func:`seoul_date`.
 
     Callers import this *inside the function* that needs it, matching how
     ``DailyRiskState`` is already imported, so that patching this one name
     covers every site.
     """
+    return (datetime.now(_KST) - timedelta(hours=RISK_DAY_START_KST)).date()
+
+
+def seoul_date() -> date:
+    """The calendar date in Asia/Seoul — **not** the risk day.
+
+    For things keyed by KIS's own day, which is the Seoul calendar date: an
+    order number (ODNO) restarts at Seoul midnight, so an order idempotency key
+    built from the risk day could give a 23:00 order and a 01:00 order with the
+    same reused number the same key.
+    """
     return datetime.now(_KST).date()
 
 
 def trading_days_in_play() -> tuple[date, date]:
-    """The trading days a live halt can be sitting on — ``(today, yesterday)``.
+    """The risk days a live halt can be sitting on — ``(today, yesterday)``.
 
-    The US session runs 22:30–05:00 KST, so it **straddles Seoul midnight**: a
-    halt that fires before midnight is on yesterday's row, one that fires after
-    it is on today's. Anything asking "is trading halted right now" has to read
-    both, or it misses half the session.
+    A halt is never cleared by the date changing: it blocks until someone
+    clears it. The writers carry an uncleared halt onto the new day's row at
+    their first write, but a restart before that write reads a new day with no
+    row yet — so anything asking "is trading halted right now" reads the
+    previous risk day too.
 
     Including yesterday unconditionally does not over-block. A halt that was
     cleared has ``kill_switch`` false and does not match; only an *uncleared*
     one does, and that is exactly what should still be blocking.
 
-    Before issue #160 the row key was the UTC date, whose boundary falls at
-    09:00 KST — outside every session — so one row was enough and nothing here
-    was needed. Moving the key to KST put the boundary inside the US session,
-    which is what makes this the shared definition rather than one caller's
-    special case.
+    History: with the Seoul-midnight key (#160 to #166) the US session straddled
+    the boundary, so a halt fired at 23:10 sat on the previous row while the
+    session continued — that is why this exists. The 07:00 risk day removed the
+    straddle; the carry-over above is why it stays.
     """
     today = trading_day()
     return today, today - timedelta(days=1)
@@ -180,8 +205,9 @@ def lock_risk_row(sess: Session, day: date) -> tuple["DailyRiskState", bool]:
 def lock_risk_rows(sess: Session, days) -> list["DailyRiskState"]:
     """Lock the *existing* rows among ``days``, always in date order.
 
-    For writers that act on several trading days at once (the US session
-    straddles Seoul midnight). A fixed order is what keeps two such writers
+    For writers that act on several risk days at once (a halt can still be
+    sitting on the previous day's row — see :func:`trading_days_in_play`).
+    A fixed order is what keeps two such writers
     from deadlocking on each other; a missing day is skipped, not created.
     """
     rows = []

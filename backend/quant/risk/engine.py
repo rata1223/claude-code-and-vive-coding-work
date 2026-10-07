@@ -10,7 +10,7 @@
 import logging
 import threading
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, timedelta
 from typing import Callable, Optional
 
 import numpy as np
@@ -20,12 +20,13 @@ logger = logging.getLogger(__name__)
 
 
 def _seoul_today() -> date:
-    """Today in Asia/Seoul — delegated to the one definition (issue #160).
+    """Today's **risk day** (07:00 KST to 07:00 KST) — delegated to the one
+    definition, ``models.trading_day()`` (issues #160, #166).
 
-    Kept as a name because this module reads it in a dozen places, but the
-    computation now lives beside ``DailyRiskState``, whose primary key it
-    produces. Imported inside the call so patching the one helper reaches every
-    caller, here and elsewhere.
+    The name predates the 07:00 boundary and is kept because this module reads
+    it in a dozen places and tests patch it; what it returns is the
+    ``DailyRiskState`` key, not the Seoul calendar date. Imported inside the
+    call so patching the one helper reaches every caller, here and elsewhere.
     """
     from backend.database.models import trading_day
     return trading_day()
@@ -101,12 +102,15 @@ class TrailingStopManager:
 
     def open(self, symbol: str, qty: int, entry_price: float,
              entry_date: Optional[str] = None) -> None:
+        from backend.database.models import seoul_date
         ts = entry_price * (1 - self.config.trailing_stop_pct)
         hs = entry_price * (1 - self.config.hard_stop_pct)
         self._positions[symbol] = PositionStop(
             symbol=symbol,
             entry_price=entry_price,
-            entry_date=entry_date or str(_seoul_today()),
+            # A label of when the position was opened: the calendar date, not
+            # the risk day the loss limits are kept on.
+            entry_date=entry_date or str(seoul_date()),
             peak_price=entry_price,
             trailing_stop=ts,
             hard_stop=hs,
@@ -229,7 +233,13 @@ class LossTracker:
     kill_switch: bool = False
     kill_reason: str = ""
     trade_date: date = field(default_factory=_seoul_today)
-    week_start: date = field(default_factory=_seoul_today)
+    #: ``daily_pnl`` of the risk days before ``trade_date`` still inside the
+    #: weekly window. The weekly figure is a rolling 7 risk days — these plus
+    #: today — so it is rebuilt from here at each rollover and, in the
+    #: persistent tracker, from the stored rows at boot. It used to be a window
+    #: that started when the tracker was built, so every worker restart gave the
+    #: week a fresh 6% budget.
+    _prior_days: dict = field(default_factory=dict, repr=False, compare=False)
     #: Called with the reason when a fresh MDD breach should liquidate the book
     #: (P0-03). The worker wires this to ``EmergencyFlattenManager``. It runs
     #: under the caller's lock, so it must hand the work off and return at once.
@@ -244,8 +254,37 @@ class LossTracker:
         self.trade_date = _seoul_today()
 
     def reset_weekly(self) -> None:
+        """Clear the weekly window, today's P&L so far included.
+
+        In memory only — not part of the rollover, and a restart rebuilds the
+        window from the stored rows' ``daily_pnl``.
+        """
         self.weekly_pnl = 0.0
-        self.week_start = _seoul_today()
+        self._prior_days.clear()
+
+    #: Risk days in the weekly window, today included.
+    WEEK_DAYS = 7
+
+    def _roll_week(self, today: date) -> None:
+        """Move the closing day into the window and rebuild the weekly figure.
+
+        Called at the rollover *before* the day is zeroed. The closing day's
+        share is what it added to the weekly figure — normally its
+        ``daily_pnl``, but a manual ``reset_daily``/``reset_weekly`` during the
+        day moves one counter without the other, and the week keeps what the
+        week saw. Days older than the window drop out by date, so a gap of a
+        week or more empties it.
+        """
+        self._prior_days[self.trade_date] = (
+            self.weekly_pnl - sum(self._prior_days.values()))
+        self._prune_week(today)
+        self.weekly_pnl = sum(self._prior_days.values())
+
+    def _prune_week(self, today: date) -> None:
+        self._prior_days = {
+            d: v for d, v in self._prior_days.items()
+            if 0 < (today - d).days < self.WEEK_DAYS
+        }
 
     def record_pnl(self, pnl: float, current_equity: float) -> str:
         """Record realized P&L and re-evaluate the limits.
@@ -259,9 +298,8 @@ class LossTracker:
         """
         today = _seoul_today()
         if today != self.trade_date:
+            self._roll_week(today)
             self.reset_daily()
-        if (today - self.week_start).days >= 7:
-            self.reset_weekly()
 
         self.daily_pnl += pnl
         self.weekly_pnl += pnl
@@ -458,9 +496,9 @@ class PersistentLossTracker(LossTracker):
                  db_session=None, db_factory=None):
         super().__init__(config=config)
         # RLock, not Lock: LossTracker.record_pnl() calls reset_daily() when the
-        # Seoul date rolls over, and this class overrides reset_daily() to take
+        # risk day rolls over, and this class overrides reset_daily() to take
         # this same lock. With a plain Lock that is a permanent hang on the first
-        # fill after Seoul midnight — inside the US session this system trades.
+        # fill of a new risk day.
         # (Pre-existing; found while reviewing issue #158.)
         self._lock = threading.RLock()  # serialises concurrent record_pnl() calls
         # ── kill-switch ownership (issue #158) ───────────────────────────────
@@ -515,20 +553,33 @@ class PersistentLossTracker(LossTracker):
             )
 
         db_state = self._load_db_full(today)
-        if db_state:
-            self.weekly_pnl = db_state.weekly_pnl
-            self.peak_equity = db_state.peak_equity
 
-        # The equity numbers above belong to today's row alone, but the halt
-        # does not: the US session runs 22:30–05:00 KST, so a halt fired at
-        # 23:10 is on yesterday's row while a worker restarting at 00:10 reads
-        # today's. Looking at one row let that worker come up unhalted, and
-        # `StartupRecovery._step_risk` branches on this flag — fail-open, in
-        # the middle of the session that set it.
+        # The weekly figure is the last 7 risk days, so it is rebuilt from the
+        # earlier rows rather than read from today's `weekly_pnl` column — that
+        # column only exists once today has a row, and a restart before the
+        # day's first write used to hand the week a fresh budget.
+        self._prior_days = self._load_prior_days(today)
+        self.weekly_pnl = sum(self._prior_days.values()) + self.daily_pnl
+
+        # Peak equity is the MDD baseline and belongs to no single day: the
+        # latest recorded peak, wherever it is. Taken from today's row alone, a
+        # restart before the day's first write came up with 0 and the worker
+        # re-seeded it from the current balance — resetting the drawdown it
+        # exists to measure.
+        if db_state is not None and db_state.peak_equity:
+            self.peak_equity = db_state.peak_equity
+        else:
+            self.peak_equity = self._load_latest_peak() or 0.0
+
+        # The halt is read from the previous risk day too: it is never cleared
+        # by the date changing, and a restart before the first write of a new
+        # day finds no row for it yet. Looking at one row let that worker come
+        # up unhalted, and `StartupRecovery._step_risk` branches on this flag —
+        # fail-open.
         #
         # A live process does not hit this: `_write_db`'s `is_new` path carries
-        # the halt onto the new day's row at the first write after midnight.
-        # Only a restart in the gap before that write does.
+        # the halt onto the new day's row at its first write. Only a restart in
+        # the gap before that write does.
         from backend.database.models import trading_days_in_play
         for key in trading_days_in_play():
             row = db_state if key == today else self._load_db_full(key)
@@ -801,17 +852,45 @@ class PersistentLossTracker(LossTracker):
 
     def _load_db_full(self, today: date):
         from backend.database.models import DailyRiskState
+        return self._query(lambda s: s.get(DailyRiskState, today))
+
+    def _load_prior_days(self, today: date) -> dict:
+        """``{risk day: daily_pnl}`` for the days before ``today`` in the weekly window."""
+        from backend.database.models import DailyRiskState
+        first = today - timedelta(days=self.WEEK_DAYS - 1)
+
+        def _rows(s):
+            return {r.trade_date: r.daily_pnl or 0.0
+                    for r in s.query(DailyRiskState)
+                    .filter(DailyRiskState.trade_date >= first,
+                            DailyRiskState.trade_date < today)}
+        return self._query(_rows) or {}
+
+    def _load_latest_peak(self) -> Optional[float]:
+        """The most recent recorded peak equity, from any risk day."""
+        from backend.database.models import DailyRiskState
+
+        def _peak(s):
+            row = (s.query(DailyRiskState)
+                   .filter(DailyRiskState.peak_equity > 0)
+                   .order_by(DailyRiskState.trade_date.desc())
+                   .first())
+            return row.peak_equity if row is not None else None
+        return self._query(_peak)
+
+    def _query(self, fn):
+        """Run ``fn(session)``; ``None`` on any error or with no database."""
         if self._db_factory is not None:
             sess = self._db_factory()
             try:
-                return sess.get(DailyRiskState, today)
+                return fn(sess)
             except Exception:
                 return None
             finally:
                 sess.close()
         elif self._db is not None:
             try:
-                return self._db.get(DailyRiskState, today)
+                return fn(self._db)
             except Exception:
                 return None
         return None
