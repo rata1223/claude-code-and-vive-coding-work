@@ -120,6 +120,71 @@ def test_the_days_own_halt_reason_is_shown_first(factory, sent):
     assert sent[0]["kill_reason"] == "오늘"
 
 
+def test_a_broker_failure_still_sends_the_halt(factory, monkeypatch, sent):
+    """The halt line needs only the database; the morning notice must not
+    depend on the balance call."""
+    class _Down:
+        def get_balance(self):
+            raise RuntimeError("KIS 응답 없음")
+
+        def get_positions(self):
+            raise RuntimeError("KIS 응답 없음")
+
+    monkeypatch.setattr("backend.brokers.kis.get_kis_broker", lambda: _Down())
+    _seed(factory, DAY, kill_switch=True, kill_reason="MDD 한도 초과",
+          daily_pnl=-10_000.0, peak_equity=2_000_000.0)
+
+    _run()
+
+    (summary,) = sent
+    assert summary["kill_switch"] is True
+    assert summary["total_equity"] is None
+    assert summary["position_count"] is None
+    assert summary["daily_pnl_pct"] == pytest.approx(-0.5)
+
+
+def test_the_day_is_fixed_when_the_job_starts(factory, monkeypatch, sent):
+    """A slow broker call that ends after 07:00 must not move the summary onto
+    the new, empty risk day."""
+    days = iter([DAY])
+    monkeypatch.setattr("backend.database.models.trading_day",
+                        lambda: next(days, DAY + timedelta(days=1)))
+    _seed(factory, DAY, daily_pnl=-20_000.0, peak_equity=2_000_000.0)
+
+    _run()
+
+    assert sent[0]["risk_day"] == "2026-10-09"
+    assert sent[0]["daily_pnl_pct"] == pytest.approx(-1.0)
+
+
+def test_a_database_failure_reports_the_halt_as_unknown(factory, monkeypatch, sent):
+    class _Broken:
+        def get(self, *a, **k):
+            raise RuntimeError("db down")
+
+        def add(self, *a):
+            raise RuntimeError("db down")
+
+        query = get
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("backend.worker.scheduler._get_db", lambda: _Broken())
+
+    _run()
+
+    assert sent[0]["kill_switch"] is None
+    assert sent[0]["total_equity"] == 2_000_000.0
+
+
+def test_a_late_start_is_allowed_only_until_06_59():
+    from backend.worker.scheduler import build_scheduler
+    job = build_scheduler().get_job("equity_snapshot")
+    assert job.misfire_grace_time == 9 * 60
+    assert job.coalesce is True
+
+
 class TestTheMessage:
     def _msg(self, monkeypatch, summary):
         import bot.notifier as notifier
@@ -131,6 +196,13 @@ class TestTheMessage:
     def test_it_names_the_risk_day(self, monkeypatch):
         msg = self._msg(monkeypatch, {"risk_day": "2026-10-09", "total_equity": 1.0})
         assert "리스크 데이: 2026-10-09 (07:00~07:00 KST)" in msg
+
+    def test_unread_values_are_dashes_not_zero(self, monkeypatch):
+        msg = self._msg(monkeypatch, {"total_equity": None, "daily_pnl_pct": None,
+                                      "position_count": None, "kill_switch": None})
+        assert "총 자산: —" in msg and "일 수익률: —" in msg and "포지션 수: —" in msg
+        assert "0원" not in msg
+        assert "킬스위치 상태 조회 실패" in msg
 
     def test_callers_without_a_risk_day_are_unchanged(self, monkeypatch):
         msg = self._msg(monkeypatch, {"total_equity": 1.0})

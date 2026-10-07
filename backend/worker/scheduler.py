@@ -27,6 +27,36 @@ def _get_db():
     return _get_db_factory()()
 
 
+def _closing_day_risk(day):
+    """``(daily_pnl_pct, kill_switch, kill_reason)`` for the summary; Nones if unread.
+
+    The halt is read on its own, not behind the peak check — a halted row with
+    no peak read as "no halt" — and from every risk day a halt can be on, like
+    ``/api/status`` and the tracker's restore (#216): the day's own halt first,
+    else the newest.
+    """
+    from backend.database.models import DailyRiskState, risk_days_in_play
+    db = None
+    try:
+        db = _get_db()
+        row = db.get(DailyRiskState, day)
+        pnl_pct = 0.0
+        if row and row.peak_equity > 0:
+            pnl_pct = row.daily_pnl / row.peak_equity * 100
+        halted = [r for r in (db.get(DailyRiskState, k) for k in risk_days_in_play(db, day))
+                  if r is not None and r.kill_switch]
+        if not halted:
+            return pnl_pct, False, ""
+        shown = next((r for r in halted if r.trade_date == day), halted[0])
+        return pnl_pct, True, shown.kill_reason or ""
+    except Exception as e:
+        logger.warning("일일 결산 리스크 상태 조회 실패: %s", e)
+        return None, None, None
+    finally:
+        if db is not None:
+            db.close()
+
+
 def _save_equity_snapshot():
     """자산 스냅샷을 DB에 저장 + Telegram 일일 결산 발송.
 
@@ -35,63 +65,55 @@ def _save_equity_snapshot():
     just closed — the Korean session plus the US session after it — and the
     summary covers all of it. At 23:50 it reported the Korean session and only
     the first ~80 minutes of the US one (#166, CLAUDE.md known issue 15).
+
+    The day is fixed when the job starts — a slow broker call must not carry
+    the summary past 07:00 onto the new, empty day — and the summary is sent
+    even if the broker or the snapshot fails: the halt line is the part an
+    operator most needs in the morning, and it needs only the database.
     """
-    db = None
+    from backend.database.models import EquitySnapshot, trading_day
+    day = trading_day()
+    daily_pnl_pct, kill_switch, kill_reason = _closing_day_risk(day)
+
+    total_equity = None
+    position_count = None
+    broker = None
     try:
         from backend.brokers.kis import get_kis_broker
-        from backend.database.models import (
-            EquitySnapshot, DailyRiskState, risk_days_in_play, trading_day,
-        )
         broker = get_kis_broker()
         bal = broker.get_balance()
+        total_equity = bal.total_eval_krw
         db = _get_db()
-        snap = EquitySnapshot(
-            total_krw=bal.total_eval_krw,
-            cash_krw=bal.cash_krw,
-            cash_usd=bal.cash_usd,
-        )
-        db.add(snap)
-        db.commit()
-        logger.info("자산 스냅샷 저장: %.0f원", bal.total_eval_krw)
-
-        # Collect daily risk state for Telegram summary
-        day = trading_day()
-        risk_row = db.get(DailyRiskState, day)
-        daily_pnl_pct = 0.0
-        if risk_row and risk_row.peak_equity > 0:
-            daily_pnl_pct = risk_row.daily_pnl / risk_row.peak_equity * 100
-
-        # The halt is read on its own, not behind the peak check — a halted row
-        # with no peak (one carried forward by the 07:01 job) read as "no halt"
-        # — and from every risk day a halt can be on, like `/api/status` and the
-        # tracker's restore (#216). The day's own halt first, else the newest.
-        kill_switch = False
-        kill_reason = ""
-        halted = [r for r in (db.get(DailyRiskState, k) for k in risk_days_in_play(db, day))
-                  if r is not None and r.kill_switch]
-        if halted:
-            shown = next((r for r in halted if r.trade_date == day), halted[0])
-            kill_switch = True
-            kill_reason = shown.kill_reason or ""
-
         try:
-            from bot.notifier import alert_daily_summary
-            alert_daily_summary({
-                "total_equity": bal.total_eval_krw,
-                "daily_pnl_pct": daily_pnl_pct,
-                "position_count": len(broker.get_positions()),
-                "kill_switch": kill_switch,
-                "kill_reason": kill_reason,
-                "risk_day": day.isoformat(),
-            })
-        except Exception as e:
-            logger.warning("Telegram 일일 결산 알림 실패: %s", e)
-
+            db.add(EquitySnapshot(
+                total_krw=bal.total_eval_krw,
+                cash_krw=bal.cash_krw,
+                cash_usd=bal.cash_usd,
+            ))
+            db.commit()
+        finally:
+            db.close()
+        logger.info("자산 스냅샷 저장: %.0f원", bal.total_eval_krw)
     except Exception as e:
         logger.warning("자산 스냅샷 실패: %s", e)
-    finally:
-        if db is not None:
-            db.close()
+    if broker is not None:
+        try:
+            position_count = len(broker.get_positions())
+        except Exception as e:
+            logger.warning("일일 결산 포지션 조회 실패: %s", e)
+
+    try:
+        from bot.notifier import alert_daily_summary
+        alert_daily_summary({
+            "total_equity": total_equity,
+            "daily_pnl_pct": daily_pnl_pct,
+            "position_count": position_count,
+            "kill_switch": kill_switch,
+            "kill_reason": kill_reason,
+            "risk_day": day.isoformat(),
+        })
+    except Exception as e:
+        logger.warning("Telegram 일일 결산 알림 실패: %s", e)
 
 
 def _reset_daily_risk():
@@ -175,9 +197,8 @@ def _carry_halt_forward(from_day, reason, peak_equity) -> None:
     A halt lasts until someone clears it, and readers find it on any still-
     halted row (``risk_days_in_play``). Keeping it on the newest row as well
     means today's row says what is in force — the tracker adopts it at its
-    first write, and the daily summary and ``/api/metrics`` PnL read today's
-    row — rather than leaving that to the tracker's next fill or shutdown,
-    which a halted worker over a weekend may never have.
+    first write — rather than leaving that to the tracker's next fill or
+    shutdown, which a halted worker over a weekend may never have.
 
     Today's row may already exist unhalted — a tracker write in the minute
     since 07:00 that had not yet adopted an outside halt creates it with its
@@ -213,7 +234,8 @@ def _carry_halt_forward(from_day, reason, peak_equity) -> None:
             row.kill_switch = True
             row.kill_reason = source[0].kill_reason or reason
             if is_new:
-                # Not a zero-peak row (the daily summary skips those).
+                # The peak goes along: a new row with peak 0 has no MDD
+                # baseline for `/api/metrics` and the 06:50 summary's PnL %.
                 row.peak_equity = source[0].peak_equity or peak_equity or 0.0
         db.commit()
         if carried:
@@ -335,10 +357,13 @@ def build_scheduler() -> BackgroundScheduler:
 
     # 자산 스냅샷 + 일일 결산 06:50 KST — 미국 마감(05:00, 겨울 06:00) 뒤, 리스크 데이가
     # 바뀌는 07:00 전. 방금 끝난 리스크 데이(한국 세션 + 그날 밤 미국 세션) 전체를 보고한다.
+    # 늦게 시작해도(재기동·스레드 지연) 06:59까지는 실행한다 — 날짜는 시작할 때 정하므로 07:00
+    # 전에 시작하면 끝난 리스크 데이를 보고한다. 그 뒤로 밀린 실행은 버린다(새 날을 보고하게 된다).
     scheduler.add_job(
         _save_equity_snapshot,
         CronTrigger(hour=6, minute=50, timezone="Asia/Seoul"),
         id="equity_snapshot", name="자산 스냅샷",
+        misfire_grace_time=9 * 60, coalesce=True,
     )
 
     # 30분 주기 포지션·주문 조정 — 한국 장중 09:05~15:30, 미국 장중 22:35~06:00 KST
