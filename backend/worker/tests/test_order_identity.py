@@ -57,9 +57,9 @@ def factory(monkeypatch):
 
 @pytest.fixture()
 def day(monkeypatch):
-    """The Seoul trading day `_persist_order` sees; tests move it."""
+    """The Seoul calendar date `_persist_order` keys orders by; tests move it."""
     state = {"day": TODAY}
-    monkeypatch.setattr("backend.database.models.trading_day", lambda: state["day"])
+    monkeypatch.setattr("backend.database.models.seoul_date", lambda: state["day"])
     return state
 
 

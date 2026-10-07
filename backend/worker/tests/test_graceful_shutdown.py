@@ -545,7 +545,7 @@ class TestCheckpointDoesNotTouchTheHalt:
 
     def test_it_writes_the_equity_columns(self, patched_factory):
         # `trading_day()`, not `date.today()`: `_checkpoint_equity` keys the row
-        # by the Seoul date, and the two differ for nine hours a day (#160).
+        # by the KST risk day, and the UTC date differs from it daily (#160, #166).
         from backend.database.models import DailyRiskState, trading_day
 
         w = _worker(loss_tracker=self._tracker())

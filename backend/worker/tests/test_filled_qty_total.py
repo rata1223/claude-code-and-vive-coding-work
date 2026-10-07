@@ -34,7 +34,7 @@ def factory(monkeypatch):
     Base.metadata.create_all(engine)
     f = sessionmaker(bind=engine, expire_on_commit=False)
     monkeypatch.setattr(runner, "_SessionFactory", f)
-    monkeypatch.setattr("backend.database.models.trading_day", lambda: date(2026, 9, 28))
+    monkeypatch.setattr("backend.database.models.seoul_date", lambda: date(2026, 9, 28))
     return f
 
 

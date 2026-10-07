@@ -86,11 +86,11 @@ def _reset_daily_risk():
 
     # `daily_pnl` is deliberately left alone here — it is not this job's to reset.
     #
-    # `LossTracker.record_pnl()` already rolls the day over on the Seoul date,
-    # zeroing `daily_pnl` at KST midnight and persisting it, so the tracker owns
-    # that counter on the same boundary as the row key. This job runs at 06:01,
-    # six hours into the Seoul day it would be zeroing — a day that already
-    # holds the 00:00–05:00 overnight US session's losses.
+    # `LossTracker.record_pnl()` already rolls the day over itself, on the risk
+    # day (`trading_day()`, 07:00 KST since #166) — the same boundary as the row
+    # key — and persists it, so the tracker owns that counter. This job runs at
+    # 07:01, just after the risk day turns; zeroing anything here would race the
+    # tracker's own rollover.
     #
     # It used to look harmless because it keyed by the UTC date and so touched
     # the *closed* day, missing both the live row and the live
@@ -108,16 +108,18 @@ def _reset_daily_risk():
         from backend.database.models import DailyRiskState, trading_days_in_play
         from backend.worker.recovery import SAFE_MODE
         kill_active = False
+        halted_row = None
         #: Only a lookup that actually completed can license re-enabling trading.
         checked = False
         db_check = None
         try:
-            # Both days, because the US session straddles Seoul midnight
-            # (22:30–05:00 KST). A halt before midnight is on yesterday's row, a
-            # halt after it is on today's, and this job runs at 06:01 — after
-            # both. Reading one row resumed trading over a live halt.
+            # Both risk days (`trading_days_in_play`). At 07:01 that is the day
+            # that just began and the one that just ended — the Korean session
+            # plus the US session that closed overnight. Reading one row once
+            # resumed trading over a live halt (with the old Seoul-midnight key,
+            # a halt fired before midnight sat on the other row).
             #
-            # Yesterday must also be KST-yesterday: on the UTC date it landed a
+            # Yesterday must also be KST-based: on the UTC date it landed a
             # further day back, normally an empty row, so even the pre-midnight
             # halt read as "no halt" (issue #160).
             db_check = _get_db()
@@ -125,6 +127,7 @@ def _reset_daily_risk():
                 row = db_check.get(DailyRiskState, key)
                 if row and row.kill_switch:
                     kill_active = True
+                    halted_row = (key, row.kill_reason, row.peak_equity)
                     break
             checked = True
         except Exception as e:
@@ -137,11 +140,66 @@ def _reset_daily_risk():
                 db_check.close()
         if kill_active:
             logger.warning("킬스위치 활성 — SAFE_MODE 재활성화 차단. 수동 해제 필요.")
+            _carry_halt_forward(*halted_row)
         elif checked and not SAFE_MODE.can_trade:
             SAFE_MODE.enable()
             logger.info("일일 리셋 후 SAFE_MODE 재활성화")
     except Exception as e:
         logger.warning("SAFE_MODE 재활성화 실패: %s", e)
+
+
+def _carry_halt_forward(from_day, reason, peak_equity) -> None:
+    """Put a live halt on the new risk day's row.
+
+    A halt lasts until someone clears it, but readers only look at today's and
+    yesterday's rows, and the tracker carries the halt forward only when it
+    writes — at a fill or a shutdown, which a halted worker over a weekend may
+    never have. Two quiet days and the halt aged out: this job re-armed
+    SAFE_MODE over it and a restart came up unhalted. Running daily, this keeps
+    it on the newest row.
+
+    Today's row may already exist unhalted — a tracker write in the minute
+    since 07:00 that had not yet adopted an outside halt creates it with its
+    own ``False``. That ``False`` is nobody's clear: an operator's release
+    (``api/routers/risk.py``) clears *every* halted in-play row in one
+    transaction, so while the earlier row is still halted the halt is in force
+    and today's row should say so. Only the flag is set; the equity columns of
+    an existing row are left alone.
+
+    The earlier row is re-read under its lock, in date order like every
+    multi-day writer: a release that committed after this job's first read is
+    seen here, and the halt is not put back over it (#158, #164).
+    """
+    from backend.database.models import lock_risk_row, lock_risk_rows, trading_day
+    today = trading_day()
+    if from_day == today:
+        return
+    db = None
+    try:
+        db = _get_db()
+        source = lock_risk_rows(db, [from_day])
+        if not source or not source[0].kill_switch:
+            db.rollback()
+            logger.info("킬스위치 이월 생략 — %s 행이 그 사이 해제됨", from_day)
+            return
+        row, is_new = lock_risk_row(db, today)
+        carried = not row.kill_switch
+        if carried:
+            row.kill_switch = True
+            row.kill_reason = source[0].kill_reason or reason
+            if is_new:
+                # Not a zero-peak row (the daily summary skips those).
+                row.peak_equity = source[0].peak_equity or peak_equity or 0.0
+        db.commit()
+        if carried:
+            logger.warning("킬스위치를 새 리스크 데이(%s)로 이월: %s", today, row.kill_reason)
+    except Exception as e:
+        logger.warning("킬스위치 이월 실패: %s", e)
+        if db is not None:
+            db.rollback()
+    finally:
+        if db is not None:
+            db.close()
 
 
 def _publish_session_signal(channel: str) -> None:
@@ -242,10 +300,11 @@ def build_scheduler() -> BackgroundScheduler:
         id="us_session", name="미국주식 매매",
     )
 
-    # 일일 리스크 카운터 리셋 06:01 KST — 미국 세션(22:30~05:00 KST) 종료 후 실행
+    # 일일 리스크 리셋 07:01 KST — 리스크 데이(07:00 경계, #166)가 바뀐 직후,
+    # 한국 개장(09:00) 전. 미국 세션은 05:00(겨울 06:00)에 끝난다.
     scheduler.add_job(
         _reset_daily_risk,
-        CronTrigger(hour=6, minute=1, timezone="Asia/Seoul"),
+        CronTrigger(hour=7, minute=1, timezone="Asia/Seoul"),
         id="risk_reset", name="리스크 카운터 리셋",
     )
 

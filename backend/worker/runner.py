@@ -779,7 +779,12 @@ class StrategyWorker:
         from backend.database.models import lock_risk_row, trading_day
 
         # The tracker's own mutex (P0-05) — read the four values consistently.
+        # Resolved once and rolled to first: between 07:00 and the day's first
+        # fill the tracker still holds the closed day, and writing that onto the
+        # new day's row made a restart count it twice (#166).
+        day = trading_day()
         with tracker._lock:
+            tracker.roll_over(day)
             daily_pnl = tracker.daily_pnl
             weekly_pnl = tracker.weekly_pnl
             peak_equity = tracker.peak_equity
@@ -788,7 +793,7 @@ class StrategyWorker:
 
         with _session() as db:
             # Locked like every other writer of this row (#164).
-            row, is_new = lock_risk_row(db, trading_day())
+            row, is_new = lock_risk_row(db, day)
             row.daily_pnl = daily_pnl
             row.weekly_pnl = weekly_pnl
             row.peak_equity = peak_equity
@@ -798,7 +803,7 @@ class StrategyWorker:
                 # "Never writes the halt flag" is about not clobbering an external
                 # one, and on a brand-new row there is nothing external to clobber
                 # — while `kill_switch` would otherwise default to False, which is
-                # writing a clear by omission. Shutting down at 00:30 KST while
+                # writing a clear by omission. Shutting down at 07:30 KST while
                 # halted would leave the new day's row reading "not halted".
                 #
                 # Same reasoning as `_write_db`'s `is_new` path (issue #158).
@@ -1510,13 +1515,16 @@ class StrategyWorker:
         # Derive a deterministic idempotency key from broker order id + date.
         # KIS ODNO is unique per trading day per account, so this composite key
         # prevents duplicate DB rows when the same order is processed twice.
-        # The trading day must be KIS's, i.e. Seoul's: on the UTC date the key
-        # rolled over at 09:00 KST — the Korean market open — so one order seen
-        # either side of the open produced two keys and two rows (issue #160).
+        # The day must be KIS's, i.e. the Seoul calendar date — not the 07:00
+        # risk day (`trading_day()`, #166): ODNO restarts at Seoul midnight, so a
+        # risk-day key could give two different orders sharing a reused number
+        # (23:00 and 01:00) the same key. On the UTC date the key rolled over at
+        # 09:00 KST — the Korean market open — so one order seen either side of
+        # the open produced two keys and two rows (issue #160).
         # Resolved once: two calls could straddle Seoul midnight and put one
         # date in the key and the next in `trade_date` on the same row.
-        from backend.database.models import trading_day
-        day = trading_day()
+        from backend.database.models import seoul_date
+        day = seoul_date()
         idem_key = (
             f"{order.id}:{order.symbol}:{order.side}:{day.isoformat()}"
             if order.id else None

@@ -144,18 +144,38 @@ class TestTheHelperItself:
         monkeypatch.setattr(models, "datetime", _Frozen)
         return models.trading_day()
 
-    def test_inside_the_window_it_is_a_day_ahead_of_utc(self, monkeypatch):
-        """16:30 UTC is 01:30 the next day in Seoul — the whole point of #160."""
-        assert self._at(monkeypatch, "2026-09-21T16:30:00") == date(2026, 9, 22)
+    # Since issue #166 the key is the **risk day**, 07:00 KST to 07:00 KST — one
+    # Korean session plus the US session that follows it — labelled by the date
+    # it starts on. It is still computed in KST (the #160 fix), never UTC.
 
-    def test_outside_the_window_it_matches_the_utc_date(self, monkeypatch):
+    def test_the_korean_session_is_on_its_own_date(self, monkeypatch):
         """06:30 UTC is 15:30 the same day in Seoul."""
         assert self._at(monkeypatch, "2026-09-21T06:30:00") == date(2026, 9, 21)
 
-    def test_it_is_right_at_both_edges_of_the_window(self, monkeypatch):
-        """15:00 UTC is exactly KST midnight; 14:59:59 is still the day before."""
-        assert self._at(monkeypatch, "2026-09-21T15:00:00") == date(2026, 9, 22)
+    def test_the_us_session_after_seoul_midnight_stays_on_the_day_it_began(
+            self, monkeypatch):
+        """16:30 UTC is 01:30 KST on the 22nd — the US session that opened on
+        the evening of the 21st. With the Seoul-midnight key it was the 22nd,
+        which split the session across two daily-loss budgets (#166)."""
+        assert self._at(monkeypatch, "2026-09-21T16:30:00") == date(2026, 9, 21)
+
+    def test_the_day_turns_over_at_07_00_kst(self, monkeypatch):
+        """22:00 UTC is 07:00 KST the next day; a second earlier is the day before.
+        After the US close (05:00/06:00 KST) and before the Korean open (09:00)."""
+        assert self._at(monkeypatch, "2026-09-21T22:00:00") == date(2026, 9, 22)
+        assert self._at(monkeypatch, "2026-09-21T21:59:59") == date(2026, 9, 21)
+
+    def test_seoul_midnight_is_no_longer_a_boundary(self, monkeypatch):
         assert self._at(monkeypatch, "2026-09-21T14:59:59") == date(2026, 9, 21)
+        assert self._at(monkeypatch, "2026-09-21T15:00:00") == date(2026, 9, 21)
+
+    def test_seoul_date_is_the_calendar_date_for_order_keys(self, monkeypatch):
+        """KIS order numbers restart at Seoul midnight, so order keys use the
+        calendar date: 01:30 KST on the 22nd is the 22nd there."""
+        import backend.database.models as models
+        self._at(monkeypatch, "2026-09-21T16:30:00")
+        assert models.seoul_date() == date(2026, 9, 22)
+        assert models.trading_day() == date(2026, 9, 21)
 
 
 class TestHaltSurvivesRestartInsideTheWindow:
@@ -248,8 +268,8 @@ class TestYesterdaysHaltBlocksResume:
         _reset_daily_risk()
 
         assert SAFE_MODE.can_trade is False, (
-            "the 06:01 re-arm resumed trading over a halt fired earlier "
-            "the same Seoul day, during the overnight US session"
+            "the daily re-arm resumed trading over a halt on today's row "
+            "(fired during the overnight US session under the old key)"
         )
 
     def test_with_no_halt_on_either_day_safe_mode_still_re_arms(
@@ -429,50 +449,59 @@ class TestTheTrackerRestoresAcrossSeoulMidnight:
             "while the overnight session's halt was still in force")
         assert t.kill_reason == "MDD 한도 초과"
 
-    def test_equity_numbers_still_come_from_todays_row_only(
+    def test_peak_comes_from_todays_row_and_the_week_from_daily_figures(
             self, in_window, factory):
-        """Only the halt spans days. PnL and peak belong to their own day."""
-        _seed(factory, KST_DAY - timedelta(days=1),
+        """Today's peak wins over an older one. The weekly figure is the sum of
+        the risk days' `daily_pnl` — not today's stored `weekly_pnl` column,
+        which a restart before the day's first write does not have (#166)."""
+        _seed(factory, KST_DAY - timedelta(days=1), daily_pnl=-30_000.0,
               weekly_pnl=-99_000.0, peak_equity=9_999_999.0)
-        _seed(factory, KST_DAY, weekly_pnl=-1_000.0, peak_equity=2_000_000.0)
+        _seed(factory, KST_DAY, daily_pnl=-1_000.0,
+              weekly_pnl=-1_000.0, peak_equity=2_000_000.0)
 
         t = _tracker(factory)
 
         assert t.peak_equity == 2_000_000.0
-        assert t.weekly_pnl == -1_000.0
+        assert t.daily_pnl == -1_000.0
+        assert t.weekly_pnl == -31_000.0
 
     def test_a_cleared_previous_day_does_not_resurrect_a_halt(
             self, in_window, factory):
         _seed(factory, KST_DAY - timedelta(days=1), kill_switch=False)
         assert _tracker(factory).kill_switch is False
 
-    def test_equity_is_not_taken_from_yesterday_when_today_has_no_row(
+    def test_a_restart_before_the_days_first_write_keeps_peak_and_week(
             self, in_window, factory):
-        """The likely shape of a wrong fix: falling back to yesterday wholesale.
+        """Before the first write of a risk day there is no row for it yet.
 
-        Before the first write of a Seoul day there is no row yet. Reaching
-        back for the equity numbers would restore a stale peak — and peak
-        equity is the denominator of the MDD limit, so a stale high one makes
-        the drawdown look worse and a stale low one hides a real breach.
+        Peak equity is the MDD baseline: coming up with 0 made the worker
+        re-seed it from the current balance and forget the drawdown so far.
+        The weekly figure likewise restarted at 0, handing the week a fresh
+        budget on every restart. Both now carry across (#166); P&L for the
+        new day itself still starts at 0.
         """
         _seed(factory, KST_DAY - timedelta(days=1),
               kill_switch=True, kill_reason="MDD 한도 초과",
-              weekly_pnl=-99_000.0, peak_equity=9_999_999.0)
+              daily_pnl=-40_000.0, weekly_pnl=-99_000.0,
+              peak_equity=9_999_999.0)
 
         t = _tracker(factory)
 
         assert t.kill_switch is True, "the halt must still cross the boundary"
-        assert t.peak_equity == 0.0
-        assert t.weekly_pnl == 0.0
+        assert t.peak_equity == 9_999_999.0
+        assert t.daily_pnl == 0.0
+        assert t.weekly_pnl == -40_000.0
 
 
 class TestTheDailyResetLeavesTheLiveCounterAlone:
-    """06:01 KST is six hours *into* the Seoul day, not the start of it.
+    """The daily job must not touch the live day's counter.
 
-    That day already holds the 00:00–05:00 overnight US session. Zeroing its
-    `daily_pnl` and deleting its Redis key wiped both stores
-    `_restore_state()` reads, so a restart after 06:01 handed the Korean
-    session a fresh 3% budget on top of the overnight loss.
+    When it ran at 06:01 under the Seoul-midnight key, that was six hours into
+    a day already holding the overnight US session: zeroing its `daily_pnl`
+    and deleting its Redis key wiped both stores `_restore_state()` reads, so a
+    restart afterwards handed the Korean session a fresh 3% budget on top of
+    the overnight loss. The tracker owns the rollover (07:00 since #166); the
+    job (now 07:01) still must not zero anything.
     """
 
     @pytest.fixture(autouse=True)
@@ -520,7 +549,7 @@ class TestTheDailyResetLeavesTheLiveCounterAlone:
 class TestOneTradingDayValuePerOrderRow:
     def test_the_idempotency_key_and_trade_date_cannot_disagree(
             self, factory, monkeypatch):
-        """Two `trading_day()` calls could straddle midnight and split one row.
+        """Two date calls could straddle midnight and split one row.
 
         Driven by making the helper return a different day on each call: with a
         single resolved value the row stays coherent regardless, and with two
@@ -532,7 +561,7 @@ class TestOneTradingDayValuePerOrderRow:
 
         days = itertools.chain([KST_DAY, KST_DAY + timedelta(days=1)],
                                itertools.repeat(KST_DAY + timedelta(days=9)))
-        monkeypatch.setattr("backend.database.models.trading_day",
+        monkeypatch.setattr("backend.database.models.seoul_date",
                             lambda: next(days))
         _persist_via(monkeypatch, factory, runner_mod, _StubOrder())
 

@@ -121,10 +121,12 @@ def _is_risk_admin(user: User) -> bool:
 def _halt_rows(db: Session):
     """Rows that can hold a live halt right now, today's first.
 
-    Not just today's. The US session straddles Seoul midnight, so a halt fired
-    at 23:10 sits on yesterday's row while a reset at 00:40 addresses today's.
-    Reading one row let an operator see "not halted" — and be told there was
-    nothing to release — while the halt was still in force.
+    Not just today's. A halt is not cleared by the risk day changing (07:00
+    KST), so one fired yesterday sits on yesterday's row until someone clears
+    it, while a reset addresses today's. Reading one row let an operator see
+    "not halted" — and be told there was nothing to release — while the halt
+    was still in force. (With the old Seoul-midnight key the US session itself
+    straddled the boundary, which is how this was found.)
     """
     from backend.database.models import DailyRiskState, trading_days_in_play
     rows = [db.get(DailyRiskState, key) for key in trading_days_in_play()]
@@ -191,7 +193,7 @@ def reset_kill_switch(
         return Resp.err("킬스위치가 활성 상태가 아닙니다 — 해제할 것이 없습니다.")
 
     # Every halted row, in one transaction. Releasing only one leaves the other
-    # blocking the 06:01 SAFE_MODE re-arm with no endpoint able to reach it.
+    # blocking the daily (07:01) SAFE_MODE re-arm with no endpoint able to reach it.
     previous_reason = halted[0].kill_reason
     # Each day's own reason, so the audit row does not drop the older one when
     # both days are halted for different causes.
