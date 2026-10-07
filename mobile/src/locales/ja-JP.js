@@ -677,14 +677,6 @@ export default {
     to_login: 'ログインに戻る',
     to_register: 'アカウントをお持ちでない方は登録',
     footer_tip: 'Cloudflare Turnstile で保護',
-    oauth_divider: 'または',
-    continue_with_google: 'Google で続行',
-    continue_with_github: 'GitHub で続行',
-    oauth_err_missing_params: 'OAuth パラメータが不足しています。再試行してください。',
-    oauth_err_state: 'OAuth セッションが期限切れです。再ログインしてください。',
-    oauth_err_user_failed: 'アカウントを作成できませんでした。サポートにお問い合わせください。',
-    oauth_err_server: 'OAuth ログインに失敗しました。後でもう一度お試しください。',
-    oauth_err_generic: 'OAuth ログインに失敗しました'
   },
   language: {
     label: '言語',

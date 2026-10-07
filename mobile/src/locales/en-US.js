@@ -677,14 +677,6 @@ export default {
     to_login: 'Back to login',
     to_register: "Don't have an account? Sign up",
     footer_tip: 'Protected by Cloudflare Turnstile',
-    oauth_divider: 'Or continue with',
-    continue_with_google: 'Continue with Google',
-    continue_with_github: 'Continue with GitHub',
-    oauth_err_missing_params: 'OAuth parameters missing, please retry.',
-    oauth_err_state: 'OAuth session expired, please sign in again.',
-    oauth_err_user_failed: 'Unable to create account, please contact support.',
-    oauth_err_server: 'OAuth sign-in failed, please try again later.',
-    oauth_err_generic: 'OAuth sign-in failed'
   },
   language: {
     label: 'Language',

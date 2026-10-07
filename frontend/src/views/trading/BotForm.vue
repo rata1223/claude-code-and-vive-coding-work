@@ -774,15 +774,15 @@ export default {
         this.$route.query?.fromAi === '1' || this.$route.query?.fromAiScript === '1'
       if (fromAi) {
         try {
-          const code = sessionStorage.getItem('qd_ai_strategy_code')
-          const metaRaw = sessionStorage.getItem('qd_ai_strategy_preset')
+          const code = sessionStorage.getItem('kis_ai_strategy_code')
+          const metaRaw = sessionStorage.getItem('kis_ai_strategy_preset')
           if (code) {
             this.aiStrategyCode = code
-            sessionStorage.removeItem('qd_ai_strategy_code')
+            sessionStorage.removeItem('kis_ai_strategy_code')
           }
           if (metaRaw) {
             parsed = JSON.parse(metaRaw)
-            sessionStorage.removeItem('qd_ai_strategy_preset')
+            sessionStorage.removeItem('kis_ai_strategy_preset')
           }
         } catch {
           /* ignore */

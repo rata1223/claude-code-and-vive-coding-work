@@ -12,7 +12,7 @@
 
 ---
 
-## 프로젝트 진행 현황 (2026-10-04 기준, main `370af9b` = PR #212)
+## 프로젝트 진행 현황 (2026-10-07 기준, main `185b6e9` = PR #213)
 
 > **이 섹션이 최신 상태의 단일 진실 공급원(SoT).** 아래 "다음 작업 목록(Stage 1~9)"은 초기 설계 로드맵으로,
 > 대부분 이미 구현 완료됐다. 실제 진행은 `AUDIT.md` → `ROADMAP.md` 기반 하드닝 트랙으로 이어지고 있다.
@@ -79,6 +79,7 @@
 | 업스트림 주소 제거 | #211 | **알려진 이슈 13 + 나머지** — 앱이 QuantDinger에서 와서 그쪽 서버를 기본값으로 갖고 있었다. ① 모바일 개발 서버 `/api` 프록시가 `api.quantdinger.com` — `npm run dev`의 로그인·자격증명 요청이 제3자 서버로 갔다 → `VITE_API_TARGET`(기본 `http://localhost:8000`). ② 모바일 `PUBLIC_WEB_BASE_URL` 기본값 `m.quantdinger.com`(아무도 안 씀) → 두 앱에서 제거. ③ About(두 앱 동일): 업데이트가 **업스트림 APK로 대체 다운로드**하던 경로(지금은 서버가 버전을 안 보내 휴면) 제거 — 서버가 준 `https://` 주소만 열고, 없거나 다른 스킴이면 대화상자 없이 안내. 업스트림 웹사이트·지원 메일 행 숨김(새 연락처는 만들지 않음), 소개 문구를 KIS 주식·ETF 플랫폼으로(디지털 자산 → 주식·ETF 위험 고지), 안 쓰는 로케일 키 4개 제거. 5개 로케일 × 2앱. 정적 가드: 두 앱 `src/**`·`vite.config.js`에 `quantdinger.com` 없음, 복사본 동일, https 전용 |
 | 운영 계좌 카드 | #212 | kis-ws가 `position:update`·`equity:update`를 중계했지만 **발행처가 없었다**. 워커 `backend/worker/portfolio_feed.py` `publish_portfolio`: 브로커에서 잔고·포지션을 읽어 두 채널로 발행(총자산·현금 KRW/USD·`equity_verified`, 종목·수량·평단·현재가·시장). **보기일 뿐 판단 입력이 아니다** — 두 읽기는 서로 독립(한쪽이 실패해도 다른 쪽은 발행), 예외는 삼키고, 겹친 호출은 합친다(진행 중에 온 요청은 끝난 뒤 한 번 더 읽게 표시 — 마지막 체결이 반영되고, 몰려도 추가 조회는 1회). 트리거: 체결 직후(`_spawn_aux`, 종료 시 join, `__init__`으로 만든 워커만 — 테스트용 `__new__` 워커는 브로커에 닿지 않게), 기동 직후, 스케줄러 10분 주기(한국 장중 + 서울 기준 미국 장중). kis-ws는 두 상태 채널의 마지막 값을 `ws:last:<채널>`(TTL 1일)에 두고 **운영자 연결이 수락되면 그 소켓에만** 보낸다 — 발행 사이에 화면을 열어도 바로 보인다(주문·경보는 재생하지 않음). 운영 전략 화면 "실시간"에 계좌 카드: 모르는 숫자는 0이 아니라 `—`(#149·#192), `equity_verified`가 false면 미검증 표시(#178). 5개 로케일 × 2앱 |
 | 4주 관문 가동 시간 | #213 | **#206·#209가 남긴 마지막 한계** — 관문이 달력 28일을 셌다. 워커가 내려가 있던 시간도 실행한 것으로 쳤다. 이제 **그 실행이 실제로 돌던 시간**이 28일이어야 한다(운영자 결정: 다운타임만큼 뒤로 민다 — 재기동은 그 몇 초만, 6시간 장애는 6시간). 기록: 새 테이블 `run_uptime`(열 추가가 아니라 새 테이블이라 `create_all`이 기존 DB에 만든다, #194 함정 아님 + Alembic `d1e2f3a4b5c6`). **워커가 아니라 실행 단위**(code-review): 복원이 실패한 실행은 다음 기동을 위해 활성으로 남는데 아무도 돌리지 않는다 — 워커 가동으로 세면 그 시간이 통과에 들어간다. 그래서 실행의 `WorkerSession`이 `strategy.start()`에 성공한 뒤부터 `backend/worker/uptime.py` `UptimeRecorder`로 기록한다(60초마다 `last_beat_at`, 세션이 끝나면 `ended_at`). 기록은 `main()`이 **복구가 성공한 뒤에만** 켠다(`enable_run_uptime` — 복구 중이거나 SafeMode로 남은 워커는 매매할 수 없다). 죽은 프로세스의 행은 마지막 박동 + `UPTIME_GRACE`(120초)까지. **박동을 못 쓴 시간은 가동이 아니다** — 마지막으로 쓴 박동에서 grace보다 오래 지나면 행을 늘리지 않고 새 행을 연다(DB 장애·컨테이너 일시정지가 가동으로 메워지지 않게). 종료 기록은 최대 2초만 기다린다 — DB가 멈춰도 세션 정리·워커 종료 예산을 잡아먹지 않는다(code-review, 못 쓰면 마지막 박동에서 끝난 것으로 센다). 계산은 `promotion_guard.uptime_by_run`(그 실행의 행만, 겹친 구간은 한 번, 실행 구간으로 자름, 기록 없으면 0 — 이전 실행은 세지 않음). `paper_gate_status`·`paper_run_qualifies`가 `uptime`을 받는다(사유는 그대로 `duration`). kis-api 목록에 `uptime_sec`·`downtime_sec`, 프록시는 없거나 이상한 값이면 0(fail-closed)·실행 구간으로 상한 후 판정, `uptime_days`·`downtime_hours`, 관문 예정일 = 지금 + 남은 가동 시간. 운영 화면에 "가동 X일 · 다운타임 Y시간". 5개 로케일 × 2앱 |
+| 업스트림 이름·OAuth 제거 | #214 | **#211의 나머지** — 주소는 걷어냈지만 이름과 죽은 업스트림 코드가 남아 있었다. **OAuth 로그인 전부 제거**(운영자 결정): 백엔드에 OAuth가 없는데(`/api/auth/oauth/*` 라우트 없음, `security-config`가 버튼을 켜지 않음) 로그인 화면은 URL의 `oauth_token`을 받아 그대로 `finalizeLogin`했다 — **링크 하나로 방문자를 남의 계정에 로그인시킬 수 있었고**, 그 계정에 KIS 자격증명을 저장하게 될 수 있었다. 로그인 화면 OAuth 섹션·핸들러·`$route.query` 감시, `main.js`의 딥링크 처리(`appUrlOpen`·`getLaunchUrl`, OAuth 전용), `utils/oauthRedirect.js`(스킴 `com.quantdinger.mobile://`, `localStorage.oauthRedirectUri`), 로케일 키 8개×10 삭제. 로그인 약관·면책(`constants/legal.js`, 5개 로케일): 이름을 KIS 자동매매/KIS Trading으로, "디지털 자산"을 주식·ETF로, "거래소 API"를 증권사 API로 — **최소 수정**(위험 강도는 그대로, 회사·연락처·준거법은 추가하지 않음, 출시 전 운영자가 채울 것). 모바일 `<title>`, 웹 `capacitor.config.json`(모바일과 같은 `com.kistrade.mobile`), `package.json` 이름, sessionStorage `qd_ai_strategy_*`→`kis_ai_strategy_*`(페이지 간 1회성 전달이라 영향은 열린 탭의 대기 중 프리셋 하나), 주석. `mobile/README*`를 KIS 설명 + **출처 한 줄**로 교체하고 업스트림 홍보 이미지 `banner.png` 삭제, `mobile/LICENSE`는 **유지**(업스트림 라이선스가 출처 표기를 요구). 정적 가드(`test_frontend_no_upstream_hosts.py`): 두 앱의 소스·`index.html`·`capacitor.config.json`·`package.json`·`vite.config.js`에 "quantdinger" 없음, README는 출처 한 줄만, `oauth` 코드·`oauthRedirect.js` 없음, `qd_` 키 없음, 로그인·`main.js`·약관 두 앱 동일, 약관이 KIS·ETF를 말함. **범위 밖(남김)**: 백엔드 환경변수 `QUANTDINGER_SECRET_KEY`(`backend/websocket/server.py`, compose·`.env`와 묶임)와 compose의 `quantdinger-*` 서비스 |
 
 **열린 PR 0건.** 다음 작업은 `origin/main`에서 새로 분기하면 된다.
 
@@ -206,7 +207,8 @@
 13. ~~**모바일 개발 서버의 `/api` 프록시가 외부 도메인을 가리킨다**~~ — PR #211에서 해결. `mobile/vite.config.js`가
    `process.env.VITE_API_TARGET || 'http://localhost:8000'`을 쓴다. 같은 PR에서 앱에 남은 QuantDinger 주소를 모두 걷어냈다(About의
    업스트림 APK 대체 다운로드·웹사이트·지원 메일, 모바일 `PUBLIC_WEB_BASE_URL`). 정적 가드 `tests/integration/test_frontend_no_upstream_hosts.py`.
-   **남은 잔재**(네트워크 호스트 아님): OAuth 딥링크 스킴 `com.quantdinger.mobile://login`(`src/utils/oauthRedirect.js`) — Capacitor appId와 다를 수 있다. 앱에 OAuth 로그인이 쓰이게 되면 확인할 것
+   ~~**남은 잔재**: OAuth 딥링크 스킴~~ — PR #214에서 OAuth 경로를 통째로 제거(백엔드에 OAuth가 없었고, URL의 `oauth_token`으로 로그인되는 구멍이었다). 앱에서 업스트림 이름도 걷어냈다.
+   **아직 남은 업스트림 이름**(배포 설정과 묶여 별도 결정): 환경변수 `QUANTDINGER_SECRET_KEY`(`backend/websocket/server.py`), compose의 `quantdinger-frontend`·`quantdinger-backend` 서비스와 알려진 이슈 1의 클론 절차
 
 ---
 
@@ -532,7 +534,7 @@ KR_ETF   = ["069500", "360750", "091160"]  # KODEX200, TIGER S&P500, KODEX반도
 - **PR #79** (`claude/update-MW7LQ`): 실패 시나리오 통합테스트 (TASK 4-1C) — **머지됨** (2026-06-16)
 - 하드닝 트랙 PR #85~#156: 위 "프로젝트 진행 현황" 표 참조 — **모두 머지됨**
 - **PR #116**은 미머지 종료(2026-07-05). 같은 작업을 **#119**가 대체 구현해 머지했다
-- **현재 열린 PR 0건.** main = `370af9b` (PR #212)
+- **현재 열린 PR 0건.** main = `185b6e9` (PR #213)
 
 > 작업 방식: 기능별 새 브랜치에서 작업 → `main`으로 드래프트 PR → CodeRabbit/CodeQL 리뷰 → 머지.
 > 브랜치 보호 룰셋(PR 필수 + 코드 스캐닝)이 적용돼 `main` 직접 푸시 불가.

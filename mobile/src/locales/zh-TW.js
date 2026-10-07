@@ -676,14 +676,6 @@ export default {
     to_login: '返回登入',
     to_register: '還沒有帳號？立即註冊',
     footer_tip: '受 Cloudflare Turnstile 風控保護',
-    oauth_divider: '或使用第三方帳號',
-    continue_with_google: '使用 Google 登入',
-    continue_with_github: '使用 GitHub 登入',
-    oauth_err_missing_params: '第三方登入參數缺失，請重試',
-    oauth_err_state: '登入工作階段已過期，請重新登入',
-    oauth_err_user_failed: '無法建立第三方帳號，請聯絡客服',
-    oauth_err_server: '第三方登入失敗，請稍後再試',
-    oauth_err_generic: '第三方登入失敗'
   },
   language: {
     label: '語言',

@@ -677,14 +677,6 @@ export default {
     to_login: '로그인으로 돌아가기',
     to_register: '계정이 없으신가요? 가입하기',
     footer_tip: 'Cloudflare Turnstile로 보호됨',
-    oauth_divider: '또는',
-    continue_with_google: 'Google로 계속',
-    continue_with_github: 'GitHub로 계속',
-    oauth_err_missing_params: 'OAuth 파라미터가 누락되었습니다. 다시 시도해 주세요.',
-    oauth_err_state: 'OAuth 세션이 만료되었습니다. 다시 로그인해 주세요.',
-    oauth_err_user_failed: '계정을 생성할 수 없습니다. 지원팀에 문의하세요.',
-    oauth_err_server: 'OAuth 로그인에 실패했습니다. 잠시 후 다시 시도해 주세요.',
-    oauth_err_generic: 'OAuth 로그인에 실패했습니다'
   },
   language: {
     label: '언어',
