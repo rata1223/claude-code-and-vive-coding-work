@@ -85,8 +85,8 @@ def test_about_opens_only_an_https_address_from_the_server():
 def _node_eval(module_rel, expr):
     import json
     import subprocess
-    script = (f"import('file://{ROOT}/{module_rel}')"
-              f".then(m => process.stdout.write(JSON.stringify({expr})))")
+    uri = json.dumps((ROOT / module_rel).as_uri())
+    script = f"import({uri}).then(m => process.stdout.write(JSON.stringify({expr})))"
     return json.loads(subprocess.run(["node", "-e", script], capture_output=True, text=True,
                                      check=True).stdout)
 
@@ -101,6 +101,10 @@ def test_both_apps_carry_the_license_text(app):
 def test_the_page_title_and_native_app_name_keep_the_brand(app):
     assert "<title>QuantDinger</title>" in _read(f"{app}/index.html")
     assert '"appName": "QuantDinger"' in _read(f"{app}/capacitor.config.json")
+    # The router rewrites document.title on every navigation, so the brand has
+    # to be there too or the static <title> is never seen.
+    router = _read(f"{app}/src/router/index.js")
+    assert "document.title = title ? `${title} | QuantDinger` : 'QuantDinger'" in router
 
 
 LOCALES = ("ko-KR", "en-US", "ja-JP", "zh-CN", "zh-TW")
@@ -111,7 +115,7 @@ def test_the_terms_keep_the_brand_and_name_the_market(locale):
     """The brand stays; what changed is the market — the terms described a
     digital-asset service, and this one trades stocks and ETFs."""
     legal = _node_eval("frontend/src/constants/legal.js", f"m.getLegal('{locale}')")
-    assert legal["terms"].lstrip().find("QuantDinger") != -1
+    assert "QuantDinger" in legal["terms"]
     assert "ETF" in legal["terms"]
     assert not re.search(r"digital asset|数字资产|數位資產|デジタル資産|디지털 자산", legal["terms"])
 
@@ -150,6 +154,23 @@ def test_both_capacitor_configs_are_the_same():
 
 @pytest.mark.parametrize("app", APPS)
 def test_no_login_token_is_taken_from_the_url(app):
+    """The invariant, not the word: a login token comes only from the login API
+    response — never from the address the visitor was sent to."""
+    login = _read(f"{app}/src/views/login/index.vue")
+    calls = re.findall(r"this\.finalizeLogin\(([^)]*)\)", login)
+    assert calls and all(c.startswith("res.data.token") for c in calls), calls
+    for rel in ("src/views/login/index.vue", "src/main.js", "src/router/index.js"):
+        src = _read(f"{app}/{rel}")
+        assert not re.search(r"location\.(search|hash)|URLSearchParams|getLaunchUrl|appUrlOpen",
+                             src), rel
+        # the only query value the login page reads is where to go next
+        assert set(re.findall(r"\$route\.query\??\.(\w+)", src)) <= {"redirect"}, rel
+
+
+@pytest.mark.parametrize("app", APPS)
+def test_the_oauth_code_is_gone(app):
+    """OAuth needs a backend this platform does not have; bringing any of it back
+    should be a deliberate change, so this fails on the word anywhere in src."""
     hits = [f"{path.relative_to(ROOT)}:{n}"
             for path in (ROOT / app / "src").rglob("*")
             if path.is_file() and path.suffix in {".js", ".vue", ".ts"}
