@@ -204,7 +204,8 @@ class TestTheDailyJob:
         assert SAFE_MODE.can_trade is False
         assert _row(factory, TODAY) is None
 
-    def test_with_no_halt_anywhere_it_still_re_arms(self, factory):
+    def test_with_no_halt_anywhere_it_opens_nothing(self, factory):
+        """The job carries halts; reopening is the worker's resume poll (P0-12)."""
         from backend.worker.recovery import SAFE_MODE
         from backend.worker.scheduler import _reset_daily_risk
         _seed(factory, LONG_AGO, kill_switch=False)
@@ -212,7 +213,8 @@ class TestTheDailyJob:
 
         _reset_daily_risk()
 
-        assert SAFE_MODE.can_trade is True
+        assert SAFE_MODE.can_trade is False
+        assert _row(factory, TODAY) is None
 
 
 class TestTheFlaskReporters:

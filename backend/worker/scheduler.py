@@ -145,14 +145,11 @@ def _reset_daily_risk():
     # Two writers with different day boundaries is the shape of issue #158; the
     # replacement here is the tracker's own rollover, which is already in place.
 
-    # Re-arm SAFE_MODE for the new day — skip if a kill switch is still live
+    # Carry a live halt onto the new risk day's row
     try:
         from backend.database.models import DailyRiskState, risk_days_in_play
-        from backend.worker.recovery import SAFE_MODE
         kill_active = False
         halted_row = None
-        #: Only a lookup that actually completed can license re-enabling trading.
-        checked = False
         db_check = None
         try:
             # Every risk day a halt can be on (`risk_days_in_play`): the day
@@ -172,23 +169,25 @@ def _reset_daily_risk():
                     kill_active = True
                     halted_row = (key, row.kill_reason, row.peak_equity)
                     break
-            checked = True
         except Exception as e:
-            # Fail closed. Swallowing this left `kill_active` False and fell
-            # through to SAFE_MODE.enable(), so a database outage re-opened
-            # trading without anyone having checked the kill switch.
-            logger.warning("킬스위치 조회 실패 — SAFE_MODE 재활성화 보류: %s", e)
+            # Nothing carried; the halt stays on its own row, where every
+            # reader still finds it (`risk_days_in_play`).
+            logger.warning("킬스위치 조회 실패 — 정지 이월 보류: %s", e)
         finally:
             if db_check is not None:
                 db_check.close()
         if kill_active:
-            logger.warning("킬스위치 활성 — SAFE_MODE 재활성화 차단. 수동 해제 필요.")
+            logger.warning("킬스위치 활성 — 해제될 때까지 매매 차단 유지")
             _carry_halt_forward(*halted_row)
-        elif checked and not SAFE_MODE.can_trade:
-            SAFE_MODE.enable()
-            logger.info("일일 리셋 후 SAFE_MODE 재활성화")
+        # This job no longer re-opens SAFE_MODE (P0-12). It did so for any
+        # cause once no halt was in play, so a worker whose startup recovery
+        # failed — untrusted state, which needs a restart — began trading at
+        # 07:01. A halt lasts until released now (#215, #216), so the day
+        # turning re-opens nothing; a release is picked up within a minute by
+        # the worker's resume poll (`StrategyWorker._resume_if_released`),
+        # which reopens only a risk halt in a worker that recovered.
     except Exception as e:
-        logger.warning("SAFE_MODE 재활성화 실패: %s", e)
+        logger.warning("킬스위치 이월 실패: %s", e)
 
 
 def _carry_halt_forward(from_day, reason, peak_equity) -> None:

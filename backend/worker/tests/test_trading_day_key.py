@@ -272,18 +272,20 @@ class TestYesterdaysHaltBlocksResume:
             "(fired during the overnight US session under the old key)"
         )
 
-    def test_with_no_halt_on_either_day_safe_mode_still_re_arms(
+    def test_with_no_halt_the_job_still_opens_nothing(
             self, in_window, factory):
-        """The guard must not become unconditional — the normal path still opens."""
+        """P0-12: the job no longer re-opens SAFE_MODE for any cause. The gate
+        it opened could be an untrusted-state one from a failed recovery; a
+        release is resumed by the worker's poll instead."""
         from backend.worker.recovery import SAFE_MODE
         _seed(factory, KST_DAY - timedelta(days=1), kill_switch=False)
         _seed(factory, KST_DAY, kill_switch=False)
-        SAFE_MODE.disable("야간 정지")
+        SAFE_MODE.disable("복구 실패: 브로커 잔고 조회")
 
         from backend.worker.scheduler import _reset_daily_risk
         _reset_daily_risk()
 
-        assert SAFE_MODE.can_trade is True
+        assert SAFE_MODE.can_trade is False
 
 
 class TestTheContractHolds:

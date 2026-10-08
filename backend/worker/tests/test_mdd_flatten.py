@@ -94,10 +94,14 @@ class TestTheTrackerRequestsAFlatten:
         assert t.kill_reason.startswith("주간") and calls == []
 
     def test_a_manual_reset_rearms_it(self):
+        """The reset rebases the drawdown on current equity (P0-12): the breach
+        it accepted does not flatten again, a fresh 15% from there does."""
         t, calls = _hooked()
         t.record_pnl(0.0, PEAK * 0.80)
         t.manual_reset()
         t.record_pnl(0.0, PEAK * 0.80)
+        assert len(calls) == 1
+        t.record_pnl(0.0, PEAK * 0.80 * 0.84)
         assert len(calls) == 2
 
     def test_a_failing_hook_does_not_undo_the_halt(self):
@@ -181,10 +185,11 @@ class TestOnlyAMeasuredBreachFlattens:
         assert t.record_pnl(0.0, PEAK) == "adopted"
         assert calls == []
 
-    def test_a_clear_during_a_live_breach_re_halts_without_a_second_flatten(self, factory):
-        """While the breach holds, ``_evaluate`` re-halts before the write, so the
-        operator's clear is overwritten (issue #158) — and the book, already
-        liquidated, is not liquidated again."""
+    def test_a_clear_during_a_live_breach_holds_without_a_second_flatten(self, factory):
+        """The operator's release accepts the drawdown as it stands (P0-12):
+        the peak is rebased on current equity, so the book — already
+        liquidated — is neither halted nor liquidated again by the same
+        breach. A fresh 15% from the new peak is a new breach."""
         _set_row(factory)
         t, calls = _persistent(factory)
         t.peak_equity = PEAK
@@ -192,8 +197,13 @@ class TestOnlyAMeasuredBreachFlattens:
         _set_row(factory, kill_switch=False, kill_reason=None)
 
         t.record_pnl(0.0, PEAK * 0.80)
-        assert t.kill_switch is True
+        assert t.kill_switch is False
+        assert t.peak_equity == PEAK * 0.80
         assert len(calls) == 1
+
+        t.record_pnl(0.0, PEAK * 0.80 * 0.84)
+        assert t.kill_switch is True
+        assert len(calls) == 2
 
     def test_a_clear_adopted_after_recovery_rearms_it(self, factory):
         """Once the breach no longer holds, the tracker adopts the operator's
