@@ -505,6 +505,8 @@ class StrategyWorker:
                 _eq = _bal.total_eval_krw
                 if _eq > 0:
                     self._last_equity_reading = (_eq, getattr(_bal, "equity_verified", True))
+                    # A release applied at boot rebases MDD on this reading.
+                    self._loss_tracker.seed_equity(_eq)
                     if self._loss_tracker.peak_equity == 0:
                         self._loss_tracker.peak_equity = _eq
                         self._loss_tracker._persist()

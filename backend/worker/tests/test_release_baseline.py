@@ -178,6 +178,33 @@ class TestTheDailyLimitAfterARelease:
         assert t.kill_switch is True
         assert t.kill_reason.startswith("일일 손실 한도 초과")
 
+    def test_a_limit_that_had_not_fired_is_not_loosened(self, factory, today):
+        """Daily halt in a bad week: day -3.5%, week -5.5%. The release accepts
+        the daily loss only — the weekly 6% limit stays at 6%, not -6.5%."""
+        _seed(factory, DAY - timedelta(days=1), daily_pnl=-20_000.0, peak_equity=PEAK)
+        t = _tracker(factory)
+        t.record_pnl(-35_000.0, PEAK - 55_000.0)
+        assert t.kill_reason.startswith("일일")
+        _release(factory)
+        t.record_pnl(0.0, PEAK - 55_000.0)
+        assert t._weekly_floor is None
+
+        t.record_pnl(-6_000.0, PEAK - 61_000.0)        # week -6.1%, day -4.1%
+
+        assert t.kill_reason.startswith("주간"), "the weekly limit moved past 6%"
+
+    def test_a_watchdog_halt_release_loosens_nothing(self, factory, today):
+        _seed(factory, DAY, daily_pnl=-25_000.0, peak_equity=PEAK,
+              kill_switch=True, kill_reason="Worker 하트비트 없음")
+        t = _tracker(factory)
+        _release(factory)
+        t.refresh_from_db()
+        assert t._daily_floor is None and t._weekly_floor is None
+
+        t.record_pnl(-6_000.0, PEAK - 31_000.0)        # day -3.1%
+
+        assert t.kill_reason.startswith("일일")
+
     def test_a_halt_of_its_own_sets_no_floor(self, factory, today):
         t = _halted_daily(factory)
         assert t._daily_floor is None and t._weekly_floor is None
@@ -306,15 +333,17 @@ class TestTheBaselineSurvivesARestart:
         assert t2.kill_switch is True
 
     def test_a_restart_the_next_day_keeps_only_the_weekly_floor(self, factory, today):
-        t = _halted_daily(factory)
+        _seed(factory, DAY - timedelta(days=1), daily_pnl=-30_000.0, peak_equity=PEAK)
+        t = _tracker(factory)
+        t.record_pnl(-35_000.0, PEAK - 65_000.0)       # day -3.5%, week -6.5%
         _release(factory)
-        t.record_pnl(0.0, PEAK - 35_000.0)
+        t.record_pnl(0.0, PEAK - 65_000.0)
 
         today["day"] = DAY + timedelta(days=1)
         t2 = _tracker(factory)
 
         assert t2._daily_floor is None
-        assert t2._weekly_floor_level() == -45_000.0
+        assert t2._weekly_floor_level() == -75_000.0
 
     def test_a_release_made_while_the_worker_was_down_is_applied_at_boot(
             self, factory, today):
@@ -337,6 +366,42 @@ class TestTheBaselineSurvivesARestart:
         assert flattens == []
         assert t.peak_equity == PEAK * 0.80
         assert _audits(factory)[-1]["release_id"] > 0
+
+    def test_the_boot_balance_settles_the_mdd_rebase(self, factory, today):
+        """Released while the worker was down; it boots with equity read at
+        boot. The accepted drawdown is that one — not whatever the book shows
+        at the first sell fill, maybe days later."""
+        _seed(factory, DAY, peak_equity=PEAK, kill_switch=True,
+              kill_reason="MDD 한도 초과 (-20%)")
+        _release(factory)
+        _audit_release(factory)
+        t = _tracker(factory)
+        t.on_mdd_breach = lambda r: None
+
+        t.seed_equity(PEAK * 0.80)
+        t.write_pending()
+
+        assert t.peak_equity == PEAK * 0.80
+        assert t._mdd_rebase_pending is None
+        assert _audits(factory)[-1]["peak_equity"] == PEAK * 0.80
+        t.record_pnl(0.0, PEAK * 0.80 * 0.84)          # a fresh 16% from there
+        assert t.kill_reason.startswith("MDD")
+
+    def test_a_pending_rebase_lapses_after_the_release_day(self, factory, today):
+        """No balance at boot: the first reading on a later day measures
+        against the old peak — halt, fail-closed."""
+        _seed(factory, DAY, peak_equity=PEAK, kill_switch=True,
+              kill_reason="MDD 한도 초과 (-20%)")
+        _release(factory)
+        _audit_release(factory)
+        t = _tracker(factory)
+        t.on_mdd_breach = lambda r: None
+        t.write_pending()
+
+        today["day"] = DAY + timedelta(days=2)
+        t.record_pnl(0.0, PEAK * 0.80)
+
+        assert t.kill_reason.startswith("MDD")
 
     def test_an_applied_release_is_not_applied_again(self, factory, today):
         _seed(factory, DAY, daily_pnl=-35_000.0, peak_equity=PEAK)

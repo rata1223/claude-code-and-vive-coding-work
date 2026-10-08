@@ -32,9 +32,10 @@ hand-edited row never leaves behind: a named operator and a written reason.
 
 2. **A release accepts the loss as it stands.** Clearing the row does not clear
    the *breach*, and the next PnL write used to halt straight back. Now the
-   tracker adopting the release sets a baseline: the daily and weekly limits
-   halt again only once another 1% of capital is lost (the next risk day starts
-   fresh), and MDD is measured from equity at the release.
+   tracker adopting the release sets a baseline: a daily or weekly limit that
+   was past its setting halts again only once another 1% of capital is lost
+   (one that was not stays as configured; the next risk day starts fresh), and
+   MDD is measured from equity at the release.
 
 What is no longer true: the reset used to be *silently* undone.
 ``PersistentLossTracker._write_db`` overwrote the column from its in-memory
@@ -72,8 +73,9 @@ router = APIRouter(prefix="/api/risk", tags=["risk"])
 RELEASE_NOTICE = (
     "해제는 즉시 반영되며 실행 중인 워커가 덮어쓰지 않습니다. 리스크 한도"
     "(일손실·주간손실·MDD)로 정지한 워커는 **1분 안에 재시작 없이 매매를 "
-    "재개**합니다. 해제는 지금의 손실을 받아들인 것으로 봅니다 — 일·주간 "
-    "한도는 **해제 시점보다 자본의 1%를 더 잃으면 다시 정지**하고(다음 "
+    "재개**합니다. 해제는 지금의 손실을 받아들인 것으로 봅니다 — 해제 때 "
+    "넘어 있던 일·주간 한도는 **해제 시점보다 자본의 1%를 더 잃으면 다시 정지**하고"
+    "(넘지 않았던 한도는 그대로, 다음 "
     "리스크 데이는 새로 시작), MDD는 해제 시점 자산을 새 기준으로 잽니다. "
     "복구 실패처럼 상태를 믿을 수 없어 멈춘 워커는 여전히 재시작이 필요합니다."
 )

@@ -570,10 +570,11 @@ class TestTheDailyJobCarriesAHaltForward:
             sess.close()
 
     def test_no_halt_no_row(self, clock, factory):
+        """And the job opens nothing (P0-12): reopening is the resume poll's."""
         from backend.worker.recovery import SAFE_MODE
         SAFE_MODE.disable("테스트")
         self._run_job(clock, 26)
-        assert SAFE_MODE.can_trade is True
+        assert SAFE_MODE.can_trade is False
         sess = factory()
         try:
             assert sess.get(DailyRiskState, date(2026, 9, 26)) is None

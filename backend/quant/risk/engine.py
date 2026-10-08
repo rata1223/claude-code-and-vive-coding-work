@@ -266,8 +266,10 @@ class LossTracker:
     #: the window stops being accepted with it.
     _daily_floor: Optional[tuple] = field(default=None, repr=False, compare=False)
     _weekly_floor: Optional[tuple] = field(default=None, repr=False, compare=False)
-    #: A release adopted before any equity reading: the MDD rebase waits for it.
-    _mdd_rebase_pending: bool = field(default=False, repr=False, compare=False)
+    #: The risk day of a release adopted before any equity reading: the MDD
+    #: rebase waits for the first reading on that day. Later, a drawdown is no
+    #: longer the one the operator accepted, and is measured as usual.
+    _mdd_rebase_pending: Optional[date] = field(default=None, repr=False, compare=False)
 
     def reset_daily(self) -> None:
         self.daily_pnl = 0.0
@@ -337,9 +339,7 @@ class LossTracker:
         self.daily_pnl += pnl
         self.weekly_pnl += pnl
         self.current_equity = current_equity
-        if self._mdd_rebase_pending and current_equity > 0:
-            self._mdd_rebase_pending = False
-            self._rebase_mdd_if_breached()
+        self._resolve_mdd_rebase()
         if current_equity > self.peak_equity:
             self.peak_equity = current_equity
 
@@ -436,22 +436,41 @@ class LossTracker:
         """An operator released the halt: accept the loss as it stands (P0-12).
 
         The daily and weekly limits halt again only once another
-        ``release_step_pct`` of capital is lost. If MDD is breached now, the
+        ``release_step_pct`` of capital is lost — each only if it is breached
+        now: the operator accepted the loss that fired, and a floor on a limit
+        not yet reached would move that limit past its setting. If MDD is
+        breached now, the
         drawdown is measured from current equity from here on; a release with
         no MDD breach leaves the peak alone, so it never loosens a healthy
         baseline. With equity not known yet (0 — nothing recorded since boot)
-        the check waits for the first reading (``record_pnl``): measured against
-        the old peak, that fill would halt and liquidate over the release.
+        the check waits for the first reading that risk day (``seed_equity`` at
+        boot, else ``record_pnl``): measured against the old peak, that fill
+        would halt and liquidate over the release.
         Callers hold the tracker's lock.
         """
-        step = self.config.release_step_pct * max(self.peak_equity, 1.0)
-        self._daily_floor = (self.trade_date, self.daily_pnl - step)
-        window = dict(self._prior_days)
-        # Today's share of the week, as `_roll_week` will count it.
-        window[self.trade_date] = self.weekly_pnl - sum(self._prior_days.values())
-        self._weekly_floor = (self.trade_date, window, step)
-        self._mdd_rebase_pending = self.current_equity <= 0
+        capital = max(self.peak_equity, 1.0)
+        step = self.config.release_step_pct * capital
+        self._daily_floor = None
+        self._weekly_floor = None
+        if self.daily_pnl / capital < -self.config.daily_loss_limit_pct:
+            self._daily_floor = (self.trade_date, self.daily_pnl - step)
+        if self.weekly_pnl / capital < -self.config.weekly_loss_limit_pct:
+            window = dict(self._prior_days)
+            # Today's share of the week, as `_roll_week` will count it.
+            window[self.trade_date] = self.weekly_pnl - sum(self._prior_days.values())
+            self._weekly_floor = (self.trade_date, window, step)
+        self._mdd_rebase_pending = self.trade_date if self.current_equity <= 0 else None
         self._rebase_mdd_if_breached()
+
+    def _resolve_mdd_rebase(self) -> None:
+        """Apply a release's deferred MDD rebase at the first equity reading on
+        the release's risk day; drop it after that day."""
+        day = self._mdd_rebase_pending
+        if day is None or self.current_equity <= 0:
+            return
+        self._mdd_rebase_pending = None
+        if day == self.trade_date:
+            self._rebase_mdd_if_breached()
 
     def _rebase_mdd_if_breached(self) -> None:
         if (self.peak_equity > 0 and self.current_equity > 0
@@ -758,23 +777,26 @@ class PersistentLossTracker(LossTracker):
             try:
                 d = json.loads(detail)
                 day = date.fromisoformat(d["trade_date"])
-                daily = float(d["daily_floor"])
-                window = {date.fromisoformat(k): float(v)
-                          for k, v in d["weekly_window"].items()}
-                step = float(d["step"])
+                daily = d["daily_floor"]
+                daily = None if daily is None else float(daily)
+                window = d["weekly_window"]
+                window = (None if window is None else
+                          {date.fromisoformat(k): float(v) for k, v in window.items()})
+                step = None if window is None else float(d["step"])
                 seen = int(d.get("release_id") or 0)
             except Exception as e:  # a malformed row restores nothing — fail-closed
                 logger.error("해제 기준 복원 실패 — 해제 전 기준으로 기동: %s", e)
             else:
                 self._release_seen = seen
                 age = (today - day).days
-                if age == 0:
+                if age == 0 and daily is not None:
                     self._daily_floor = (day, daily)
-                if 0 <= age < self.WEEK_DAYS:
+                if 0 <= age < self.WEEK_DAYS and window is not None:
                     self._weekly_floor = (day, window, step)
-                    logger.info("해제 기준 복원 (%s): 일 %s / 주간 창 %d일",
-                                day, f"{daily:.0f}" if age == 0 else "없음(새 리스크 데이)",
-                                len(window))
+                if self._daily_floor or self._weekly_floor:
+                    logger.info("해제 기준 복원 (%s): 일 %s / 주 %s", day,
+                                "있음" if self._daily_floor else "없음",
+                                "있음" if self._weekly_floor else "없음")
 
         latest = self._latest_release_id()
         if latest is not None and latest > self._release_seen:
@@ -822,17 +844,34 @@ class PersistentLossTracker(LossTracker):
 
     def _set_release_baseline(self) -> None:
         super()._set_release_baseline()
-        day, window, step = self._weekly_floor
+        daily = self._daily_floor[1] if self._daily_floor else None
+        weekly = self._weekly_floor
         self._release_unwritten = {
             "trade_date": self.trade_date.isoformat(),
-            "daily_floor": self._daily_floor[1],
-            "weekly_window": {d.isoformat(): v for d, v in window.items()},
-            "step": step,
+            "daily_floor": daily,
+            "weekly_window": ({d.isoformat(): v for d, v in weekly[1].items()}
+                              if weekly else None),
+            "step": weekly[2] if weekly else None,
             "peak_equity": self.peak_equity,
         }
-        logger.warning("킬스위치 해제 반영 — 재정지 기준: 일 %.0f / 주 %.0f / 고점 %.0f%s",
-                       self._daily_floor[1], self._weekly_floor_level(), self.peak_equity,
+        logger.warning("킬스위치 해제 반영 — 재정지 기준: 일 %s / 주 %s / 고점 %.0f%s",
+                       "—" if daily is None else f"{daily:.0f}",
+                       "—" if weekly is None else f"{self._weekly_floor_level():.0f}",
+                       self.peak_equity,
                        " (MDD 기준은 첫 자산 판독 때)" if self._mdd_rebase_pending else "")
+
+    def seed_equity(self, equity: float) -> None:
+        """A balance read at boot: settle a release's deferred MDD rebase now,
+        not at the first sell fill — days later the drawdown is no longer the
+        one the operator accepted."""
+        with self._lock:
+            if equity > 0 and self.current_equity <= 0:
+                self.current_equity = equity
+            if self._mdd_rebase_pending is None:
+                return
+            self._resolve_mdd_rebase()
+            if self._release_unwritten is not None:
+                self._release_unwritten["peak_equity"] = self.peak_equity
 
     def refresh_from_db(self, current_equity: Optional[float] = None) -> bool:
         """Settle with the stored row now, without waiting for a fill (P0-12).

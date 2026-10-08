@@ -406,8 +406,9 @@ Any single incomplete P0 item is sufficient to block the paper→real transition
 > 2. **Re-halt only if it gets worse.** A breach on an already-halted tracker
 >    decides nothing new (`LossTracker._halt`), so the next write adopts the
 >    release instead of re-asserting the halt, and adopting it sets a baseline
->    (`_set_release_baseline`): the daily and weekly limits halt again only
->    after another `release_step_pct` (1%) of capital is lost — the daily floor
+>    (`_set_release_baseline`): a daily or weekly limit past its setting at the
+>    release halts again only after another `release_step_pct` (1%) of capital
+>    is lost (one not reached stays as configured) — the daily floor
 >    for that risk day only; the weekly one counts only the accepted loss still
 >    inside the rolling window, so it lapses as that loss rolls out — and an
 >    MDD breach is rebased on current equity (on the first reading, if none
