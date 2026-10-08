@@ -107,6 +107,17 @@ def _release(factory):
         sess.close()
 
 
+def _audit_release(factory):
+    """The audit row the app's reset writes with the clear."""
+    sess = factory()
+    try:
+        sess.add(AuditLog(event_type="kill_switch_reset", actor="operator:1",
+                          detail=json.dumps({"reason": "test"})))
+        sess.commit()
+    finally:
+        sess.close()
+
+
 def _audits(factory):
     sess = factory()
     try:
@@ -195,6 +206,29 @@ class TestTheWeeklyLimitAfterARelease:
         assert t.kill_switch is True
         assert t.kill_reason.startswith("주간 손실 한도 초과")
 
+    def test_a_loss_that_rolls_out_of_the_window_is_no_longer_accepted(
+            self, factory, today):
+        """The weekly floor follows the rolling window: once the losses the
+        release accepted drop out, fresh loss counts again — not 1% past an
+        absolute level that no longer means anything."""
+        _seed(factory, DAY - timedelta(days=6), daily_pnl=-50_000.0, peak_equity=PEAK)
+        t = _tracker(factory)
+        t.record_pnl(-20_000.0, PEAK - 70_000.0)        # week -7%
+        assert t.kill_reason.startswith("주간")
+        _release(factory)
+        t.record_pnl(0.0, PEAK - 70_000.0)
+
+        today["day"] = DAY + timedelta(days=1)          # D-6's -5% rolls out
+        t.record_pnl(-25_000.0, PEAK - 95_000.0)        # week -4.5%, day -2.5%
+        assert t.kill_switch is False
+        today["day"] = DAY + timedelta(days=2)
+        t.record_pnl(-25_000.0, PEAK - 120_000.0)       # week -7%, 5% of it fresh
+
+        # An absolute floor (-8%, set at the release) would not halt here.
+
+        assert t.kill_switch is True
+        assert t.kill_reason.startswith("주간")
+
     def test_the_weekly_floor_still_holds_the_next_day(self, factory, today):
         t = self._halted_weekly(factory)
         _release(factory)
@@ -280,7 +314,51 @@ class TestTheBaselineSurvivesARestart:
         t2 = _tracker(factory)
 
         assert t2._daily_floor is None
-        assert t2._weekly_floor == (DAY, -45_000.0)
+        assert t2._weekly_floor_level() == -45_000.0
+
+    def test_a_release_made_while_the_worker_was_down_is_applied_at_boot(
+            self, factory, today):
+        """Halted at -3.5% (MDD too), the worker down, the operator released.
+        No tracker saw the cleared flag; the next boot finds the release on the
+        audit trail and accepts the loss — the first fill neither halts nor
+        liquidates."""
+        _seed(factory, DAY, daily_pnl=-35_000.0, peak_equity=PEAK,
+              kill_switch=True, kill_reason="MDD 한도 초과 (-20%)")
+        _release(factory)
+        _audit_release(factory)
+        flattens = []
+
+        t = _tracker(factory)
+        t.on_mdd_breach = flattens.append
+        t.write_pending()
+        t.record_pnl(0.0, PEAK * 0.80)
+
+        assert t.kill_switch is False
+        assert flattens == []
+        assert t.peak_equity == PEAK * 0.80
+        assert _audits(factory)[-1]["release_id"] > 0
+
+    def test_an_applied_release_is_not_applied_again(self, factory, today):
+        _seed(factory, DAY, daily_pnl=-35_000.0, peak_equity=PEAK)
+        _audit_release(factory)
+        t = _tracker(factory)
+        t.write_pending()
+        t.record_pnl(-20_000.0, PEAK - 55_000.0)   # -5.5%: 2% past the release
+        assert t.kill_switch is True
+
+        _release(factory)                          # cleared by hand, no new release
+        t2 = _tracker(factory)
+        assert t2._daily_floor == (DAY, -45_000.0), "the old release was re-applied"
+
+    def test_a_release_older_than_the_window_is_ignored(self, factory, today):
+        from datetime import datetime
+        sess = factory()
+        sess.add(AuditLog(event_type="kill_switch_reset", detail="{}",
+                          created_at=datetime.utcnow() - timedelta(days=8)))
+        sess.commit()
+        sess.close()
+
+        assert _tracker(factory)._daily_floor is None
 
     def test_a_malformed_record_restores_nothing(self, factory, today, caplog):
         sess = factory()
@@ -305,6 +383,18 @@ class TestRefreshAndPendingWrites:
         _release(factory)
         assert t.refresh_from_db() is False
         assert t._daily_floor == (DAY, -45_000.0)
+
+    def test_refresh_applies_a_release_its_memory_never_held(self, factory, today):
+        """The watchdog halted the row and the operator cleared it before any
+        write of this tracker adopted the halt: no cleared flag to see, but the
+        release is on the audit trail, and it is applied."""
+        _seed(factory, DAY, daily_pnl=-35_000.0, peak_equity=PEAK)
+        t = _tracker(factory)
+        _audit_release(factory)
+
+        assert t.refresh_from_db() is False
+        assert t._daily_floor == (DAY, -45_000.0)
+        assert _audits(factory)[-1]["release_id"] > 0
 
     def test_a_carried_halt_is_written_before_it_can_overwrite_a_release(
             self, factory, today):
@@ -506,6 +596,42 @@ class TestTheResumePoll:
         assert worker._resume_if_released() is False
         assert SAFE_MODE.can_trade is False
 
+    def test_a_session_already_running_starts_recording_on_resume(
+            self, monkeypatch):
+        """A run restored while the worker came up halted has no uptime
+        recorder; turning recording on must reach it, not only new sessions."""
+        import backend.worker.runner as runner
+        started = []
+        monkeypatch.setattr(runner, "_run_uptime_factory", None)
+        monkeypatch.setattr(runner, "_start_run_uptime",
+                            lambda run_id: started.append(run_id) or None
+                            if runner._run_uptime_factory is None else
+                            started.append(run_id) or _Rec())
+
+        class _Strategy:
+            def start(self):
+                pass
+
+            def stop(self):
+                pass
+        s = runner.WorkerSession.__new__(runner.WorkerSession)
+        s.run_id = 7
+        s.strategy = _Strategy()
+        s._stop_event = threading.Event()
+        s._callbacks_cv = threading.Condition()
+        s._callbacks = 0
+        s._deactivate_on_exit = False
+        th = threading.Thread(target=s._run, daemon=True)
+        th.start()
+        import time
+        time.sleep(0.3)
+        runner._run_uptime_factory = object()
+        time.sleep(1.5)
+        s._stop_event.set()
+        th.join(5)
+
+        assert started == [7, 7], "the running session never started recording"
+
     def test_it_is_scheduled_every_minute(self, worker):
         from apscheduler.schedulers.background import BackgroundScheduler
         scheduler = BackgroundScheduler()
@@ -537,3 +663,8 @@ class TestEndToEnd:
         t.record_pnl(-6_000.0, PEAK - 46_000.0)               # -4.6%
         assert SAFE_MODE.can_trade is False
         assert _row(factory).kill_switch is True
+
+
+class _Rec:
+    def stop(self):
+        pass

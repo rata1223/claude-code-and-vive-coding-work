@@ -213,6 +213,10 @@ class SafeModeState:
         return self._can_trade
 
     @property
+    def reason(self) -> str:
+        return self._reason
+
+    @property
     def halt_cause(self) -> Optional[HaltCause]:
         """The active halt cause, or ``None`` when trading is allowed."""
         return None if self._can_trade else self._cause

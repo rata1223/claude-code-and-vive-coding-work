@@ -401,16 +401,21 @@ Any single incomplete P0 item is sufficient to block the paper→real transition
 >      so no poll could ever reopen it. It is `RISK_BREACH` now
 >      (`halted_by_risk`); an unreadable risk state stays untrusted.
 >    - The 07:01 job no longer reopens `SAFE_MODE` at all — it did so for any
->      cause, so a worker whose recovery failed began trading at 07:01.
+>      cause, so a worker whose recovery failed began trading at 07:01. A failed
+>      recovery now raises a Telegram alert ("재시작 필요") instead.
 > 2. **Re-halt only if it gets worse.** A breach on an already-halted tracker
 >    decides nothing new (`LossTracker._halt`), so the next write adopts the
 >    release instead of re-asserting the halt, and adopting it sets a baseline
 >    (`_set_release_baseline`): the daily and weekly limits halt again only
 >    after another `release_step_pct` (1%) of capital is lost — the daily floor
->    for that risk day only, the weekly one inside the 7-day window — and an
+>    for that risk day only; the weekly one counts only the accepted loss still
+>    inside the rolling window, so it lapses as that loss rolls out — and an
 >    MDD breach is rebased on current equity (on the first reading, if none
 >    yet). Floors persist as an `AuditLog` row (`risk_release_baseline`) and
->    are restored at boot; no schema change. A halt restored from an older row
+>    are restored at boot; no schema change. A release *is* the app's
+>    `kill_switch_reset` audit row (written with the clear), so one made while
+>    the worker was down, or before its tracker held the halt, is still applied
+>    — at boot, or by the poll. A halt restored from an older row
 >    is written to today's row at boot (`write_pending`) so the carry cannot
 >    overwrite a later release.
 >

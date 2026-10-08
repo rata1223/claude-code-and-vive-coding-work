@@ -360,7 +360,13 @@ class WorkerSession:
             # The 4-week gate counts the time this run was running — from here,
             # not from a restore that never got this far.
             uptime = _start_run_uptime(self.run_id)
+            #: Recording off at the start — the worker came up halted. A release
+            #: turns it on later (P0-12), and this run then counts from there.
+            recording_off = _run_uptime_factory is None
             while not self._stop_event.is_set():
+                if recording_off and _run_uptime_factory is not None:
+                    recording_off = False
+                    uptime = _start_run_uptime(self.run_id)
                 time.sleep(1)
         except Exception as e:
             logger.exception("전략 실행 오류 run_id=%d: %s", self.run_id, e)
@@ -636,7 +642,7 @@ class StrategyWorker:
           (``allow_risk_resume``);
         * the gate is shut for a risk limit (``RISK_BREACH``) — untrusted state
           still needs a restart;
-        * no row is halted (``risk_days_in_play``) — a failed read is no;
+        * no row is halted, whatever its date — a failed read is no;
         * the tracker, settled with the row now, is not halted. That write
           adopts the release and sets its baseline *before* trading reopens.
 
@@ -645,7 +651,7 @@ class StrategyWorker:
         reopened. Never raises — a failed poll leaves the gate shut.
         """
         try:
-            from backend.database.models import DailyRiskState, risk_days_in_play
+            from backend.database.models import DailyRiskState
             from backend.risk.halt_policy import HaltCause
             from backend.worker.recovery import SAFE_MODE
             tracker = self._loss_tracker
@@ -655,10 +661,11 @@ class StrategyWorker:
                 return False
             sess = _get_session_factory()()
             try:
-                for day in risk_days_in_play(sess):
-                    row = sess.get(DailyRiskState, day)
-                    if row is not None and row.kill_switch:
-                        return False
+                # Any halted row is a live halt (#216) — one query answers it.
+                if (sess.query(DailyRiskState.trade_date)
+                        .filter(DailyRiskState.kill_switch.is_(True)).first()
+                        is not None):
+                    return False
             finally:
                 sess.close()
             if tracker.refresh_from_db(self._last_known_equity):
@@ -679,6 +686,7 @@ class StrategyWorker:
         if _run_uptime_factory is None:
             # Recovery stopped at the restored halt; it had passed everything
             # else, so from here the run's time counts as for any running worker.
+            # Sessions already running pick it up (``WorkerSession._run``).
             enable_run_uptime(_get_session_factory())
         try:
             from bot.notifier import alert_emergency
@@ -2052,9 +2060,19 @@ def main():
         worker.shutdown()
         return
 
-    if not recovered:
+    from backend.worker.recovery import SAFE_MODE
+    if not recovered and not recovery.halted_by_risk:
         logger.critical("복구 실패 — Worker SafeMode로 계속 실행")
-    else:
+        # Nothing reopens an untrusted halt but a restart — not the resume poll,
+        # and since P0-12 not the 07:01 job either (it reopened any cause, so a
+        # worker that never reconciled began trading). Say so, loudly.
+        try:
+            from bot.notifier import alert_emergency
+            alert_emergency(f"[워커 복구 실패] 매매 차단 중 — 원인 확인 후 재시작 필요\n"
+                            f"사유: {SAFE_MODE.reason}")
+        except Exception as e:
+            logger.warning("복구 실패 알림 전송 실패: %s", e)
+    elif recovered:
         # The 4-week gate counts run uptime from here: a worker that is still
         # recovering, or stuck in SafeMode because recovery failed, cannot trade,
         # so its time is not paper-run time. Sessions record their own runs.

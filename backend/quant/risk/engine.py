@@ -227,6 +227,9 @@ MDD_REASON_PREFIX = "MDD 한도 초과"
 #: The floors live here rather than in a column: no schema change, and the
 #: latest row is all a restart needs.
 RELEASE_BASELINE_EVENT = "risk_release_baseline"
+#: ``AuditLog.event_type`` the app's reset writes in the transaction that
+#: clears the rows (``api/routers/risk.py``) — what a release *is*.
+RELEASE_EVENT = "kill_switch_reset"
 
 @dataclass
 class LossTracker:
@@ -255,10 +258,12 @@ class LossTracker:
     #: Set once a flatten has been requested; re-armed only when the kill switch
     #: is cleared. Without it every fill during the breach re-requests one.
     _mdd_flatten_requested: bool = field(default=False, repr=False, compare=False)
-    #: Set when an operator's release is adopted (P0-12): ``(risk day, floor)``.
-    #: The release accepts the loss as it stands, so the daily limit halts again
-    #: only below its floor, and only on that risk day — the next one starts
-    #: fresh. The weekly floor holds while its day is inside the window.
+    #: Set by an operator's release (P0-12), which accepts the loss as it
+    #: stands. Daily: ``(risk day, floor)`` — below the floor, and only on that
+    #: risk day; the next one starts fresh. Weekly: ``(risk day, {day: P&L in
+    #: the window at the release}, step)`` — the floor is what of that P&L is
+    #: still in the rolling window, less the step, so a loss that rolls out of
+    #: the window stops being accepted with it.
     _daily_floor: Optional[tuple] = field(default=None, repr=False, compare=False)
     _weekly_floor: Optional[tuple] = field(default=None, repr=False, compare=False)
     #: A release adopted before any equity reading: the MDD rebase waits for it.
@@ -377,14 +382,13 @@ class LossTracker:
 
         # 일일 손실 한도
         if (self.daily_pnl / capital < -self.config.daily_loss_limit_pct
-                and self._past_floor(self._daily_floor, self.daily_pnl, days=1)):
+                and self._past_floor(self._daily_floor_level(), self.daily_pnl)):
             self._halt(f"일일 손실 한도 초과 ({self.daily_pnl/capital:.2%})", "일일")
             return
 
         # 주간 손실 한도
         if (self.weekly_pnl / capital < -self.config.weekly_loss_limit_pct
-                and self._past_floor(self._weekly_floor, self.weekly_pnl,
-                                     days=self.WEEK_DAYS)):
+                and self._past_floor(self._weekly_floor_level(), self.weekly_pnl)):
             self._halt(f"주간 손실 한도 초과 ({self.weekly_pnl/capital:.2%})", "주간")
 
     def _halt(self, reason: str, tag: str) -> None:
@@ -408,15 +412,25 @@ class LossTracker:
         logger.error("킬스위치 [%s] %s", tag, reason)
         self._fire_kill_switch_alert(reason)
 
-    def _past_floor(self, floor, value: float, *, days: int) -> bool:
-        """False only while a release floor covers ``value``: set within the
-        last ``days`` risk days and not yet crossed."""
-        if floor is None:
-            return True
-        day, level = floor
-        if not 0 <= (self.trade_date - day).days < days:
-            return True
-        return value < level
+    @staticmethod
+    def _past_floor(level: Optional[float], value: float) -> bool:
+        """False only while a release floor applies and ``value`` is not below it."""
+        return level is None or value < level
+
+    def _daily_floor_level(self) -> Optional[float]:
+        if self._daily_floor is None or self._daily_floor[0] != self.trade_date:
+            return None
+        return self._daily_floor[1]
+
+    def _weekly_floor_level(self) -> Optional[float]:
+        if self._weekly_floor is None:
+            return None
+        day, window, step = self._weekly_floor
+        if not 0 <= (self.trade_date - day).days < self.WEEK_DAYS:
+            return None
+        held = sum(v for d, v in window.items()
+                   if 0 <= (self.trade_date - d).days < self.WEEK_DAYS)
+        return held - step
 
     def _set_release_baseline(self) -> None:
         """An operator released the halt: accept the loss as it stands (P0-12).
@@ -432,7 +446,10 @@ class LossTracker:
         """
         step = self.config.release_step_pct * max(self.peak_equity, 1.0)
         self._daily_floor = (self.trade_date, self.daily_pnl - step)
-        self._weekly_floor = (self.trade_date, self.weekly_pnl - step)
+        window = dict(self._prior_days)
+        # Today's share of the week, as `_roll_week` will count it.
+        window[self.trade_date] = self.weekly_pnl - sum(self._prior_days.values())
+        self._weekly_floor = (self.trade_date, window, step)
         self._mdd_rebase_pending = self.current_equity <= 0
         self._rebase_mdd_if_breached()
 
@@ -595,6 +612,11 @@ class PersistentLossTracker(LossTracker):
         #: the rebased peak, which the write that adopted the release had
         #: already snapshotted.
         self._release_unwritten = None
+        #: ``AuditLog.id`` of the newest operator release (``kill_switch_reset``)
+        #: this tracker has applied a baseline for. A release is the audit row,
+        #: not this tracker seeing a cleared flag: one made while the worker was
+        #: down, or while its tracker held no halt in memory, is still applied.
+        self._release_seen = 0
         self._redis = redis_client
         # Prefer db_factory (creates per-op sessions) over a long-lived db_session.
         # Long-lived sessions cause stale connections and pool exhaustion on 24h+ processes.
@@ -712,11 +734,15 @@ class PersistentLossTracker(LossTracker):
         self._restore_release_baseline(today)
 
     def _restore_release_baseline(self, today: date) -> None:
-        """The floors of the latest release, while they still apply (P0-12).
+        """The latest release's floors, while they still apply (P0-12) — and a
+        release this tracker has not applied yet, applied now.
 
         Without them a restart on the day of a release halted again at the
         first fill — the loss the operator accepted was still past the limit.
-        The rebased peak needs nothing here: it is on the row like any peak.
+        A release made while no worker was running has no baseline row; it is
+        applied here from the restored numbers. Equity is not known yet, so an
+        MDD breach rebases at the first reading (``_mdd_rebase_pending``) rather
+        than halting — and liquidating — over the release.
         """
         import json
         from backend.database.models import AuditLog
@@ -728,21 +754,49 @@ class PersistentLossTracker(LossTracker):
                    .first())
             return row.detail if row is not None else None
         detail = self._query(_latest, "해제 기준")
-        if not detail:
-            return
-        try:
-            d = json.loads(detail)
-            day = date.fromisoformat(d["trade_date"])
-            daily, weekly = float(d["daily_floor"]), float(d["weekly_floor"])
-        except Exception as e:  # a malformed row restores nothing — fail-closed
-            logger.error("해제 기준 복원 실패 — 해제 전 기준으로 기동: %s", e)
-            return
-        age = (today - day).days
-        if age == 0:
-            self._daily_floor = (day, daily)
-        if 0 <= age < self.WEEK_DAYS:
-            self._weekly_floor = (day, weekly)
-            logger.info("해제 기준 복원 (%s): 일 %.0f / 주 %.0f", day, daily, weekly)
+        if detail:
+            try:
+                d = json.loads(detail)
+                day = date.fromisoformat(d["trade_date"])
+                daily = float(d["daily_floor"])
+                window = {date.fromisoformat(k): float(v)
+                          for k, v in d["weekly_window"].items()}
+                step = float(d["step"])
+                seen = int(d.get("release_id") or 0)
+            except Exception as e:  # a malformed row restores nothing — fail-closed
+                logger.error("해제 기준 복원 실패 — 해제 전 기준으로 기동: %s", e)
+            else:
+                self._release_seen = seen
+                age = (today - day).days
+                if age == 0:
+                    self._daily_floor = (day, daily)
+                if 0 <= age < self.WEEK_DAYS:
+                    self._weekly_floor = (day, window, step)
+                    logger.info("해제 기준 복원 (%s): 일 %s / 주간 창 %d일",
+                                day, f"{daily:.0f}" if age == 0 else "없음(새 리스크 데이)",
+                                len(window))
+
+        latest = self._latest_release_id()
+        if latest is not None and latest > self._release_seen:
+            logger.warning("기동 전 해제(audit id=%d) — 지금 수치로 해제 기준 적용", latest)
+            self._set_release_baseline()
+            self._release_seen = latest
+
+    def _latest_release_id(self) -> Optional[int]:
+        """``AuditLog.id`` of the newest operator release within the weekly
+        window, or ``None`` (none, or the read failed). Older releases have no
+        floor left to set."""
+        from datetime import datetime
+        from sqlalchemy import func
+        from backend.database.models import AuditLog
+        since = datetime.utcnow() - timedelta(days=self.WEEK_DAYS)
+
+        def _max(s):
+            return (s.query(func.max(AuditLog.id))
+                    .filter(AuditLog.event_type == RELEASE_EVENT,
+                            AuditLog.created_at >= since)
+                    .scalar())
+        return self._query(_max, "해제 기록")
 
     def record_pnl(self, pnl: float, current_equity: float) -> str:
         """As the base, plus ``"adopted"`` when the write picked up a halt that
@@ -768,14 +822,17 @@ class PersistentLossTracker(LossTracker):
 
     def _set_release_baseline(self) -> None:
         super()._set_release_baseline()
+        day, window, step = self._weekly_floor
         self._release_unwritten = {
             "trade_date": self.trade_date.isoformat(),
             "daily_floor": self._daily_floor[1],
-            "weekly_floor": self._weekly_floor[1],
+            "weekly_window": {d.isoformat(): v for d, v in window.items()},
+            "step": step,
             "peak_equity": self.peak_equity,
         }
-        logger.warning("킬스위치 해제 반영 — 재정지 기준: 일 %.0f / 주 %.0f / 고점 %.0f",
-                       self._daily_floor[1], self._weekly_floor[1], self.peak_equity)
+        logger.warning("킬스위치 해제 반영 — 재정지 기준: 일 %.0f / 주 %.0f / 고점 %.0f%s",
+                       self._daily_floor[1], self._weekly_floor_level(), self.peak_equity,
+                       " (MDD 기준은 첫 자산 판독 때)" if self._mdd_rebase_pending else "")
 
     def refresh_from_db(self, current_equity: Optional[float] = None) -> bool:
         """Settle with the stored row now, without waiting for a fill (P0-12).
@@ -790,6 +847,18 @@ class PersistentLossTracker(LossTracker):
             if current_equity and current_equity > 0 and self.current_equity <= 0:
                 self.current_equity = current_equity
         self._persist()
+        # A release this tracker never saw as a cleared flag — the halt was not
+        # in its memory (set by the watchdog, say, and cleared before a write
+        # adopted it). The release is the audit row, so it is applied anyway.
+        latest = self._latest_release_id()
+        with self._lock:
+            if self.kill_switch:
+                return True
+            fresh = latest is not None and latest > self._release_seen
+            if fresh:
+                self._set_release_baseline()
+        if fresh:
+            self._persist()
         with self._lock:
             return self.kill_switch
 
@@ -801,7 +870,8 @@ class PersistentLossTracker(LossTracker):
         overwritten by the carry at the first write.
         """
         with self._lock:
-            pending = self._ks_epoch != self._ks_written
+            pending = (self._ks_epoch != self._ks_written
+                       or self._release_unwritten is not None)
         if pending:
             self._persist()
 
@@ -864,6 +934,12 @@ class PersistentLossTracker(LossTracker):
         with self._lock:
             release, self._release_unwritten = self._release_unwritten, None
         if release is not None:
+            # Which release this was, so a restart does not apply it again.
+            latest = self._latest_release_id()
+            with self._lock:
+                if latest is not None and latest > self._release_seen:
+                    self._release_seen = latest
+                release["release_id"] = self._release_seen
             # The write that adopted the release had snapshotted the old peak;
             # this one puts the rebased peak on the row.
             self._write_db()
@@ -872,7 +948,7 @@ class PersistentLossTracker(LossTracker):
 
     def _write_release_audit(self, detail: dict) -> None:
         """Keep the release floors for a restart (``_restore_release_baseline``).
-        Lost, a restart halts again at the first fill — fail-closed."""
+        Lost, a restart applies the release again from the restored numbers."""
         if self._db_factory is None:
             return
         try:

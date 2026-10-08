@@ -195,7 +195,9 @@ def reset_kill_switch(
         return Resp.err("킬스위치가 활성 상태가 아닙니다 — 해제할 것이 없습니다.")
 
     # Every halted row, in one transaction. Releasing only one leaves the other
-    # blocking the daily (07:01) SAFE_MODE re-arm with no endpoint able to reach it.
+    # blocking the worker's resume poll (any halted row does) with no endpoint
+    # able to reach it. The audit row below is what the worker's tracker reads
+    # as "a release" (`RELEASE_EVENT`) — keep it in this transaction.
     previous_reason = halted[0].kill_reason
     # Each day's own reason, so the audit row does not drop an older one when
     # several days are halted for different causes.
