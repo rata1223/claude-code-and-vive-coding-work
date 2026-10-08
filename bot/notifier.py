@@ -53,14 +53,27 @@ def alert_emergency(message: str):
 
 
 def alert_daily_summary(summary: dict):
+    """A value of ``None`` means it could not be read — shown as ``—``, never
+    as 0 (an unread balance is not an empty account, #149/#192)."""
     kill_line = ""
     if summary.get("kill_switch"):
         kill_line = f"\n🚨 킬스위치: {summary.get('kill_reason', '활성')}"
+    elif "kill_switch" in summary and summary["kill_switch"] is None:
+        kill_line = "\n⚠️ 킬스위치 상태 조회 실패 — 직접 확인할 것"
+    day_line = ""
+    if summary.get("risk_day"):
+        day_line = f"리스크 데이: {summary['risk_day']} (07:00~07:00 KST)\n"
+
+    def _num(key, fmt, unit):
+        value = summary.get(key, 0)
+        return "—" if value is None else f"{value:{fmt}}{unit}"
+
     msg = (
         f"📊 <b>일일 결산</b>\n"
-        f"총 자산: {summary.get('total_equity', 0):,.0f}원\n"
-        f"일 수익률: {summary.get('daily_pnl_pct', 0):.2f}%\n"
-        f"포지션 수: {summary.get('position_count', 0)}개"
+        f"{day_line}"
+        f"총 자산: {_num('total_equity', ',.0f', '원')}\n"
+        f"일 수익률: {_num('daily_pnl_pct', '.2f', '%')}\n"
+        f"포지션 수: {_num('position_count', 'd', '개')}"
         f"{kill_line}"
     )
     send_alert(msg)
