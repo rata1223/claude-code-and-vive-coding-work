@@ -357,13 +357,14 @@ def build_scheduler() -> BackgroundScheduler:
 
     # 자산 스냅샷 + 일일 결산 06:50 KST — 미국 마감(05:00, 겨울 06:00) 뒤, 리스크 데이가
     # 바뀌는 07:00 전. 방금 끝난 리스크 데이(한국 세션 + 그날 밤 미국 세션) 전체를 보고한다.
-    # 늦게 시작해도(재기동·스레드 지연) 06:59까지는 실행한다 — 날짜는 시작할 때 정하므로 07:00
+    # 늦게 시작해도(스레드 지연) 06:59:59까지는 실행한다 — 날짜는 시작할 때 정하므로 07:00
     # 전에 시작하면 끝난 리스크 데이를 보고한다. 그 뒤로 밀린 실행은 버린다(새 날을 보고하게 된다).
+    # 작업 저장소가 메모리라 06:50~07:00에 워커가 재시작되면 그날 결산은 건너뛴다(정보용 알림 1건 — 리스크 판단과 무관, 받아들인 것).
     scheduler.add_job(
         _save_equity_snapshot,
         CronTrigger(hour=6, minute=50, timezone="Asia/Seoul"),
         id="equity_snapshot", name="자산 스냅샷",
-        misfire_grace_time=9 * 60, coalesce=True,
+        misfire_grace_time=9 * 60 + 59, coalesce=True,
     )
 
     # 30분 주기 포지션·주문 조정 — 한국 장중 09:05~15:30, 미국 장중 22:35~06:00 KST

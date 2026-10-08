@@ -178,10 +178,23 @@ def test_a_database_failure_reports_the_halt_as_unknown(factory, monkeypatch, se
     assert sent[0]["total_equity"] == 2_000_000.0
 
 
-def test_a_late_start_is_allowed_only_until_06_59():
+def test_a_late_start_is_allowed_through_06_59_59_but_not_07_00():
+    """APScheduler runs a late job while ``now - run_time <= misfire_grace_time``.
+
+    The date is fixed when the job starts, so a start at 06:59:59 still
+    reports the closing risk day; one at 07:00:00 would report the new one.
+    """
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
     from backend.worker.scheduler import build_scheduler
     job = build_scheduler().get_job("equity_snapshot")
-    assert job.misfire_grace_time == 9 * 60
+    kst = ZoneInfo("Asia/Seoul")
+    fire = job.trigger.get_next_fire_time(None, datetime(2026, 10, 9, 6, 0, tzinfo=kst))
+    grace = timedelta(seconds=job.misfire_grace_time)
+
+    assert fire.hour == 6 and fire.minute == 50
+    assert fire + grace >= datetime(2026, 10, 9, 6, 59, 59, tzinfo=kst)
+    assert fire + grace < datetime(2026, 10, 9, 7, 0, 0, tzinfo=kst)
     assert job.coalesce is True
 
 
