@@ -10,9 +10,8 @@ behaviour of a 3% daily-loss limit, and it clears itself. Nothing to rescue.
 
 **This router's business — the MDD kill switch.** ``DailyRiskState.kill_switch``
 is a Postgres flag with no expiry. `StartupRecovery._step_risk` restores it on
-every boot, `_step_enable_trading` then calls ``SAFE_MODE.disable(...)`` and
-logs *"킬스위치 복원 — 매매 차단. 수동 해제 후 재시작 필요."* The daily
-scheduler only reads it for the Telegram summary. The one function that writes
+every boot and `_step_enable_trading` then closes ``SAFE_MODE`` for it. The
+daily scheduler reads it for the Telegram summary and carries it forward. The one function that writes
 it back to ``False`` — ``KillSwitch._clear_halt_in_db``, via
 ``KillSwitch.resume()`` — sits in a class that is **never constructed in
 production**.
@@ -22,20 +21,21 @@ is the gap: a control that can only be set, never released, is not a safety
 control — it is an outage. This router is the release path, with the thing a
 hand-edited row never leaves behind: a named operator and a written reason.
 
-**What clearing the flag does and does not achieve.** Two things still stand
-between a cleared row and a trading worker, and the response says both.
+**What clearing the flag achieves (P0-12).**
 
-1. **A running worker does not resume.** It caches ``_kill_switch_active``
-   during `StartupRecovery` and `_step_enable_trading` acts on that, so lifting
-   ``SAFE_MODE`` needs a restart. That is the half of ROADMAP P0-12 still open
-   (it depends on P0-04).
+1. **A running worker resumes within a minute, without a restart** — if it was
+   halted for a risk limit and its startup recovery succeeded (a halt restored
+   at boot counts: recovery passed everything else). Its resume poll
+   (``StrategyWorker._resume_if_released``) sees no halted row, settles the
+   tracker with it, and reopens ``SAFE_MODE``. A worker halted because its
+   state cannot be trusted — failed recovery — still needs a restart.
 
-2. **A halt whose cause still holds comes straight back.** Clearing the row does
-   not clear the *breach*. On the next PnL write ``LossTracker._evaluate()``
-   re-checks the daily, weekly and MDD limits and halts again if any is still
-   exceeded — a fresh decision, logged and alerted, not a stale overwrite. For a
-   daily-loss or MDD halt the condition normally holds for the rest of the
-   session, so **this endpoint alone does not resume intraday trading.**
+2. **A release accepts the loss as it stands.** Clearing the row does not clear
+   the *breach*, and the next PnL write used to halt straight back. Now the
+   tracker adopting the release sets a baseline: a daily or weekly limit that
+   was past its setting halts again only once another 1% of capital is lost
+   (one that was not stays as configured; the next risk day starts fresh), and
+   MDD is measured from equity at the release.
 
 What is no longer true: the reset used to be *silently* undone.
 ``PersistentLossTracker._write_db`` overwrote the column from its in-memory
@@ -68,14 +68,16 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/risk", tags=["risk"])
 
-#: Told to the operator on a successful reset. Clearing the row is necessary but
-#: not sufficient — see the module docstring for both remaining gates.
-RESTART_NOTICE = (
-    "해제는 즉시 반영되며 실행 중인 워커가 덮어쓰지 않습니다. 다만 "
-    "**매매 재개에는 워커 재시작이 필요합니다** — 워커가 기동 시 킬스위치를 "
-    "캐시해 SAFE_MODE를 잠그기 때문입니다. 또한 **위반 조건 자체가 아직 "
-    "유효하면**(일손실·주간손실·MDD 한도) 다음 PnL 기록에서 다시 정지됩니다. "
-    "그건 덮어쓰기가 아니라 새 판단이며 로그와 알림이 남습니다."
+#: Told to the operator on a successful reset — what the release does to the
+#: running worker (module docstring).
+RELEASE_NOTICE = (
+    "해제는 즉시 반영되며 실행 중인 워커가 덮어쓰지 않습니다. 리스크 한도"
+    "(일손실·주간손실·MDD)로 정지한 워커는 **1분 안에 재시작 없이 매매를 "
+    "재개**합니다. 해제는 지금의 손실을 받아들인 것으로 봅니다 — 해제 때 "
+    "넘어 있던 일·주간 한도는 **해제 시점보다 자본의 1%를 더 잃으면 다시 정지**하고"
+    "(넘지 않았던 한도는 그대로, 다음 "
+    "리스크 데이는 새로 시작), MDD는 해제 시점 자산을 새 기준으로 잽니다. "
+    "복구 실패처럼 상태를 믿을 수 없어 멈춘 워커는 여전히 재시작이 필요합니다."
 )
 
 
@@ -170,7 +172,7 @@ def kill_switch_status(
         "active": active,
         "reason": (row.kill_reason if row else None),
         "since": (row.updated_at.isoformat() if row and row.updated_at else None),
-        "note": RESTART_NOTICE if active else None,
+        "note": RELEASE_NOTICE if active else None,
     })
 
 
@@ -195,7 +197,9 @@ def reset_kill_switch(
         return Resp.err("킬스위치가 활성 상태가 아닙니다 — 해제할 것이 없습니다.")
 
     # Every halted row, in one transaction. Releasing only one leaves the other
-    # blocking the daily (07:01) SAFE_MODE re-arm with no endpoint able to reach it.
+    # blocking the worker's resume poll (any halted row does) with no endpoint
+    # able to reach it. The audit row below is what the worker's tracker reads
+    # as "a release" (`RELEASE_EVENT`) — keep it in this transaction.
     previous_reason = halted[0].kill_reason
     # Each day's own reason, so the audit row does not drop an older one when
     # several days are halted for different causes.
@@ -229,5 +233,5 @@ def reset_kill_switch(
     return Resp.ok({
         "active": False,
         "previous_reason": previous_reason,
-        "note": RESTART_NOTICE,
-    }, msg=f"킬스위치를 해제했습니다. {RESTART_NOTICE}")
+        "note": RELEASE_NOTICE,
+    }, msg=f"킬스위치를 해제했습니다. {RELEASE_NOTICE}")

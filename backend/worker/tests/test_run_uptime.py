@@ -409,5 +409,6 @@ def test_main_enables_recording_only_after_a_successful_recovery():
     import inspect
     src = inspect.getsource(runner.main)
     i = src.index("enable_run_uptime(factory)")
-    assert src.rindex("if not recovered:", 0, i) < src.rindex("else:", 0, i) < i
+    assert src.rindex("if not recovered and not recovery.halted_by_risk:", 0, i) \
+        < src.rindex("elif recovered:", 0, i) < i
     assert src.index("if worker.shutdown_requested:") < i

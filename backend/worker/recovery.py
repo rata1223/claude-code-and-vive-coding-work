@@ -213,6 +213,10 @@ class SafeModeState:
         return self._can_trade
 
     @property
+    def reason(self) -> str:
+        return self._reason
+
+    @property
     def halt_cause(self) -> Optional[HaltCause]:
         """The active halt cause, or ``None`` when trading is allowed."""
         return None if self._can_trade else self._cause
@@ -251,6 +255,10 @@ class StartupRecovery:
         self._redis = redis_client
         self._broker = broker
         self._shared_poller = poller  # Worker's poller — avoid creating a second one
+        #: True when every check passed and only a restored risk halt keeps
+        #: trading closed. The worker's resume poll may then reopen it once the
+        #: operator releases the halt (P0-12); any other failure needs a restart.
+        self.halted_by_risk = False
         self._ca_runtime = ca_runtime  # P2-02C: CorporateActionRuntime (optional)
         self._actions: list[ReconcileAction] = []
         #: Optional ``() -> bool``. Checked before each step; True stops the
@@ -293,6 +301,14 @@ class StartupRecovery:
             try:
                 ok = fn()
                 if not ok:
+                    if self.halted_by_risk:
+                        # Recovery itself succeeded; the gate stays closed with
+                        # its RISK_BREACH cause, which the resume poll reads.
+                        # Overwriting it as untrusted would need a restart for
+                        # what a release should resume.
+                        logger.warning("[복구 %d/%d] 킬스위치로 매매 차단 — 해제되면 재개",
+                                       i, len(steps))
+                        return False
                     logger.error("[복구 %d/%d] 실패: %s — SafeMode 유지", i, len(steps), name)
                     SAFE_MODE.disable(f"복구 실패: {name}")
                     return False
@@ -350,6 +366,9 @@ class StartupRecovery:
                 logger.warning("킬스위치 복원됨: %s — 매매 차단 유지", tracker.kill_reason)
                 self._kill_switch_active = True
                 self._kill_reason = tracker.kill_reason
+                #: A halt read off a row — a risk halt. The failure branch below
+                #: is not: there the risk state itself is unknown.
+                self._kill_switch_from_row = True
             return True
         except Exception as e:
             # Fail-closed: if risk state cannot be verified, assume the
@@ -744,12 +763,22 @@ class StartupRecovery:
         # Block trading if kill-switch was active from the previous session
         if getattr(self, "_kill_switch_active", False):
             reason = getattr(self, "_kill_reason", "알 수 없음")
-            SAFE_MODE.disable(f"킬스위치 복원: {reason}")
-            logger.critical("킬스위치 복원 — 매매 차단. 수동 해제 후 재시작 필요.")
+            if getattr(self, "_kill_switch_from_row", False):
+                # A risk halt, like the one the tracker closes the gate with:
+                # every other check passed, so once the operator releases it the
+                # worker's resume poll reopens trading (P0-12). It used to be
+                # recorded as untrusted state, which only a restart cleared.
+                SAFE_MODE.disable(f"킬스위치 복원: {reason}", cause=HaltCause.RISK_BREACH)
+                self.halted_by_risk = True
+                hint = "앱에서 해제하면 1분 안에 재개"
+            else:
+                SAFE_MODE.disable(f"킬스위치 복원: {reason}")
+                hint = "리스크 상태를 읽지 못함 — 원인 확인 후 재시작 필요"
+            logger.critical("킬스위치 복원 — 매매 차단. %s", hint)
             try:
                 from bot.notifier import alert_emergency
                 alert_emergency(
-                    f"[킬스위치 복원] 재시작 후에도 매매 차단 중\n사유: {reason}\n수동 해제 필요"
+                    f"[킬스위치 복원] 재시작 후에도 매매 차단 중\n사유: {reason}\n{hint}"
                 )
             except Exception as e:
                 logger.warning("킬스위치 재시작 Telegram 알림 실패: %s", e)

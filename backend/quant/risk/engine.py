@@ -49,6 +49,8 @@ class RiskConfig:
     daily_loss_limit_pct: float = 0.03    # 일일 3% 손실 → 당일 매수 차단
     weekly_loss_limit_pct: float = 0.06   # 주간 6% 손실 → 킬스위치
     mdd_limit_pct: float = 0.15           # MDD 15% → 전량 청산
+    # 운영자 해제 후 재정지 (P0-12): 해제 시점보다 자본의 1% 더 잃어야 다시 정지
+    release_step_pct: float = 0.01
 
     # 상관관계
     max_corr_overlap: float = 0.80        # 0.80 이상 상관 → 2번째 포지션 차단
@@ -221,6 +223,14 @@ class ExposureManager:
 #: ``_restore_state`` to recognise a restored MDD halt, so it is one constant.
 MDD_REASON_PREFIX = "MDD 한도 초과"
 
+#: ``AuditLog.event_type`` of the baseline an operator's release sets (P0-12).
+#: The floors live here rather than in a column: no schema change, and the
+#: latest row is all a restart needs.
+RELEASE_BASELINE_EVENT = "risk_release_baseline"
+#: ``AuditLog.event_type`` the app's reset writes in the transaction that
+#: clears the rows (``api/routers/risk.py``) — what a release *is*.
+RELEASE_EVENT = "kill_switch_reset"
+
 @dataclass
 class LossTracker:
     """일별·주별 손실 추적 + 킬스위치."""
@@ -248,6 +258,18 @@ class LossTracker:
     #: Set once a flatten has been requested; re-armed only when the kill switch
     #: is cleared. Without it every fill during the breach re-requests one.
     _mdd_flatten_requested: bool = field(default=False, repr=False, compare=False)
+    #: Set by an operator's release (P0-12), which accepts the loss as it
+    #: stands. Daily: ``(risk day, floor)`` — below the floor, and only on that
+    #: risk day; the next one starts fresh. Weekly: ``(risk day, {day: P&L in
+    #: the window at the release}, step)`` — the floor is what of that P&L is
+    #: still in the rolling window, less the step, so a loss that rolls out of
+    #: the window stops being accepted with it.
+    _daily_floor: Optional[tuple] = field(default=None, repr=False, compare=False)
+    _weekly_floor: Optional[tuple] = field(default=None, repr=False, compare=False)
+    #: The risk day of a release adopted before any equity reading: the MDD
+    #: rebase waits for the first reading on that day. Later, a drawdown is no
+    #: longer the one the operator accepted, and is measured as usual.
+    _mdd_rebase_pending: Optional[date] = field(default=None, repr=False, compare=False)
 
     def reset_daily(self) -> None:
         self.daily_pnl = 0.0
@@ -317,6 +339,7 @@ class LossTracker:
         self.daily_pnl += pnl
         self.weekly_pnl += pnl
         self.current_equity = current_equity
+        self._resolve_mdd_rebase()
         if current_equity > self.peak_equity:
             self.peak_equity = current_equity
 
@@ -343,9 +366,9 @@ class LossTracker:
         limit (3%) and MDD (15%) break together, the daily branch returned, and
         MDD was never evaluated — no flatten on exactly the day it was for.
 
-        Every branch re-runs on each PnL write while the breach holds; that is
-        what re-halts after a reset (see ``api/routers/risk.py``). The flatten
-        request is therefore guarded separately, in ``_request_mdd_flatten``.
+        A breach while already halted is not a new decision (``_halt``). After
+        an operator's release the daily and weekly limits halt again only past
+        the floors the release set (P0-12, ``_set_release_baseline``).
         """
         capital = max(self.peak_equity, 1.0)
 
@@ -353,30 +376,107 @@ class LossTracker:
         if self.peak_equity > 0:
             mdd = (self.current_equity - self.peak_equity) / self.peak_equity
             if mdd < -self.config.mdd_limit_pct:
-                self.kill_switch = True
-                self._mark_kill_switch_changed()
-                self.kill_reason = f"{MDD_REASON_PREFIX} ({mdd:.2%})"
-                logger.error("킬스위치 [MDD] %s", self.kill_reason)
-                self._fire_kill_switch_alert(self.kill_reason)
+                self._halt(f"{MDD_REASON_PREFIX} ({mdd:.2%})", "MDD")
                 self._request_mdd_flatten(self.kill_reason)
                 return
 
         # 일일 손실 한도
-        if self.daily_pnl / capital < -self.config.daily_loss_limit_pct:
-            self.kill_switch = True
-            self._mark_kill_switch_changed()
-            self.kill_reason = f"일일 손실 한도 초과 ({self.daily_pnl/capital:.2%})"
-            logger.error("킬스위치 [일일] %s", self.kill_reason)
-            self._fire_kill_switch_alert(self.kill_reason)
+        if (self.daily_pnl / capital < -self.config.daily_loss_limit_pct
+                and self._past_floor(self._daily_floor_level(), self.daily_pnl)):
+            self._halt(f"일일 손실 한도 초과 ({self.daily_pnl/capital:.2%})", "일일")
             return
 
         # 주간 손실 한도
+        if (self.weekly_pnl / capital < -self.config.weekly_loss_limit_pct
+                and self._past_floor(self._weekly_floor_level(), self.weekly_pnl)):
+            self._halt(f"주간 손실 한도 초과 ({self.weekly_pnl/capital:.2%})", "주간")
+
+    def _halt(self, reason: str, tag: str) -> None:
+        """Halt for ``reason`` — unless already halted, which decides nothing new.
+
+        Every fill re-runs ``_evaluate`` while a breach holds, and this used to
+        re-halt (and re-alert) on each one. Each was a fresh decision, so it
+        was asserted over an operator's release before the worker had even
+        seen it — no release could hold while the loss stood (P0-12). Now a
+        breach on an already-halted tracker is a no-op: the halt this process
+        decided is already on its way to the row, and one somebody else set or
+        cleared is adopted at the next write. MDD is the exception — it
+        liquidates, so it takes over a daily or weekly halt's reason.
+        """
+        if self.kill_switch and (tag != "MDD"
+                                 or self.kill_reason.startswith(MDD_REASON_PREFIX)):
+            return
+        self.kill_switch = True
+        self._mark_kill_switch_changed()
+        self.kill_reason = reason
+        logger.error("킬스위치 [%s] %s", tag, reason)
+        self._fire_kill_switch_alert(reason)
+
+    @staticmethod
+    def _past_floor(level: Optional[float], value: float) -> bool:
+        """False only while a release floor applies and ``value`` is not below it."""
+        return level is None or value < level
+
+    def _daily_floor_level(self) -> Optional[float]:
+        if self._daily_floor is None or self._daily_floor[0] != self.trade_date:
+            return None
+        return self._daily_floor[1]
+
+    def _weekly_floor_level(self) -> Optional[float]:
+        if self._weekly_floor is None:
+            return None
+        day, window, step = self._weekly_floor
+        if not 0 <= (self.trade_date - day).days < self.WEEK_DAYS:
+            return None
+        held = sum(v for d, v in window.items()
+                   if 0 <= (self.trade_date - d).days < self.WEEK_DAYS)
+        return held - step
+
+    def _set_release_baseline(self) -> None:
+        """An operator released the halt: accept the loss as it stands (P0-12).
+
+        The daily and weekly limits halt again only once another
+        ``release_step_pct`` of capital is lost — each only if it is breached
+        now: the operator accepted the loss that fired, and a floor on a limit
+        not yet reached would move that limit past its setting. If MDD is
+        breached now, the
+        drawdown is measured from current equity from here on; a release with
+        no MDD breach leaves the peak alone, so it never loosens a healthy
+        baseline. With equity not known yet (0 — nothing recorded since boot)
+        the check waits for the first reading that risk day (``seed_equity`` at
+        boot, else ``record_pnl``): measured against the old peak, that fill
+        would halt and liquidate over the release.
+        Callers hold the tracker's lock.
+        """
+        capital = max(self.peak_equity, 1.0)
+        step = self.config.release_step_pct * capital
+        self._daily_floor = None
+        self._weekly_floor = None
+        if self.daily_pnl / capital < -self.config.daily_loss_limit_pct:
+            self._daily_floor = (self.trade_date, self.daily_pnl - step)
         if self.weekly_pnl / capital < -self.config.weekly_loss_limit_pct:
-            self.kill_switch = True
-            self._mark_kill_switch_changed()
-            self.kill_reason = f"주간 손실 한도 초과 ({self.weekly_pnl/capital:.2%})"
-            logger.error("킬스위치 [주간] %s", self.kill_reason)
-            self._fire_kill_switch_alert(self.kill_reason)
+            window = dict(self._prior_days)
+            # Today's share of the week, as `_roll_week` will count it.
+            window[self.trade_date] = self.weekly_pnl - sum(self._prior_days.values())
+            self._weekly_floor = (self.trade_date, window, step)
+        self._mdd_rebase_pending = self.trade_date if self.current_equity <= 0 else None
+        self._rebase_mdd_if_breached()
+
+    def _resolve_mdd_rebase(self) -> None:
+        """Apply a release's deferred MDD rebase at the first equity reading on
+        the release's risk day; drop it after that day."""
+        day = self._mdd_rebase_pending
+        if day is None or self.current_equity <= 0:
+            return
+        self._mdd_rebase_pending = None
+        if day == self.trade_date:
+            self._rebase_mdd_if_breached()
+
+    def _rebase_mdd_if_breached(self) -> None:
+        if (self.peak_equity > 0 and self.current_equity > 0
+                and (self.current_equity - self.peak_equity) / self.peak_equity
+                < -self.config.mdd_limit_pct):
+            self.peak_equity = self.current_equity
 
     def _request_mdd_flatten(self, reason: str) -> None:
         """Ask for the book to be liquidated — once per breach (P0-03).
@@ -387,9 +487,9 @@ class LossTracker:
         Re-armed by ``_rearm_mdd_flatten`` in three cases only:
 
         * the kill switch is cleared — ``manual_reset``, or an operator clear
-          the tracker adopts. That adoption happens only once the breach no
-          longer holds: while it does, ``_evaluate`` re-halts first and the
-          clear is overwritten (issue #158), so no second flatten follows;
+          the tracker adopts. The release rebases the drawdown on current
+          equity (``_set_release_baseline``), so the breach it accepted does
+          not flatten a second time — only a fresh 15% from there does;
         * the worker's flatten sent nothing and failed, so the next fill
           retries it (``StrategyWorker._emergency_flatten``).
 
@@ -449,6 +549,7 @@ class LossTracker:
         self._mark_kill_switch_changed()
         self.kill_reason = ""
         self._rearm_mdd_flatten()
+        self._set_release_baseline()
         logger.info("킬스위치 수동 해제")
 
 
@@ -526,6 +627,15 @@ class PersistentLossTracker(LossTracker):
         # up. Set before _restore_state() below, which must not count as intent.
         self._ks_epoch = 0
         self._ks_written = 0
+        #: A release baseline not yet written (``_persist``): its audit row, and
+        #: the rebased peak, which the write that adopted the release had
+        #: already snapshotted.
+        self._release_unwritten = None
+        #: ``AuditLog.id`` of the newest operator release (``kill_switch_reset``)
+        #: this tracker has applied a baseline for. A release is the audit row,
+        #: not this tracker seeing a cleared flag: one made while the worker was
+        #: down, or while its tracker held no halt in memory, is still applied.
+        self._release_seen = 0
         self._redis = redis_client
         # Prefer db_factory (creates per-op sessions) over a long-lived db_session.
         # Long-lived sessions cause stale connections and pool exhaustion on 24h+ processes.
@@ -640,6 +750,76 @@ class PersistentLossTracker(LossTracker):
                 # halt is then carried by nothing newer than its old row.
                 self._mark_kill_switch_changed()
 
+        self._restore_release_baseline(today)
+
+    def _restore_release_baseline(self, today: date) -> None:
+        """The latest release's floors, while they still apply (P0-12) — and a
+        release this tracker has not applied yet, applied now.
+
+        Without them a restart on the day of a release halted again at the
+        first fill — the loss the operator accepted was still past the limit.
+        A release made while no worker was running has no baseline row; it is
+        applied here from the restored numbers. Equity is not known yet, so an
+        MDD breach rebases at the first reading (``_mdd_rebase_pending``) rather
+        than halting — and liquidating — over the release.
+        """
+        import json
+        from backend.database.models import AuditLog
+
+        def _latest(s):
+            row = (s.query(AuditLog)
+                   .filter(AuditLog.event_type == RELEASE_BASELINE_EVENT)
+                   .order_by(AuditLog.id.desc())
+                   .first())
+            return row.detail if row is not None else None
+        detail = self._query(_latest, "해제 기준")
+        if detail:
+            try:
+                d = json.loads(detail)
+                day = date.fromisoformat(d["trade_date"])
+                daily = d["daily_floor"]
+                daily = None if daily is None else float(daily)
+                window = d["weekly_window"]
+                window = (None if window is None else
+                          {date.fromisoformat(k): float(v) for k, v in window.items()})
+                step = None if window is None else float(d["step"])
+                seen = int(d.get("release_id") or 0)
+            except Exception as e:  # a malformed row restores nothing — fail-closed
+                logger.error("해제 기준 복원 실패 — 해제 전 기준으로 기동: %s", e)
+            else:
+                self._release_seen = seen
+                age = (today - day).days
+                if age == 0 and daily is not None:
+                    self._daily_floor = (day, daily)
+                if 0 <= age < self.WEEK_DAYS and window is not None:
+                    self._weekly_floor = (day, window, step)
+                if self._daily_floor or self._weekly_floor:
+                    logger.info("해제 기준 복원 (%s): 일 %s / 주 %s", day,
+                                "있음" if self._daily_floor else "없음",
+                                "있음" if self._weekly_floor else "없음")
+
+        latest = self._latest_release_id()
+        if latest is not None and latest > self._release_seen:
+            logger.warning("기동 전 해제(audit id=%d) — 지금 수치로 해제 기준 적용", latest)
+            self._set_release_baseline()
+            self._release_seen = latest
+
+    def _latest_release_id(self) -> Optional[int]:
+        """``AuditLog.id`` of the newest operator release within the weekly
+        window, or ``None`` (none, or the read failed). Older releases have no
+        floor left to set."""
+        from datetime import datetime
+        from sqlalchemy import func
+        from backend.database.models import AuditLog
+        since = datetime.utcnow() - timedelta(days=self.WEEK_DAYS)
+
+        def _max(s):
+            return (s.query(func.max(AuditLog.id))
+                    .filter(AuditLog.event_type == RELEASE_EVENT,
+                            AuditLog.created_at >= since)
+                    .scalar())
+        return self._query(_max, "해제 기록")
+
     def record_pnl(self, pnl: float, current_equity: float) -> str:
         """As the base, plus ``"adopted"`` when the write picked up a halt that
         was set outside this process.
@@ -661,6 +841,87 @@ class PersistentLossTracker(LossTracker):
         with self._lock:
             super().reset_daily()
         self._persist()
+
+    def _set_release_baseline(self) -> None:
+        super()._set_release_baseline()
+        daily = self._daily_floor[1] if self._daily_floor else None
+        weekly = self._weekly_floor
+        self._release_unwritten = {
+            "trade_date": self.trade_date.isoformat(),
+            "daily_floor": daily,
+            "weekly_window": ({d.isoformat(): v for d, v in weekly[1].items()}
+                              if weekly else None),
+            "step": weekly[2] if weekly else None,
+            "peak_equity": self.peak_equity,
+        }
+        logger.warning("킬스위치 해제 반영 — 재정지 기준: 일 %s / 주 %s / 고점 %.0f%s",
+                       "—" if daily is None else f"{daily:.0f}",
+                       "—" if weekly is None else f"{self._weekly_floor_level():.0f}",
+                       self.peak_equity,
+                       " (MDD 기준은 첫 자산 판독 때)" if self._mdd_rebase_pending else "")
+
+    def seed_equity(self, equity: float) -> None:
+        """A balance read at boot: settle a release's deferred MDD rebase now,
+        not at the first sell fill — days later the drawdown is no longer the
+        one the operator accepted."""
+        with self._lock:
+            if equity > 0 and self.current_equity <= 0:
+                self.current_equity = equity
+            if self._mdd_rebase_pending is None:
+                return
+            self._resolve_mdd_rebase()
+            if self._release_unwritten is not None:
+                self._release_unwritten["peak_equity"] = self.peak_equity
+
+    def refresh_from_db(self, current_equity: Optional[float] = None) -> bool:
+        """Settle with the stored row now, without waiting for a fill (P0-12).
+
+        One ordinary write: it adopts an operator's release — and sets the
+        release baseline — or carries this process's own unwritten halt, by
+        the same ownership rules as any write (#158). ``current_equity`` fills
+        in an unknown reading so a released MDD halt can rebase at once.
+        Returns whether the tracker is still halted.
+        """
+        with self._lock:
+            if current_equity and current_equity > 0 and self.current_equity <= 0:
+                self.current_equity = current_equity
+        self._persist()
+        # A release this tracker never saw as a cleared flag — the halt was not
+        # in its memory (set by the watchdog, say, and cleared before a write
+        # adopted it). The release is the audit row, so it is applied anyway.
+        latest = self._latest_release_id()
+        with self._lock:
+            if self.kill_switch:
+                return True
+            fresh = latest is not None and latest > self._release_seen
+            if fresh:
+                self._set_release_baseline()
+        if fresh:
+            self._persist()
+        with self._lock:
+            return self.kill_switch
+
+    def write_pending(self) -> None:
+        """Write now if this process holds a halt decision the row lacks.
+
+        At boot that is a halt restored from an older row (``_restore_state``):
+        until it is on today's row, a release the operator makes meanwhile is
+        overwritten by the carry at the first write.
+        """
+        with self._lock:
+            pending = (self._ks_epoch != self._ks_written
+                       or self._release_unwritten is not None)
+        if pending:
+            self._persist()
+
+    def if_clear(self, fn) -> bool:
+        """Run ``fn`` only while not halted, under the lock a halt is decided
+        under — so no halt lands between the check and ``fn``."""
+        with self._lock:
+            if self.kill_switch:
+                return False
+            fn()
+            return True
 
     def manual_reset(self) -> None:
         with self._lock:
@@ -708,7 +969,43 @@ class PersistentLossTracker(LossTracker):
     def _persist(self) -> bool:
         """Returns True when the write adopted a halt set outside this process."""
         self._write_redis()
-        return self._write_db()
+        adopted = self._write_db()
+        with self._lock:
+            release, self._release_unwritten = self._release_unwritten, None
+        if release is not None:
+            # Which release this was, so a restart does not apply it again.
+            latest = self._latest_release_id()
+            with self._lock:
+                if latest is not None and latest > self._release_seen:
+                    self._release_seen = latest
+                release["release_id"] = self._release_seen
+            # The write that adopted the release had snapshotted the old peak;
+            # this one puts the rebased peak on the row.
+            self._write_db()
+            self._write_release_audit(release)
+        return adopted
+
+    def _write_release_audit(self, detail: dict) -> None:
+        """Keep the release floors for a restart (``_restore_release_baseline``).
+        Lost, a restart applies the release again from the restored numbers."""
+        if self._db_factory is None:
+            return
+        try:
+            import json
+            from backend.database.models import AuditLog
+            sess = self._db_factory()
+            try:
+                sess.add(AuditLog(event_type=RELEASE_BASELINE_EVENT,
+                                  actor="risk_engine",
+                                  detail=json.dumps(detail, ensure_ascii=False)))
+                sess.commit()
+            except Exception as e:
+                logger.warning("해제 기준 기록 실패 — 재시작하면 다시 정지될 수 있음: %s", e)
+                sess.rollback()
+            finally:
+                sess.close()
+        except Exception as e:
+            logger.warning("해제 기준 기록 예외: %s", e)
 
     def _write_redis(self) -> None:
         if self._redis is None:
@@ -795,7 +1092,10 @@ class PersistentLossTracker(LossTracker):
                     elif was and not adopted[0]:
                         # Somebody cleared it (the operator reset): a breach
                         # after this is a new one, and flattens again (P0-03).
+                        # The release accepts the loss as it stands — the
+                        # limits halt again only if it gets worse (P0-12).
                         self._rearm_mdd_flatten()
+                        self._set_release_baseline()
 
             if adopt_halt is not None:
                 # Converging the attribute is not enough to stop anything:
@@ -814,9 +1114,10 @@ class PersistentLossTracker(LossTracker):
                                       cause=HaltCause.RISK_BREACH)
                 except Exception as e:
                     logger.warning("SAFE_MODE 비활성화 실패: %s", e)
-            # Adopting a *clear* deliberately does NOT re-enable SAFE_MODE:
-            # resuming has to go through StartupRecovery's checks, which is the
-            # half of P0-12 that is still open.
+            # Adopting a *clear* deliberately does NOT re-enable SAFE_MODE here:
+            # a write runs on fill threads and at shutdown. The worker's resume
+            # poll does it (``StrategyWorker._resume_if_released``), and only
+            # for a risk halt in a worker whose recovery succeeded (P0-12).
             return adopt_halt is not None
 
         # One helper, applied on both paths — these two branches were copy-pasted

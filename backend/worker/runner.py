@@ -236,6 +236,10 @@ def _record_never_ran(run_id: int, strategy_type, reason: str) -> bool:
 _run_uptime_factory = None
 
 
+#: How often the worker checks for an operator's release (P0-12).
+RISK_RESUME_POLL_SEC = 60
+
+
 def enable_run_uptime(db_factory) -> None:
     global _run_uptime_factory
     _run_uptime_factory = db_factory
@@ -356,7 +360,13 @@ class WorkerSession:
             # The 4-week gate counts the time this run was running — from here,
             # not from a restore that never got this far.
             uptime = _start_run_uptime(self.run_id)
+            #: Recording off at the start — the worker came up halted. A release
+            #: turns it on later (P0-12), and this run then counts from there.
+            recording_off = _run_uptime_factory is None
             while not self._stop_event.is_set():
+                if recording_off and _run_uptime_factory is not None:
+                    recording_off = False
+                    uptime = _start_run_uptime(self.run_id)
                 time.sleep(1)
         except Exception as e:
             logger.exception("전략 실행 오류 run_id=%d: %s", self.run_id, e)
@@ -434,6 +444,10 @@ class StrategyWorker:
         #: The 10s SIGKILL clock starts at the signal, so the budget must too.
         self._shutdown_at: float | None = None
         self._scheduler = None          # set by main() via attach_scheduler()
+        #: Set by main() once startup recovery succeeded, or failed only on a
+        #: restored risk halt. Until then the resume poll never opens the gate:
+        #: a worker whose recovery failed keeps a later risk halt's cause too.
+        self._risk_resume_allowed = False
         #: One-shot threads spawned per market open / periodic reconcile. They do
         #: broker I/O and DB writes, so they are tracked in order to be joined on
         #: the way out rather than SIGKILLed mid-flight.
@@ -491,12 +505,18 @@ class StrategyWorker:
                 _eq = _bal.total_eval_krw
                 if _eq > 0:
                     self._last_equity_reading = (_eq, getattr(_bal, "equity_verified", True))
+                    # A release applied at boot rebases MDD on this reading.
+                    self._loss_tracker.seed_equity(_eq)
                     if self._loss_tracker.peak_equity == 0:
                         self._loss_tracker.peak_equity = _eq
                         self._loss_tracker._persist()
                         logger.info("peak_equity 초기화: %.0f원", _eq)
             except Exception as _e:
                 logger.warning("기준 잔고 시드 실패 — 첫 체결 MDD 평가가 스킵될 수 있음: %s", _e)
+            # A halt restored from an older row goes on today's row now, before
+            # the operator can release it: written later, at the first fill or
+            # resume poll, the carry would overwrite that release (P0-12).
+            self._loss_tracker.write_pending()
 
         except Exception as e:
             logger.warning("PersistentLossTracker 초기화 실패: %s", e)
@@ -602,8 +622,82 @@ class StrategyWorker:
         self._shutdown.set()
 
     def attach_scheduler(self, scheduler) -> None:
-        """Hand the APScheduler instance over so the teardown can stop it first."""
+        """Hand the APScheduler instance over so the teardown can stop it first,
+        and add the jobs that need this worker."""
         self._scheduler = scheduler
+        scheduler.add_job(self._resume_if_released, "interval",
+                          seconds=RISK_RESUME_POLL_SEC, id="risk_resume",
+                          coalesce=True, max_instances=1, replace_existing=True)
+
+    def allow_risk_resume(self, allowed: bool) -> None:
+        self._risk_resume_allowed = bool(allowed)
+
+    def _resume_if_released(self) -> bool:
+        """Reopen trading once the operator has released a risk halt (P0-12).
+
+        A release (``POST /api/risk/kill-switch/reset``) clears the rows, but
+        the order gate is this process's ``SAFE_MODE``, and adopting the clear
+        on a write deliberately leaves it shut. Trading stayed closed until a
+        restart. This polls instead, and reopens only when all of these hold:
+
+        * recovery succeeded, or failed only on a restored risk halt
+          (``allow_risk_resume``);
+        * the gate is shut for a risk limit (``RISK_BREACH``) — untrusted state
+          still needs a restart;
+        * no row is halted, whatever its date — a failed read is no;
+        * the tracker, settled with the row now, is not halted. That write
+          adopts the release and sets its baseline *before* trading reopens.
+
+        The check and the reopening run under the tracker's lock, so a halt a
+        fill decides meanwhile is not reopened over. Returns True if it
+        reopened. Never raises — a failed poll leaves the gate shut.
+        """
+        try:
+            from backend.database.models import DailyRiskState
+            from backend.risk.halt_policy import HaltCause
+            from backend.worker.recovery import SAFE_MODE
+            tracker = self._loss_tracker
+            if (not self._risk_resume_allowed or tracker is None
+                    or self.shutdown_requested
+                    or SAFE_MODE.halt_cause is not HaltCause.RISK_BREACH):
+                return False
+            sess = _get_session_factory()()
+            try:
+                # Any halted row is a live halt (#216) — one query answers it.
+                if (sess.query(DailyRiskState.trade_date)
+                        .filter(DailyRiskState.kill_switch.is_(True)).first()
+                        is not None):
+                    return False
+            finally:
+                sess.close()
+            if tracker.refresh_from_db(self._last_known_equity):
+                return False
+
+            def _reopen():
+                # Re-read: something else may have shut it since, for a reason
+                # this poll must not override.
+                if SAFE_MODE.halt_cause is HaltCause.RISK_BREACH:
+                    SAFE_MODE.enable()
+            if not tracker.if_clear(_reopen) or not SAFE_MODE.can_trade:
+                return False
+        except Exception as e:
+            logger.warning("킬스위치 해제 확인 실패 — 매매 차단 유지: %s", e)
+            return False
+
+        logger.warning("킬스위치 해제 확인 — 매매 재개 (재시작 없이)")
+        if _run_uptime_factory is None:
+            # Recovery stopped at the restored halt; it had passed everything
+            # else, so from here the run's time counts as for any running worker.
+            # Sessions already running pick it up (``WorkerSession._run``).
+            enable_run_uptime(_get_session_factory())
+        try:
+            from bot.notifier import alert_emergency
+            alert_emergency("킬스위치 해제 확인 — 매매 재개\n"
+                            "일·주 한도는 해제 시점보다 1% 더 잃으면 다시 정지, "
+                            "MDD는 해제 시점 자산 기준")
+        except Exception as e:
+            logger.warning("매매 재개 알림 실패: %s", e)
+        return True
 
     def shutdown(self) -> None:
         """Stop everything this process owns, in order, inside the grace period.
@@ -1968,13 +2062,26 @@ def main():
         worker.shutdown()
         return
 
-    if not recovered:
+    from backend.worker.recovery import SAFE_MODE
+    if not recovered and not recovery.halted_by_risk:
         logger.critical("복구 실패 — Worker SafeMode로 계속 실행")
-    else:
+        # Nothing reopens an untrusted halt but a restart — not the resume poll,
+        # and since P0-12 not the 07:01 job either (it reopened any cause, so a
+        # worker that never reconciled began trading). Say so, loudly.
+        try:
+            from bot.notifier import alert_emergency
+            alert_emergency(f"[워커 복구 실패] 매매 차단 중 — 원인 확인 후 재시작 필요\n"
+                            f"사유: {SAFE_MODE.reason}")
+        except Exception as e:
+            logger.warning("복구 실패 알림 전송 실패: %s", e)
+    elif recovered:
         # The 4-week gate counts run uptime from here: a worker that is still
         # recovering, or stuck in SafeMode because recovery failed, cannot trade,
         # so its time is not paper-run time. Sessions record their own runs.
         enable_run_uptime(factory)
+
+    # A restored risk halt is the one recovery failure a release can resume.
+    worker.allow_risk_resume(recovered or recovery.halted_by_risk)
 
     from backend.worker.scheduler import build_scheduler
     scheduler = build_scheduler()

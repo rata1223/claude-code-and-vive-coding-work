@@ -365,52 +365,56 @@ class TestResetDailyLeavesTheHalt:
         assert _row(factory).kill_switch is True
 
 
-# ── the other way a reset gets undone — deliberate, and NOT fixed here ───────
+# ── a release holds while the loss stands, and halts again if it grows ──────
 
-class TestABreachStillReAsserts:
-    """Pinning a behaviour this change deliberately leaves alone.
+class TestAReleaseHoldsUntilItGetsWorse:
+    """P0-12. Clearing the row does not make the breach *condition* go away.
 
-    Clearing the row does not make the breach *condition* go away. While it
-    still holds, the next `record_pnl()` runs `_evaluate()`, which halts again —
-    bumping the epoch, so the new value is asserted. That is a fresh decision by
-    this process, not the stale overwrite #158 is about, and suppressing it would
-    mean trading on through a live limit breach.
-
-    The consequence is worth stating plainly: for a daily-loss or MDD halt the
-    condition normally holds for the rest of the session, so an operator's reset
-    does **not** let trading resume intraday by itself. Fixing #158 does not
-    change that. See the PR description.
+    This used to re-halt at the next fill: `_evaluate()` decided again on
+    every write while the loss stood, so no release could hold intraday. Now a
+    breach on an already-halted tracker decides nothing new, the write adopts
+    the release, and the release sets a baseline — the limits halt again only
+    once another 1% of capital is lost (MDD: from the rebased peak). The full
+    behaviour is in `test_release_baseline.py`; these pin the #158 side.
     """
 
-    def test_the_halt_returns_while_the_condition_holds(self, factory):
+    def test_the_release_holds_while_the_loss_stands(self, factory):
         t = _tracker(factory)
         _breach(t)
         _external_write(factory, kill_switch=False, kill_reason=None)
 
-        t.record_pnl(0.0, 500_000.0)          # day's loss still past the limit
+        t.record_pnl(0.0, 500_000.0)          # the same loss the operator accepted
 
+        assert _row(factory).kill_switch is False
+        assert t.kill_switch is False
+
+    def test_a_worse_loss_is_a_fresh_assertion(self, factory):
+        """Reads `_ks_epoch` directly because that is the thing under test —
+        whether `_evaluate()` formed a new opinion rather than replaying an
+        old value (the stale overwrite #158 removed)."""
+        t = _tracker(factory)
+        _breach(t)
+        _external_write(factory, kill_switch=False, kill_reason=None)
+        t.record_pnl(0.0, 500_000.0)
+        before = t._ks_epoch
+
+        t.record_pnl(0.0, 500_000.0 * 0.84)   # 16% below the rebased peak
+
+        assert t._ks_epoch > before
         assert _row(factory).kill_switch is True
-        assert t.kill_switch is True
 
-    def test_and_that_is_a_fresh_assertion_not_a_stale_write(self, factory):
-        """The distinction matters: the tracker *decided* again rather than
-        replaying an old value.
-
-        Reads `_ks_epoch` directly because that is precisely the thing under
-        test — whether `_evaluate()` formed a new opinion. `record_pnl()`'s
-        return value cannot answer it: the tracker was already halted, so there
-        is no transition to report and the call correctly says `"unchanged"`.
-        """
+    def test_a_breach_while_halted_decides_nothing_new(self, factory):
+        """Nor re-alerts: every fill during a halt used to fire the alert again."""
         t = _tracker(factory)
         _breach(t)
         before = t._ks_epoch
-        _external_write(factory, kill_switch=False, kill_reason=None)
+        alerts = []
+        t._fire_kill_switch_alert = alerts.append
 
-        t.record_pnl(0.0, 500_000.0)
+        t.record_pnl(-1_000.0, 490_000.0)
 
-        assert t._ks_epoch > before, (
-            "the halt came back without _evaluate() deciding — that would be "
-            "the stale overwrite this change removes")
+        assert t._ks_epoch == before
+        assert alerts == []
 
 
 # ── review findings: cases where "the DB wins" must NOT apply ────────────────
@@ -539,8 +543,9 @@ class TestAdoptedHaltActuallyStopsTrading:
             "blocked in this process")
 
     def test_adopting_a_clear_does_not_re_open_the_gate(self, factory):
-        """Re-enabling SAFE_MODE from here would bypass `StartupRecovery`'s
-        checks. Resuming is a restart's job (P0-12's remaining half)."""
+        """Not from a write: writes run on fill threads and at shutdown.
+        Resuming is the worker's poll (`_resume_if_released`, P0-12), which
+        checks the cause and that recovery succeeded first."""
         from backend.worker.recovery import SAFE_MODE
 
         t = _tracker(factory)

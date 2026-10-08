@@ -27,9 +27,10 @@ problem this endpoint exists to solve:
    endpoint is that manual step, with an operator, a written reason, and an
    audit trail instead.
 
-The endpoint deliberately does **not** claim to resume a running worker: the
-worker caches ``_kill_switch_active`` at startup, so clearing the flag takes
-effect on its next start. That matches the message the code already prints.
+A running worker halted for a risk limit resumes within a minute of the
+release, without a restart, and the release accepts the loss as it stands
+(P0-12 — ``backend/worker/tests/test_release_baseline.py``). A worker whose
+state cannot be trusted still needs a restart; the response says both.
 
 No broker, no network — the DB is a local SQLite session.
 """
@@ -227,10 +228,9 @@ def test_status_reports_a_clear_system(db, user):
     assert resp.data["active"] is False
 
 
-def test_status_tells_the_operator_a_restart_is_needed(db, user):
-    """``StartupRecovery`` caches the flag at boot, so clearing the row does not
-    un-halt a worker that is already running. The response has to say that or
-    the operator will think trading resumed when it has not."""
+def test_the_response_says_when_trading_resumes(db, user):
+    """A risk halt resumes within a minute; an untrusted-state halt still needs
+    a restart. The operator has to know which to expect (P0-12)."""
     from api.routers import risk
 
     _risk_row(db, kill_switch=True, reason="MDD")
@@ -239,7 +239,8 @@ def test_status_tells_the_operator_a_restart_is_needed(db, user):
 
     assert resp.code == 1
     note = resp.msg + str(resp.data)
-    assert "기동" in note, "the operator must be told the worker has to come back up"
+    assert "1분 안에 재시작 없이" in note
+    assert "재시작이 필요" in note, "the untrusted-state case must still be named"
 
 
 # ── the reset actually reaches the thing that halts trading ──────────────────
@@ -367,16 +368,10 @@ def test_the_reason_is_stored_trimmed(db, user):
 
 # ── what the operator is told, now that the overwrite is gone ────────────────
 
-def test_the_response_states_both_remaining_gates(db, user):
-    """Clearing the row is necessary but not sufficient, for two separate
-    reasons, and an operator who is told neither will think trading resumed.
-
-    1. ``StartupRecovery`` caches the flag at boot and ``_step_enable_trading``
-       locks ``SAFE_MODE`` from it — lifting that needs a restart (the half of
-       P0-12 still open).
-    2. Clearing the row does not clear the *breach*. If a limit is still
-       exceeded, ``LossTracker._evaluate()`` halts again on the next PnL write.
-    """
+def test_the_response_states_what_the_release_accepts(db, user):
+    """Clearing the row does not clear the *breach*. The release accepts the
+    loss as it stands, and the operator is told where the next halt is: a
+    further 1% for the daily and weekly limits, and a new MDD baseline."""
     from api.routers import risk
 
     _risk_row(db, kill_switch=True, reason="MDD")
@@ -385,9 +380,8 @@ def test_the_response_states_both_remaining_gates(db, user):
 
     assert resp.code == 1
     note = resp.msg + str(resp.data)
-    assert "재시작" in note, "the operator must be told a restart is needed"
-    assert "위반 조건" in note or "다시 정지" in note, (
-        "the operator must be told a live breach re-halts")
+    assert "1%를 더 잃으면 다시 정지" in note
+    assert "MDD는 해제 시점 자산" in note
 
 
 def test_the_response_no_longer_tells_them_to_stop_the_worker_first(db, user):

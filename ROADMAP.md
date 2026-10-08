@@ -126,7 +126,7 @@ Any single incomplete P0 item is sufficient to block the paper→real transition
 > be blocked by another broker's halt, and a KIS breach must not flatten Kiwoom —
 > is met without it: the flatten sells directly on the KIS broker instance and
 > never consults `SAFE_MODE`. **Revisit when Kiwoom is wired into the worker**;
-> P0-12's in-process release still names this as its dependency.
+> P0-12's in-process release shipped without it (one gate for one broker).
 
 | Field | Value |
 |---|---|
@@ -341,9 +341,10 @@ Any single incomplete P0 item is sufficient to block the paper→real transition
 
 ---
 
-#### P0-12 — Kill-switch reset API endpoint — ⚠️ PARTIAL
+#### P0-12 — Kill-switch reset API endpoint — ✅ DONE
 
-> **Durable half done; in-process half still open.** This item was written about
+> **Done (PR #218).** Both halves: the durable release (below) and resuming
+> without a restart. This item was written about
 > the in-memory `SAFE_MODE` ("no programmatic way to clear it without restarting
 > the process"). Investigating it surfaced a **worse, different gap** that was
 > closed first:
@@ -383,29 +384,50 @@ Any single incomplete P0 item is sufficient to block the paper→real transition
 >   permanent hang on the first fill after KST midnight, inside the US session.
 >   Now an `RLock`.
 >
-> ❌ **Still open, and it is what keeps this PARTIAL**:
+> ✅ **Closed in PR #218 — resume without a restart, and what a release accepts**
+> (operator decisions, 2026-10-08):
 >
-> 1. The in-memory `SAFE_MODE` half this item was written about — a restart is
->    still required to resume trading (depends on P0-04).
-> 2. Clearing the row does not clear the **breach**. While a limit is still
->    exceeded, `LossTracker._evaluate()` halts again on the next PnL write — a
->    fresh, logged decision, not a stale overwrite. For a daily-loss or MDD halt
->    the condition normally holds for the rest of the session, so the endpoint
->    alone does not resume intraday trading. Deciding what "resume" should mean
->    (reset the baseline? only re-halt on a worse reading?) is risk-policy work,
->    not a mechanical fix.
+> 1. **Resume.** `StrategyWorker._resume_if_released` (`backend/worker/runner.py`,
+>    every 60 s, job `risk_resume`) reopens `SAFE_MODE` once no row is halted
+>    (`risk_days_in_play`) and the tracker, settled with the row
+>    (`PersistentLossTracker.refresh_from_db`), is clear — **only** for a
+>    `RISK_BREACH` halt in a worker whose recovery succeeded or stopped only at
+>    a restored halt (`allow_risk_resume`). Untrusted state still needs a
+>    restart. The check and the reopening run under the tracker's lock
+>    (`if_clear`). Not P0-04: the worker is single-broker, so one gate is the
+>    right granularity until Kiwoom joins it.
+>    - Found on the way: `StartupRecovery` recorded a restored halt as
+>      untrusted state (`_step_enable_trading`, then `run()` overwrote it again),
+>      so no poll could ever reopen it. It is `RISK_BREACH` now
+>      (`halted_by_risk`); an unreadable risk state stays untrusted.
+>    - The 07:01 job no longer reopens `SAFE_MODE` at all — it did so for any
+>      cause, so a worker whose recovery failed began trading at 07:01. A failed
+>      recovery now raises a Telegram alert ("재시작 필요") instead.
+> 2. **Re-halt only if it gets worse.** A breach on an already-halted tracker
+>    decides nothing new (`LossTracker._halt`), so the next write adopts the
+>    release instead of re-asserting the halt, and adopting it sets a baseline
+>    (`_set_release_baseline`): a daily or weekly limit past its setting at the
+>    release halts again only after another `release_step_pct` (1%) of capital
+>    is lost (one not reached stays as configured) — the daily floor
+>    for that risk day only; the weekly one counts only the accepted loss still
+>    inside the rolling window, so it lapses as that loss rolls out — and an
+>    MDD breach is rebased on current equity (on the first reading, if none
+>    yet). Floors persist as an `AuditLog` row (`risk_release_baseline`) and
+>    are restored at boot; no schema change. A release *is* the app's
+>    `kill_switch_reset` audit row (written with the clear), so one made while
+>    the worker was down, or before its tracker held the halt, is still applied
+>    — at boot, or by the poll. A halt restored from an older row
+>    is written to today's row at boot (`write_pending`) so the carry cannot
+>    overwrite a later release.
 >
-> ❌ **Still open**: clearing in-process `SAFE_MODE` *without* a restart, as
-> originally specified. The reset endpoint deliberately tells the operator a
-> worker restart is required, because the worker caches the flag at boot. That
-> half still depends on **P0-04** (per-broker SAFE_MODE map).
+> Tests: `backend/worker/tests/test_release_baseline.py`,
+> `tests/postgres/test_release_baseline_db.py`, and the updated
+> `test_kill_switch_convergence.py` / `test_mdd_flatten.py`.
 
-| Field | Value |
-|---|---|
 | **Purpose** | Once `SAFE_MODE` activates, there is no programmatic way to clear it without restarting the process. Operators must SSH in and restart the worker, which creates a window of uncontrolled state. |
 | **Risk Level** | MEDIUM |
 | **Implementation Complexity** | Low — add `POST /admin/safe-mode/reset` with admin token auth; call `safe_mode_map[broker].clear()` |
-| **Dependencies** | P0-04 (per-broker SAFE_MODE map) |
+| **Dependencies** | ~~P0-04~~ — not needed while the worker is single-broker (see above) |
 | **Operational Impact** | Controlled recovery path without process restart; audit log of who reset which broker |
 | **Affected Files** | `backend/api/routers/` (new `admin.py`), `backend/worker/recovery.py` |
 | **Deployment Priority** | 12 of 15 |
