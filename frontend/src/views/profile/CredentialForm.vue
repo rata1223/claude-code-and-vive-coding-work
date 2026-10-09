@@ -16,45 +16,70 @@
       />
       <van-cell
         :title="$t('credentials.exchange')"
-        :value="selectedExchangeLabel || $t('credentials.exchange_placeholder')"
+        :value="selectedBrokerLabel || $t('credentials.exchange_placeholder')"
         is-link
-        @click="showExchangePicker = true"
-      />
-      <van-field
-        v-model="form.api_key"
-        label="API Key"
-        :placeholder="$t('credentials.api_key_placeholder')"
-      />
-      <van-field
-        v-model="form.secret_key"
-        label="Secret Key"
-        type="password"
-        :placeholder="$t('credentials.secret_key_placeholder')"
-      />
-      <van-field
-        v-model="form.passphrase"
-        label="Passphrase"
-        :placeholder="$t('credentials.passphrase_placeholder')"
+        @click="showBrokerPicker = true"
       />
 
-      <div class="switch-row">
-        <div>
-          <span class="switch-title">{{ $t('credentials.demo_enable') }}</span>
-          <p class="switch-desc">{{ $t('credentials.demo_desc') }}</p>
+      <!-- KIS: app key/secret, the account orders are placed on, HTS ID. -->
+      <template v-if="form.exchange_id === 'kis'">
+        <van-field
+          v-model="form.api_key"
+          label="App Key"
+          :placeholder="$t('credentials.api_key_placeholder')"
+        />
+        <van-field
+          v-model="form.secret_key"
+          label="App Secret"
+          type="password"
+          :placeholder="$t('credentials.secret_key_placeholder')"
+        />
+        <van-field
+          v-model="form.account_no"
+          :label="$t('credentials.account_no')"
+          :placeholder="$t('credentials.account_no_placeholder')"
+          maxlength="13"
+        />
+        <van-field
+          v-model="form.hts_id"
+          :label="$t('credentials.hts_id')"
+          :placeholder="$t('credentials.hts_id_placeholder')"
+        />
+        <div class="switch-row">
+          <div>
+            <span class="switch-title">{{ $t('credentials.demo_enable') }}</span>
+            <p class="switch-desc">{{ $t('credentials.demo_desc') }}</p>
+          </div>
+          <van-switch v-model="form.enable_demo_trading" size="20px" />
         </div>
-        <van-switch v-model="form.enable_demo_trading" size="20px" />
-      </div>
+      </template>
 
-      <van-button block type="primary" :loading="saving" @click="submit">
+      <!-- Kiwoom: not tradable yet, so nothing to save. -->
+      <van-notice-bar
+        v-else-if="form.exchange_id === 'kiwoom'"
+        :text="$t('credentials.kiwoom_unsupported')"
+        left-icon="info-o"
+        wrapable
+        :scrollable="false"
+        class="kiwoom-notice"
+      />
+
+      <van-button
+        block
+        type="primary"
+        :loading="saving"
+        :disabled="form.exchange_id !== 'kis'"
+        @click="submit"
+      >
         {{ $t('credentials.save') }}
       </van-button>
     </div>
 
-    <van-popup v-model:show="showExchangePicker" position="bottom" round>
+    <van-popup v-model:show="showBrokerPicker" position="bottom" round>
       <van-picker
-        :columns="exchangeColumns"
-        @cancel="showExchangePicker = false"
-        @confirm="onSelectExchange"
+        :columns="brokerColumns"
+        @cancel="showBrokerPicker = false"
+        @confirm="onSelectBroker"
       />
     </van-popup>
   </div>
@@ -65,61 +90,73 @@ import { showToast } from 'vant'
 import { credentialsApi } from '@/api'
 import { EXCHANGE_OPTIONS } from '@/constants/exchanges'
 
+/**
+ * A KIS account is 10 digits: the 8-digit CANO and the 2-digit product code
+ * (the backend splits it as [:8] / [8:]). It is usually written 50123456-01,
+ * so hyphens and spaces are dropped here — and again by the API.
+ */
+export function normalizeAccountNo(value) {
+  return String(value || '').replace(/[-\s]/g, '')
+}
+
+export function isKisAccountNo(value) {
+  return /^\d{10}$/.test(normalizeAccountNo(value))
+}
+
 export default {
   name: 'CredentialCreate',
 
   data() {
     return {
       saving: false,
-      showExchangePicker: false,
+      showBrokerPicker: false,
       form: {
         name: '',
-        exchange_id: '',
+        exchange_id: 'kis',
         api_key: '',
         secret_key: '',
-        passphrase: '',
-        enable_demo_trading: false
+        account_no: '',
+        hts_id: '',
+        // Paper by default: switching to real money is a deliberate act.
+        enable_demo_trading: true
       }
     }
   },
 
   computed: {
-    exchangeColumns() {
-      return EXCHANGE_OPTIONS.map((item) => ({
-        text: item.label,
-        value: item.value
-      }))
+    brokerColumns() {
+      return EXCHANGE_OPTIONS.map((item) => ({ text: item.label, value: item.value }))
     },
-    selectedExchangeLabel() {
+    selectedBrokerLabel() {
       return EXCHANGE_OPTIONS.find((item) => item.value === this.form.exchange_id)?.label || ''
     }
   },
 
   methods: {
-    onSelectExchange(payload) {
+    onSelectBroker(payload) {
       const selected = payload?.selectedOptions?.[0] || payload?.selectedOption || payload?.[0] || payload
-      this.form.exchange_id = selected?.value || ''
-      this.showExchangePicker = false
+      this.form.exchange_id = selected?.value || 'kis'
+      this.showBrokerPicker = false
+    },
+
+    fail(key) {
+      showToast({ message: this.$t(key), type: 'fail' })
+      return false
     },
 
     validate() {
-      if (!this.form.name.trim()) {
-        showToast({ message: this.$t('credentials.name_required'), type: 'fail' })
-        return false
-      }
-      if (!this.form.exchange_id) {
-        showToast({ message: this.$t('credentials.exchange_required'), type: 'fail' })
-        return false
-      }
+      if (!this.form.name.trim()) return this.fail('credentials.name_required')
+      if (this.form.exchange_id !== 'kis') return this.fail('credentials.kiwoom_unsupported')
       if (!this.form.api_key.trim() || !this.form.secret_key.trim()) {
-        showToast({ message: this.$t('credentials.keys_required'), type: 'fail' })
-        return false
+        return this.fail('credentials.keys_required')
       }
+      if (!normalizeAccountNo(this.form.account_no)) return this.fail('credentials.account_no_required')
+      if (!isKisAccountNo(this.form.account_no)) return this.fail('credentials.account_no_format')
       return true
     },
 
     async submit() {
-      if (!this.validate()) return
+      if (this.saving || !this.validate()) return
       this.saving = true
       try {
         await credentialsApi.create({
@@ -127,13 +164,15 @@ export default {
           exchange_id: this.form.exchange_id,
           api_key: this.form.api_key.trim(),
           secret_key: this.form.secret_key.trim(),
-          passphrase: this.form.passphrase.trim(),
+          account_no: normalizeAccountNo(this.form.account_no),
+          hts_id: this.form.hts_id.trim(),
           enable_demo_trading: this.form.enable_demo_trading
         })
         showToast({ message: this.$t('credentials.saved'), type: 'success' })
         this.$router.replace('/profile/credentials')
       } catch (error) {
         console.error('Create credential failed:', error)
+        showToast({ message: this.$t('credentials.save_failed'), type: 'fail' })
       } finally {
         this.saving = false
       }
@@ -191,6 +230,11 @@ export default {
   font-size: 12px;
   color: var(--text-2);
   line-height: 1.5;
+}
+
+.kiwoom-notice {
+  margin: 12px 0;
+  border-radius: 8px;
 }
 
 .credential-form-page :deep(.van-cell) {

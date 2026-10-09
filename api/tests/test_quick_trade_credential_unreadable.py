@@ -189,7 +189,9 @@ class TestReadPaths:
         resp = dashboard.get_pending_orders(1, user, db)
 
         assert resp.code == 1
-        assert seen == ["12345678-01"]
+        # A row stored in the written form is used as the 10 digits KIS
+        # splits [:8]/[8:] — the hyphen would otherwise be the product code.
+        assert seen == ["1234567801"]
 
 
 def test_the_recovery_sweep_skips_instead_of_querying_with_blank_credentials(

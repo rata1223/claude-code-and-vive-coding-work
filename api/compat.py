@@ -168,6 +168,22 @@ class CompatCredentialCreate(BaseModel):
         return None
 
     @model_validator(mode="after")
+    def _kis_account(self) -> "CompatCredentialCreate":
+        """A KIS account is 10 digits, split by the order path as
+        ``[:8]``/``[8:]`` (CANO + product code). It is usually written
+        ``50123456-01``: stored as ``5012345601``. Any other length would be
+        sent to KIS as a wrong account, so it is refused here. A KIS credential
+        without one is still accepted (the app forms require it; it cannot
+        trade until one is set — ``KISAuth.require_account``)."""
+        if self.account_no is not None:
+            from kis_adapter.auth import normalize_account_no
+            self.account_no = normalize_account_no(self.account_no) or None
+        if (self.exchange_id == "kis" and self.account_no is not None
+                and (len(self.account_no) != 10 or not self.account_no.isdigit())):
+            raise ValueError("KIS 계좌번호는 숫자 10자리입니다 (8자리-2자리, 예: 50123456-01)")
+        return self
+
+    @model_validator(mode="after")
     def _derive_env(self) -> "CompatCredentialCreate":
         if self.enable_demo_trading is not None:
             self.env = "paper" if self.enable_demo_trading else "real"
