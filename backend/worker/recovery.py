@@ -639,14 +639,15 @@ class StartupRecovery:
         except Exception as e:
             logger.warning("복구 포지션 DB 갱신 실패 (%s): %s", symbol, e)
 
-    def _audit_inconsistency(self, kind: str, detail: dict) -> None:
+    def _audit_inconsistency(self, kind: str, detail: dict,
+                             event_type: str = "recovery_inconsistency") -> None:
         """Append-only AuditLog write for a detected recovery inconsistency. Never raises."""
         try:
             from backend.database.models import AuditLog
             db = self._factory()
             try:
                 db.add(AuditLog(
-                    event_type="recovery_inconsistency",
+                    event_type=event_type,
                     symbol=detail.get("symbol"),
                     order_id=detail.get("order_id"),
                     actor="recovery",
@@ -792,27 +793,30 @@ class StartupRecovery:
             self._audit_inconsistency("order_status_event_mismatch", d)
         if unlogged:
             logger.info("주문 이력 없는 주문 %d건 — 이력 기록(P2-01) 이전 행", unlogged)
-        return len(data) + self._check_history_guard()
+        self._check_history_guard()
+        return len(data)
 
-    def _check_history_guard(self) -> int:
+    def _check_history_guard(self) -> None:
         """On Postgres, whether ``order_events`` is append-only below the ORM
         (``order_history.ensure_db_guard``). Its install never stops a process;
-        this is where a missing guard is reported. Returns the issues found."""
+        this is where a missing guard is reported — as its own audit event, not
+        a ``recovery_inconsistency``: it is about the database, not about the
+        orders and positions those rows describe."""
         try:
             from backend.database.order_history import guard_installed
             db = self._factory()
             try:
                 if db.get_bind().dialect.name != "postgresql" or guard_installed(db):
-                    return 0
+                    return
             finally:
                 db.close()
         except Exception as e:
             logger.warning("주문 이력 트리거 확인 실패 (계속 진행): %s", e)
-            return 0
-        logger.error("일관성 경고 — order_events append-only 트리거 없음: DB 수준에서 이력을 "
+            return
+        logger.error("order_events append-only 트리거 없음: DB 수준에서 이력을 "
                      "고치거나 지울 수 있다 (ORM 가드만 동작)")
-        self._audit_inconsistency("order_events_guard_missing", {"table": "order_events"})
-        return 1
+        self._audit_inconsistency("order_events_guard_missing", {"table": "order_events"},
+                                  event_type="order_events_guard_missing")
 
     def _step_enable_trading(self) -> bool:
         import os

@@ -172,11 +172,14 @@ def test_recovery_reports_a_missing_guard(scratch_db_url):
     def audited():
         with f() as s:
             return [r.detail for r in s.query(AuditLog)
-                    .filter(AuditLog.event_type == "recovery_inconsistency")]
+                    .filter(AuditLog.event_type == "order_events_guard_missing")]
 
     try:
         StartupRecovery(db_session_factory=f)._step_validate_state()
-        assert any("order_events_guard_missing" in d for d in audited())
+        assert len(audited()) == 1
+        with f() as s:
+            assert s.query(AuditLog).filter(
+                AuditLog.event_type == "recovery_inconsistency").count() == 0
 
         from backend.database.order_history import ensure_db_guard
         assert ensure_db_guard(eng) is True
