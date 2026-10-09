@@ -42,6 +42,11 @@ class HaltCause(Enum):
     #: validated live execution price (P0-07 G2 rules).
     DEGRADED_FEED = "degraded_feed"
 
+    #: A real fill could not be recorded (P1-10): the database says less than
+    #: the broker. The in-memory tracker has the fill, so exits stay possible;
+    #: only a restart, whose recovery reconciles with the broker, clears it.
+    RECORD_FAILURE = "record_failure"
+
 
 class OperationClass(Enum):
     ENTRY = "entry"                  # creates exposure — or cannot be proven not to
@@ -58,6 +63,7 @@ def is_allowed(cause: Optional[HaltCause], op: OperationClass) -> bool:
     | RUNNING               | ALLOW | ALLOW | ALLOW     | ALLOW        |
     | HALT(RISK_BREACH)     | BLOCK | ALLOW | ALLOW     | ALLOW        |
     | HALT(DEGRADED_FEED)   | BLOCK | ALLOW*| ALLOW*    | ALLOW        |
+    | HALT(RECORD_FAILURE)  | BLOCK | ALLOW | ALLOW     | ALLOW        |
     | HALT(UNTRUSTED_STATE) | BLOCK | BLOCK | ALLOW     | ALLOW        |
 
     *EXIT/EMERGENCY under DEGRADED_FEED additionally require a valid live
@@ -74,7 +80,8 @@ def is_allowed(cause: Optional[HaltCause], op: OperationClass) -> bool:
         return False
     # EXIT: allowed unless the halt says our position data is untrustworthy.
     # Listed positively so an unrecognised cause fails closed (R1/R3).
-    return cause in (HaltCause.RISK_BREACH, HaltCause.DEGRADED_FEED)
+    return cause in (HaltCause.RISK_BREACH, HaltCause.DEGRADED_FEED,
+                     HaltCause.RECORD_FAILURE)
 
 
 def is_valid_execution_price(raw) -> bool:

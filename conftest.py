@@ -3,18 +3,17 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
-def _isolate_fill_write_failure():
-    """A test that makes a fill write fail latches the worker's process-level
-    flag and closes ``SAFE_MODE`` (P1-10). Undo both after that test only, so
-    the rest of the session runs as it did before the flag existed."""
+def _isolate_fill_write_latch():
+    """A test that makes a fill write fail latches the worker's ``SAFE_MODE``
+    until the process ends (P1-10). Undo it after that test only, so the rest
+    of the session runs as it did before the latch existed."""
     try:
-        from backend.worker import recovery
+        from backend.worker.recovery import SAFE_MODE as gate
     except Exception:          # suites that do not import the worker
         yield
         return
-    gate = recovery.SAFE_MODE
     saved = (gate._can_trade, gate._reason, gate._cause)
     yield
-    if recovery._fill_write_failure is not None:
-        recovery._fill_write_failure = None
+    if gate._latch is not None:
+        gate._latch = None
         gate._can_trade, gate._reason, gate._cause = saved

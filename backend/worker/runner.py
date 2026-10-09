@@ -1734,11 +1734,12 @@ class StrategyWorker:
         never add up to more than the order's quantity.
 
         A fill that cannot be recorded — the write raised, or there is no row
-        to file it under — closes ``SAFE_MODE`` and alerts the operator
-        (``report_fill_write_failure``, P1-10). A skipped duplicate or a
+        to file it under — latches ``SAFE_MODE`` until a restart and alerts the
+        operator (``report_fill_write_failure``, P1-10). A skipped duplicate or a
         refused overfill is a decision, not a failure.
         """
         failure = None
+        qty = fill.qty
         try:
             with _session() as db:
                 db_order = None
@@ -1766,7 +1767,6 @@ class StrategyWorker:
                 db.refresh(db_order, with_for_update=True)
                 recorded = int(db.query(func.coalesce(func.sum(DBFill.qty), 0))
                                .filter(DBFill.order_id == db_order.id).scalar() or 0)
-                qty = fill.qty
                 if cumulative is not None:
                     if recorded >= cumulative:
                         logger.info("중복 체결 감지 — Fill 삽입 스킵: order=%s qty=%d 누적=%d (기록=%d)",
@@ -1826,9 +1826,9 @@ class StrategyWorker:
         finally:
             if failure is not None:
                 from backend.worker.recovery import report_fill_write_failure
-                report_fill_write_failure(order.id, fill.symbol, fill.qty, fill.price, failure)
-                _audit("fill_write_failed", symbol=fill.symbol, order_id=order.id,
-                       detail={"qty": fill.qty, "price": fill.price, "error": str(failure)})
+                # ``qty``: what was missing, after the broker-total adjustment.
+                report_fill_write_failure(order.id, fill.symbol, qty, fill.price, failure,
+                                          session_factory=_get_session_factory())
 
     def _restore_positions(self, tracker: PositionTracker, broker: str = "kis"):
         try:
