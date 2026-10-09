@@ -20,6 +20,7 @@ from datetime import datetime
 from types import SimpleNamespace
 
 import redis
+from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 
 from backend.brokers.kis import KISBroker, get_kis_broker
@@ -1561,7 +1562,8 @@ class StrategyWorker:
                     logger.warning("P&L 기록 실패: %s", e)
 
             # 4. Persist fill + update order status
-            self._persist_fill(fill, order, row_id=row_id, filled_total=filled_total)
+            self._persist_fill(fill, order, row_id=row_id, filled_total=filled_total,
+                              cumulative=order.cumulative_filled_qty)
 
             # 5. Upsert position in DB to reflect fill
             self._upsert_position_db(fill.symbol, fill.market, tracker.get_position(fill.symbol))
@@ -1704,7 +1706,7 @@ class StrategyWorker:
             logger.warning("주문 DB 저장 실패: %s", e)
 
     def _persist_fill(self, fill: Fill, order: Order, row_id: int | None = None,
-                      filled_total: int | None = None):
+                      filled_total: int | None = None, cumulative: int | None = None):
         """File one fill under its order's row.
 
         ``row_id`` is the row the fill pipeline settled on while the symbol was
@@ -1721,6 +1723,15 @@ class StrategyWorker:
         (`_persist_order` wrote it in step 1), so it is set, never added to.
         Without it — the machine skipped this order — ``fill.qty`` is the
         increment and is added, which is the only write in that case.
+
+        ``cumulative`` is the order's broker-reported filled total once this
+        fill is in (``Order.cumulative_filled_qty``, set by the poller). It is
+        the fill's identity: a redelivery of this fill carries the same total,
+        a second fill of the same size a larger one (P2-03). The fills already
+        on file add up to how far the order has been recorded, so the fill is
+        a duplicate exactly when they already reach ``cumulative``. Without it
+        nothing tells the two apart, and only the invariant is checked: fills
+        never add up to more than the order's quantity.
         """
         try:
             with _session() as db:
@@ -1737,16 +1748,28 @@ class StrategyWorker:
                 if db_order is None:
                     logger.warning("체결 DB 저장 스킵: 미등록 주문 %s", order.id)
                     return
-                # Idempotency: skip if a matching fill row already exists for this order.
-                # Keeps the append-only fill history correct if the same fill is delivered
-                # twice (e.g. recovery callback + re-registered poller callback racing).
-                dup = db.query(DBFill).filter(
-                    DBFill.order_id == db_order.id,
-                    DBFill.qty == fill.qty,
-                    DBFill.price == fill.price,
-                ).first()
-                if dup is not None:
-                    logger.info("중복 체결 감지 — Fill 삽입 스킵: order=%s qty=%d", order.id, fill.qty)
+                # Idempotency. The poller's watermark is the first line: it hands
+                # each increment over once. This is the second, for a fill that
+                # reaches here twice anyway. Not by (qty, price): two real fills
+                # of 5 at the limit price share that key, and the second was
+                # dropped. The row is locked first so two sessions cannot both
+                # pass the check (no-op on SQLite).
+                db.query(DBOrder.id).filter(DBOrder.id == db_order.id).with_for_update().one()
+                recorded = int(db.query(func.coalesce(func.sum(DBFill.qty), 0))
+                               .filter(DBFill.order_id == db_order.id).scalar() or 0)
+                if cumulative is not None:
+                    if recorded >= cumulative:
+                        logger.info("중복 체결 감지 — Fill 삽입 스킵: order=%s qty=%d 누적=%d (기록=%d)",
+                                    order.id, fill.qty, cumulative, recorded)
+                        return
+                elif db_order.qty and recorded + fill.qty > db_order.qty:
+                    order_qty = db_order.qty
+                    db.rollback()  # release the row lock before auditing
+                    logger.error("과체결 체결 거부: order=%s 기록=%d + %d > 주문 %d",
+                                 order.id, recorded, fill.qty, order_qty)
+                    _audit("fill_overfill_rejected", symbol=fill.symbol, order_id=order.id,
+                           detail={"recorded": recorded, "qty": fill.qty, "price": fill.price,
+                                   "order_qty": order_qty})
                     return
                 row = DBFill(order_id=db_order.id, qty=fill.qty, price=fill.price)
                 db.add(row)

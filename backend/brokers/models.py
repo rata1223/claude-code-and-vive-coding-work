@@ -84,6 +84,11 @@ class Order:
     filled_qty: int = 0
     avg_fill_price: float = 0.0
     raw: dict = field(default_factory=dict)
+    #: Set only on the copy ``OrderFillPoller`` hands a fill callback, whose
+    #: ``filled_qty`` is the increment: the order's total filled quantity once
+    #: that increment is in. It is what tells a redelivered fill (same total)
+    #: from a second fill of the same size (larger total) — P2-03.
+    cumulative_filled_qty: Optional[int] = None
 
 
 @dataclass
