@@ -802,9 +802,11 @@ class TestDuplicateEvent:
             broker_order_id="ORD001", symbol="005930",
         )
 
-        # Call twice — second call must be a no-op
-        w._persist_fill(fill, order)
-        w._persist_fill(fill, order)
+        # Call twice with the total the poller reports — second call must be a
+        # no-op. The total is what makes it a redelivery: without it, a second
+        # 5-share fill of a 10-share order is a real fill (P2-03).
+        w._persist_fill(fill, order, cumulative=5)
+        w._persist_fill(fill, order, cumulative=5)
 
         # 상태 일관성: only 1 DBFill row and filled_qty not double-counted
         sess = db_factory()

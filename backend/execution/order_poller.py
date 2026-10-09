@@ -367,7 +367,8 @@ class OrderFillPoller:
             if incremental > 0:
                 # Pass a copy with filled_qty=incremental so the callback records
                 # only the new quantity — same convention as PARTIAL_FILLED.
-                final_fill = dataclasses.replace(updated, filled_qty=incremental)
+                final_fill = dataclasses.replace(updated, filled_qty=incremental,
+                                                 cumulative_filled_qty=updated.filled_qty)
                 try:
                     entry.on_filled(final_fill)
                 except Exception as e:
@@ -429,7 +430,8 @@ class OrderFillPoller:
                             updated.id, incremental, updated.filled_qty, updated.qty)
                 # Pass a copy with filled_qty=incremental so the callback records
                 # only the new quantity without double-counting prior partials.
-                partial = dataclasses.replace(updated, filled_qty=incremental)
+                partial = dataclasses.replace(updated, filled_qty=incremental,
+                                              cumulative_filled_qty=updated.filled_qty)
                 try:
                     entry.on_filled(partial)
                 except Exception as e:
