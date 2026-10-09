@@ -17,8 +17,8 @@ Every item below was checked against the code at this commit (P6-05, PR #220): t
 
 | Status | Count |
 |---|---|
-| ✅ DONE (some shipped differently from the prescription — the note says how) | 35 |
-| ⚠️ PARTIAL (incl. P2-01, phase 1 of 2) | 10 |
+| ✅ DONE (some shipped differently from the prescription — the note says how) | 34 |
+| ⚠️ PARTIAL | 11 |
 | ❌ OPEN | 4 |
 | ⏸ DEFERRED | 2 |
 | **Total** | **51** |
@@ -35,8 +35,9 @@ Every item below was checked against the code at this commit (P6-05, PR #220): t
 | P1-10 Fill-write failure surfaced | ⚠️ | A failed fill write is a warning only — no SAFE_MODE, no alert |
 | P1-12 Quantity tolerance | ❌ | `_QTY_TOLERANCE = 1` fixed |
 | P2-01 Order event log | ⚠️ | Phase 1 (the log) done; deriving state from it and dropping `orders.status` is P6 |
-| P2-03 Fill idempotency | ⚠️ | Checked in code, not by a unique constraint |
+| P2-03 Fill idempotency | ⚠️ | **Defect**: dedup key `(order_id, qty, price)` drops a second genuine partial fill of the same size and price; no unique constraint |
 | P2-06 Poller circuit breaker | ⚠️ | Poll failures only log CRITICAL after ten; nothing opens |
+| P6-02 Deploy gated on tests | ⚠️ | `deploy.yml` is disabled; manual deploys are not gated |
 | P3-02 Credential form | ⚠️ | **The web app's form has no account number or HTS ID** — a KIS credential saved from the web cannot trade |
 | P5-03 Risk system unification | ❌ | The app's quick-trade halt gate reads legacy Redis keys **nothing writes** — it never trips on losses |
 | P6-01 State-machine tests | ⚠️ | No exhaustive all-pairs transition test |
@@ -182,7 +183,7 @@ Any single incomplete P0 item is sufficient to block the paper→real transition
 
 #### P0-05 — Thread-safe `PersistentLossTracker`: add `RLock` around all read-modify-write operations — ✅ DONE
 
-> **Audit (2026-10-09):** `PersistentLossTracker._lock` is an `RLock` around every read-modify-write (`backend/quant/risk/engine.py:612`–`616`), and `record_pnl` decides under it (issue #158/#163).
+> **Audit (2026-10-09):** `PersistentLossTracker._lock` is an `RLock` (`backend/quant/risk/engine.py:616`) held around each read-modify-write: `record_pnl` evaluates under it (`:833`), so does `reset_daily` (`:841`), and `_write_db` snapshots under it (`:1041`) — issue #158/#163.
 >
 > Test gap: the concurrent test (`backend/database/tests/test_postgres_compat.py:109`) asserts no error and one row, not that the summed loss is exact.
 
@@ -201,9 +202,9 @@ Any single incomplete P0 item is sufficient to block the paper→real transition
 
 #### P0-06 — Fix US order status lookup: remove `output[0]` fallback — ✅ DONE
 
-> **Audit (2026-10-09):** The status lookups match the requested `odno` and never fall back to another row (`backend/brokers/kis.py:431`–`438`); a read failure raises instead of returning `None` (PR #196).
+> **Audit (2026-10-09):** The status lookups match the requested `odno` and never fall back to another row; a read failure raises instead of returning `None` (PR #196).
 >
-> Shipped as `None` = "read every page, no such order" rather than an `OrderNotFound` exception. Test: `backend/brokers/tests/test_kr_order_status.py:35` (`test_matches_requested_order_not_first_row`).
+> Both lookups match on `odno` (`backend/brokers/kis.py:390` KR, `:435` US). Shipped as `None` = "read every page, no such order" rather than an `OrderNotFound` exception. Test gap: `backend/brokers/tests/test_kr_order_status.py:35` pins the KR path only; no test asserts the US match.
 
 | Field | Value |
 |---|---|
@@ -751,7 +752,7 @@ Makes the execution layer correct-by-construction rather than correct-by-convent
 
 ---
 
-#### P2-01 — Append-only `order_events` table: replace mutable status with event log — ✅ PHASE 1 DONE (PR #219)
+#### P2-01 — Append-only `order_events` table: replace mutable status with event log — ⚠️ PARTIAL (phase 1 of 2 done, PR #219)
 
 > **Phase 1 shipped: the log.** Every insert of an `orders` row and every change
 > of its status, fill (`filled_qty`, `avg_fill_price`) or broker order number
@@ -804,9 +805,9 @@ Makes the execution layer correct-by-construction rather than correct-by-convent
 
 #### P2-03 — Fill idempotency: deduplicate on `(order_id, seq_no)` before inserting — ⚠️ PARTIAL
 
-> **Audit (2026-10-09):** Deduplicated in code: `_persist_fill` skips a fill row that already exists for the order (`backend/worker/runner.py:1743`), and the poller seeds its watermark from the stored `filled_qty`. Test: `backend/worker/tests/test_recovery_safety.py` (C2).
+> **Audit (2026-10-09):** Deduplicated in code — **on a key that is too weak**: `_persist_fill` treats any existing fill row with the same `(order_id, qty, price)` as a duplicate (`backend/worker/runner.py:1743`–`1750`) and returns before writing anything. Two genuine partial fills of the same size at the limit price — normal for a limit order — are the same key, so **the second one is dropped** (on the path where the state machine did not see the order, `orders.filled_qty` misses it too). The poller also seeds its watermark from the stored `filled_qty`; test `backend/worker/tests/test_recovery_safety.py` (C2) covers only a true redelivery.
 >
-> No `UNIQUE(order_id, seq)` / `ON CONFLICT DO NOTHING` as prescribed, so two sessions can still race the check.
+> Fix needs a real fill identity (KIS execution number or the cumulative quantity a fill brings the order to), then the prescribed `UNIQUE` + `ON CONFLICT DO NOTHING` on it — a unique constraint on today's key would make the drop permanent. Two sessions can also still race the check.
 
 | Field | Value |
 |---|---|
@@ -892,7 +893,7 @@ Makes the execution layer correct-by-construction rather than correct-by-convent
 
 > **Audit (2026-10-09):** Mobile: account number (12 digits), HTS ID and paper toggle (`mobile/src/views/profile/CredentialForm.vue:31`–`35`).
 >
-> **Web: still the crypto form** — API Key / Secret Key / Passphrase, no account number or HTS ID (`frontend/src/views/profile/CredentialForm.vue:23`–`46`). The API maps only key and secret (`api/compat.py:142`), so a KIS credential saved from the web app has no account number.
+> **Web: still the crypto form** — API Key / Secret Key / Passphrase, no account number or HTS ID (`frontend/src/views/profile/CredentialForm.vue:23`–`46`). The API already accepts `account_no` and `hts_id` (`api/compat.py:142`–`153`); the web form never sends them, so a KIS credential saved from the web app has no account number — and orders need it (`CANO`, `kis_adapter/orders.py:46`). The fix is the form only.
 
 | Field | Value |
 |---|---|
@@ -1090,9 +1091,9 @@ Makes the execution layer correct-by-construction rather than correct-by-convent
 
 ---
 
-#### P6-02 — Integration test: paper trade dry-run must pass before any deploy — ✅ DONE
+#### P6-02 — Integration test: paper trade dry-run must pass before any deploy — ⚠️ PARTIAL
 
-> **Audit (2026-10-09):** The paper-trading harness and its E2E suites (`backend/testing/`, `tests/postgres/test_paper_e2e_db.py`, PRs #99/#102) run in CI, and deploy is gated on that workflow (PR #88). `scripts/test_paper_trade.py` itself belongs to the legacy `kis-bot` and is not a gate.
+> **Audit (2026-10-09):** The paper-trading harness and its E2E suites (`backend/testing/`, `tests/postgres/test_paper_e2e_db.py`, PRs #99/#102) run in CI, and `deploy.yml` is gated on that workflow (PR #88). **But `deploy.yml` is disabled** (`disabled_manually`) and deploys are manual over SSH, so today nothing stops a deploy on a red suite. `scripts/test_paper_trade.py` belongs to the legacy `kis-bot` and is not a gate.
 
 | Field | Value |
 |---|---|
@@ -1120,7 +1121,7 @@ Makes the execution layer correct-by-construction rather than correct-by-convent
 
 #### P6-04 — Gate `quantdinger` dependency behind env flag — ✅ DONE
 
-> **Audit (2026-10-09):** Nothing builds from `./quantdinger` any more — `docker-compose.yml` builds `./frontend` and `.` only. The upstream name survives only in container names and `QUANTDINGER_*` variables (CLAUDE.md known issue 14). `scripts/setup_oracle_cloud.sh:50` still clones the upstream repo — no longer needed; harmless, left for a deploy-script change.
+> **Audit (2026-10-09):** Nothing builds from `./quantdinger` any more — `docker-compose.yml` builds `./frontend` and `.` only. The upstream name survives only in container names and `QUANTDINGER_*` variables (CLAUDE.md known issue 14). `scripts/setup_oracle_cloud.sh:50` still clones the upstream repo and its comment still calls it required — not needed any more, and the clone lands inside the `.` build context (no `.dockerignore`), so every build ships it to the Docker daemon. Left for a deploy-script change.
 
 | Field | Value |
 |---|---|
