@@ -673,6 +673,9 @@ class StartupRecovery:
           4. two or more open rows sharing one broker order number — a KIS number
              restarts every day, so this means an earlier order was never closed
              and is now indistinguishable, by number, from a live one (issue #168)
+          5. an order whose status disagrees with its latest ``order_events``
+             row — a write that went around the session hook (P2-01). Orders
+             with no events at all predate the log and are only counted.
 
         Checks 3 and 4 count `unknown` as open, as the worker's order matching
         does: nothing re-polls such a row, so this report is how anyone learns
@@ -680,7 +683,8 @@ class StartupRecovery:
         """
         try:
             from sqlalchemy import func
-            from backend.database.models import Order as DBOrder, Position as DBPosition
+            from backend.database.models import (Order as DBOrder, OrderEvent,
+                                                 Position as DBPosition)
             issues = 0
             cutoff = datetime.utcnow() - timedelta(hours=_RECOVERY_STALE_ORDER_HOURS)
             db = self._factory()
@@ -713,6 +717,19 @@ class StartupRecovery:
                                if o.created_at else None}
                               for o in stale]
                 shared_data = [{"order_id": oid, "open_rows": n} for oid, n in shared]
+                latest = (db.query(OrderEvent.order_id, func.max(OrderEvent.id).label("eid"))
+                          .group_by(OrderEvent.order_id).subquery())
+                mismatched = (db.query(DBOrder, OrderEvent.to_status)
+                              .join(latest, latest.c.order_id == DBOrder.id)
+                              .join(OrderEvent, OrderEvent.id == latest.c.eid)
+                              .filter(OrderEvent.to_status != DBOrder.status)
+                              .all())
+                mismatch_data = [{"order_id": str(o.id), "symbol": o.symbol,
+                                  "status": o.status, "event_status": ev}
+                                 for o, ev in mismatched]
+                unlogged = (db.query(func.count(DBOrder.id))
+                            .filter(~DBOrder.id.in_(db.query(OrderEvent.order_id)))
+                            .scalar()) or 0
             finally:
                 db.close()
 
@@ -734,6 +751,13 @@ class StartupRecovery:
                                d["open_rows"], d["order_id"])
                 self._audit_inconsistency("duplicate_open_broker_order_id", d)
                 issues += 1
+            for d in mismatch_data:
+                logger.warning("일관성 경고 — 주문 상태가 이력과 다름: id=%s %s (%s, 이력 %s)",
+                               d["order_id"], d["symbol"], d["status"], d["event_status"])
+                self._audit_inconsistency("order_status_event_mismatch", d)
+                issues += 1
+            if unlogged:
+                logger.info("주문 이력 없는 주문 %d건 — 이력 기록(P2-01) 이전 행", unlogged)
 
             if issues:
                 logger.warning("복구 상태 일관성 검증: %d개 이슈 감지 — AuditLog 기록 완료", issues)

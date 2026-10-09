@@ -122,6 +122,27 @@ class Order(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
+class OrderEvent(Base):
+    """Append-only history of ``orders`` (P2-01): one row per insert and per
+    change of status, fill or broker order number, oldest first by ``id``.
+
+    Written by a session hook (``backend/database/order_history.py``) in the
+    same transaction as the change it records — no writer logs it by hand, so
+    none can forget to. ``orders`` stays the current-state read model.
+    ``order_id`` is ``orders.id``, unconstrained like ``fills.order_id``.
+    """
+    __tablename__ = "order_events"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    order_id = Column(Integer, nullable=False, index=True)
+    kind = Column(String(10), nullable=False)          # created | updated
+    from_status = Column(String(20), nullable=True)
+    to_status = Column(String(20), nullable=False)
+    filled_qty = Column(Integer, nullable=True)
+    avg_fill_price = Column(Float, nullable=True)
+    broker_order_id = Column(String(50), nullable=True)
+    recorded_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
 class Fill(Base):
     __tablename__ = "fills"
     id = Column(Integer, primary_key=True, autoincrement=True)
@@ -382,3 +403,10 @@ def init_db_factory(db_url: str) -> sessionmaker:
     engine = create_engine(db_url, pool_pre_ping=True, echo=False)
     Base.metadata.create_all(engine)
     return sessionmaker(bind=engine, expire_on_commit=False)
+
+
+# Every session records order history (P2-01). Imported here, at the end,
+# so any process or test that has the models has the hook too.
+from backend.database import order_history as _order_history  # noqa: E402
+
+_order_history.install()

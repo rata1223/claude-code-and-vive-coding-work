@@ -660,7 +660,23 @@ Makes the execution layer correct-by-construction rather than correct-by-convent
 
 ---
 
-#### P2-01 — Append-only `order_events` table: replace mutable status with event log
+#### P2-01 — Append-only `order_events` table: replace mutable status with event log — ✅ PHASE 1 DONE (PR #219)
+
+> **Phase 1 shipped: the log.** Every insert of an `orders` row and every change
+> of its status, fill (`filled_qty`, `avg_fill_price`) or broker order number
+> appends an `order_events` row — written by one session hook
+> (`backend/database/order_history.py`, `after_flush`) on the flush's own
+> connection, so the event commits or rolls back with the change. No writer
+> logs by hand (runner, recovery, reconciler, terminal events, harness were not
+> touched), so none can forget to. Append-only: the ORM refuses to update or
+> delete an event, and on Postgres the Alembic migration `e2f3a4b5c6d7` adds a
+> trigger refusing UPDATE/DELETE. A static guard keeps production code from
+> writing `orders` around a session (Core/bulk/raw SQL). Startup recovery
+> audits an order whose status disagrees with its latest event
+> (`order_status_event_mismatch`); orders from before the log are only counted.
+>
+> **Phase 2 — deferred to P6 (R-CRIT-03):** derive current state from the log
+> and drop the `orders.status` shadow. Readers still read `orders`.
 
 | Field | Value |
 |---|---|
