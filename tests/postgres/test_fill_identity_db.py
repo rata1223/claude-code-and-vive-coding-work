@@ -66,3 +66,42 @@ def test_a_concurrent_copy_of_the_same_fill_waits_and_is_skipped(factory):
 
     with factory() as s:
         assert s.query(DBFill).filter(DBFill.order_id == row_id).count() == 1
+
+
+def test_the_order_totals_start_from_what_the_other_session_committed(factory):
+    """The worker loads the row before it waits for the lock. A committed 5
+    shares while it waited; the row it then writes must say 10, not 0 + 5."""
+    with factory() as s:
+        row = DBOrder(broker_order_id=ODNO, symbol="005930", side="buy", qty=10,
+                      price=70000.0, filled_qty=0, status="submitted",
+                      market="KR", broker="kis", created_at=datetime.utcnow())
+        s.add(row)
+        s.commit()
+        row_id = row.id
+
+    w = runner.StrategyWorker.__new__(runner.StrategyWorker)
+    order = BOrder(id=ODNO, symbol="005930", side="buy", qty=10, price=70000.0,
+                   status=OrderStatus.FILLED, filled_qty=5, avg_fill_price=70000.0)
+    fill = Fill(order_id=ODNO, symbol="005930", side="buy", qty=5, price=70000.0, market="KR")
+
+    a = factory()
+    try:
+        locked = a.query(DBOrder).filter(DBOrder.id == row_id).with_for_update().one()
+        a.add(DBFill(order_id=row_id, qty=5, price=70000.0))
+        locked.filled_qty = 5
+        locked.status = "partial_filled"
+        a.flush()
+
+        t = threading.Thread(target=w._persist_fill, args=(fill, order),
+                             kwargs={"row_id": row_id})
+        t.start()
+        time.sleep(0.5)
+        assert t.is_alive()
+        a.commit()
+    finally:
+        a.close()
+    t.join(10)
+
+    with factory() as s:
+        assert s.get(DBOrder, row_id).filled_qty == 10
+        assert s.query(DBFill).filter(DBFill.order_id == row_id).count() == 2

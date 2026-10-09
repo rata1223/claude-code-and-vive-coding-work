@@ -139,6 +139,22 @@ class TestARedeliveryIsSkipped:
         assert len(_state(factory)[1]) == 2
 
 
+class TestTheBrokerTotalBoundsTheRecord:
+    def test_fills_on_file_behind_the_watermark(self, factory):
+        """3 shares are on file, the broker says 10 and the increment is 10:
+        the two records disagree. Only the 7 missing shares are filed and
+        `orders.filled_qty` is the broker's 10 — not 13 of a 10-share order."""
+        _seed_row(factory, filled_qty=3, status="partial_filled")
+        with factory() as s:
+            s.add(DBFill(order_id=s.query(DBOrder.id).scalar(), qty=3, price=70000.0))
+            s.commit()
+        w = _worker()
+
+        w._persist_fill(_fill(qty=10), _broker_order(10, OrderStatus.FILLED), cumulative=10)
+
+        assert _state(factory) == (10, [(3, 70000.0), (7, 70000.0)])
+
+
 class TestWithoutATotal:
     """Nothing in between told us the total (no poller), so a redelivery and a
     new fill look alike. Only the invariant can be checked."""
@@ -194,7 +210,9 @@ class TestThroughThePoller:
 
     def test_a_callback_retried_after_its_write_landed(self, factory):
         """The callback raised after `_persist_fill` committed, so the poller
-        kept its watermark and hands the same increment over again: one fill."""
+        kept its watermark and hands the same increment over again: one fill.
+        (The worker's callback catches each step's errors, so this is the
+        database's second line, not a path the pipeline is expected to take.)"""
         _seed_row(factory)
         poller, entry, seen = self._poller(factory)
         inner = entry.on_filled

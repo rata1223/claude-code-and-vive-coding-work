@@ -1752,16 +1752,26 @@ class StrategyWorker:
                 # each increment over once. This is the second, for a fill that
                 # reaches here twice anyway. Not by (qty, price): two real fills
                 # of 5 at the limit price share that key, and the second was
-                # dropped. The row is locked first so two sessions cannot both
-                # pass the check (no-op on SQLite).
-                db.query(DBOrder.id).filter(DBOrder.id == db_order.id).with_for_update().one()
+                # dropped. The row is locked, and re-read under the lock, first:
+                # two sessions cannot both pass the check, and the totals below
+                # start from what the other one committed (no-op on SQLite).
+                db.refresh(db_order, with_for_update=True)
                 recorded = int(db.query(func.coalesce(func.sum(DBFill.qty), 0))
                                .filter(DBFill.order_id == db_order.id).scalar() or 0)
+                qty = fill.qty
                 if cumulative is not None:
                     if recorded >= cumulative:
                         logger.info("중복 체결 감지 — Fill 삽입 스킵: order=%s qty=%d 누적=%d (기록=%d)",
                                     order.id, fill.qty, cumulative, recorded)
                         return
+                    if recorded + qty > cumulative:
+                        # The fills on file and the poller's watermark disagree
+                        # (a row from before this check, a fallback write). File
+                        # only what the broker's total says is missing.
+                        qty = cumulative - recorded
+                        logger.warning("체결 기록이 브로커 누적과 어긋남 — %d주만 기록: order=%s "
+                                       "기록=%d + %d > 누적 %d",
+                                       qty, order.id, recorded, fill.qty, cumulative)
                 elif db_order.qty and recorded + fill.qty > db_order.qty:
                     order_qty = db_order.qty
                     db.rollback()  # release the row lock before auditing
@@ -1771,11 +1781,15 @@ class StrategyWorker:
                            detail={"recorded": recorded, "qty": fill.qty, "price": fill.price,
                                    "order_qty": order_qty})
                     return
-                row = DBFill(order_id=db_order.id, qty=fill.qty, price=fill.price)
+                row = DBFill(order_id=db_order.id, qty=qty, price=fill.price)
                 db.add(row)
                 db_order.status = order.status.value
-                db_order.filled_qty = (filled_total if filled_total is not None
-                                       else (db_order.filled_qty or 0) + fill.qty)
+                if filled_total is not None:
+                    db_order.filled_qty = filled_total
+                elif cumulative is not None:
+                    db_order.filled_qty = cumulative     # the broker's own total
+                else:
+                    db_order.filled_qty = (db_order.filled_qty or 0) + fill.qty
                 db_order.avg_fill_price = order.avg_fill_price or fill.price
                 db.commit()
 
