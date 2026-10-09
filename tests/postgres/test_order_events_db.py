@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import threading
+from datetime import datetime
 import uuid
 
 import pytest
@@ -109,7 +110,7 @@ def test_the_migration_makes_the_table_append_only(scratch_db_url):
         with eng.begin() as c:
             c.execute(OrderEvent.__table__.insert(), {
                 "order_id": 1, "kind": "created", "to_status": "pending",
-                "recorded_at": sa.func.now()})
+                "recorded_at": datetime.utcnow()})
         for stmt in ("UPDATE order_events SET to_status = 'filled'",
                      "DELETE FROM order_events"):
             with pytest.raises(sa.exc.DBAPIError, match="append-only"):
