@@ -1764,13 +1764,15 @@ class StrategyWorker:
                         logger.info("중복 체결 감지 — Fill 삽입 스킵: order=%s qty=%d 누적=%d (기록=%d)",
                                     order.id, fill.qty, cumulative, recorded)
                         return
-                    if recorded + qty > cumulative:
-                        # The fills on file and the poller's watermark disagree
-                        # (a row from before this check, a fallback write). File
-                        # only what the broker's total says is missing.
+                    if recorded + qty != cumulative:
+                        # The fills on file and the poller's watermark disagree:
+                        # a row from before this check or a fallback write (more
+                        # on file), or an earlier fill write that failed (less).
+                        # File what the broker's total says is missing, so the
+                        # fills add up to the `filled_qty` written below.
                         qty = cumulative - recorded
-                        logger.warning("체결 기록이 브로커 누적과 어긋남 — %d주만 기록: order=%s "
-                                       "기록=%d + %d > 누적 %d",
+                        logger.warning("체결 기록이 브로커 누적과 어긋남 — %d주로 기록: order=%s "
+                                       "기록=%d + 증분 %d ≠ 누적 %d",
                                        qty, order.id, recorded, fill.qty, cumulative)
                 elif db_order.qty and recorded + fill.qty > db_order.qty:
                     order_qty = db_order.qty
@@ -1803,7 +1805,7 @@ class StrategyWorker:
                         actor="worker",
                         detail=json.dumps({
                             "side": fill.side,
-                            "qty": fill.qty,
+                            "qty": qty,
                             "price": fill.price,
                             "market": fill.market,
                         }),

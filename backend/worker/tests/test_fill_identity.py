@@ -153,6 +153,31 @@ class TestTheBrokerTotalBoundsTheRecord:
         w._persist_fill(_fill(qty=10), _broker_order(10, OrderStatus.FILLED), cumulative=10)
 
         assert _state(factory) == (10, [(3, 70000.0), (7, 70000.0)])
+        with factory() as s:
+            detail = s.query(AuditLog.detail).filter(AuditLog.event_type == "fill").scalar()
+        assert '"qty": 7' in detail                      # what was filed, not the increment
+
+    def test_a_fill_lost_to_an_earlier_failed_write(self, factory):
+        """The first 5-share write failed (a warning only), the poller moved on,
+        and the next 5 bring the broker total to 10. Nothing is on file: both
+        are filed, so the fills add up to the `filled_qty` of 10."""
+        _seed_row(factory)
+        w = _worker()
+
+        w._persist_fill(_fill(), _broker_order(5, OrderStatus.FILLED), cumulative=10)
+
+        assert _state(factory) == (10, [(10, 70000.0)])
+
+    def test_a_redelivery_after_the_first_write_failed_is_filed_once(self, factory):
+        """Nothing on file reaches 5, so the redelivered fill is not a
+        duplicate of anything recorded — it is the missing record."""
+        _seed_row(factory)
+        w = _worker()
+
+        w._persist_fill(_fill(), _broker_order(5), cumulative=5)
+        w._persist_fill(_fill(), _broker_order(5), cumulative=5)
+
+        assert _state(factory) == (5, [(5, 70000.0)])
 
 
 class TestWithoutATotal:
