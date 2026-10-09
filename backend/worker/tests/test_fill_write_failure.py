@@ -79,7 +79,7 @@ def _broken_session(monkeypatch):
 
 
 class TestAFailedWrite:
-    def test_closes_the_gate_as_untrusted_and_alerts(self, factory, alerts, monkeypatch):
+    def test_latches_the_gate_and_alerts(self, factory, alerts, monkeypatch):
         _broken_session(monkeypatch)
 
         _worker()._persist_fill(_fill(), _order(), cumulative=5)   # does not raise
@@ -153,12 +153,45 @@ class TestNothingReopensALatchedGate:
         assert is_allowed(gate.halt_cause, OperationClass.EXIT)
         assert not is_allowed(gate.halt_cause, OperationClass.ENTRY)
 
+    def test_a_risk_halt_does_not_loosen_an_untrusted_latch(self, gate, alerts):
+        """Latched during recovery (untrusted): a later risk halt must not
+        turn it into RECORD_FAILURE, which would allow exits."""
+        gate.disable("초기화 중", cause=HaltCause.UNTRUSTED_STATE)
+        recovery.report_fill_write_failure(ODNO, "005930", 5, 70000.0, RuntimeError("x"))
+        gate.disable("일일 손실 한도 초과", cause=HaltCause.RISK_BREACH)
+        assert gate.halt_cause is HaltCause.UNTRUSTED_STATE
+
     def test_an_untrusted_state_stays_untrusted(self, gate, alerts):
         gate.disable("복구 미완료", cause=HaltCause.UNTRUSTED_STATE)
         recovery.report_fill_write_failure(ODNO, "005930", 5, 70000.0, RuntimeError("x"))
         assert gate.halt_cause is HaltCause.UNTRUSTED_STATE
         gate.disable("또 다른 정지", cause=HaltCause.UNTRUSTED_STATE)
         assert gate.halt_cause is HaltCause.UNTRUSTED_STATE
+
+
+    def test_no_session_factory_still_latches(self, factory, alerts, monkeypatch):
+        """The factory itself cannot be built — that is the failure."""
+        _broken_session(monkeypatch)
+
+        def no_factory():
+            raise RuntimeError("DB 초기화 실패")
+        monkeypatch.setattr(runner, "_get_session_factory", no_factory)
+
+        _worker()._persist_fill(_fill(), _order(), cumulative=5)
+
+        assert recovery.SAFE_MODE.halt_cause is HaltCause.RECORD_FAILURE
+        assert len(alerts) == 1
+
+    def test_a_failed_audit_is_not_retried_for_every_fill(self, alerts):
+        calls = {"n": 0}
+
+        def down():
+            calls["n"] += 1
+            raise RuntimeError("DB 연결 끊김")
+        for _ in range(3):
+            recovery.report_fill_write_failure(ODNO, "005930", 5, 70000.0, RuntimeError("x"),
+                                               session_factory=down)
+        assert calls["n"] == 1
 
 
 class TestDecisionsAreNotFailures:
@@ -169,6 +202,45 @@ class TestDecisionsAreNotFailures:
         w._persist_fill(_fill(), _order(), cumulative=5)
 
         assert recovery.SAFE_MODE.can_trade and alerts == []
+
+    def test_a_redelivered_last_fill_after_its_row_closed(self, factory, alerts):
+        """The row closed with the last fill and the pipeline forgot it; the
+        same fill again finds no open row — its fills already reach the total."""
+        _seed(factory)
+        with factory() as s:
+            s.query(DBOrder).update({"trade_date": date(2026, 10, 9)})
+            s.commit()
+            row_id = s.query(DBOrder.id).scalar()
+        w = _worker()
+        w._persist_fill(_fill(qty=10), _order(10, OrderStatus.FILLED), row_id=row_id,
+                        cumulative=10)
+
+        w._persist_fill(_fill(qty=10), _order(10, OrderStatus.FILLED), cumulative=10)
+
+        assert recovery.SAFE_MODE.can_trade and alerts == []
+
+    def test_yesterdays_closed_row_with_the_number_is_another_order(self, factory, alerts):
+        """KIS numbers restart daily (#168): yesterday's filled order with this
+        number says nothing about today's fill, which has no row."""
+        _seed(factory)
+        with factory() as s:
+            s.query(DBOrder).update({"trade_date": date(2026, 10, 8), "status": "filled"})
+            s.add(DBFill(order_id=s.query(DBOrder.id).scalar(), qty=10, price=70000.0))
+            s.commit()
+
+        _worker()._persist_fill(_fill(), _order(), cumulative=5)
+
+        assert recovery.SAFE_MODE.halt_cause is HaltCause.RECORD_FAILURE
+
+    def test_a_closed_row_that_falls_short_is_still_a_failure(self, factory, alerts):
+        _seed(factory)
+        with factory() as s:
+            s.query(DBOrder).update({"trade_date": date(2026, 10, 9), "status": "canceled"})
+            s.commit()
+
+        _worker()._persist_fill(_fill(), _order(), cumulative=5)
+
+        assert recovery.SAFE_MODE.halt_cause is HaltCause.RECORD_FAILURE
 
     def test_a_refused_overfill(self, factory, alerts):
         _seed(factory)
@@ -191,6 +263,21 @@ class TestStartupRecovery:
         r._actions = []
         assert r._step_enable_trading() is False
         assert not recovery.SAFE_MODE.can_trade
+
+    def test_the_recovery_failure_reason_names_the_unrecorded_fill(self, alerts, monkeypatch):
+        """Through `run()`: its generic failure must still say why."""
+        recovery.report_fill_write_failure(ODNO, "005930", 5, 70000.0, RuntimeError("x"))
+        r = recovery.StartupRecovery.__new__(recovery.StartupRecovery)
+        r._actions, r._should_abort, r.halted_by_risk = [], lambda: False, False
+        steps = [m for m in dir(r) if m.startswith("_step_")]
+        for m in steps:
+            if m != "_step_enable_trading":
+                monkeypatch.setattr(r, m, lambda: True)
+        try:
+            r.run()
+        except Exception:
+            pass
+        assert ODNO in recovery.SAFE_MODE.reason
 
     def test_a_restored_kill_switch_does_not_make_it_resumable(self, alerts):
         """The kill-switch branch marks the worker resumable on release; it
@@ -226,6 +313,22 @@ class TestStartupRecovery:
 
         assert recovery.SAFE_MODE.halt_cause is HaltCause.RECORD_FAILURE
         assert len(alerts) == 1
+
+    def test_the_recovery_stub_reports_a_missing_row(self, factory, alerts):
+        from unittest.mock import MagicMock
+        _seed(factory)
+        poller = MagicMock()
+        r = recovery.StartupRecovery.__new__(recovery.StartupRecovery)
+        r._factory, r._broker, r._shared_poller = factory, MagicMock(), poller
+        r._step_pending_orders()
+        stub = poller.register.call_args.kwargs["on_filled"]
+        with factory() as s:
+            s.query(DBOrder).delete()
+            s.commit()
+
+        stub(_order())
+
+        assert recovery.SAFE_MODE.halt_cause is HaltCause.RECORD_FAILURE
 
     def test_the_recovery_stub_failure_is_audited(self, factory, alerts, monkeypatch):
         """Its session fails only on commit; the audit goes through a new one."""

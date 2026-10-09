@@ -231,27 +231,37 @@ class SafeModeState:
         return self._latch
 
     def enable(self) -> None:
-        if self._latch is not None:
-            # Every opener — the end of startup recovery, the kill-switch
-            # resume poll — goes through here; none may reopen past this.
-            logger.error("SafeMode 해제 거부 — 체결 기록 실패, 재시작 필요: %s", self._latch)
-            return
-        self._can_trade = True
-        self._reason = "정상"
-        self._cause = None
+        with self._latch_lock:
+            if self._latch is not None:
+                # Every opener — the end of startup recovery, the kill-switch
+                # resume poll — goes through here; none may reopen past this.
+                logger.error("SafeMode 해제 거부 — 체결 기록 실패, 재시작 필요: %s", self._latch)
+                return
+            self._can_trade = True
+            self._reason = "정상"
+            self._cause = None
         logger.info("SafeMode 해제 — 매매 허용")
 
     def disable(self, reason: str,
                 cause: Optional[HaltCause] = HaltCause.UNTRUSTED_STATE) -> None:
         cause = cause or HaltCause.UNTRUSTED_STATE
-        self._can_trade = False
-        self._reason = reason
-        if self._latch is not None and cause is not HaltCause.UNTRUSTED_STATE:
-            # A later risk halt must not turn this into one the resume poll
-            # reopens; only the stricter untrusted state replaces it.
-            cause = HaltCause.RECORD_FAILURE
-        self._cause = cause
-        logger.warning("SafeMode 활성화 [%s]: %s", self._cause.value, reason)
+        with self._latch_lock:
+            if self._latch is not None:
+                # A later halt must not turn this into one the resume poll
+                # reopens, nor loosen an untrusted state into one that allows
+                # exits: untrusted wins, anything else stays RECORD_FAILURE.
+                untrusted = (cause is HaltCause.UNTRUSTED_STATE
+                             or (not self._can_trade
+                                 and self._cause is HaltCause.UNTRUSTED_STATE))
+                cause = HaltCause.UNTRUSTED_STATE if untrusted else HaltCause.RECORD_FAILURE
+                if self._latch not in reason:
+                    # The reason the operator reads must keep saying a fill
+                    # is unrecorded, whatever halts on top of it.
+                    reason = f"{reason} — {self._latch}"
+            self._can_trade = False
+            self._reason = reason
+            self._cause = cause
+        logger.warning("SafeMode 활성화 [%s]: %s", cause.value, reason)
 
     def latch(self, reason: str) -> bool:
         """Shut the gate for a fill that could not be recorded (P1-10) until
@@ -266,7 +276,8 @@ class SafeModeState:
             self._can_trade = False
             self._reason = reason
             self._cause = HaltCause.UNTRUSTED_STATE if stricter else HaltCause.RECORD_FAILURE
-        logger.warning("SafeMode 고정 [%s]: %s", self._cause.value, reason)
+            cause = self._cause
+        logger.warning("SafeMode 고정 [%s]: %s", cause.value, reason)
         return first
 
     def __repr__(self) -> str:
@@ -276,6 +287,11 @@ class SafeModeState:
 
 # Process-level safe mode gate — strategies should check this before placing orders
 SAFE_MODE = SafeModeState()
+
+
+#: Set when a ``fill_write_failed`` audit could not be written; later failures
+#: in this process only log and latch.
+_audit_down = False
 
 
 def report_fill_write_failure(order_id, symbol, qty, price, error,
@@ -292,7 +308,8 @@ def report_fill_write_failure(order_id, symbol, qty, price, error,
     reason = f"체결 기록 실패: order={order_id} {symbol} {qty}주 @ {price} — {error}"
     logger.error(reason)
     first = SAFE_MODE.latch(reason)
-    if session_factory is not None:
+    global _audit_down
+    if session_factory is not None and not _audit_down:
         try:
             from backend.database.models import AuditLog
             sess = session_factory()
@@ -306,7 +323,10 @@ def report_fill_write_failure(order_id, symbol, qty, price, error,
             finally:
                 sess.close()
         except Exception as e:
-            logger.warning("fill_write_failed 감사 기록 실패: %s", e)
+            # The database is likely what failed: don't spend another connect
+            # timeout on the poller thread for every further fill.
+            _audit_down = True
+            logger.warning("fill_write_failed 감사 기록 실패 — 이후 감사 생략: %s", e)
     if not first:
         return
     try:
@@ -598,7 +618,9 @@ class StartupRecovery:
                         sess = self._factory()
                         try:
                             row = sess.get(DBOrder, db_order_pk)
-                            if row:
+                            if row is None:
+                                failure = "주문 행 없음"
+                            else:
                                 fill_qty = order.filled_qty or order.qty
                                 fill_price = order.avg_fill_price or order.price
                                 # P3-02C-D F2: the poller delivers INCREMENTAL fill
