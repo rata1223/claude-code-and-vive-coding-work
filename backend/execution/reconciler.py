@@ -170,7 +170,7 @@ class PositionReconciler:
 
     def _reconcile_positions(self, broker_pos: dict[str, Position],
                              result: ReconciliationResult, dry_run: bool):
-        from backend.database.models import Position as DBPosition
+        from backend.database.models import Position as DBPosition, insert_position_if_missing
 
         with _session(self._factory) as db:
             # P2-02C: CONFIRMED corporate actions detected during this run. We
@@ -201,18 +201,24 @@ class PositionReconciler:
                     result.gap("missing_in_db", sym,
                                f"브로커 qty={bp.qty} avg={bp.avg_price:.2f} — DB 없음")
                     if not dry_run:
-                        self._audit_position_change(
-                            "reconcile_insert", sym,
-                            {"broker_qty": bp.qty, "broker_avg": bp.avg_price,
-                             "broker_name": self._broker_name, "trigger": result.trigger},
-                        )
-                        new_row = DBPosition(
-                            symbol=sym, qty=bp.qty, avg_price=bp.avg_price,
-                            market=bp.market, broker=self._broker_name,
-                        )
-                        db.add(new_row)
-                        result.repaired("insert_position", sym,
-                                        f"DB에 포지션 추가: qty={bp.qty}")
+                        # P0-09: ON CONFLICT DO NOTHING. A row another writer
+                        # (the fill pipeline) inserted after this pass read the
+                        # table is newer than this snapshot — leave it for the
+                        # next pass. A plain add would fail this pass's single
+                        # commit and roll back every other repair in it.
+                        if insert_position_if_missing(
+                                db, symbol=sym, broker=self._broker_name, qty=bp.qty,
+                                avg_price=bp.avg_price, market=bp.market):
+                            self._audit_position_change(
+                                "reconcile_insert", sym,
+                                {"broker_qty": bp.qty, "broker_avg": bp.avg_price,
+                                 "broker_name": self._broker_name, "trigger": result.trigger},
+                            )
+                            result.repaired("insert_position", sym,
+                                            f"DB에 포지션 추가: qty={bp.qty}")
+                        else:
+                            result.gap("position_appeared_during_reconcile", sym,
+                                       "재조정 중 다른 쓰기가 포지션을 추가함 — 다음 회차에 비교")
                 else:
                     qty_diff = abs(dp["qty"] - bp.qty)
                     price_changed = abs(dp["avg_price"] - bp.avg_price) > 0.01
