@@ -2,12 +2,47 @@
 
 **Version**: 1.0  
 **Date**: 2026-05-29  
-**Status**: PLANNING — do not begin implementation until P0 is fully reviewed  
+**Status**: IN PROGRESS — every item audited against the code on 2026-10-09; see [Status at a glance](#status-at-a-glance-2026-10-09-main-f02dbf7)  
 **Depends on**: [`PHILOSOPHY.md`](PHILOSOPHY.md), [`AUDIT.md`](AUDIT.md), [`BROKER_SEMANTICS.md`](BROKER_SEMANTICS.md)
 
 > This roadmap translates the audit findings in `AUDIT.md` into a phased, dependency-respecting action plan.
 > Every task references the originating defect, risk, or constraint code from the audit.
 > Capital context: ₩2,000,000 (~$1,500 USD). A single duplicate order or unrecovered crash is material.
+
+---
+
+## Status at a glance (2026-10-09, main `f02dbf7`)
+
+Every item below was checked against the code at this commit (P6-05, PR #220): the heading carries the status and an **Audit** note cites the file and line. Unmarked items no longer exist.
+
+| Status | Count |
+|---|---|
+| ✅ DONE (some shipped differently from the prescription — the note says how) | 35 |
+| ⚠️ PARTIAL (incl. P2-01, phase 1 of 2) | 10 |
+| ❌ OPEN | 4 |
+| ⏸ DEFERRED | 2 |
+| **Total** | **51** |
+
+**What is left — the next-work candidates**, by phase:
+
+| Item | Status | Gap |
+|---|---|---|
+| P0-02 Pre-submission fence | ⚠️ | Worker strategy orders are recorded only after `place_order` returns (the app's quick-trade path reserves first) |
+| P0-09 Atomic position upsert | ⚠️ | SELECT-then-write without `ON CONFLICT`; a racing first insert leaves the row stale until the next fill |
+| P0-13 FK constraints | ❌ | No foreign keys; `fills.order_id` is unconstrained (schema change on an existing table) |
+| P1-03 Client order id before submit | ❌ | KIS has no client order id; tied to P0-02 |
+| P1-08 Legacy bot removal | ⚠️ | `kis-bot` disabled, but `bot/` stays — `bot/notifier.py` is the worker's alert path |
+| P1-10 Fill-write failure surfaced | ⚠️ | A failed fill write is a warning only — no SAFE_MODE, no alert |
+| P1-12 Quantity tolerance | ❌ | `_QTY_TOLERANCE = 1` fixed |
+| P2-01 Order event log | ⚠️ | Phase 1 (the log) done; deriving state from it and dropping `orders.status` is P6 |
+| P2-03 Fill idempotency | ⚠️ | Checked in code, not by a unique constraint |
+| P2-06 Poller circuit breaker | ⚠️ | Poll failures only log CRITICAL after ten; nothing opens |
+| P3-02 Credential form | ⚠️ | **The web app's form has no account number or HTS ID** — a KIS credential saved from the web cannot trade |
+| P5-03 Risk system unification | ❌ | The app's quick-trade halt gate reads legacy Redis keys **nothing writes** — it never trips on losses |
+| P6-01 State-machine tests | ⚠️ | No exhaustive all-pairs transition test |
+| P6-03 Compose health checks | ⚠️ | None on frontend, kis-worker, kis-ws |
+
+Deferred: P0-04 (per-broker SAFE_MODE — single-broker worker) and P4-04 (FX in the disabled legacy `bot/main.py`).
 
 ---
 
@@ -46,7 +81,11 @@ Any single incomplete P0 item is sufficient to block the paper→real transition
 
 ---
 
-#### P0-02 — Pre-submission fence: write PENDING before every `place_order()` call
+#### P0-02 — Pre-submission fence: write PENDING before every `place_order()` call — ⚠️ PARTIAL
+
+> **Audit (2026-10-09):** The app's quick-trade path reserves before it sends: `reserve_and_submit` writes a `QT_RESERVED` row first (`api/services/quick_trade_service.py:118`).
+>
+> The **worker** strategy path does not: `StrategyBase.buy/sell` call `place_order` directly (`backend/strategy/base.py:172`, `:196`) and the order reaches the state machine only afterwards (`_register_order`, `backend/strategy/indicator/strategy.py:217` — "after placement"). A crash between the two leaves an order the DB never saw; reconciliation (broker = ground truth) is what finds it.
 
 | Field | Value |
 |---|---|
@@ -141,7 +180,11 @@ Any single incomplete P0 item is sufficient to block the paper→real transition
 
 ---
 
-#### P0-05 — Thread-safe `PersistentLossTracker`: add `RLock` around all read-modify-write operations
+#### P0-05 — Thread-safe `PersistentLossTracker`: add `RLock` around all read-modify-write operations — ✅ DONE
+
+> **Audit (2026-10-09):** `PersistentLossTracker._lock` is an `RLock` around every read-modify-write (`backend/quant/risk/engine.py:612`–`616`), and `record_pnl` decides under it (issue #158/#163).
+>
+> Test gap: the concurrent test (`backend/database/tests/test_postgres_compat.py:109`) asserts no error and one row, not that the summed loss is exact.
 
 | Field | Value |
 |---|---|
@@ -156,7 +199,11 @@ Any single incomplete P0 item is sufficient to block the paper→real transition
 
 ---
 
-#### P0-06 — Fix US order status lookup: remove `output[0]` fallback
+#### P0-06 — Fix US order status lookup: remove `output[0]` fallback — ✅ DONE
+
+> **Audit (2026-10-09):** The status lookups match the requested `odno` and never fall back to another row (`backend/brokers/kis.py:431`–`438`); a read failure raises instead of returning `None` (PR #196).
+>
+> Shipped as `None` = "read every page, no such order" rather than an `OrderNotFound` exception. Test: `backend/brokers/tests/test_kr_order_status.py:35` (`test_matches_requested_order_not_first_row`).
 
 | Field | Value |
 |---|---|
@@ -171,7 +218,11 @@ Any single incomplete P0 item is sufficient to block the paper→real transition
 
 ---
 
-#### P0-07 — Populate `idempotency_key` in `_persist_order()` using deterministic schema
+#### P0-07 — Populate `idempotency_key` in `_persist_order()` using deterministic schema — ✅ DONE
+
+> **Audit (2026-10-09):** `_persist_order` sets a deterministic key (broker order id, symbol, side, Seoul date — PR #215) and the column is unique (`backend/worker/runner.py:1667`, `backend/database/models.py:105`). A duplicate is skipped, not re-inserted.
+>
+> The key is `NULL` only for an order with no broker id, which is never registered (P3-02B orphan path).
 
 | Field | Value |
 |---|---|
@@ -186,7 +237,9 @@ Any single incomplete P0 item is sufficient to block the paper→real transition
 
 ---
 
-#### P0-08 — Add `UniqueConstraint("symbol", "broker")` to `positions` table
+#### P0-08 — Add `UniqueConstraint("symbol", "broker")` to `positions` table — ✅ DONE
+
+> **Audit (2026-10-09):** `uq_position_symbol_broker` (`backend/database/models.py:184`). Test: `tests/postgres/test_pg_regression.py:57`.
 
 | Field | Value |
 |---|---|
@@ -201,7 +254,11 @@ Any single incomplete P0 item is sufficient to block the paper→real transition
 
 ---
 
-#### P0-09 — Fix `db.merge()` → explicit upsert using `ON CONFLICT DO UPDATE`
+#### P0-09 — Fix `db.merge()` → explicit upsert using `ON CONFLICT DO UPDATE` — ⚠️ PARTIAL
+
+> **Audit (2026-10-09):** `db.merge()` is gone, and the unique constraint (P0-08) rules out duplicate rows. `_upsert_position_db` writes the tracker's absolute quantity (`backend/worker/runner.py:1910`).
+>
+> Still a SELECT then UPDATE/INSERT, without `ON CONFLICT DO UPDATE` or a row lock: two first inserts for one symbol race, the loser's `IntegrityError` is logged and that row stays stale until the next fill.
 
 | Field | Value |
 |---|---|
@@ -435,7 +492,9 @@ Any single incomplete P0 item is sufficient to block the paper→real transition
 
 ---
 
-#### P0-13 — Add FK constraints: `fills.order_id → orders.id`, `trades.order_id → orders.id`
+#### P0-13 — Add FK constraints: `fills.order_id → orders.id`, `trades.order_id → orders.id` — ❌ OPEN
+
+> **Audit (2026-10-09):** No `ForeignKey` anywhere in `backend/database/models.py`; `fills.order_id` (and `order_events.order_id`, PR #219) are plain integers. Adding one is a schema change on an existing table — plan it with the `create_all` caveat (#194).
 
 | Field | Value |
 |---|---|
@@ -450,7 +509,11 @@ Any single incomplete P0 item is sufficient to block the paper→real transition
 
 ---
 
-#### P0-14 — Alembic migration framework
+#### P0-14 — Alembic migration framework — ✅ DONE
+
+> **Audit (2026-10-09):** `alembic/` with four revisions (head `e2f3a4b5c6d7`, PR #219). CI runs upgrade → downgrade → upgrade on a fresh database (`.github/workflows/ci-postgres.yml`).
+>
+> Production tables still come from `create_all` (`init_db_factory`); Alembic is the reviewed record of the schema, not what boots it.
 
 | Field | Value |
 |---|---|
@@ -465,7 +528,9 @@ Any single incomplete P0 item is sufficient to block the paper→real transition
 
 ---
 
-#### P0-15 — Fix CORS: replace `allow_origins=["*"]` with env-var allowlist
+#### P0-15 — Fix CORS: replace `allow_origins=["*"]` with env-var allowlist — ✅ DONE
+
+> **Audit (2026-10-09):** Allowlist from `CORS_ORIGINS`/`CORS_ALLOWED_ORIGINS`, and `*` is refused while credentials are allowed (`api/main.py:165`–`183`).
 
 | Field | Value |
 |---|---|
@@ -486,7 +551,9 @@ Tasks that make the running system observable and resilient to common failure mo
 
 ---
 
-#### P1-01 — Fix Kiwoom base URL
+#### P1-01 — Fix Kiwoom base URL — ✅ DONE
+
+> **Audit (2026-10-09):** `KIWOOM_BASE = "https://openapi.kiwoom.com:10000"` (`kiwoom_adapter/client.py:12`). Whether it is reachable without an SSL error needs a live call; `backend/brokers/kiwoom.py` is still a stub (`NotImplementedError`) — see known issue 2.
 
 | Field | Value |
 |---|---|
@@ -500,7 +567,9 @@ Tasks that make the running system observable and resilient to common failure mo
 
 ---
 
-#### P1-02 — `OrderStateMachine` callback outside lock
+#### P1-02 — `OrderStateMachine` callback outside lock — ✅ DONE
+
+> **Audit (2026-10-09):** `OrderStateMachine` calls `on_state_change` after leaving its lock in `register`, `transition` and `process_fill` (`backend/execution/order_machine.py:54`, `:70`, `:110`).
 
 | Field | Value |
 |---|---|
@@ -514,7 +583,9 @@ Tasks that make the running system observable and resilient to common failure mo
 
 ---
 
-#### P1-03 — Fix order ID mutation: generate client order ID before submission
+#### P1-03 — Fix order ID mutation: generate client order ID before submission — ❌ OPEN
+
+> **Audit (2026-10-09):** KIS takes no client order id (`backend/brokers/models.py:44`, `retry_safe_on_submit` False for both brokers), so the id exists only after the broker answers. The worker records the order after placement (see P0-02). The quick-trade reservation covers the app path.
 
 | Field | Value |
 |---|---|
@@ -528,7 +599,9 @@ Tasks that make the running system observable and resilient to common failure mo
 
 ---
 
-#### P1-04 — `StaleDataWatchdog`: TTL-based staleness rejection on all market data reads
+#### P1-04 — `StaleDataWatchdog`: TTL-based staleness rejection on all market data reads — ✅ DONE
+
+> **Audit (2026-10-09):** Shipped as `FreshnessGate` (`backend/data/freshness_gate.py:69`), raising `StaleFeedError` (`:189`) in the strategy buy/sell path (`backend/strategy/base.py:136`). The old `StaleDataWatchdog` was dead code and was removed (R-11). Tests: `backend/data/tests/test_freshness_gate.py`.
 
 | Field | Value |
 |---|---|
@@ -542,7 +615,9 @@ Tasks that make the running system observable and resilient to common failure mo
 
 ---
 
-#### P1-05 — Redis reconnect resilience
+#### P1-05 — Redis reconnect resilience — ✅ DONE
+
+> **Audit (2026-10-09):** `_run_with_pubsub` reconnects on `redis.ConnectionError` with backoff 2 → 64 s (`backend/worker/runner.py:1037`–`1084`). The 30 s target holds for the first attempts; a long outage waits up to 64 s between tries.
 
 | Field | Value |
 |---|---|
@@ -556,7 +631,9 @@ Tasks that make the running system observable and resilient to common failure mo
 
 ---
 
-#### P1-06 — Worker heartbeat: periodic liveness signal to Redis
+#### P1-06 — Worker heartbeat: periodic liveness signal to Redis — ✅ DONE
+
+> **Audit (2026-10-09):** `WorkerHeartbeat` and the API-side `WorkerWatchdog` (`backend/worker/heartbeat.py`), which halts on an expired beat. `/api/admin/heartbeat` (`backend/api/server.py:447`) answers `alive: false` with 200 rather than 503.
 
 | Field | Value |
 |---|---|
@@ -570,7 +647,9 @@ Tasks that make the running system observable and resilient to common failure mo
 
 ---
 
-#### P1-07 — SQLAlchemy session safety: per-operation sessions, no long-lived session reuse
+#### P1-07 — SQLAlchemy session safety: per-operation sessions, no long-lived session reuse — ✅ DONE
+
+> **Audit (2026-10-09):** Worker code opens a session per operation (`_get_session_factory`/`_session`, `backend/worker/runner.py:68`–`80`). Nothing passes the legacy `db_session=` to the tracker, and `init_db()` has no callers.
 
 | Field | Value |
 |---|---|
@@ -584,7 +663,9 @@ Tasks that make the running system observable and resilient to common failure mo
 
 ---
 
-#### P1-08 — Decommission legacy bot: remove `kis-bot` from docker-compose
+#### P1-08 — Decommission legacy bot: remove `kis-bot` from docker-compose — ⚠️ PARTIAL
+
+> **Audit (2026-10-09):** `kis-bot` is commented out of `docker-compose.yml` (`:93`–`100`). `bot/` is not archived: `bot/notifier.py` is a live dependency of the worker (every alert), and `bot/main.py`/`bot/scheduler.py` remain as dead legacy.
 
 | Field | Value |
 |---|---|
@@ -598,7 +679,9 @@ Tasks that make the running system observable and resilient to common failure mo
 
 ---
 
-#### P1-09 — Single scheduler: unify duplicate APScheduler instances
+#### P1-09 — Single scheduler: unify duplicate APScheduler instances — ✅ DONE
+
+> **Audit (2026-10-09):** One `BackgroundScheduler` in the running services (`backend/worker/scheduler.py:331`); `bot/scheduler.py` runs only in the disabled `kis-bot`.
 
 | Field | Value |
 |---|---|
@@ -612,7 +695,11 @@ Tasks that make the running system observable and resilient to common failure mo
 
 ---
 
-#### P1-10 — `on_filled` exception propagation: remove bare except in fill callback
+#### P1-10 — `on_filled` exception propagation: remove bare except in fill callback — ⚠️ PARTIAL
+
+> **Audit (2026-10-09):** The poller no longer swallows a failed fill callback — it keeps the entry and retries (`backend/execution/order_poller.py:371`–`377`).
+>
+> But a failed fill **write** is only a warning (`backend/worker/runner.py:1777`–`1778`, `_persist_fill`): no SAFE_MODE, no alert, as the acceptance test asks.
 
 | Field | Value |
 |---|---|
@@ -626,7 +713,9 @@ Tasks that make the running system observable and resilient to common failure mo
 
 ---
 
-#### P1-11 — Mask `hts_id` in API credential response
+#### P1-11 — Mask `hts_id` in API credential response — ✅ DONE
+
+> **Audit (2026-10-09):** `"hts_id": "****"` in the credential response (`api/routers/credentials.py:25`).
 
 | Field | Value |
 |---|---|
@@ -640,7 +729,9 @@ Tasks that make the running system observable and resilient to common failure mo
 
 ---
 
-#### P1-12 — `_QTY_TOLERANCE` fractional: replace hardcoded `1` share with dynamic calculation
+#### P1-12 — `_QTY_TOLERANCE` fractional: replace hardcoded `1` share with dynamic calculation — ❌ OPEN
+
+> **Audit (2026-10-09):** `_QTY_TOLERANCE = 1` is still a fixed share count (`backend/execution/reconciler.py:96`).
 
 | Field | Value |
 |---|---|
@@ -695,7 +786,9 @@ Makes the execution layer correct-by-construction rather than correct-by-convent
 
 ---
 
-#### P2-02 — `StartupRecovery` 8-gate validation sequence
+#### P2-02 — `StartupRecovery` 8-gate validation sequence — ✅ DONE
+
+> **Audit (2026-10-09):** `StartupRecovery.run()` runs nine gates — DB, Redis, risk state, balance, positions, reconcile, pending orders, consistency, enable trading (`backend/worker/recovery.py`). A failed gate keeps SAFE_MODE shut (the process stays up rather than refusing to start); the consistency gate is observability by design.
 
 | Field | Value |
 |---|---|
@@ -709,7 +802,11 @@ Makes the execution layer correct-by-construction rather than correct-by-convent
 
 ---
 
-#### P2-03 — Fill idempotency: deduplicate on `(order_id, seq_no)` before inserting
+#### P2-03 — Fill idempotency: deduplicate on `(order_id, seq_no)` before inserting — ⚠️ PARTIAL
+
+> **Audit (2026-10-09):** Deduplicated in code: `_persist_fill` skips a fill row that already exists for the order (`backend/worker/runner.py:1743`), and the poller seeds its watermark from the stored `filled_qty`. Test: `backend/worker/tests/test_recovery_safety.py` (C2).
+>
+> No `UNIQUE(order_id, seq)` / `ON CONFLICT DO NOTHING` as prescribed, so two sessions can still race the check.
 
 | Field | Value |
 |---|---|
@@ -723,7 +820,9 @@ Makes the execution layer correct-by-construction rather than correct-by-convent
 
 ---
 
-#### P2-04 — `PositionReconciler`: broker-wins reconciliation with divergence logging
+#### P2-04 — `PositionReconciler`: broker-wins reconciliation with divergence logging — ✅ DONE
+
+> **Audit (2026-10-09):** `PositionReconciler.reconcile()` is broker-wins with divergence audit (`backend/execution/reconciler.py:116`). Tests: `backend/execution/tests/test_reconciler.py`.
 
 | Field | Value |
 |---|---|
@@ -737,7 +836,9 @@ Makes the execution layer correct-by-construction rather than correct-by-convent
 
 ---
 
-#### P2-05 — `BrokerCapabilities` dataclass + `BrokerSemanticMapper` ABC
+#### P2-05 — `BrokerCapabilities` dataclass + `BrokerSemanticMapper` ABC — ✅ DONE
+
+> **Audit (2026-10-09):** `BrokerCapabilities` (`backend/brokers/models.py:14`) and `BrokerSemanticMapper` (`backend/brokers/semantic_mapper.py:58`). Market routing is enforced by `BrokerCapabilityValidator` (`backend/brokers/validator.py:81`), raising `UnsupportedCapabilityError` rather than `MarketMismatchError`.
 
 | Field | Value |
 |---|---|
@@ -751,7 +852,11 @@ Makes the execution layer correct-by-construction rather than correct-by-convent
 
 ---
 
-#### P2-06 — KIS polling loop: structured `OrderFillPoller` with exponential backoff and circuit breaker
+#### P2-06 — KIS polling loop: structured `OrderFillPoller` with exponential backoff and circuit breaker — ⚠️ PARTIAL
+
+> **Audit (2026-10-09):** Per-order escalating intervals 10 → 300 s (`backend/execution/order_poller.py:29`, `advance()`), a per-app-key rate limit (PR #154), and a circuit breaker on order placement (`backend/brokers/kis.py:130`, 5 failures / 10 min).
+>
+> Poll failures themselves trip nothing: ten in a row only log CRITICAL (`backend/execution/order_poller.py:113`–`121`).
 
 | Field | Value |
 |---|---|
@@ -769,7 +874,9 @@ Makes the execution layer correct-by-construction rather than correct-by-convent
 
 ---
 
-#### P3-01 — Replace crypto exchanges with KIS + Kiwoom in `exchanges.js`
+#### P3-01 — Replace crypto exchanges with KIS + Kiwoom in `exchanges.js` — ✅ DONE
+
+> **Audit (2026-10-09):** KIS and Kiwoom only, in both apps (`frontend/src/constants/exchanges.js:1`–`14`, `mobile/src/constants/exchanges.js`; PR #152).
 
 | Field | Value |
 |---|---|
@@ -781,7 +888,11 @@ Makes the execution layer correct-by-construction rather than correct-by-convent
 
 ---
 
-#### P3-02 — `CredentialForm.vue`: KIS + Kiwoom fields, paper/real toggle
+#### P3-02 — `CredentialForm.vue`: KIS + Kiwoom fields, paper/real toggle — ⚠️ PARTIAL
+
+> **Audit (2026-10-09):** Mobile: account number (12 digits), HTS ID and paper toggle (`mobile/src/views/profile/CredentialForm.vue:31`–`35`).
+>
+> **Web: still the crypto form** — API Key / Secret Key / Passphrase, no account number or HTS ID (`frontend/src/views/profile/CredentialForm.vue:23`–`46`). The API maps only key and secret (`api/compat.py:142`), so a KIS credential saved from the web app has no account number.
 
 | Field | Value |
 |---|---|
@@ -793,7 +904,9 @@ Makes the execution layer correct-by-construction rather than correct-by-convent
 
 ---
 
-#### P3-03 — Remove dead routes: `profile/referral`, `profile/credits`, `market/*`
+#### P3-03 — Remove dead routes: `profile/referral`, `profile/credits`, `market/*` — ✅ DONE
+
+> **Audit (2026-10-09):** No `profile/referral`, `profile/credits` or `market/*` route in `mobile/src/router/index.js` or `frontend/src/router/index.js` (PR #152).
 
 | Field | Value |
 |---|---|
@@ -805,7 +918,9 @@ Makes the execution layer correct-by-construction rather than correct-by-convent
 
 ---
 
-#### P3-04 — Pinia store split: auth, broker, strategy, market, websocket
+#### P3-04 — Pinia store split: auth, broker, strategy, market, websocket — ✅ DONE
+
+> **Audit (2026-10-09):** PR #200: eight store modules, identical in both apps; guard `tests/integration/test_frontend_store_parity.py`.
 
 | Field | Value |
 |---|---|
@@ -817,7 +932,9 @@ Makes the execution layer correct-by-construction rather than correct-by-convent
 
 ---
 
-#### P3-05 — Fix `DEFAULT_SERVER_URL`: set to empty string, configure from build-time env
+#### P3-05 — Fix `DEFAULT_SERVER_URL`: set to empty string, configure from build-time env — ✅ DONE
+
+> **Audit (2026-10-09):** `DEFAULT_SERVER_URL = ''` in both apps (`frontend/src/config/index.js:1`, `mobile/src/config/index.js:1`).
 
 | Field | Value |
 |---|---|
@@ -834,7 +951,9 @@ Makes the execution layer correct-by-construction rather than correct-by-convent
 
 ---
 
-#### P4-01 — Deduplicate `EXCD_MAP`: single canonical source in `universe.py`
+#### P4-01 — Deduplicate `EXCD_MAP`: single canonical source in `universe.py` — ✅ DONE
+
+> **Audit (2026-10-09):** One `EXCD_MAP` in `backend/quant/data/universe.py`, imported by `backend/market/symbols.py:29` (PRs #151, #153, #197).
 
 | Field | Value |
 |---|---|
@@ -847,7 +966,9 @@ Makes the execution layer correct-by-construction rather than correct-by-convent
 
 ---
 
-#### P4-02 — `SimulatedBroker`: same `BrokerAdapter` interface for backtesting and live
+#### P4-02 — `SimulatedBroker`: same `BrokerAdapter` interface for backtesting and live — ✅ DONE
+
+> **Audit (2026-10-09):** `SimulatedBroker(BrokerAdapter)` with commission and slippage (`backend/strategy/runtime/simulator.py:19`, `:67`–`68`); also `backend/brokers/paper_broker.py` for the paper harness.
 
 | Field | Value |
 |---|---|
@@ -859,7 +980,9 @@ Makes the execution layer correct-by-construction rather than correct-by-convent
 
 ---
 
-#### P4-03 — `IndicatorStrategy` backtest endpoint
+#### P4-03 — `IndicatorStrategy` backtest endpoint — ✅ DONE
+
+> **Audit (2026-10-09):** `POST /api/strategies/backtest` (`api/routers/strategies.py:591`): indicator strategies through `IndicatorStrategy.from_config`, scripts in a time- and memory-bounded child process (PR #191). Uses the project's own `Backtester`, not `backtesting.py`.
 
 | Field | Value |
 |---|---|
@@ -871,7 +994,9 @@ Makes the execution layer correct-by-construction rather than correct-by-convent
 
 ---
 
-#### P4-04 — Wire `TradingEngine` real FX rate with graceful degradation
+#### P4-04 — Wire `TradingEngine` real FX rate with graceful degradation — ⏸ DEFERRED
+
+> **Audit (2026-10-09):** Only the legacy `bot/main.py` converts FX, falling back to a hardcoded 1350 (`bot/main.py:26`–`33`), and `kis-bot` is disabled. The live worker's equity comes from the KIS balance, whose USD gaps are tracked as #178 (known issue 10).
 
 | Field | Value |
 |---|---|
@@ -888,7 +1013,9 @@ Makes the execution layer correct-by-construction rather than correct-by-convent
 
 ---
 
-#### P5-01 — `StrategyBase` event methods: `on_start`, `on_bar`, `on_fill`, `on_market_open/close`, `on_stop`
+#### P5-01 — `StrategyBase` event methods: `on_start`, `on_bar`, `on_fill`, `on_market_open/close`, `on_stop` — ✅ DONE
+
+> **Audit (2026-10-09):** `on_start`, `on_stop`, `on_market_open`, `on_market_close`, `on_bar`, `on_fill` (`backend/strategy/base.py:106`–`146`).
 
 | Field | Value |
 |---|---|
@@ -900,7 +1027,9 @@ Makes the execution layer correct-by-construction rather than correct-by-convent
 
 ---
 
-#### P5-02 — `ScriptStrategy` sandbox: RestrictedPython + AST whitelist + timeout
+#### P5-02 — `ScriptStrategy` sandbox: RestrictedPython + AST whitelist + timeout — ✅ DONE
+
+> **Audit (2026-10-09):** `compile_restricted` with guarded builtins (`backend/strategy/script/sandbox.py:16`, `:157`; legacy `strategy/script_strategy.py:14`, PR #187); backtests run in a killed-on-budget child process (`strategy/script_backtest.py`, PR #191).
 
 | Field | Value |
 |---|---|
@@ -912,7 +1041,9 @@ Makes the execution layer correct-by-construction rather than correct-by-convent
 
 ---
 
-#### P5-03 — Dual risk system unification: route all state through `backend/quant/risk/engine.py` + DB
+#### P5-03 — Dual risk system unification: route all state through `backend/quant/risk/engine.py` + DB — ❌ OPEN
+
+> **Audit (2026-10-09):** Two risk systems remain. The worker uses `backend/quant/risk/engine.py` + `DailyRiskState`. The app's quick-trade halt gate still asks the legacy `strategy/risk.py` `RiskManager` (`api/routers/quick_trade.py:27`, `:49`), whose Redis keys and peak file (`strategy/risk.py:47`) **nothing in the running services writes** — no live caller of `record_daily_loss`. So that gate never trips on a loss.
 
 | Field | Value |
 |---|---|
@@ -925,7 +1056,9 @@ Makes the execution layer correct-by-construction rather than correct-by-convent
 
 ---
 
-#### P5-04 — API/Worker process separation via Redis PubSub
+#### P5-04 — API/Worker process separation via Redis PubSub — ✅ DONE
+
+> **Audit (2026-10-09):** kis-api publishes `strategy:start`/`strategy:stop` (`backend/api/server.py:306`, `:327`); the worker subscribes (`_run_with_pubsub`, `backend/worker/runner.py:1037`). Separate `kis-api`/`kis-worker`/`kis-ws` services.
 
 | Field | Value |
 |---|---|
@@ -941,7 +1074,11 @@ Makes the execution layer correct-by-construction rather than correct-by-convent
 
 ---
 
-#### P6-01 — Unit tests: `OrderStateMachine` all valid/invalid transitions + duplicate fill rejection
+#### P6-01 — Unit tests: `OrderStateMachine` all valid/invalid transitions + duplicate fill rejection — ⚠️ PARTIAL
+
+> **Audit (2026-10-09):** Transition tests exist (`tests/execution/test_order_machine_new_statuses.py`, ten, invalid ones included) and the machine is exercised across the worker suites; over-fill is refused in `process_fill` (`backend/execution/order_machine.py:78`).
+>
+> No exhaustive all-pairs transition test against `VALID_TRANSITIONS`.
 
 | Field | Value |
 |---|---|
@@ -953,7 +1090,9 @@ Makes the execution layer correct-by-construction rather than correct-by-convent
 
 ---
 
-#### P6-02 — Integration test: paper trade dry-run must pass before any deploy
+#### P6-02 — Integration test: paper trade dry-run must pass before any deploy — ✅ DONE
+
+> **Audit (2026-10-09):** The paper-trading harness and its E2E suites (`backend/testing/`, `tests/postgres/test_paper_e2e_db.py`, PRs #99/#102) run in CI, and deploy is gated on that workflow (PR #88). `scripts/test_paper_trade.py` itself belongs to the legacy `kis-bot` and is not a gate.
 
 | Field | Value |
 |---|---|
@@ -965,7 +1104,9 @@ Makes the execution layer correct-by-construction rather than correct-by-convent
 
 ---
 
-#### P6-03 — Docker Compose health checks for all services
+#### P6-03 — Docker Compose health checks for all services — ⚠️ PARTIAL
+
+> **Audit (2026-10-09):** `healthcheck:` on postgres, redis, api and kis-api (`docker-compose.yml:14`, `:32`, `:87`, `:154`); none on frontend, kis-worker or kis-ws.
 
 | Field | Value |
 |---|---|
@@ -977,7 +1118,9 @@ Makes the execution layer correct-by-construction rather than correct-by-convent
 
 ---
 
-#### P6-04 — Gate `quantdinger` dependency behind env flag
+#### P6-04 — Gate `quantdinger` dependency behind env flag — ✅ DONE
+
+> **Audit (2026-10-09):** Nothing builds from `./quantdinger` any more — `docker-compose.yml` builds `./frontend` and `.` only. The upstream name survives only in container names and `QUANTDINGER_*` variables (CLAUDE.md known issue 14). `scripts/setup_oracle_cloud.sh:50` still clones the upstream repo — no longer needed; harmless, left for a deploy-script change.
 
 | Field | Value |
 |---|---|
@@ -990,7 +1133,9 @@ Makes the execution layer correct-by-construction rather than correct-by-convent
 
 ---
 
-#### P6-05 — Update `CLAUDE.md`: mark completed stages, advance next-work pointers
+#### P6-05 — Update `CLAUDE.md`: mark completed stages, advance next-work pointers — ✅ DONE
+
+> **Audit (2026-10-09):** This audit (PR #220): every item carries a status and evidence; see "Status at a glance" at the top.
 
 | Field | Value |
 |---|---|
