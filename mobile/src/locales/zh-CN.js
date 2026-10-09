@@ -725,7 +725,6 @@ export default {
     account_no_placeholder: '10位数字（例: 50123456-01）',
     account_no_format: 'KIS账号为10位数字（8位-2位）',
     kiwoom_unsupported: '暂不支持 Kiwoom 证券',
-    save_failed: '保存失败',
     demo_enable: '模拟交易模式',
     demo_desc: '勾选连接模拟交易（paper），取消勾选连接实盘（real）',
     save: '保存',

@@ -171,8 +171,8 @@ export default {
         showToast({ message: this.$t('credentials.saved'), type: 'success' })
         this.$router.replace('/profile/credentials')
       } catch (error) {
+        // The API client has already shown why (its toast would be replaced).
         console.error('Create credential failed:', error)
-        showToast({ message: this.$t('credentials.save_failed'), type: 'fail' })
       } finally {
         this.saving = false
       }

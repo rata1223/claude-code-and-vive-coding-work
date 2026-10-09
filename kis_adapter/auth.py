@@ -115,6 +115,11 @@ class KISAuth:
         self.app_key = creds.app_key
         self.app_secret = creds.app_secret
         self.account_no = normalize_account_no(creds.account_no)
+        if self.account_no and not (len(self.account_no) == 10 and self.account_no.isdigit()):
+            # Saved before the 10-digit check (the old mobile form asked for
+            # 12): KIS would get the wrong product code. Say so — re-enter it.
+            logger.warning("KIS 계좌번호 형식 이상 (%d자) — 10자리(8+2)여야 한다, 자격증명을 다시 입력할 것",
+                           len(self.account_no))
         self.hts_id = creds.hts_id
         self.env = creds.env
         self.base_url = PAPER_BASE if self.env == "paper" else REAL_BASE

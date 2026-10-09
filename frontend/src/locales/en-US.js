@@ -726,7 +726,6 @@ export default {
     account_no_placeholder: '10 digits (e.g. 50123456-01)',
     account_no_format: 'A KIS account number is 10 digits (8-2)',
     kiwoom_unsupported: 'Kiwoom is not supported yet',
-    save_failed: 'Could not save',
     demo_enable: 'Paper trading mode',
     demo_desc: 'Checked connects to paper trading; unchecked connects to real trading',
     save: 'Save',

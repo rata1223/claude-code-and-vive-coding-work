@@ -57,7 +57,7 @@ def test_only_kis_can_be_saved():
 def test_every_key_the_form_uses_exists_in_every_locale(app):
     used = set(re.findall(r"\$t\('credentials\.([a-z_]+)'\)", _read(f"{app}/{FORM}")))
     used |= set(re.findall(r"fail\('credentials\.([a-z_]+)'\)", _read(f"{app}/{FORM}")))
-    assert {"account_no", "account_no_format", "hts_id", "kiwoom_unsupported", "save_failed"} <= used
+    assert {"account_no", "account_no_format", "hts_id", "kiwoom_unsupported"} <= used
     for loc in LOCALES:
         block = _read(f"{app}/src/locales/{loc}.js").split("\n  credentials: {", 1)
         assert len(block) == 2, f"{app}/{loc}"

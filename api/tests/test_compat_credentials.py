@@ -221,8 +221,15 @@ class TestKisAccountFormat:
         assert self._create(client, auth_headers).status_code == 200
         assert self._create(client, auth_headers, account_no="").status_code == 200
 
-    def test_other_brokers_are_not_held_to_the_kis_format(self, client, auth_headers):
+    def test_other_brokers_keep_their_own_form(self, client, auth_headers, db_session):
+        """Kiwoom splits its account on the hyphen (``kiwoom_adapter``)."""
         res = client.post("/api/credentials/create", headers=auth_headers, json={
             "name": "KW", "exchange_id": "kiwoom", "api_key": "k", "secret_key": "s",
-            "account_no": "1234-5678"})
+            "account_no": "12345678-01"})
         assert res.status_code == 200
+        cred = db_session.query(Credential).order_by(Credential.id.desc()).first()
+        assert decrypt(cred.account_no_enc) == "12345678-01"
+
+    def test_the_broker_name_is_matched_case_insensitively(self, client, auth_headers):
+        assert self._create(client, auth_headers, exchange_id="KIS",
+                            account_no="123").status_code == 422

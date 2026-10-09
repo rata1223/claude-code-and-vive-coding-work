@@ -726,7 +726,6 @@ export default {
     account_no_placeholder: '숫자 10자리 (예: 50123456-01)',
     account_no_format: 'KIS 계좌번호는 숫자 10자리입니다 (8자리-2자리)',
     kiwoom_unsupported: '키움증권은 아직 지원 준비 중입니다',
-    save_failed: '저장하지 못했습니다',
     demo_enable: '모의투자 모드',
     demo_desc: '체크 시 모의투자(paper), 해제 시 실전투자(real)로 연결됩니다',
     save: '저장',

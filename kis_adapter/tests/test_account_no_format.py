@@ -75,3 +75,23 @@ def test_the_env_fallback_in_require_account_is_normalised(monkeypatch):
     auth = KISAuth()
     monkeypatch.setenv("KIS_ACCOUNT_NO", "50123456-01")
     assert auth.require_account() == "5012345601"
+
+
+def test_a_stored_account_of_the_wrong_length_is_reported(caplog):
+    """Rows saved before the check (the old mobile form asked for 12)."""
+    creds = KISCredentials(app_key="K", app_secret="S", account_no="123456789012", env="paper")
+    with caplog.at_level("WARNING", logger="kis_adapter.auth"):
+        KISAuth(creds)
+    assert "10자리" in caplog.text
+
+
+def test_the_worker_broker_splits_a_hyphenated_env_account(monkeypatch):
+    """`backend/brokers/kis.py` cancels and status queries split the account
+    themselves; they read it through the auth, normalised."""
+    monkeypatch.setenv("KIS_APP_KEY", "K")
+    monkeypatch.setenv("KIS_APP_SECRET", "S")
+    monkeypatch.setenv("KIS_ACCOUNT_NO", "50123456-01")
+    monkeypatch.setenv("KIS_ENV", "paper")
+    from backend.brokers.kis import KISBroker
+    broker = KISBroker()
+    assert (broker._account[:8], broker._account[8:]) == ("50123456", "01")

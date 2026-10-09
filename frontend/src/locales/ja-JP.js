@@ -726,7 +726,6 @@ export default {
     account_no_placeholder: '数字10桁（例: 50123456-01）',
     account_no_format: 'KIS口座番号は数字10桁です（8桁-2桁）',
     kiwoom_unsupported: 'キウム証券はまだサポートしていません',
-    save_failed: '保存できませんでした',
     demo_enable: '模擬取引モード',
     demo_desc: 'オンで模擬取引（paper）、オフで実取引（real）に接続します',
     save: '保存',
