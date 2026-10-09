@@ -152,6 +152,31 @@ def _open_order_row(db, order, broker: str = "kis"):
     return rows[0] if rows else None
 
 
+def _already_filed_on_closed_row(db, order, cumulative, broker: str = "kis") -> bool:
+    """Whether today's newest closed row for this broker order already has
+    fills reaching ``cumulative`` — a redelivered last fill, not a lost one.
+    Only today's (KIS numbers restart daily, issue #168), and only with a
+    broker total to compare against."""
+    if cumulative is None or not order.id:
+        return False
+    from sqlalchemy import func
+    from backend.database.models import seoul_date
+    row = (db.query(DBOrder.id)
+           .filter(DBOrder.broker_order_id == order.id,
+                   DBOrder.broker == broker,
+                   DBOrder.symbol == order.symbol,
+                   DBOrder.side == order.side,
+                   DBOrder.trade_date == seoul_date(),
+                   DBOrder.status.notin_(_OPEN_ORDER_STATUSES))
+           .order_by(DBOrder.id.desc())
+           .first())
+    if row is None:
+        return False
+    filed = (db.query(func.coalesce(func.sum(DBFill.qty), 0))
+             .filter(DBFill.order_id == row.id).scalar() or 0)
+    return int(filed) >= cumulative
+
+
 def _audit(event_type: str, symbol: str = None, order_id: str = None,
            actor: str = "worker", detail: dict = None):
     """Fire-and-forget append-only audit log write. Never raises."""
@@ -1732,7 +1757,14 @@ class StrategyWorker:
         a duplicate exactly when they already reach ``cumulative``. Without it
         nothing tells the two apart, and only the invariant is checked: fills
         never add up to more than the order's quantity.
+
+        A fill that cannot be recorded — the write raised, or there is no row
+        to file it under — latches ``SAFE_MODE`` until a restart and alerts the
+        operator (``report_fill_write_failure``, P1-10). A skipped duplicate or a
+        refused overfill is a decision, not a failure.
         """
+        failure = None
+        qty = fill.qty
         try:
             with _session() as db:
                 db_order = None
@@ -1746,7 +1778,15 @@ class StrategyWorker:
                 if db_order is None:
                     db_order = _open_order_row(db, order)
                 if db_order is None:
-                    logger.warning("체결 DB 저장 스킵: 미등록 주문 %s", order.id)
+                    if _already_filed_on_closed_row(db, order, cumulative):
+                        # A redelivery of an order's last fill: the row closed
+                        # with it, and its fills already reach this total.
+                        logger.info("중복 체결 감지 — 종결된 행에 이미 기록됨: order=%s 누적=%s",
+                                    order.id, cumulative)
+                        return
+                    # A real fill with no row to file it under: it is recorded
+                    # nowhere, which is the same failure as a write that raised.
+                    failure = "주문 행 없음"
                     return
                 # Idempotency. The poller's watermark is the first line: it hands
                 # each increment over once. This is the second, for a fill that
@@ -1758,7 +1798,6 @@ class StrategyWorker:
                 db.refresh(db_order, with_for_update=True)
                 recorded = int(db.query(func.coalesce(func.sum(DBFill.qty), 0))
                                .filter(DBFill.order_id == db_order.id).scalar() or 0)
-                qty = fill.qty
                 if cumulative is not None:
                     if recorded >= cumulative:
                         logger.info("중복 체결 감지 — Fill 삽입 스킵: order=%s qty=%d 누적=%d (기록=%d)",
@@ -1814,7 +1853,17 @@ class StrategyWorker:
                 except Exception as _ae:
                     logger.warning("AuditLog 체결 기록 실패: %s", _ae)
         except Exception as e:
-            logger.warning("체결 DB 저장 실패: %s", e)
+            failure = e
+        finally:
+            if failure is not None:
+                from backend.worker.recovery import report_fill_write_failure
+                try:
+                    factory = _get_session_factory()
+                except Exception:          # the database is what failed
+                    factory = None
+                # ``qty``: what was missing, after the broker-total adjustment.
+                report_fill_write_failure(order.id, fill.symbol, qty, fill.price, failure,
+                                          session_factory=factory)
 
     def _restore_positions(self, tracker: PositionTracker, broker: str = "kis"):
         try:

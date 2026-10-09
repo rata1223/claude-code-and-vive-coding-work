@@ -207,6 +207,10 @@ class SafeModeState:
         # Startup begins in the untrusted state: recovery has not run yet, so
         # position data cannot be relied on for an exit decision.
         self._cause: Optional[HaltCause] = HaltCause.UNTRUSTED_STATE
+        #: Why a fill could not be recorded (P1-10), or ``None``. While set,
+        #: nothing in this process opens the gate or softens the cause.
+        self._latch: Optional[str] = None
+        self._latch_lock = threading.Lock()
 
     @property
     def can_trade(self) -> bool:
@@ -221,18 +225,60 @@ class SafeModeState:
         """The active halt cause, or ``None`` when trading is allowed."""
         return None if self._can_trade else self._cause
 
+    @property
+    def latched(self) -> Optional[str]:
+        """Why a fill could not be recorded in this process, or ``None``."""
+        return self._latch
+
     def enable(self) -> None:
-        self._can_trade = True
-        self._reason = "정상"
-        self._cause = None
+        with self._latch_lock:
+            if self._latch is not None:
+                # Every opener — the end of startup recovery, the kill-switch
+                # resume poll — goes through here; none may reopen past this.
+                logger.error("SafeMode 해제 거부 — 체결 기록 실패, 재시작 필요: %s", self._latch)
+                return
+            self._can_trade = True
+            self._reason = "정상"
+            self._cause = None
         logger.info("SafeMode 해제 — 매매 허용")
 
     def disable(self, reason: str,
                 cause: Optional[HaltCause] = HaltCause.UNTRUSTED_STATE) -> None:
-        self._can_trade = False
-        self._reason = reason
-        self._cause = cause or HaltCause.UNTRUSTED_STATE
-        logger.warning("SafeMode 활성화 [%s]: %s", self._cause.value, reason)
+        cause = cause or HaltCause.UNTRUSTED_STATE
+        with self._latch_lock:
+            if self._latch is not None:
+                # A later halt must not turn this into one the resume poll
+                # reopens, nor loosen an untrusted state into one that allows
+                # exits: untrusted wins, anything else stays RECORD_FAILURE.
+                untrusted = (cause is HaltCause.UNTRUSTED_STATE
+                             or (not self._can_trade
+                                 and self._cause is HaltCause.UNTRUSTED_STATE))
+                cause = HaltCause.UNTRUSTED_STATE if untrusted else HaltCause.RECORD_FAILURE
+                if self._latch not in reason:
+                    # The reason the operator reads must keep saying a fill
+                    # is unrecorded, whatever halts on top of it.
+                    reason = f"{reason} — {self._latch}"
+            self._can_trade = False
+            self._reason = reason
+            self._cause = cause
+        logger.warning("SafeMode 활성화 [%s]: %s", cause.value, reason)
+
+    def latch(self, reason: str) -> bool:
+        """Shut the gate for a fill that could not be recorded (P1-10) until
+        the process restarts. Exits stay allowed (``RECORD_FAILURE``) unless the
+        state was already untrusted. Returns whether this was the first."""
+        with self._latch_lock:
+            first = self._latch is None
+            if first:
+                self._latch = reason
+            stricter = (not self._can_trade
+                        and self._cause is HaltCause.UNTRUSTED_STATE)
+            self._can_trade = False
+            self._reason = reason
+            self._cause = HaltCause.UNTRUSTED_STATE if stricter else HaltCause.RECORD_FAILURE
+            cause = self._cause
+        logger.warning("SafeMode 고정 [%s]: %s", cause.value, reason)
+        return first
 
     def __repr__(self) -> str:
         return (f"SafeModeState(can_trade={self._can_trade}, "
@@ -241,6 +287,54 @@ class SafeModeState:
 
 # Process-level safe mode gate — strategies should check this before placing orders
 SAFE_MODE = SafeModeState()
+
+
+#: Set when a ``fill_write_failed`` audit could not be written; later failures
+#: in this process only log and latch.
+_audit_down = False
+
+
+def report_fill_write_failure(order_id, symbol, qty, price, error,
+                              session_factory=None) -> None:
+    """A real fill could not be written to ``fills``/``orders`` (P1-10).
+
+    Latches ``SAFE_MODE`` until a restart, whose recovery reconciles orders,
+    fills and positions with the broker: entries stop, exits stay possible
+    (the in-memory tracker has the fill), and nothing in this process reopens
+    it — see ``SafeModeState.latch``. The operator is alerted once per process
+    (a database outage fails every fill), and the failure is audited as
+    ``fill_write_failed`` when the database allows. Never raises.
+    """
+    reason = f"체결 기록 실패: order={order_id} {symbol} {qty}주 @ {price} — {error}"
+    logger.error(reason)
+    first = SAFE_MODE.latch(reason)
+    global _audit_down
+    if session_factory is not None and not _audit_down:
+        try:
+            from backend.database.models import AuditLog
+            sess = session_factory()
+            try:
+                sess.add(AuditLog(event_type="fill_write_failed", symbol=symbol,
+                                  order_id=str(order_id), actor="worker",
+                                  detail=json.dumps({"qty": qty, "price": price,
+                                                     "error": str(error)},
+                                                    ensure_ascii=False)))
+                sess.commit()
+            finally:
+                sess.close()
+        except Exception as e:
+            # The database is likely what failed: don't spend another connect
+            # timeout on the poller thread for every further fill.
+            _audit_down = True
+            logger.warning("fill_write_failed 감사 기록 실패 — 이후 감사 생략: %s", e)
+    if not first:
+        return
+    try:
+        from bot.notifier import alert_emergency
+        alert_emergency(f"[체결 기록 실패] 신규 매매 차단(청산은 허용) — 재시작 필요(기동 복구가 브로커와 맞춘다)\n"
+                        f"주문: {order_id} {symbol} {qty}주 @ {price}\n오류: {error}")
+    except Exception as e:
+        logger.warning("체결 기록 실패 Telegram 알림 실패: %s", e)
 
 
 class StartupRecovery:
@@ -520,10 +614,13 @@ class StartupRecovery:
                 def _make_recovery_fill_cb(db_order_pk: int, broker_order_id: str):
                     """Persist fill + update positions table so restored strategies see correct state."""
                     def on_filled(order: BOrder):
+                        failure = None
                         sess = self._factory()
                         try:
                             row = sess.get(DBOrder, db_order_pk)
-                            if row:
+                            if row is None:
+                                failure = "주문 행 없음"
+                            else:
                                 fill_qty = order.filled_qty or order.qty
                                 fill_price = order.avg_fill_price or order.price
                                 # P3-02C-D F2: the poller delivers INCREMENTAL fill
@@ -545,9 +642,14 @@ class StartupRecovery:
                                 sess.commit()
                                 logger.info("복구 체결 DB 업데이트: %s → FILLED", broker_order_id)
                         except Exception as e:
-                            logger.warning("복구 체결 DB 저장 실패: %s", e)
+                            failure = e
                         finally:
                             sess.close()
+                        if failure is not None:
+                            report_fill_write_failure(
+                                broker_order_id, order.symbol, order.filled_qty or order.qty,
+                                order.avg_fill_price or order.price, failure,
+                                session_factory=self._factory)
                     return on_filled
 
                 for row in pending:
@@ -820,6 +922,12 @@ class StartupRecovery:
 
     def _step_enable_trading(self) -> bool:
         import os
+        if SAFE_MODE.latched is not None:
+            # A recovered order's fill could not be recorded while recovery ran.
+            # Before every other branch: none of them may count this as a halt
+            # a release can lift.
+            logger.critical("복구 중 체결 기록 실패 — 매매 차단 유지, 재시작 필요")
+            return False
         if os.environ.get("KIS_ENV") == "real":
             try:
                 from backend.worker.promotion_guard import LivePromotionGuard
