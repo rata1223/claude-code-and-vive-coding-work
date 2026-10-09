@@ -95,3 +95,10 @@ def test_the_worker_broker_splits_a_hyphenated_env_account(monkeypatch):
     from backend.brokers.kis import KISBroker
     broker = KISBroker()
     assert (broker._account[:8], broker._account[8:]) == ("50123456", "01")
+
+
+def test_digits_of_other_scripts_are_not_an_account():
+    from kis_adapter.auth import is_kis_account_no
+    assert is_kis_account_no("5012345601")
+    assert not is_kis_account_no("50123456٠١")
+    assert not is_kis_account_no("501234560")

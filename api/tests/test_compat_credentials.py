@@ -210,7 +210,7 @@ class TestKisAccountFormat:
 
     def test_a_wrong_length_is_refused(self, client, auth_headers, db_session):
         before = db_session.query(Credential).count()
-        for bad in ("123456789", "123456789012", "12345678-0", "5012345A01"):
+        for bad in ("123456789", "123456789012", "12345678-0", "5012345A01", "50123456٠١"):
             res = self._create(client, auth_headers, account_no=bad)
             assert res.status_code == 422, bad
         assert db_session.query(Credential).count() == before
