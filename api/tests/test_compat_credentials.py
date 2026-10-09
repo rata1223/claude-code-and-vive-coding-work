@@ -39,7 +39,8 @@ class TestCredentialRequestMapping:
         assert decrypt(cred.app_key_enc) == "plain-app-key-123"
         assert decrypt(cred.app_secret_enc) == "plain-app-secret-456"
         assert cred.env == "paper"
-        assert decrypt(cred.account_no_enc) == "12345678-01"
+        # Stored as the 10 digits the order path splits [:8]/[8:] (P3-02).
+        assert decrypt(cred.account_no_enc) == "1234567801"
         assert decrypt(cred.hts_id_enc) == "myhtsid"
         # The distinct legacy `api_key` column must NOT also receive the
         # frontend's app-key value — regression guard for the alias-overlap
@@ -125,7 +126,7 @@ class TestCredentialBackwardCompatibility:
                 "exchange_id": "kis",
                 "app_key": "direct-app-key",
                 "app_secret": "direct-app-secret",
-                "account_no": "999",
+                "account_no": "9990000001",
                 "hts_id": "hts999",
                 "env": "real",
             },
@@ -189,3 +190,46 @@ class TestRegressionExistingEndpoints:
 
         assert res.status_code == 200
         assert res.json()["code"] == 1
+
+
+# ── 5. KIS account format (P3-02) ───────────────────────────────────────────
+class TestKisAccountFormat:
+    """A KIS account is 10 digits, split by the order path as [:8]/[8:]."""
+
+    def _create(self, client, auth_headers, **extra):
+        body = {"name": "KIS", "exchange_id": "kis", "api_key": "k", "secret_key": "s",
+                "enable_demo_trading": True}
+        body.update(extra)
+        return client.post("/api/credentials/create", headers=auth_headers, json=body)
+
+    def test_the_written_form_is_stored_as_ten_digits(self, client, auth_headers, db_session):
+        res = self._create(client, auth_headers, account_no=" 50123456-01 ")
+        assert res.status_code == 200
+        cred = db_session.query(Credential).order_by(Credential.id.desc()).first()
+        assert decrypt(cred.account_no_enc) == "5012345601"
+
+    def test_a_wrong_length_is_refused(self, client, auth_headers, db_session):
+        before = db_session.query(Credential).count()
+        for bad in ("123456789", "123456789012", "12345678-0", "5012345A01", "50123456٠١"):
+            res = self._create(client, auth_headers, account_no=bad)
+            assert res.status_code == 422, bad
+        assert db_session.query(Credential).count() == before
+
+    def test_no_account_is_still_accepted(self, client, auth_headers):
+        """The app forms require it; the API keeps its contract — a credential
+        without one cannot trade until one is set (``require_account``)."""
+        assert self._create(client, auth_headers).status_code == 200
+        assert self._create(client, auth_headers, account_no="").status_code == 200
+
+    def test_other_brokers_keep_their_own_form(self, client, auth_headers, db_session):
+        """Kiwoom splits its account on the hyphen (``kiwoom_adapter``)."""
+        res = client.post("/api/credentials/create", headers=auth_headers, json={
+            "name": "KW", "exchange_id": "kiwoom", "api_key": "k", "secret_key": "s",
+            "account_no": "12345678-01"})
+        assert res.status_code == 200
+        cred = db_session.query(Credential).order_by(Credential.id.desc()).first()
+        assert decrypt(cred.account_no_enc) == "12345678-01"
+
+    def test_the_broker_name_is_matched_case_insensitively(self, client, auth_headers):
+        assert self._create(client, auth_headers, exchange_id="KIS",
+                            account_no="123").status_code == 422

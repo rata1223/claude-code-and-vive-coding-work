@@ -1,4 +1,3 @@
-import os
 import logging
 import threading
 import time
@@ -124,7 +123,9 @@ class KISBroker(BrokerAdapter):
         self._market = KISMarketData(self._client)
         self._orders = KISOrders(self._client)
         self._portfolio = KISPortfolio(self._client)
-        self._account = os.environ["KIS_ACCOUNT_NO"]
+        # Through the client's auth: normalised (``50123456-01`` → 10 digits),
+        # so the [:8]/[8:] splits below send the right product code.
+        self._account = self._client.auth.require_account()
         self._paper = self._client.auth.env == "paper"
         # Shared breaker for all KIS API calls — trips after 5 consecutive failures
         self._breaker = ConsecutiveFailureBreaker(threshold=5, cooldown_minutes=10)

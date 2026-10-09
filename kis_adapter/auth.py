@@ -4,6 +4,7 @@ import time
 import json
 import hashlib
 import logging
+import re
 import requests
 import redis
 from dataclasses import dataclass
@@ -96,6 +97,21 @@ class KISCredentials:
         )
 
 
+def normalize_account_no(value) -> str:
+    """A KIS account as the API wants it: 8-digit ``CANO`` + 2-digit
+    ``ACNT_PRDT_CD``, 10 digits. Accepts the written form ``50123456-01`` and
+    stray whitespace — the callers split it as ``[:8]``/``[8:]``, so a hyphen
+    left in would be sent as the product code. Only ``-`` and whitespace are
+    removed: anything else stays, for the caller (or KIS) to reject."""
+    return "".join(ch for ch in str(value or "") if ch != "-" and not ch.isspace())
+
+
+def is_kis_account_no(value) -> bool:
+    """Exactly ten ASCII digits — ``str.isdigit`` would also take other
+    scripts' digits (``٠١``), which KIS would not."""
+    return bool(re.fullmatch(r"[0-9]{10}", value or ""))
+
+
 class KISAuth:
     def __init__(self, credentials: "KISCredentials | None" = None):
         creds = credentials or KISCredentials.from_env()
@@ -105,7 +121,12 @@ class KISAuth:
         self._env_sourced = credentials is None
         self.app_key = creds.app_key
         self.app_secret = creds.app_secret
-        self.account_no = creds.account_no
+        self.account_no = normalize_account_no(creds.account_no)
+        if self.account_no and not is_kis_account_no(self.account_no):
+            # Saved before the 10-digit check (the old mobile form asked for
+            # 12): KIS would get the wrong product code. Say so — re-enter it.
+            logger.warning("KIS 계좌번호 형식 이상 (%d자) — 10자리(8+2)여야 한다, 자격증명을 다시 입력할 것",
+                           len(self.account_no))
         self.hts_id = creds.hts_id
         self.env = creds.env
         self.base_url = PAPER_BASE if self.env == "paper" else REAL_BASE
@@ -207,7 +228,7 @@ class KISAuth:
         if self.account_no:
             return self.account_no
         if self._env_sourced:
-            return os.environ["KIS_ACCOUNT_NO"]
+            return normalize_account_no(os.environ["KIS_ACCOUNT_NO"])
         raise ValueError("KIS credential has no account_no (request-scoped account required)")
 
     def get_hashkey(self, body: dict) -> str:

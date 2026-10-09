@@ -13,12 +13,12 @@
 
 ## Status at a glance (2026-10-09, main `f02dbf7`)
 
-Every item below was checked against the code at this commit (P6-05, PR #220): the heading carries the status and an **Audit** note cites the file and line. Unmarked items no longer exist. Since then: P2-03 ⚠️→✅ (PR #221), P1-10 ⚠️→✅ (PR #222).
+Every item below was checked against the code at this commit (P6-05, PR #220): the heading carries the status and an **Audit** note cites the file and line. Unmarked items no longer exist. Since then: P2-03 ⚠️→✅ (PR #221), P1-10 ⚠️→✅ (PR #222), P3-02 ⚠️→✅ (PR #223).
 
 | Status | Count |
 |---|---|
-| ✅ DONE (some shipped differently from the prescription — the note says how) | 36 |
-| ⚠️ PARTIAL | 9 |
+| ✅ DONE (some shipped differently from the prescription — the note says how) | 37 |
+| ⚠️ PARTIAL | 8 |
 | ❌ OPEN | 4 |
 | ⏸ DEFERRED | 2 |
 | **Total** | **51** |
@@ -36,7 +36,6 @@ Every item below was checked against the code at this commit (P6-05, PR #220): t
 | P2-01 Order event log | ⚠️ | Phase 1 (the log) done; deriving state from it and dropping `orders.status` is P6 |
 | P2-06 Poller circuit breaker | ⚠️ | Poll failures only log CRITICAL after ten; nothing opens |
 | P6-02 Deploy gated on tests | ⚠️ | `deploy.yml` is disabled; manual deploys are not gated |
-| P3-02 Credential form | ⚠️ | **The web app's form has no account number or HTS ID** — a KIS credential saved from the web cannot trade |
 | P5-03 Risk system unification | ❌ | The app's quick-trade halt gate reads legacy Redis keys **nothing writes** — it never trips on losses |
 | P6-01 State-machine tests | ⚠️ | No exhaustive all-pairs transition test |
 | P6-03 Compose health checks | ⚠️ | None on frontend, kis-worker, kis-ws |
@@ -887,11 +886,11 @@ Makes the execution layer correct-by-construction rather than correct-by-convent
 
 ---
 
-#### P3-02 — `CredentialForm.vue`: KIS + Kiwoom fields, paper/real toggle — ⚠️ PARTIAL
+#### P3-02 — `CredentialForm.vue`: KIS + Kiwoom fields, paper/real toggle — ✅ DONE (PR #223)
 
-> **Audit (2026-10-09):** Mobile: account number (12 digits), HTS ID and paper toggle (`mobile/src/views/profile/CredentialForm.vue:31`–`35`).
+> **Audit (2026-10-09):** The web form was still the crypto form (API Key / Secret / Passphrase, no account number), so a KIS credential saved from the web could not trade (`CANO`, `kis_adapter/orders.py:46`). The mobile form had the fields but demanded **12** characters — a KIS account is 10 digits (CANO 8 + product code 2, split `[:8]`/`[8:]`).
 >
-> **Web: still the crypto form** — API Key / Secret Key / Passphrase, no account number or HTS ID (`frontend/src/views/profile/CredentialForm.vue:23`–`46`). The API already accepts `account_no` and `hts_id` (`api/compat.py:142`–`153`); the web form never sends them, so a KIS credential saved from the web app has no account number — and orders need it (`CANO`, `kis_adapter/orders.py:46`). The fix is the form only.
+> **Done in PR #223.** One internationalised form, identical in both apps (`frontend/` = `mobile/` `src/views/profile/CredentialForm.vue`): App Key, App Secret, account number (`50123456-01` or `5012345601`, sent as 10 digits), optional HTS ID, paper on by default; Kiwoom shows "not supported yet" and cannot be saved; no passphrase. The API stores the account as 10 digits and refuses another length for KIS (`api/compat.py` `_kis_account`; a missing account is still accepted — the forms require it). `kis_adapter/auth.py` `normalize_account_no` drops `-` and whitespace where the account enters `KISAuth`, and the worker's `KISBroker` (whose cancel and order-status calls split the account themselves) reads it through `auth.require_account()` — so the `.env.example` form `50123456-01` no longer sends `-01` as the product code. An account that is still not 10 digits (rows saved through the old 12-character mobile form) is logged as a warning. Kiwoom accounts are not normalised (`kiwoom_adapter` splits on the hyphen). Tests: `tests/integration/test_frontend_credential_form.py`, `api/tests/test_compat_credentials.py::TestKisAccountFormat`, `kis_adapter/tests/test_account_no_format.py`.
 
 | Field | Value |
 |---|---|
