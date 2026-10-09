@@ -13,12 +13,12 @@
 
 ## Status at a glance (2026-10-09, main `f02dbf7`)
 
-Every item below was checked against the code at this commit (P6-05, PR #220): the heading carries the status and an **Audit** note cites the file and line. Unmarked items no longer exist. Since then: P2-03 ⚠️→✅ (PR #221).
+Every item below was checked against the code at this commit (P6-05, PR #220): the heading carries the status and an **Audit** note cites the file and line. Unmarked items no longer exist. Since then: P2-03 ⚠️→✅ (PR #221), P1-10 ⚠️→✅ (PR #222).
 
 | Status | Count |
 |---|---|
-| ✅ DONE (some shipped differently from the prescription — the note says how) | 35 |
-| ⚠️ PARTIAL | 10 |
+| ✅ DONE (some shipped differently from the prescription — the note says how) | 36 |
+| ⚠️ PARTIAL | 9 |
 | ❌ OPEN | 4 |
 | ⏸ DEFERRED | 2 |
 | **Total** | **51** |
@@ -32,7 +32,6 @@ Every item below was checked against the code at this commit (P6-05, PR #220): t
 | P0-13 FK constraints | ❌ | No foreign keys; `fills.order_id` is unconstrained (schema change on an existing table) |
 | P1-03 Client order id before submit | ❌ | KIS has no client order id; tied to P0-02 |
 | P1-08 Legacy bot removal | ⚠️ | `kis-bot` disabled, but `bot/` stays — `bot/notifier.py` is the worker's alert path |
-| P1-10 Fill-write failure surfaced | ⚠️ | A failed fill write is a warning only — no SAFE_MODE, no alert |
 | P1-12 Quantity tolerance | ❌ | `_QTY_TOLERANCE = 1` fixed |
 | P2-01 Order event log | ⚠️ | Phase 1 (the log) done; deriving state from it and dropping `orders.status` is P6 |
 | P2-06 Poller circuit breaker | ⚠️ | Poll failures only log CRITICAL after ten; nothing opens |
@@ -695,11 +694,11 @@ Tasks that make the running system observable and resilient to common failure mo
 
 ---
 
-#### P1-10 — `on_filled` exception propagation: remove bare except in fill callback — ⚠️ PARTIAL
+#### P1-10 — `on_filled` exception propagation: remove bare except in fill callback — ✅ DONE (PR #222)
 
 > **Audit (2026-10-09):** The poller no longer swallows a failed fill callback — it keeps the entry and retries (`backend/execution/order_poller.py:371`–`377`).
 >
-> But a failed fill **write** is only a warning (`backend/worker/runner.py:1777`–`1778`, `_persist_fill`): no SAFE_MODE, no alert, as the acceptance test asks.
+> **Done in PR #222.** A fill that cannot be recorded — the write raised, or there is no order row to file it under — calls `report_fill_write_failure` (`backend/worker/recovery.py:259`): `SAFE_MODE` closes as `UNTRUSTED_STATE` (the kill-switch resume poll only reopens a risk halt, so it stays shut until a restart, whose recovery reconciles with the broker; emergency flatten and cancels still pass), one emergency alert per process, an ERROR log, and a `fill_write_failed` audit when the database allows (`backend/worker/runner.py:1757`, `:1824`–`1831`). The startup-recovery fill stub reports the same way, and recovery's last step does not reopen the gate after it (`backend/worker/recovery.py:903`). A skipped duplicate or a refused overfill (P2-03) is a decision, not a failure. Tests: `backend/worker/tests/test_fill_write_failure.py`. Exceptions still do not propagate out of `on_filled` — each step catches its own, which is what keeps the poller from re-running steps that already applied.
 
 | Field | Value |
 |---|---|

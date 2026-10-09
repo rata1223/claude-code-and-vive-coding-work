@@ -243,6 +243,46 @@ class SafeModeState:
 SAFE_MODE = SafeModeState()
 
 
+#: Set once a fill could not be recorded (P1-10): the database now says less
+#: than the broker, so this process must not open the gate again — not even at
+#: the end of a startup recovery that is still running when it happens. A
+#: restart clears it, and its recovery reconciles with the broker.
+_fill_write_failure: Optional[str] = None
+_fill_write_lock = threading.Lock()
+
+
+def fill_write_failure() -> Optional[str]:
+    """Why a fill could not be recorded in this process, or ``None``."""
+    return _fill_write_failure
+
+
+def report_fill_write_failure(order_id, symbol, qty, price, error) -> None:
+    """A real fill could not be written to ``fills``/``orders`` (P1-10).
+
+    Closes ``SAFE_MODE`` as untrusted state — the kill-switch resume poll only
+    reopens a risk halt, so it stays shut until a restart, whose recovery
+    reconciles orders, fills and positions with the broker. Emergency flatten
+    and cancels still pass (``halt_policy``). The operator is alerted once per
+    process: a database outage fails every fill. Never raises.
+    """
+    global _fill_write_failure
+    reason = f"체결 기록 실패: order={order_id} {symbol} {qty}주 @ {price} — {error}"
+    logger.error(reason)
+    with _fill_write_lock:
+        first = _fill_write_failure is None
+        if first:
+            _fill_write_failure = reason
+        SAFE_MODE.disable(reason, cause=HaltCause.UNTRUSTED_STATE)
+    if not first:
+        return
+    try:
+        from bot.notifier import alert_emergency
+        alert_emergency(f"[체결 기록 실패] 매매 차단 — 재시작 필요(기동 복구가 브로커와 맞춘다)\n"
+                        f"주문: {order_id} {symbol} {qty}주 @ {price}\n오류: {error}")
+    except Exception as e:
+        logger.warning("체결 기록 실패 Telegram 알림 실패: %s", e)
+
+
 class StartupRecovery:
     """
     Worker 시작 시 8단계 복구 시퀀스 실행.
@@ -545,7 +585,9 @@ class StartupRecovery:
                                 sess.commit()
                                 logger.info("복구 체결 DB 업데이트: %s → FILLED", broker_order_id)
                         except Exception as e:
-                            logger.warning("복구 체결 DB 저장 실패: %s", e)
+                            report_fill_write_failure(
+                                broker_order_id, order.symbol, order.filled_qty or order.qty,
+                                order.avg_fill_price or order.price, e)
                         finally:
                             sess.close()
                     return on_filled
@@ -858,6 +900,11 @@ class StartupRecovery:
                 logger.warning("킬스위치 재시작 Telegram 알림 실패: %s", e)
             return False
 
+        if _fill_write_failure is not None:
+            # A recovered order's fill could not be recorded while recovery ran.
+            SAFE_MODE.disable(_fill_write_failure)
+            logger.critical("복구 중 체결 기록 실패 — 매매 차단 유지, 재시작 필요")
+            return False
         SAFE_MODE.enable()
         logger.info("복구 완료 — 매매 허용. reconcile actions=%d", len(self._actions))
         return True

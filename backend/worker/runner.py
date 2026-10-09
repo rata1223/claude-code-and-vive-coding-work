@@ -1732,7 +1732,13 @@ class StrategyWorker:
         a duplicate exactly when they already reach ``cumulative``. Without it
         nothing tells the two apart, and only the invariant is checked: fills
         never add up to more than the order's quantity.
+
+        A fill that cannot be recorded — the write raised, or there is no row
+        to file it under — closes ``SAFE_MODE`` and alerts the operator
+        (``report_fill_write_failure``, P1-10). A skipped duplicate or a
+        refused overfill is a decision, not a failure.
         """
+        failure = None
         try:
             with _session() as db:
                 db_order = None
@@ -1746,7 +1752,9 @@ class StrategyWorker:
                 if db_order is None:
                     db_order = _open_order_row(db, order)
                 if db_order is None:
-                    logger.warning("체결 DB 저장 스킵: 미등록 주문 %s", order.id)
+                    # A real fill with no row to file it under: it is recorded
+                    # nowhere, which is the same failure as a write that raised.
+                    failure = "주문 행 없음"
                     return
                 # Idempotency. The poller's watermark is the first line: it hands
                 # each increment over once. This is the second, for a fill that
@@ -1814,7 +1822,13 @@ class StrategyWorker:
                 except Exception as _ae:
                     logger.warning("AuditLog 체결 기록 실패: %s", _ae)
         except Exception as e:
-            logger.warning("체결 DB 저장 실패: %s", e)
+            failure = e
+        finally:
+            if failure is not None:
+                from backend.worker.recovery import report_fill_write_failure
+                report_fill_write_failure(order.id, fill.symbol, fill.qty, fill.price, failure)
+                _audit("fill_write_failed", symbol=fill.symbol, order_id=order.id,
+                       detail={"qty": fill.qty, "price": fill.price, "error": str(failure)})
 
     def _restore_positions(self, tracker: PositionTracker, broker: str = "kis"):
         try:
