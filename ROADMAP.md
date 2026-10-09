@@ -13,12 +13,12 @@
 
 ## Status at a glance (2026-10-09, main `f02dbf7`)
 
-Every item below was checked against the code at this commit (P6-05, PR #220): the heading carries the status and an **Audit** note cites the file and line. Unmarked items no longer exist.
+Every item below was checked against the code at this commit (P6-05, PR #220): the heading carries the status and an **Audit** note cites the file and line. Unmarked items no longer exist. Since then: P2-03 ⚠️→✅ (PR #221).
 
 | Status | Count |
 |---|---|
-| ✅ DONE (some shipped differently from the prescription — the note says how) | 34 |
-| ⚠️ PARTIAL | 11 |
+| ✅ DONE (some shipped differently from the prescription — the note says how) | 35 |
+| ⚠️ PARTIAL | 10 |
 | ❌ OPEN | 4 |
 | ⏸ DEFERRED | 2 |
 | **Total** | **51** |
@@ -35,7 +35,6 @@ Every item below was checked against the code at this commit (P6-05, PR #220): t
 | P1-10 Fill-write failure surfaced | ⚠️ | A failed fill write is a warning only — no SAFE_MODE, no alert |
 | P1-12 Quantity tolerance | ❌ | `_QTY_TOLERANCE = 1` fixed |
 | P2-01 Order event log | ⚠️ | Phase 1 (the log) done; deriving state from it and dropping `orders.status` is P6 |
-| P2-03 Fill idempotency | ⚠️ | **Defect**: dedup key `(order_id, qty, price)` drops a second fill whose increment and price equal the first (whether KIS reports such a sequence is unverified); no unique constraint |
 | P2-06 Poller circuit breaker | ⚠️ | Poll failures only log CRITICAL after ten; nothing opens |
 | P6-02 Deploy gated on tests | ⚠️ | `deploy.yml` is disabled; manual deploys are not gated |
 | P3-02 Credential form | ⚠️ | **The web app's form has no account number or HTS ID** — a KIS credential saved from the web cannot trade |
@@ -803,11 +802,11 @@ Makes the execution layer correct-by-construction rather than correct-by-convent
 
 ---
 
-#### P2-03 — Fill idempotency: deduplicate on `(order_id, seq_no)` before inserting — ⚠️ PARTIAL
+#### P2-03 — Fill idempotency: deduplicate on `(order_id, seq_no)` before inserting — ✅ DONE (PR #221, shipped differently)
 
-> **Audit (2026-10-09):** Deduplicated in code — **on a key that is too weak**: `_persist_fill` treats any existing fill row with the same `(order_id, qty, price)` as a duplicate (`backend/worker/runner.py:1743`–`1750`) and returns before writing anything. If two successive broker status updates raise the cumulative filled quantity by the same increment at the same effective price, the second fill is the same key, so **it is dropped** (the repository does not establish how often KIS reports such a sequence) (on the path where the state machine did not see the order, `orders.filled_qty` misses it too). The poller also seeds its watermark from the stored `filled_qty`; test `backend/worker/tests/test_recovery_safety.py` (C2) covers only a true redelivery.
+> **Audit (2026-10-09):** The audit found the dedup key too weak: `_persist_fill` skipped any fill with the same `(order_id, qty, price)`, so a second fill whose increment and price equalled the first was dropped — from `fills`, and where the state machine did not know the order, from `orders.filled_qty` too.
 >
-> Fix needs a real fill identity (KIS execution number or the cumulative quantity a fill brings the order to), then the prescribed `UNIQUE` + `ON CONFLICT DO NOTHING` on it — a unique constraint on today's key would make the drop permanent. Two sessions can also still race the check.
+> **Fixed in PR #221, differently from the prescription.** There is no broker fill number in our model and no `fills` schema change, so the identity is **the total a fill brings its order to**. The poller hands each fill over as an increment against its watermark and now also passes that total (`Order.cumulative_filled_qty`, `backend/execution/order_poller.py:370`, `:433`). `_persist_fill` locks the order row (`SELECT … FOR UPDATE`), sums the fills on file, and skips the fill only when they already reach its total (`backend/worker/runner.py:1757`–`1773`). A redelivery carries the same total; a second fill of the same size a larger one. Without a total (no poller in between) it refuses only a fill that would push the order past its quantity, and audits `fill_overfill_rejected`. The poller watermark stays the first line. Tests: `backend/worker/tests/test_fill_identity.py` (equal fills both land with and without the state machine, redelivery skipped, through the real poller including a callback retried after its write), `tests/postgres/test_fill_identity_db.py` (a concurrent copy waits for the row lock and is skipped).
 
 | Field | Value |
 |---|---|
