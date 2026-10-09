@@ -145,3 +145,26 @@ def test_the_reconcilers_pass_survives_a_concurrent_first_insert(factory):
     assert _rows(factory) == [(12, 101.0)]
     assert _rows(factory, "AAPL") == [(8, 210.0)]
     assert any(g["kind"] == "position_appeared_during_reconcile" for g in result.gaps)
+
+
+def test_the_reconciler_does_not_overwrite_a_concurrent_fill(factory):
+    """The pass reads qty=5, then waits on the row a fill is updating to 9.
+    Once the fill commits, the pass sees the row moved past its snapshot and
+    leaves it — the broker value it holds (8) is older than the fill."""
+    with factory() as s:
+        s.add(DBPosition(symbol="AAPL", qty=5, avg_price=200.0, market="US", broker="kis"))
+        s.commit()
+    broker = MagicMock()
+    broker.get_positions.return_value = [BPosition(symbol="AAPL", qty=8, avg_price=210.0,
+                                                   market="US")]
+    reconciler = PositionReconciler(broker=broker, db_factory=factory, redis_client=None,
+                                    broker_name="kis")
+    holder = factory()
+    upsert_position(holder, symbol="AAPL", broker="kis", qty=9, avg_price=205.0, market="US")
+    writer = _Writer(lambda: reconciler.reconcile("t"))
+    _assert_blocked_then_run(writer, holder)
+    holder.close()
+
+    assert writer.result.errors == []
+    assert _rows(factory, "AAPL") == [(9, 205.0)]
+    assert [g["kind"] for g in writer.result.gaps] == ["position_changed_during_reconcile"]

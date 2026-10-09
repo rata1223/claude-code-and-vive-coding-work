@@ -113,10 +113,18 @@ def _session():
 # this it would capture the next order to draw its number. Quantity is not
 # compared: KIS can omit `ord_qty`, and gating on it would drop a real fill.
 
-#: Serialises the fill pipeline's position writes (``_upsert_position_db``), so
-#: the last commit always carries the tracker's latest value. One per process:
-#: there is one worker, and each write is a single small statement.
-_POSITION_DB_LOCK = threading.Lock()
+#: Serialises the fill pipeline's position writes per symbol
+#: (``_upsert_position_db``), so the last commit always carries the tracker's
+#: latest value. Per symbol, not one lock: a write can wait on a row lock (the
+#: reconciler holds one until its pass commits), and that wait must not stall
+#: fills on every other symbol.
+_POSITION_DB_LOCKS: dict[str, threading.Lock] = {}
+_POSITION_DB_LOCKS_GUARD = threading.Lock()
+
+
+def _position_db_lock(symbol: str) -> threading.Lock:
+    with _POSITION_DB_LOCKS_GUARD:
+        return _POSITION_DB_LOCKS.setdefault(symbol, threading.Lock())
 
 #: Non-terminal statuses. `unknown` is included because the state machine and
 #: the poller still treat such an order as live (`OrderStateMachine.active_orders`).
@@ -2006,12 +2014,12 @@ class StrategyWorker:
         ``INSERT … ON CONFLICT DO UPDATE`` (no duplicate-key race on the first
         insert), or deleted when the position is closed.
 
-        The tracker is read **inside** ``_POSITION_DB_LOCK``: the symbol's
+        The tracker is read **inside** the symbol's write lock: its
         pending lock is released at step 2, so two fills on one symbol can reach
         this step together, and a value read before the lock could commit after
         a newer one — leaving the DB behind the tracker until the next fill."""
         try:
-            with _POSITION_DB_LOCK, _session() as db:
+            with _position_db_lock(symbol), _session() as db:
                 pos = tracker.get_position(symbol)
                 if pos is None or pos.qty <= 0:
                     row = lock_position(db, symbol, "kis")

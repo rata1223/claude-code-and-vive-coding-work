@@ -170,7 +170,9 @@ class PositionReconciler:
 
     def _reconcile_positions(self, broker_pos: dict[str, Position],
                              result: ReconciliationResult, dry_run: bool):
-        from backend.database.models import Position as DBPosition, insert_position_if_missing
+        from backend.database.models import (
+            Position as DBPosition, insert_position_if_missing,
+        )
 
         with _session(self._factory) as db:
             # P2-02C: CONFIRMED corporate actions detected during this run. We
@@ -217,8 +219,8 @@ class PositionReconciler:
                             result.repaired("insert_position", sym,
                                             f"DB에 포지션 추가: qty={bp.qty}")
                         else:
-                            result.gap("position_appeared_during_reconcile", sym,
-                                       "재조정 중 다른 쓰기가 포지션을 추가함 — 다음 회차에 비교")
+                            self._superseded(result, sym, "position_appeared_during_reconcile",
+                                             "재조정 중 다른 쓰기가 포지션을 추가함 — 다음 회차에 비교")
                 else:
                     qty_diff = abs(dp["qty"] - bp.qty)
                     price_changed = abs(dp["avg_price"] - bp.avg_price) > 0.01
@@ -247,7 +249,8 @@ class PositionReconciler:
                                        f"DB qty={dp['qty']} vs 브로커 qty={bp.qty}"
                                        + (f" [{ca_action.action_type.value}/{ca_action.status.value}]"
                                           if ca_action is not None else ""))
-                            if not dry_run:
+                            row = None if dry_run else self._lock_unchanged(db, sym, dp, result)
+                            if row is not None:
                                 # Record the corporate action: persists + gates (UNKNOWN → blocks,
                                 # fail-closed; CONFIRMED split → cleared below once broker value applied).
                                 if self._ca_runtime is not None and ca_action is not None:
@@ -259,11 +262,9 @@ class PositionReconciler:
                                      "db_avg": dp["avg_price"], "broker_avg": bp.avg_price,
                                      "broker_name": self._broker_name, "trigger": result.trigger},
                                 )
-                                row = db.get(DBPosition, dp["id"])
-                                if row:
-                                    row.qty = bp.qty
-                                    row.avg_price = bp.avg_price
-                                    row.updated_at = datetime.utcnow()
+                                row.qty = bp.qty
+                                row.avg_price = bp.avg_price
+                                row.updated_at = datetime.utcnow()
                                 result.repaired("fix_qty", sym,
                                                 f"DB qty {dp['qty']}→{bp.qty}")
                                 # CONFIRMED corporate action: broker has already adjusted the
@@ -278,16 +279,15 @@ class PositionReconciler:
                                     })
                     elif price_changed and qty_diff <= self._QTY_TOLERANCE:
                         # avg_price drift only — always safe to fix
-                        if not dry_run:
+                        row = None if dry_run else self._lock_unchanged(db, sym, dp, result)
+                        if row is not None:
                             self._audit_position_change(
                                 "reconcile_fix_avg_price", sym,
                                 {"db_avg": dp["avg_price"], "broker_avg": bp.avg_price,
                                  "broker_name": self._broker_name, "trigger": result.trigger},
                             )
-                            row = db.get(DBPosition, dp["id"])
-                            if row:
-                                row.avg_price = bp.avg_price
-                                row.updated_at = datetime.utcnow()
+                            row.avg_price = bp.avg_price
+                            row.updated_at = datetime.utcnow()
                             result.repaired("fix_avg_price", sym,
                                             f"avg_price {dp['avg_price']:.4f}→{bp.avg_price:.4f}")
 
@@ -309,15 +309,14 @@ class PositionReconciler:
                     else:
                         result.gap("stale_db_position", sym,
                                    f"DB qty={dp['qty']} — 브로커에 없음 (청산됨)")
-                        if not dry_run:
+                        row = None if dry_run else self._lock_unchanged(db, sym, dp, result)
+                        if row is not None:
                             self._audit_position_change(
                                 "reconcile_delete", sym,
                                 {"db_qty": dp["qty"], "age_hours": age_hours,
                                  "broker_name": self._broker_name, "trigger": result.trigger},
                             )
-                            row = db.get(DBPosition, dp["id"])
-                            if row:
-                                db.delete(row)
+                            db.delete(row)
                             result.repaired("delete_position", sym, "DB 스테일 포지션 삭제")
 
             if not dry_run:
@@ -330,6 +329,35 @@ class PositionReconciler:
                     self._ca_runtime.mark_applied(
                         ca["action"], qty_before=ca["qty_before"], avg_before=ca["avg_before"],
                         qty_after=ca["qty_after"], avg_after=ca["avg_after"], value_preserved=True)
+
+    def _lock_unchanged(self, db, symbol: str, snapshot: dict, result):
+        """The position row, locked, if it still holds what this pass read at
+        its start — else ``None`` and the symbol is left for the next pass (P0-09).
+
+        The pass reads the table first and commits once at the end. A fill
+        pipeline write in between is newer than the broker value this pass
+        compared against: overwriting it would put a stale quantity in the DB
+        (and in the tracker, on a restart), and updating a row the fill pipeline
+        deleted would fail the commit and roll back every other repair."""
+        from backend.database.models import lock_position
+        row = lock_position(db, symbol, self._broker_name)
+        if (row is None or row.id != snapshot["id"] or row.qty != snapshot["qty"]
+                or row.avg_price != snapshot["avg_price"]):
+            self._superseded(result, symbol, "position_changed_during_reconcile",
+                             "재조정 중 다른 쓰기가 포지션을 바꿈 — 다음 회차에 비교")
+            return None
+        return row
+
+    @staticmethod
+    def _superseded(result, symbol: str, kind: str, detail: str) -> None:
+        """Replace the gap this pass just recorded for ``symbol``: it was read
+        from a snapshot another writer has since moved past, so it is not a
+        mismatch — one gap saying so, not two."""
+        for i in range(len(result.gaps) - 1, -1, -1):
+            if result.gaps[i]["symbol"] == symbol:
+                del result.gaps[i]
+                break
+        result.gap(kind, symbol, detail)
 
     def _has_pending_order(self, symbol: str, db) -> bool:
         """Return True if there is any open order for this symbol and broker."""

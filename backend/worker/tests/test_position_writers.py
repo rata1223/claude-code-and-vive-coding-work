@@ -42,11 +42,29 @@ def _model_names(tree) -> set[str]:
     return names
 
 
-def _queries_model(node, names) -> bool:
+def _module_aliases(tree) -> set[str]:
+    """Names the models module itself is bound to (``from backend.database
+    import models``, ``import backend.database.models as m``)."""
+    names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == "backend.database":
+            names |= {a.asname or a.name for a in node.names if a.name == "models"}
+        elif isinstance(node, ast.Import):
+            names |= {a.asname for a in node.names if a.name == _MODELS and a.asname}
+    return names
+
+
+def _is_model(node, names, modules) -> bool:
+    return ((isinstance(node, ast.Name) and node.id in names)
+            or (isinstance(node, ast.Attribute) and node.attr == "Position"
+                and isinstance(node.value, ast.Name) and node.value.id in modules))
+
+
+def _queries_model(node, names, modules) -> bool:
     while isinstance(node, (ast.Call, ast.Attribute)):
         if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
                 and node.func.attr == "query" and node.args
-                and isinstance(node.args[0], ast.Name) and node.args[0].id in names):
+                and _is_model(node.args[0], names, modules)):
             return True
         node = node.func if isinstance(node, ast.Call) else node.value
     return False
@@ -66,25 +84,30 @@ def _writes_a_row(fn) -> bool:
 
 def bypasses(src: str) -> list[int]:
     tree = ast.parse(src)
-    names = _model_names(tree)
-    if not names:
+    names, modules = _model_names(tree), _module_aliases(tree)
+    if not names and not modules:
         return []
     hits = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
         f = node.func
-        if isinstance(f, ast.Name) and f.id in names:
+        name = getattr(f, "id", None) or getattr(f, "attr", None)
+        if _is_model(f, names, modules):
             hits.append(node.lineno)                                   # Position(...)
-        elif ((getattr(f, "id", None) or getattr(f, "attr", None)) in ("insert", "update", "delete")
-              and node.args and isinstance(node.args[0], ast.Name) and node.args[0].id in names):
+        elif (name in ("insert", "update", "delete") and node.args
+              and _is_model(node.args[0], names, modules)):
             hits.append(node.lineno)                                   # insert(Position)
+        elif (isinstance(f, ast.Attribute) and name in ("update", "delete")
+              and _queries_model(f.value, names, modules)):
+            hits.append(node.lineno)                                   # query(Position)….update()
     for fn in ast.walk(tree):
         if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)) or not _writes_a_row(fn):
             continue
         for node in ast.walk(fn):
             if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-                    and node.func.attr in _ONE_ROW and _queries_model(node.func.value, names)):
+                    and node.func.attr in _ONE_ROW
+                    and _queries_model(node.func.value, names, modules)):
                 hits.append(node.lineno)                               # query(Position).first() → write
     return sorted(set(hits))
 
@@ -112,7 +135,8 @@ def test_no_production_code_writes_positions_around_the_helpers():
             found = bypasses(src)
         except (OSError, SyntaxError):
             continue
-        if _model_names(ast.parse(src)):
+        tree = ast.parse(src)
+        if _model_names(tree) or _module_aliases(tree):
             scanned += 1
         hits += [f"{os.path.relpath(path, _repo_root())}:{n}" for n in found]
     assert scanned >= 3, "scan found fewer modules than the known writers — scan is broken"
@@ -132,6 +156,12 @@ def test_no_production_code_writes_positions_around_the_helpers():
     "def f(db):\n"
     "    row = (db.query(DBPosition)\n        .filter(DBPosition.symbol == 'A')\n        .one_or_none())\n"
     "    db.delete(row)\n",
+    "from backend.database import models\nsess.add(models.Position(symbol='A'))",
+    "import backend.database.models as m\nsess.add(m.Position(symbol='A'))",
+    "from backend.database.models import Position as P\n"
+    "db.query(P).filter(P.symbol == 'A').update({'qty': 3})",
+    "from backend.database.models import Position as P\n"
+    "(db.query(P)\n   .filter(P.symbol == 'A')\n   .delete())",
 ])
 def test_the_guard_sees_each_kind_of_bypass(src):
     assert bypasses(src)

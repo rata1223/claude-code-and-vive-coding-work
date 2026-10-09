@@ -17,6 +17,8 @@ import pytest
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from sqlalchemy import delete as sa_delete
+
 import backend.database.models as models
 from backend.brokers.models import Position as BPosition
 from backend.database.models import (
@@ -179,6 +181,31 @@ class TestFillPipeline:
         assert _rows(factory) == [(20, 105.0, "KR")]
 
 
+    def test_a_wait_on_one_symbol_does_not_stall_another(self, monkeypatch, shared_factory):
+        w = _worker(monkeypatch, shared_factory)
+        entered, release = threading.Event(), threading.Event()
+
+        class _Blocking:
+            def get_position(self, symbol):
+                entered.set()
+                release.wait(5)
+                return SimpleNamespace(qty=1, avg_price=1.0)
+
+        held = threading.Thread(target=w._upsert_position_db, args=("005930", "KR", _Blocking()))
+        held.start()
+        assert entered.wait(5)
+        other = threading.Thread(target=w._upsert_position_db,
+                                 args=("AAPL", "US", _Tracker(SimpleNamespace(qty=3, avg_price=200.0))))
+        other.start()
+        other.join(5)
+        try:
+            assert not other.is_alive(), "a write on AAPL waited for 005930's lock"
+        finally:
+            release.set()
+            held.join(5)
+        assert _rows(shared_factory, "AAPL") == [(3, 200.0, "US")]
+
+
 # ── startup recovery ────────────────────────────────────────────────────────
 def _apply(factory, side, qty, price, symbol="005930"):
     rec = StartupRecovery.__new__(StartupRecovery)
@@ -207,6 +234,23 @@ class TestRecovery:
     def test_a_sell_without_a_row_is_a_no_op(self, factory):
         _apply(factory, "sell", 4, 130.0)
         assert _rows(factory) == []
+
+    def test_a_row_deleted_between_the_conflict_and_the_lock_is_inserted_again(
+            self, monkeypatch, factory):
+        """DO NOTHING does not lock the row it ran into; a delete can commit
+        before the lock, which then finds nothing. The fill must still land."""
+        _seed(factory, qty=10, avg=100.0)
+        real, calls = models.lock_position, []
+
+        def _closed_in_between(sess, symbol, broker):
+            if not calls:
+                sess.execute(sa_delete(DBPosition).where(DBPosition.symbol == symbol))
+            calls.append(symbol)
+            return real(sess, symbol, broker)
+
+        monkeypatch.setattr(models, "lock_position", _closed_in_between)
+        _apply(factory, "buy", 5, 130.0)
+        assert _rows(factory) == [(5, 130.0, "KR")]
 
     def test_us_symbols_get_the_us_market(self, factory):
         _apply(factory, "buy", 2, 200.0, symbol="AAPL")
@@ -252,5 +296,80 @@ class TestReconciler:
         assert result.errors == []
         assert _rows(factory) == [(12, 101.0, "KR")]            # left for the next pass
         assert _rows(factory, "AAPL") == [(8, 210.0, "US")]     # the other repair committed
-        assert any(g["kind"] == "position_appeared_during_reconcile" for g in result.gaps)
+        kinds = [g["kind"] for g in result.gaps if g["symbol"] == "005930"]
+        assert kinds == ["position_appeared_during_reconcile"]       # one gap, not two
         assert not any(r["kind"] == "insert_position" for r in result.repairs)
+
+    @pytest.mark.parametrize("broker_qty, broker_avg, expect_repair", [
+        (8, 210.0, "fix_qty"),           # quantity mismatch
+        (5, 230.0, "fix_avg_price"),     # avg-price drift only
+    ])
+    def test_a_row_changed_during_the_pass_is_not_overwritten(
+            self, monkeypatch, factory, broker_qty, broker_avg, expect_repair):
+        """The pass read the row at its start; the fill pipeline then wrote a
+        newer value. The broker value the pass holds is older — leave the row."""
+        _seed(factory, symbol="AAPL", qty=5, avg=200.0, market="US")
+        _seed(factory, symbol="MSFT", qty=1, avg=300.0, market="US")   # a repair that must commit
+        real = models.lock_position
+
+        def _fill_lands_first(sess, symbol, broker):
+            if symbol == "AAPL":
+                upsert_position(sess, symbol="AAPL", broker="kis", qty=9, avg_price=205.0,
+                                market="US")
+            return real(sess, symbol, broker)
+
+        monkeypatch.setattr(models, "lock_position", _fill_lands_first)
+        result = _reconciler(factory, [
+            BPosition(symbol="AAPL", qty=broker_qty, avg_price=broker_avg, market="US"),
+            BPosition(symbol="MSFT", qty=4, avg_price=300.0, market="US"),
+        ]).reconcile("t")
+
+        assert result.errors == []
+        assert _rows(factory, "AAPL") == [(9, 205.0, "US")]
+        assert _rows(factory, "MSFT") == [(4, 300.0, "US")]
+        assert [g["kind"] for g in result.gaps if g["symbol"] == "AAPL"] == [
+            "position_changed_during_reconcile"]
+        assert not any(r["kind"] == expect_repair and r["symbol"] == "AAPL"
+                       for r in result.repairs)
+
+    def test_a_row_deleted_during_the_pass_does_not_fail_the_commit(self, monkeypatch, factory):
+        """Updating a row the fill pipeline deleted used to fail the single
+        commit (no row matched) and roll back the whole pass."""
+        _seed(factory, symbol="AAPL", qty=5, avg=200.0, market="US")
+        _seed(factory, symbol="MSFT", qty=1, avg=300.0, market="US")
+        real = models.lock_position
+
+        def _closed_first(sess, symbol, broker):
+            if symbol == "AAPL":
+                sess.execute(sa_delete(DBPosition).where(DBPosition.symbol == "AAPL"))
+            return real(sess, symbol, broker)
+
+        monkeypatch.setattr(models, "lock_position", _closed_first)
+        result = _reconciler(factory, [
+            BPosition(symbol="AAPL", qty=8, avg_price=210.0, market="US"),
+            BPosition(symbol="MSFT", qty=4, avg_price=300.0, market="US"),
+        ]).reconcile("t")
+
+        assert result.errors == []
+        assert _rows(factory, "AAPL") == []
+        assert _rows(factory, "MSFT") == [(4, 300.0, "US")]
+        assert any(g["kind"] == "position_changed_during_reconcile" for g in result.gaps)
+
+    def test_a_stale_delete_spares_a_row_that_changed(self, monkeypatch, factory):
+        from datetime import datetime, timedelta
+        with factory() as s:
+            s.add(DBPosition(symbol="AAPL", qty=5, avg_price=200.0, market="US", broker="kis",
+                             updated_at=datetime.utcnow() - timedelta(hours=5)))
+            s.commit()
+        real = models.lock_position
+
+        def _bought_again(sess, symbol, broker):
+            upsert_position(sess, symbol=symbol, broker="kis", qty=7, avg_price=201.0,
+                            market="US")
+            return real(sess, symbol, broker)
+
+        monkeypatch.setattr(models, "lock_position", _bought_again)
+        result = _reconciler(factory, []).reconcile("t")
+        assert result.errors == []
+        assert _rows(factory, "AAPL") == [(7, 201.0, "US")]
+        assert not any(r["kind"] == "delete_position" for r in result.repairs)

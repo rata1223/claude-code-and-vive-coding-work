@@ -728,11 +728,20 @@ class StartupRecovery:
                         row.updated_at = datetime.utcnow()
             else:  # buy
                 market = "KR" if (len(symbol) == 6 and symbol.isdigit()) else "US"
-                if insert_position_if_missing(sess, symbol=symbol, broker="kis",
-                                              qty=fill_qty, avg_price=fill_price,
-                                              market=market):
-                    return
-                row = lock_position(sess, symbol, "kis")
+                row = None
+                # DO NOTHING does not lock the row it ran into: a delete can
+                # commit before the lock below, which then finds nothing. Insert
+                # again in that case (code-review).
+                for _ in range(2):
+                    if insert_position_if_missing(sess, symbol=symbol, broker="kis",
+                                                  qty=fill_qty, avg_price=fill_price,
+                                                  market=market):
+                        return
+                    row = lock_position(sess, symbol, "kis")
+                    if row is not None:
+                        break
+                if row is None:
+                    raise RuntimeError("position row kept vanishing between insert and lock")
                 prev_val = row.avg_price * row.qty
                 new_val = fill_price * fill_qty
                 total_qty = row.qty + fill_qty
