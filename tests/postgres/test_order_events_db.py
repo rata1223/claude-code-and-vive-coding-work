@@ -23,8 +23,8 @@ def factory(pg_trading_engine):
     f = sessionmaker(bind=pg_trading_engine, expire_on_commit=False)
     yield f
     with f() as db:
-        # TRUNCATE, not DELETE: a database built by Alembic refuses DELETE here.
-        db.execute(sa.text("TRUNCATE order_events"))
+        # The events stay: they are append-only, and order ids are never reused
+        # within this module's tables.
         db.query(Order).filter(Order.symbol.like("P201%")).delete(synchronize_session=False)
         db.commit()
 
@@ -103,16 +103,16 @@ def _alembic(url, *args):
     assert r.returncode == 0, r.stderr
 
 
-def test_the_migration_makes_the_table_append_only(scratch_db_url):
-    _alembic(scratch_db_url, "upgrade", "head")
-    eng = sa.create_engine(scratch_db_url)
+def _assert_append_only(url):
+    eng = sa.create_engine(url)
     try:
         with eng.begin() as c:
             c.execute(OrderEvent.__table__.insert(), {
                 "order_id": 1, "kind": "created", "to_status": "pending",
                 "recorded_at": datetime.utcnow()})
         for stmt in ("UPDATE order_events SET to_status = 'filled'",
-                     "DELETE FROM order_events"):
+                     "DELETE FROM order_events",
+                     "TRUNCATE order_events"):
             with pytest.raises(sa.exc.DBAPIError, match="append-only"):
                 with eng.begin() as c:
                     c.exec_driver_sql(stmt)
@@ -120,6 +120,33 @@ def test_the_migration_makes_the_table_append_only(scratch_db_url):
             assert c.exec_driver_sql("SELECT count(*) FROM order_events").scalar() == 1
     finally:
         eng.dispose()
+
+
+def test_the_worker_installs_the_guard_on_a_create_all_database(scratch_db_url):
+    """Production databases are built by create_all, never by the migration —
+    the guard has to come from where the worker and kis-api open the database."""
+    from backend.database.models import init_db_factory
+    init_db_factory(scratch_db_url).kw["bind"].dispose()
+    init_db_factory(scratch_db_url).kw["bind"].dispose()      # idempotent
+
+    _assert_append_only(scratch_db_url)
+
+
+def test_the_migration_accepts_a_table_create_all_already_made(scratch_db_url):
+    from backend.database.models import Base
+    _alembic(scratch_db_url, "upgrade", "d1e2f3a4b5c6")
+    eng = sa.create_engine(scratch_db_url)
+    Base.metadata.tables["order_events"].create(eng)
+    eng.dispose()
+
+    _alembic(scratch_db_url, "upgrade", "head")
+
+    _assert_append_only(scratch_db_url)
+
+
+def test_the_migration_makes_the_table_append_only(scratch_db_url):
+    _alembic(scratch_db_url, "upgrade", "head")
+    _assert_append_only(scratch_db_url)
 
     _alembic(scratch_db_url, "downgrade", "d1e2f3a4b5c6")
     eng = sa.create_engine(scratch_db_url)

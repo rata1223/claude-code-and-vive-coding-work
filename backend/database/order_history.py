@@ -8,10 +8,14 @@ it is. This records it **once, at the session**, rather than at each writer:
 * ``after_flush`` turns every new ``Order`` and every change to a tracked field
   into an ``OrderEvent``, executed on the flush's own connection — the event
   commits or rolls back with the change it describes. PKs are assigned by then;
-  attribute history still shows the values before the flush.
+  attribute history still shows the values before the flush. The values
+  recorded are **read back from the row** the flush just wrote, not taken from
+  this session's object: a field this session did not touch may have been
+  changed by another one since it loaded the order.
 * ``before_flush`` refuses to update or delete an ``OrderEvent`` through the
-  ORM: the log only grows. (Postgres also enforces it with a trigger, added by
-  the Alembic migration ``e2f3a4b5c6d7``.)
+  ORM: the log only grows. On Postgres a trigger also refuses UPDATE, DELETE
+  and TRUNCATE (``ensure_db_guard``, run where the tables are created, and the
+  Alembic migration ``e2f3a4b5c6d7``).
 
 What goes around a session — a Core update statement, raw SQL — goes around
 this too; a static guard keeps production code from doing that
@@ -53,30 +57,36 @@ def _changed(obj) -> tuple[bool, object]:
     return changed, before
 
 
-def _row(obj, kind: str, from_status) -> dict:
-    return {
-        "order_id": obj.id,
-        "kind": kind,
-        "from_status": from_status,
-        "to_status": obj.status,
-        "filled_qty": obj.filled_qty,
-        "avg_fill_price": obj.avg_fill_price,
-        "broker_order_id": obj.broker_order_id,
-        "recorded_at": datetime.utcnow(),
-    }
-
-
 def _record(session: Session, flush_context) -> None:
+    from sqlalchemy import select
     from backend.database.models import Order, OrderEvent
-    rows = [_row(o, "created", None) for o in session.new if isinstance(o, Order)]
+    events = [(o.id, "created", None) for o in session.new if isinstance(o, Order)]
     for o in session.dirty:
         if isinstance(o, Order):
             changed, before = _changed(o)
             if changed:
-                rows.append(_row(o, "updated", before))
-    if rows:
-        # The flush's own connection: same transaction as the change.
-        session.connection().execute(OrderEvent.__table__.insert(), rows)
+                events.append((o.id, "updated", before))
+    if not events:
+        return
+    # The flush's own connection: same transaction as the change, and the row
+    # as this transaction now sees it — after our UPDATE, on top of whatever
+    # another session committed to the fields we did not set.
+    conn = session.connection()
+    t = Order.__table__
+    now = {r.id: r for r in conn.execute(
+        select(t.c.id, t.c.status, t.c.filled_qty, t.c.avg_fill_price, t.c.broker_order_id)
+        .where(t.c.id.in_({oid for oid, _, _ in events})))}
+    rows = [{
+        "order_id": oid,
+        "kind": kind,
+        "from_status": before,
+        "to_status": now[oid].status,
+        "filled_qty": now[oid].filled_qty,
+        "avg_fill_price": now[oid].avg_fill_price,
+        "broker_order_id": now[oid].broker_order_id,
+        "recorded_at": datetime.utcnow(),
+    } for oid, kind, before in events]
+    conn.execute(OrderEvent.__table__.insert(), rows)
 
 
 def _guard(session: Session, flush_context, instances) -> None:
@@ -95,6 +105,47 @@ def install() -> None:
         event.listen(Session, "after_flush", _record)
     if not event.contains(Session, "before_flush", _guard):
         event.listen(Session, "before_flush", _guard)
+
+
+#: The append-only guard below the ORM. Same SQL as the Alembic migration.
+_GUARD_SQL = (
+    """CREATE OR REPLACE FUNCTION order_events_append_only() RETURNS trigger AS $$
+    BEGIN
+        RAISE EXCEPTION USING MESSAGE = 'order_events is append-only: ' || TG_OP;
+    END;
+    $$ LANGUAGE plpgsql""",
+    """CREATE OR REPLACE TRIGGER order_events_append_only
+    BEFORE UPDATE OR DELETE ON order_events
+    FOR EACH ROW EXECUTE FUNCTION order_events_append_only()""",
+    """CREATE OR REPLACE TRIGGER order_events_no_truncate
+    BEFORE TRUNCATE ON order_events
+    FOR EACH STATEMENT EXECUTE FUNCTION order_events_append_only()""",
+)
+
+#: Serialises two processes installing the guard at once.
+_GUARD_LOCK_KEY = 2190001
+
+
+def ensure_db_guard(engine) -> bool:
+    """Install the Postgres trigger that refuses UPDATE, DELETE and TRUNCATE on
+    ``order_events`` — idempotently. The databases this platform runs on are
+    built by ``create_all``, which never runs the Alembic migration, so without
+    this the guard would exist only on paper. Never raises: a missing guard is
+    logged, it does not stop the process. Returns whether it is installed.
+    """
+    import logging
+    log = logging.getLogger(__name__)
+    if engine.dialect.name != "postgresql":
+        return False
+    try:
+        with engine.begin() as conn:
+            conn.exec_driver_sql(f"SELECT pg_advisory_xact_lock({_GUARD_LOCK_KEY})")
+            for stmt in _GUARD_SQL:
+                conn.exec_driver_sql(stmt)
+        return True
+    except Exception as e:
+        log.error("order_events append-only 트리거 설치 실패 — ORM 가드만 동작: %s", e)
+        return False
 
 
 def history(sess, order_id: int) -> list:

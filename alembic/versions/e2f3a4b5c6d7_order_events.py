@@ -8,9 +8,11 @@ Append-only history of ``orders`` (P2-01): one row per insert and per change of
 status, fill or broker order number, written by a session hook in the same
 transaction as the change (``backend/database/order_history.py``).
 
-On Postgres a trigger also refuses UPDATE and DELETE on the table, so the log
-stays append-only below the ORM too. Databases built by ``create_all`` get the
-table but not the trigger.
+On Postgres a trigger also refuses UPDATE, DELETE and TRUNCATE, so the log stays
+append-only below the ORM too. The worker and kis-api build their tables with
+``create_all`` and install the same trigger at start
+(``order_history.ensure_db_guard``); this migration therefore tolerates the table
+already existing.
 """
 from typing import Sequence, Union
 
@@ -26,36 +28,46 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    op.create_table('order_events',
-    sa.Column('id', sa.Integer(), autoincrement=True, nullable=False),
-    sa.Column('order_id', sa.Integer(), nullable=False),
-    sa.Column('kind', sa.String(length=10), nullable=False),
-    sa.Column('from_status', sa.String(length=20), nullable=True),
-    sa.Column('to_status', sa.String(length=20), nullable=False),
-    sa.Column('filled_qty', sa.Integer(), nullable=True),
-    sa.Column('avg_fill_price', sa.Float(), nullable=True),
-    sa.Column('broker_order_id', sa.String(length=50), nullable=True),
-    sa.Column('recorded_at', sa.DateTime(), nullable=False),
-    sa.PrimaryKeyConstraint('id')
-    )
-    op.create_index(op.f('ix_order_events_order_id'), 'order_events', ['order_id'], unique=False)
-    if op.get_bind().dialect.name == "postgresql":
+    bind = op.get_bind()
+    # The worker and kis-api build their tables with create_all, which may have
+    # made this one already; only the trigger is then missing.
+    if not sa.inspect(bind).has_table('order_events'):
+        op.create_table('order_events',
+        sa.Column('id', sa.Integer(), autoincrement=True, nullable=False),
+        sa.Column('order_id', sa.Integer(), nullable=False),
+        sa.Column('kind', sa.String(length=10), nullable=False),
+        sa.Column('from_status', sa.String(length=20), nullable=True),
+        sa.Column('to_status', sa.String(length=20), nullable=False),
+        sa.Column('filled_qty', sa.Integer(), nullable=True),
+        sa.Column('avg_fill_price', sa.Float(), nullable=True),
+        sa.Column('broker_order_id', sa.String(length=50), nullable=True),
+        sa.Column('recorded_at', sa.DateTime(), nullable=False),
+        sa.PrimaryKeyConstraint('id')
+        )
+        op.create_index(op.f('ix_order_events_order_id'), 'order_events', ['order_id'], unique=False)
+    if bind.dialect.name == "postgresql":
         op.execute("""
-            CREATE FUNCTION order_events_append_only() RETURNS trigger AS $$
+            CREATE OR REPLACE FUNCTION order_events_append_only() RETURNS trigger AS $$
             BEGIN
                 RAISE EXCEPTION USING MESSAGE = 'order_events is append-only: ' || TG_OP;
             END;
             $$ LANGUAGE plpgsql
         """)
         op.execute("""
-            CREATE TRIGGER order_events_append_only
+            CREATE OR REPLACE TRIGGER order_events_append_only
             BEFORE UPDATE OR DELETE ON order_events
             FOR EACH ROW EXECUTE FUNCTION order_events_append_only()
+        """)
+        op.execute("""
+            CREATE OR REPLACE TRIGGER order_events_no_truncate
+            BEFORE TRUNCATE ON order_events
+            FOR EACH STATEMENT EXECUTE FUNCTION order_events_append_only()
         """)
 
 
 def downgrade() -> None:
     if op.get_bind().dialect.name == "postgresql":
+        op.execute("DROP TRIGGER IF EXISTS order_events_no_truncate ON order_events")
         op.execute("DROP TRIGGER IF EXISTS order_events_append_only ON order_events")
         op.execute("DROP FUNCTION IF EXISTS order_events_append_only()")
     op.drop_index(op.f('ix_order_events_order_id'), table_name='order_events')

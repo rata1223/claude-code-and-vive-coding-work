@@ -8,6 +8,7 @@ SQLite in memory; no broker, no network.
 """
 from __future__ import annotations
 
+import ast
 import pathlib
 import re
 from unittest.mock import MagicMock
@@ -23,12 +24,62 @@ from backend.database.testing import make_test_engine
 
 REPO = pathlib.Path(__file__).resolve().parents[3]
 
-#: Writes to ``orders``/``order_events`` that do not go through a session's
-#: unit of work, so the history hook never sees them.
-BYPASS = re.compile(
-    r"(?<![\w.])(?:update|delete)\(\s*(?:DB)?Order(?:Event)?\b"
-    r"|query\(\s*(?:DB)?Order(?:Event)?\b[^)]*\)[^\n]*\.(?:update|delete)\("
-    r"|(?i:UPDATE|DELETE\s+FROM)\s+(?i:orders|order_events)\b")
+#: Raw SQL that writes ``orders`` or ``order_events``.
+RAW_SQL = re.compile(
+    r"\b(?:UPDATE|DELETE\s+FROM|INSERT\s+INTO|TRUNCATE(?:\s+TABLE)?)\s+(?:orders|order_events)\b",
+    re.IGNORECASE)
+_MODELS = {"Order", "OrderEvent"}
+#: The hook itself writes events with a Core insert — that is the point of it.
+_ALLOWED = {"backend/database/order_history.py"}
+
+
+def bypasses(src: str) -> list[int]:
+    """Lines that write ``orders``/``order_events`` without a session's unit of
+    work — a Core or bulk statement, ``Model.__table__`` DML, ``query(Model)
+    .update()/.delete()`` however it is wrapped across lines, or raw SQL. The
+    history hook never sees those. Model names are resolved per file from its
+    imports of ``backend.database.models`` (aliases included), or written as
+    ``models.Order``."""
+    tree = ast.parse(src)
+    names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and (node.module or "").endswith("database.models"):
+            names |= {a.asname or a.name for a in node.names if a.name in _MODELS}
+
+    def is_model(n) -> bool:
+        return ((isinstance(n, ast.Name) and n.id in names)
+                or (isinstance(n, ast.Attribute) and n.attr in _MODELS))
+
+    def queries_model(n) -> bool:
+        while isinstance(n, (ast.Call, ast.Attribute)):
+            if (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                    and n.func.attr == "query" and n.args and is_model(n.args[0])):
+                return True
+            n = n.func if isinstance(n, ast.Call) else n.value
+        return False
+
+    hits = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            if RAW_SQL.search(node.value):
+                hits.append(node.lineno)
+            continue
+        if not isinstance(node, ast.Call):
+            continue
+        f = node.func
+        name = f.attr if isinstance(f, ast.Attribute) else getattr(f, "id", None)
+        if name in ("update", "delete", "insert") and node.args and is_model(node.args[0]):
+            hits.append(node.lineno)                       # update(Order)
+        elif name and name.startswith("bulk_") and node.args and is_model(node.args[0]):
+            hits.append(node.lineno)                       # bulk_update_mappings(Order, …)
+        elif (isinstance(f, ast.Attribute) and name in ("update", "delete", "insert")
+              and isinstance(f.value, ast.Attribute) and f.value.attr == "__table__"
+              and is_model(f.value.value)):
+            hits.append(node.lineno)                       # Order.__table__.update()
+        elif isinstance(f, ast.Attribute) and name in ("update", "delete") \
+                and queries_model(f.value):
+            hits.append(node.lineno)                       # query(Order)….update()
+    return hits
 
 
 @pytest.fixture()
@@ -122,6 +173,36 @@ class TestTheHook:
         assert latest_status(sess, a.id) == "submitted"
         assert latest_status(sess, b.id) == "rejected"
 
+    def test_the_event_records_the_row_not_a_stale_object(self, factory):
+        """Session B loaded the order before A filled it, and changes only the
+        average price. B's UPDATE leaves A's status and quantity on the row —
+        and the event must say so, not repeat B's stale ``submitted``."""
+        sess = factory()
+        o = _order(status="submitted")
+        sess.add(o)
+        sess.commit()
+        a, b = factory(), factory()
+        ra, rb = a.get(Order, o.id), b.get(Order, o.id)
+        ra.status, ra.filled_qty = "filled", 10
+        a.commit()
+
+        rb.avg_fill_price = 100.4
+        b.commit()
+
+        last = history(factory(), o.id)[-1]
+        assert (last.to_status, last.filled_qty, last.avg_fill_price) == ("filled", 10, 100.4)
+
+    def test_re_setting_an_expired_field_to_its_value_is_not_an_event(self, factory):
+        sess = factory()
+        o = _order(status="submitted")
+        sess.add(o)
+        sess.commit()
+        sess.expire(o)
+        o.status = "submitted"
+        sess.commit()
+
+        assert len(_trail(factory, o.id)) == 1
+
     def test_latest_status_without_events_is_none(self, factory):
         assert latest_status(factory(), 12345) is None
 
@@ -153,25 +234,33 @@ class TestAppendOnly:
         for root in ("backend", "api", "bot", "kis_adapter", "strategy", "scripts"):
             for path in (REPO / root).rglob("*.py"):
                 rel = path.relative_to(REPO).as_posix()
-                if "/tests/" in rel:
+                if "/tests/" in rel or rel in _ALLOWED:
                     continue
-                for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-                    if BYPASS.search(line):
-                        hits.append(f"{rel}:{n}: {line.strip()}")
+                hits += [f"{rel}:{n}" for n in bypasses(path.read_text(encoding="utf-8"))]
         assert hits == []
 
-    @pytest.mark.parametrize("line", [
-        "sess.execute(update(Order).values(status='x'))",
-        "sess.execute(delete(DBOrder))",
-        "db.query(Order).filter(Order.id == 1).update({'status': 'x'})",
+    @pytest.mark.parametrize("src", [
+        "from backend.database.models import Order\nsess.execute(update(Order).values(status='x'))",
+        "from backend.database.models import Order as DBOrder\nsess.execute(sa.delete(DBOrder))",
+        "from backend.database.models import Order\nsess.execute(insert(Order), rows)",
+        "from backend.database import models\nsess.execute(models.Order.__table__.update())",
+        "from backend.database.models import Order\nsess.bulk_update_mappings(Order, rows)",
+        "from backend.database.models import Order as DBOrder\n"
+        "(db.query(DBOrder)\n   .filter(DBOrder.id == 1)\n   .update({'status': 'x'}))",
         'sess.execute(text("UPDATE orders SET status = :s"))',
-        'conn.exec_driver_sql("delete from order_events")',
+        'conn.exec_driver_sql("truncate table order_events")',
     ])
-    def test_the_guard_sees_each_kind_of_bypass(self, line):
-        assert BYPASS.search(line)
+    def test_the_guard_sees_each_kind_of_bypass(self, src):
+        assert bypasses(src)
 
-    def test_the_guard_ignores_lookalikes(self):
-        assert not BYPASS.search("self._publish_order_update(order)")
+    @pytest.mark.parametrize("src", [
+        "self._publish_order_update(order)",
+        "from backend.brokers.models import Order\nupdate(Order)",   # not the table
+        "from backend.database.models import Order\nrows = db.query(Order).all()\nd.update(x)",
+        "from backend.database.models import Order\nsess.delete(order)",
+    ])
+    def test_the_guard_ignores_lookalikes(self, src):
+        assert bypasses(src) == []
 
 
 class TestTheRealWriters:
@@ -241,8 +330,8 @@ class TestTheBootCheck:
         sess = factory()
         sess.execute(text(
             "INSERT INTO orders (symbol, side, qty, price, filled_qty, status, market, broker, "
-            "created_at) VALUES ('AAPL', 'buy', 1, 1.0, 1, 'filled', 'US', 'kis', "
-            "CURRENT_TIMESTAMP)"))
+            "created_at, updated_at) VALUES ('AAPL', 'buy', 1, 1.0, 1, 'filled', 'US', 'kis', "
+            "CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"))
         sess.commit()
 
         with caplog.at_level("INFO", logger="backend.worker.recovery"):
@@ -250,6 +339,35 @@ class TestTheBootCheck:
 
         assert not any("order_status_event_mismatch" in d for d in details)
         assert "주문 이력 없는 주문 1건" in caplog.text
+
+    def test_an_old_mismatch_is_not_re_reported_forever(self, factory):
+        from datetime import datetime, timedelta
+        from sqlalchemy import text
+        sess = factory()
+        o = _order(status="filled", broker_order_id="0011")
+        sess.add(o)
+        sess.commit()
+        sess.execute(text("UPDATE orders SET status = 'canceled', updated_at = :t WHERE id = :i"),
+                     {"i": o.id, "t": datetime.utcnow() - timedelta(days=8)})
+        sess.commit()
+
+        assert not any("order_status_event_mismatch" in d for d in self._validate(factory))
+
+    def test_a_failing_history_check_leaves_the_other_checks(self, factory, monkeypatch):
+        from backend.database.models import Position
+        import backend.database.models as models
+        sess = factory()
+        sess.add(Position(symbol="005930", qty=0, avg_price=1.0, market="KR", broker="kis"))
+        sess.commit()
+
+        class _Gone:
+            def __getattr__(self, name):
+                raise RuntimeError("order_events 없음")
+        monkeypatch.setattr(models, "OrderEvent", _Gone())
+
+        details = self._validate(factory)
+
+        assert any("position_nonpositive_qty" in d for d in details)
 
     def test_a_consistent_order_is_not_reported(self, factory):
         sess = factory()
