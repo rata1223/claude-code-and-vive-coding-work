@@ -639,14 +639,15 @@ class StartupRecovery:
         except Exception as e:
             logger.warning("복구 포지션 DB 갱신 실패 (%s): %s", symbol, e)
 
-    def _audit_inconsistency(self, kind: str, detail: dict) -> None:
+    def _audit_inconsistency(self, kind: str, detail: dict,
+                             event_type: str = "recovery_inconsistency") -> None:
         """Append-only AuditLog write for a detected recovery inconsistency. Never raises."""
         try:
             from backend.database.models import AuditLog
             db = self._factory()
             try:
                 db.add(AuditLog(
-                    event_type="recovery_inconsistency",
+                    event_type=event_type,
                     symbol=detail.get("symbol"),
                     order_id=detail.get("order_id"),
                     actor="recovery",
@@ -673,6 +674,11 @@ class StartupRecovery:
           4. two or more open rows sharing one broker order number — a KIS number
              restarts every day, so this means an earlier order was never closed
              and is now indistinguishable, by number, from a live one (issue #168)
+          5. an order updated in the last week whose status disagrees with its
+             latest ``order_events`` row — a write that went around the session
+             hook (P2-01). Orders with no events predate the log and are only
+             counted. Checked separately (``_check_order_history``), so a
+             failure here does not cost checks 1–4.
 
         Checks 3 and 4 count `unknown` as open, as the worker's order matching
         does: nothing re-polls such a row, so this report is how anyone learns
@@ -734,6 +740,7 @@ class StartupRecovery:
                                d["open_rows"], d["order_id"])
                 self._audit_inconsistency("duplicate_open_broker_order_id", d)
                 issues += 1
+            issues += self._check_order_history()
 
             if issues:
                 logger.warning("복구 상태 일관성 검증: %d개 이슈 감지 — AuditLog 기록 완료", issues)
@@ -743,6 +750,73 @@ class StartupRecovery:
         except Exception as e:
             logger.warning("일관성 검증 실패 (계속 진행): %s", e)
             return True  # non-fatal — observability only
+
+    #: How far back the boot check compares orders with their history (P2-01).
+    #: Bounded so the scan does not grow with the log, and so one old mismatch
+    #: stops being re-reported every boot.
+    ORDER_HISTORY_CHECK_DAYS = 7
+
+    def _check_order_history(self) -> int:
+        """Check 5 of ``_step_validate_state``; returns the issues found. Never
+        raises — its own failure is logged and leaves checks 1–4 standing."""
+        try:
+            from sqlalchemy import func
+            from backend.database.models import Order as DBOrder, OrderEvent
+            since = datetime.utcnow() - timedelta(days=self.ORDER_HISTORY_CHECK_DAYS)
+            db = self._factory()
+            try:
+                recent = DBOrder.updated_at >= since
+                latest = (db.query(OrderEvent.order_id, func.max(OrderEvent.id).label("eid"))
+                          .join(DBOrder, DBOrder.id == OrderEvent.order_id)
+                          .filter(recent)
+                          .group_by(OrderEvent.order_id).subquery())
+                mismatched = (db.query(DBOrder, OrderEvent.to_status)
+                              .join(latest, latest.c.order_id == DBOrder.id)
+                              .join(OrderEvent, OrderEvent.id == latest.c.eid)
+                              .filter(OrderEvent.to_status != DBOrder.status)
+                              .all())
+                data = [{"order_id": str(o.id), "symbol": o.symbol,
+                         "status": o.status, "event_status": ev}
+                        for o, ev in mismatched]
+                unlogged = (db.query(func.count(DBOrder.id))
+                            .filter(recent, ~db.query(OrderEvent.id)
+                                    .filter(OrderEvent.order_id == DBOrder.id).exists())
+                            .scalar()) or 0
+            finally:
+                db.close()
+        except Exception as e:
+            logger.warning("주문 이력 검증 실패 (계속 진행): %s", e)
+            return 0
+        for d in data:
+            logger.warning("일관성 경고 — 주문 상태가 이력과 다름: id=%s %s (%s, 이력 %s)",
+                           d["order_id"], d["symbol"], d["status"], d["event_status"])
+            self._audit_inconsistency("order_status_event_mismatch", d)
+        if unlogged:
+            logger.info("주문 이력 없는 주문 %d건 — 이력 기록(P2-01) 이전 행", unlogged)
+        self._check_history_guard()
+        return len(data)
+
+    def _check_history_guard(self) -> None:
+        """On Postgres, whether ``order_events`` is append-only below the ORM
+        (``order_history.ensure_db_guard``). Its install never stops a process;
+        this is where a missing guard is reported — as its own audit event, not
+        a ``recovery_inconsistency``: it is about the database, not about the
+        orders and positions those rows describe."""
+        try:
+            from backend.database.order_history import guard_installed
+            db = self._factory()
+            try:
+                if db.get_bind().dialect.name != "postgresql" or guard_installed(db):
+                    return
+            finally:
+                db.close()
+        except Exception as e:
+            logger.warning("주문 이력 트리거 확인 실패 (계속 진행): %s", e)
+            return
+        logger.error("order_events append-only 트리거 없음: DB 수준에서 이력을 "
+                     "고치거나 지울 수 있다 (ORM 가드만 동작)")
+        self._audit_inconsistency("order_events_guard_missing", {"table": "order_events"},
+                                  event_type="order_events_guard_missing")
 
     def _step_enable_trading(self) -> bool:
         import os

@@ -660,7 +660,28 @@ Makes the execution layer correct-by-construction rather than correct-by-convent
 
 ---
 
-#### P2-01 — Append-only `order_events` table: replace mutable status with event log
+#### P2-01 — Append-only `order_events` table: replace mutable status with event log — ✅ PHASE 1 DONE (PR #219)
+
+> **Phase 1 shipped: the log.** Every insert of an `orders` row and every change
+> of its status, fill (`filled_qty`, `avg_fill_price`) or broker order number
+> appends an `order_events` row — written by one session hook
+> (`backend/database/order_history.py`, `after_flush`) on the flush's own
+> connection, so the event commits or rolls back with the change. No writer
+> logs by hand (runner, recovery, reconciler, terminal events, harness were not
+> touched), so none can forget to. Append-only: the ORM refuses to update or
+> delete an event, and on Postgres a trigger refuses UPDATE/DELETE/TRUNCATE —
+> installed where the worker and kis-api open the database
+> (`init_db_factory` → `ensure_db_guard`, since production tables come from
+> `create_all`) and by the Alembic migration `e2f3a4b5c6d7`. Events record the
+> row as the flush left it, read back, not the session's possibly stale
+> object. An AST guard keeps production code from writing `orders` around a
+> session (Core, bulk, `__table__` DML, `query(...).update()`, raw SQL). Startup
+> recovery audits an order updated in the last week whose status disagrees
+> with its latest event (`order_status_event_mismatch`); orders from before the
+> log are only counted.
+>
+> **Phase 2 — deferred to P6 (R-CRIT-03):** derive current state from the log
+> and drop the `orders.status` shadow. Readers still read `orders`.
 
 | Field | Value |
 |---|---|
