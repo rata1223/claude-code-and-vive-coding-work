@@ -792,7 +792,27 @@ class StartupRecovery:
             self._audit_inconsistency("order_status_event_mismatch", d)
         if unlogged:
             logger.info("주문 이력 없는 주문 %d건 — 이력 기록(P2-01) 이전 행", unlogged)
-        return len(data)
+        return len(data) + self._check_history_guard()
+
+    def _check_history_guard(self) -> int:
+        """On Postgres, whether ``order_events`` is append-only below the ORM
+        (``order_history.ensure_db_guard``). Its install never stops a process;
+        this is where a missing guard is reported. Returns the issues found."""
+        try:
+            from backend.database.order_history import guard_installed
+            db = self._factory()
+            try:
+                if db.get_bind().dialect.name != "postgresql" or guard_installed(db):
+                    return 0
+            finally:
+                db.close()
+        except Exception as e:
+            logger.warning("주문 이력 트리거 확인 실패 (계속 진행): %s", e)
+            return 0
+        logger.error("일관성 경고 — order_events append-only 트리거 없음: DB 수준에서 이력을 "
+                     "고치거나 지울 수 있다 (ORM 가드만 동작)")
+        self._audit_inconsistency("order_events_guard_missing", {"table": "order_events"})
+        return 1
 
     def _step_enable_trading(self) -> bool:
         import os

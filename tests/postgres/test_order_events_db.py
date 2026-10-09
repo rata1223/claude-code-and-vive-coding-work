@@ -158,3 +158,30 @@ def test_the_migration_makes_the_table_append_only(scratch_db_url):
             ).scalar() == 0
     finally:
         eng.dispose()
+
+
+def test_recovery_reports_a_missing_guard(scratch_db_url):
+    """The guard's install never stops a process; startup recovery is where its
+    absence is reported."""
+    from backend.database.models import AuditLog, Base
+    from backend.worker.recovery import StartupRecovery
+    eng = sa.create_engine(scratch_db_url)
+    Base.metadata.create_all(eng)                 # create_all only: no trigger
+    f = sessionmaker(bind=eng, expire_on_commit=False)
+
+    def audited():
+        with f() as s:
+            return [r.detail for r in s.query(AuditLog)
+                    .filter(AuditLog.event_type == "recovery_inconsistency")]
+
+    try:
+        StartupRecovery(db_session_factory=f)._step_validate_state()
+        assert any("order_events_guard_missing" in d for d in audited())
+
+        from backend.database.order_history import ensure_db_guard
+        assert ensure_db_guard(eng) is True
+        before = len(audited())
+        StartupRecovery(db_session_factory=f)._step_validate_state()
+        assert len(audited()) == before
+    finally:
+        eng.dispose()

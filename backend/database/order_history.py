@@ -131,7 +131,10 @@ def ensure_db_guard(engine) -> bool:
     ``order_events`` — idempotently. The databases this platform runs on are
     built by ``create_all``, which never runs the Alembic migration, so without
     this the guard would exist only on paper. Never raises: a missing guard is
-    logged, it does not stop the process. Returns whether it is installed.
+    logged, and startup recovery audits it (``_check_order_history``), but it
+    does not stop the process — ``init_db_factory`` also opens the database
+    for the API-side heartbeat watchdog, and failing that would switch off a
+    risk halt to protect an audit table. Returns whether it is installed.
     """
     import logging
     log = logging.getLogger(__name__)
@@ -146,6 +149,15 @@ def ensure_db_guard(engine) -> bool:
     except Exception as e:
         log.error("order_events append-only 트리거 설치 실패 — ORM 가드만 동작: %s", e)
         return False
+
+
+def guard_installed(sess) -> bool:
+    """Whether both append-only triggers are on ``order_events`` (Postgres)."""
+    from sqlalchemy import text
+    n = sess.execute(text(
+        "SELECT count(*) FROM pg_trigger WHERE tgrelid = 'order_events'::regclass "
+        "AND tgname IN ('order_events_append_only', 'order_events_no_truncate')")).scalar()
+    return n == 2
 
 
 def history(sess, order_id: int) -> list:
