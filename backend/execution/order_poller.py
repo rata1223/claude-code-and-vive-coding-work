@@ -10,6 +10,10 @@ get_order_status()를 호출해 체결 여부를 확인한다.
 추가 기능:
 - Terminal-state callbacks: on_canceled, on_rejected, on_expired
 - PollingHealthMonitor: in-memory metrics (fills, errors, timeouts, ...)
+- 회로 차단기(P2-06): 연속 폴링 실패 _BREAKER_THRESHOLD회면 조회를 멈추고
+  냉각 뒤 주문 하나로 시험 조회한다.
+- 타임아웃은 그 틱에 상태 조회가 성공한 주문에만 한다 — 상태를 모르는 주문을
+  취소로 수렴시키지 않게(차단 중에는 조회가 없으니 타임아웃도 없다).
 """
 import copy
 import dataclasses
@@ -28,6 +32,19 @@ logger = logging.getLogger(__name__)
 
 _POLL_INTERVALS = [10, 30, 60, 120, 300]
 _TIMEOUT_MINUTES = 30
+
+# Circuit breaker (P2-06). Consecutive poll failures across all orders: a KIS
+# outage fails every lookup, and without a breaker the loop keeps calling a
+# broker that cannot answer — and, worse, times orders out whose status it
+# cannot read (the worker then converges them to CANCELED).
+_BREAKER_THRESHOLD = 5
+_BREAKER_COOLDOWN_SEC = 60          # doubled after each failed probe …
+_BREAKER_MAX_COOLDOWN_SEC = 300     # … up to the longest poll interval
+
+
+def _monotonic() -> float:
+    """The poller's clock (one place for tests to replace)."""
+    return time.monotonic()
 
 # Valid status transitions the poller may observe on the wire.
 # Defined locally to avoid importing from order_machine (circular-import risk).
@@ -63,10 +80,12 @@ class PollingHealth:
     consecutive_poll_errors: int = 0
     last_successful_poll_at: Optional[datetime] = None
     pending_count: int = 0
+    circuit_open: bool = False
+    circuit_opened_at: Optional[datetime] = None
 
     @property
     def is_healthy(self) -> bool:
-        return self.consecutive_poll_errors < 10
+        return not self.circuit_open and self.consecutive_poll_errors < _BREAKER_THRESHOLD
 
 
 class PollingHealthMonitor:
@@ -75,6 +94,9 @@ class PollingHealthMonitor:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._h = PollingHealth()
+        self._cooldown_sec = _BREAKER_COOLDOWN_SEC
+        self._next_probe_at = 0.0
+        self._opened_mono = 0.0
 
     def record_register(self) -> None:
         with self._lock:
@@ -104,20 +126,59 @@ class PollingHealthMonitor:
         with self._lock:
             self._h.total_expired += 1
 
-    def record_poll_success(self) -> None:
+    def record_poll_success(self) -> Optional[float]:
+        """A lookup answered. Closes the breaker if it was open and returns how
+        long it was open (seconds) — else ``None``."""
         with self._lock:
             self._h.consecutive_poll_errors = 0
             self._h.last_successful_poll_at = datetime.now(timezone.utc)
+            if not self._h.circuit_open:
+                return None
+            self._h.circuit_open = False
+            self._h.circuit_opened_at = None
+            down = _monotonic() - self._opened_mono
+        logger.info("OrderFillPoller: 회로 복구 — 주문 조회 재개 (차단 %.0f초)", down)
+        return down
 
-    def record_poll_error(self) -> None:
+    def record_poll_error(self) -> Optional[tuple[int, int]]:
+        """A lookup failed. Returns ``(consecutive, cooldown_sec)`` when this
+        failure opened the breaker — else ``None``."""
         with self._lock:
             self._h.total_poll_errors += 1
             self._h.consecutive_poll_errors += 1
-            if self._h.consecutive_poll_errors >= 10:
-                logger.critical(
-                    "OrderFillPoller: %d 연속 폴링 실패 — 브로커 접속 점검 필요",
-                    self._h.consecutive_poll_errors,
-                )
+            if self._h.circuit_open or self._h.consecutive_poll_errors < _BREAKER_THRESHOLD:
+                return None
+            self._h.circuit_open = True
+            self._h.circuit_opened_at = datetime.now(timezone.utc)
+            self._opened_mono = _monotonic()
+            self._cooldown_sec = _BREAKER_COOLDOWN_SEC
+            self._next_probe_at = self._opened_mono + self._cooldown_sec
+            opened = (self._h.consecutive_poll_errors, self._cooldown_sec)
+        logger.error("OrderFillPoller: %d 연속 폴링 실패 — 회로 차단, %d초 뒤 시험 조회 "
+                     "(차단 중 타임아웃 보류)", *opened)
+        return opened
+
+    def record_probe_failure(self) -> None:
+        """The half-open probe failed: stay open, wait twice as long."""
+        with self._lock:
+            self._h.total_poll_errors += 1
+            self._h.consecutive_poll_errors += 1
+            self._cooldown_sec = min(self._cooldown_sec * 2, _BREAKER_MAX_COOLDOWN_SEC)
+            self._next_probe_at = _monotonic() + self._cooldown_sec
+            cooldown = self._cooldown_sec
+        logger.warning("OrderFillPoller: 시험 조회 실패 — 회로 유지, %d초 뒤 재시도", cooldown)
+
+    def circuit_state(self, now: float) -> str:
+        """``closed``, ``open`` (cooling down) or ``probe`` (cooldown over —
+        one lookup may test the broker)."""
+        with self._lock:
+            if not self._h.circuit_open:
+                return "closed"
+            return "probe" if now >= self._next_probe_at else "open"
+
+    def is_circuit_open(self) -> bool:
+        with self._lock:
+            return self._h.circuit_open
 
     def set_pending_count(self, n: int) -> None:
         with self._lock:
@@ -140,7 +201,7 @@ class _PollEntry:
     on_expired: Optional[Callable[[Order], None]] = None
     registered_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     poll_index: int = 0
-    next_poll_at: float = field(default_factory=time.monotonic)
+    next_poll_at: float = field(default_factory=_monotonic)
     last_reported_qty: int = 0  # prevents double-counting on replay
     # Serializes _apply_update for THIS entry so a reconciler resync() and the
     # background poll loop can never process the same broker update concurrently
@@ -150,6 +211,9 @@ class _PollEntry:
     # entry, so a resync() racing the poll loop on the same terminal event can't
     # re-run the terminal callback or re-write its audit rows.
     terminal_fired: bool = False
+    # P2-06: an expired entry whose status lookup failed is not timed out;
+    # reported once (ERROR + audit) so a stuck order is not silent.
+    timeout_deferred_reported: bool = False
 
     @property
     def is_timed_out(self) -> bool:
@@ -161,7 +225,7 @@ class _PollEntry:
         idx = min(self.poll_index, len(_POLL_INTERVALS) - 1)
         wait = _POLL_INTERVALS[idx]
         self.poll_index += 1
-        self.next_poll_at = time.monotonic() + wait
+        self.next_poll_at = _monotonic() + wait
         return wait
 
 
@@ -183,8 +247,15 @@ class OrderFillPoller:
         broker: BrokerAdapter,
         db_factory: Optional[Callable] = None,
         semantic_mapper=None,  # Optional[BrokerSemanticMapper] — avoids circular import
+        on_circuit_open: Optional[Callable[[int, int], None]] = None,
+        on_circuit_close: Optional[Callable[[float], None]] = None,
     ):
+        """``on_circuit_open(consecutive, cooldown_sec)`` / ``on_circuit_close(down_sec)``
+        are called once per transition, outside every lock; an exception from
+        either is logged and ignored (an alert must not stop the loop)."""
         self._broker = broker
+        self._on_circuit_open = on_circuit_open
+        self._on_circuit_close = on_circuit_close
         self._db_factory = db_factory
         self._semantic_mapper = semantic_mapper
         self._entries: dict[str, _PollEntry] = {}  # order_id → entry
@@ -274,35 +345,84 @@ class OrderFillPoller:
 
     def _loop(self) -> None:
         while not self._stop.is_set():
-            now = time.monotonic()
-            with self._lock:
-                due = [e for e in self._entries.values() if e.next_poll_at <= now]
-                self._health.set_pending_count(len(self._entries))
-
-            for entry in due:
-                if entry.is_timed_out:
-                    self._handle_timeout(entry)
-                    continue
-                self._poll_one(entry)
-
+            self._poll_due(_monotonic())
             self._stop.wait(timeout=5)
 
-    def _poll_one(self, entry: _PollEntry) -> None:
+    def _poll_due(self, now: float) -> None:
+        """One tick. With the breaker closed: poll every due entry. Open:
+        nothing — no lookups. Cooldown over: one lookup, the earliest-due
+        entry, tests the broker.
+
+        An expired entry is timed out only **after a lookup in this tick
+        succeeded** and left it open. A timeout cancels and converges the
+        order (the worker marks it CANCELED even when the cancel fails), so an
+        order whose current status nobody read — during an outage, right after
+        one, or because its own lookup keeps failing — must not reach it."""
+        state = self._health.circuit_state(now)
+        with self._lock:
+            entries = list(self._entries.values())
+            self._health.set_pending_count(len(self._entries))
+        if state == "open" or not entries:
+            return
+        if state == "probe":
+            self._poll_one(min(entries, key=lambda e: e.next_poll_at), probe=True)
+            return
+        for entry in [e for e in entries if e.next_poll_at <= now]:
+            if self._health.is_circuit_open():
+                return          # opened during this tick: stop here
+            if not entry.is_timed_out:
+                self._poll_one(entry)
+                continue
+            if not self._poll_one(entry):
+                self._report_timeout_deferred(entry)
+                continue
+            with self._lock:
+                still_open = self._entries.get(entry.order.id) is entry
+            if still_open:      # the fresh read did not fill or close it
+                self._handle_timeout(entry)
+
+    def _report_timeout_deferred(self, entry: _PollEntry) -> None:
+        if entry.timeout_deferred_reported:
+            return
+        entry.timeout_deferred_reported = True
+        logger.error("주문 타임아웃 보류 — 상태 조회 실패, 취소하지 않음 (수동 확인 필요): %s %s %s",
+                     entry.order.id, entry.order.side, entry.order.symbol)
+        self._audit("poller_timeout_deferred", entry.order,
+                    {"elapsed_minutes": _TIMEOUT_MINUTES, "reason": "status lookup failed"})
+
+    def _poll_one(self, entry: _PollEntry, probe: bool = False) -> bool:
         try:
             updated = self._broker.get_order_status(entry.order.id, entry.order.symbol)
         except Exception as e:
             logger.warning("폴링 실패 %s: %s", entry.order.id, e)
-            self._health.record_poll_error()
+            if probe:
+                self._health.record_probe_failure()
+            else:
+                opened = self._health.record_poll_error()
+                if opened is not None:
+                    self._notify(self._on_circuit_open, *opened)
             entry.advance()
-            return
+            return False
 
-        self._health.record_poll_success()
+        down = self._health.record_poll_success()
+        if down is not None:
+            self._notify(self._on_circuit_close, down)
 
         if updated is None:
             entry.advance()
-            return
+            return True
 
         self._apply_update(entry, updated)
+        return True
+
+    @staticmethod
+    def _notify(callback, *args) -> None:
+        if callback is None:
+            return
+        try:
+            callback(*args)
+        except Exception as e:  # an alert must never stop the poll loop
+            logger.warning("회로 알림 콜백 오류: %s", e)
 
     def resync(self, broker_order: Order) -> tuple[bool, bool]:
         """Reconciler entry point — repair a missed callback WITHOUT a restart.

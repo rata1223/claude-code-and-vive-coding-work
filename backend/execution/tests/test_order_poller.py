@@ -848,18 +848,19 @@ class TestHealthMonitorUnit:
 
     def test_consecutive_errors_tracked(self):
         mon = PollingHealthMonitor()
+        for _ in range(4):
+            mon.record_poll_error()
+        h = mon.get_health()
+        assert h.consecutive_poll_errors == 4
+        assert h.total_poll_errors == 4
+        assert h.is_healthy is True  # below the breaker threshold (5, P2-06)
+
+    def test_5_consecutive_errors_open_the_breaker_and_are_unhealthy(self):
+        mon = PollingHealthMonitor()
         for _ in range(5):
             mon.record_poll_error()
         h = mon.get_health()
-        assert h.consecutive_poll_errors == 5
-        assert h.total_poll_errors == 5
-        assert h.is_healthy is True  # < 10
-
-    def test_10_consecutive_errors_unhealthy(self):
-        mon = PollingHealthMonitor()
-        for _ in range(10):
-            mon.record_poll_error()
-        assert mon.get_health().is_healthy is False
+        assert h.is_healthy is False and h.circuit_open is True
 
     def test_success_resets_consecutive(self):
         mon = PollingHealthMonitor()
