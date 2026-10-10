@@ -99,6 +99,9 @@ class PositionReconciler:
     # 소수점 주식 브로커가 생기면 그 인스턴스에서 바꾼다.
     _QTY_TOLERANCE = 0
 
+    # 막 체결된 주문은 이 시간 동안 아직 포지션을 움직이는 중으로 본다(_has_pending_order)
+    _RECENT_FILL_SEC = 600
+
     # 스테일 포지션(브로커에 없는 DB 포지션) 삭제 최소 나이
     _STALE_MIN_AGE_HOURS = 1.0
 
@@ -367,13 +370,24 @@ class PositionReconciler:
         result.gap(kind, symbol, detail)
 
     def _has_pending_order(self, symbol: str, db) -> bool:
-        """Return True if there is any open order for this symbol and broker."""
+        """True if an order for this symbol may still be moving its position:
+        an open one (``unknown`` included — the order reconciliation treats it
+        as open), or one that turned FILLED within ``_RECENT_FILL_SEC``.
+
+        The fill pipeline writes the order row FILLED (step 1) before it writes
+        the position (step 5, after a broker balance call) — a pass in between
+        would read the fill as a quantity mismatch and, with no tolerance
+        (P1-12), gate the symbol as an unknown corporate action (code-review)."""
+        from sqlalchemy import and_, or_
         from backend.database.models import Order as DBOrder
-        _open = [OrderStatus.PENDING.value, OrderStatus.SUBMITTED.value, OrderStatus.PARTIAL_FILLED.value]
+        _open = [OrderStatus.PENDING.value, OrderStatus.SUBMITTED.value,
+                 OrderStatus.PARTIAL_FILLED.value, OrderStatus.UNKNOWN.value]
+        recent = datetime.utcnow() - timedelta(seconds=self._RECENT_FILL_SEC)
         return db.query(DBOrder).filter(
             DBOrder.symbol == symbol,
             DBOrder.broker == self._broker_name,
-            DBOrder.status.in_(_open),
+            or_(DBOrder.status.in_(_open),
+                and_(DBOrder.status == OrderStatus.FILLED.value, DBOrder.updated_at >= recent)),
         ).first() is not None
 
     # ── Order reconciliation ────────────────────────────────────────────────
