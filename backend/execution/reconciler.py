@@ -92,8 +92,12 @@ class PositionReconciler:
         result = reconciler.reconcile("startup")
     """
 
-    # 포지션 수량 허용 오차: 브로커와 DB가 ±1주 이내면 무시
-    _QTY_TOLERANCE = 1
+    # 포지션 수량 허용 오차 (P1-12): 0 — 정확히 일치해야 한다. KIS 수량은 정수 주식이고
+    # (브로커·DB 모두 int), 체결 중인 차이는 `_has_pending_order`가 이미 보류한다. 남는
+    # 차이는 진짜 불일치다 — 예전 1주 허용은 그것을 영원히 덮었고(소량 보유에선 포지션의
+    # 30~100%), 비율 허용(ROADMAP 처방 0.5%)은 큰 포지션에서 더 큰 차이를 덮는다.
+    # 소수점 주식 브로커가 생기면 그 인스턴스에서 바꾼다.
+    _QTY_TOLERANCE = 0
 
     # 스테일 포지션(브로커에 없는 DB 포지션) 삭제 최소 나이
     _STALE_MIN_AGE_HOURS = 1.0
@@ -277,8 +281,8 @@ class PositionReconciler:
                                         "avg_before": dp["avg_price"], "qty_after": bp.qty,
                                         "avg_after": bp.avg_price,
                                     })
-                    elif price_changed and qty_diff <= self._QTY_TOLERANCE:
-                        # avg_price drift only — always safe to fix
+                    elif price_changed:
+                        # avg_price drift only (quantities within tolerance) — always safe to fix
                         row = None if dry_run else self._lock_unchanged(db, sym, dp, result)
                         if row is not None:
                             self._audit_position_change(

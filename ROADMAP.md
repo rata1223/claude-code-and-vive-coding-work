@@ -13,13 +13,13 @@
 
 ## Status at a glance (2026-10-09, main `f02dbf7`)
 
-Every item below was checked against the code at this commit (P6-05, PR #220): the heading carries the status and an **Audit** note cites the file and line. Unmarked items no longer exist. Since then: P2-03 ⚠️→✅ (PR #221), P1-10 ⚠️→✅ (PR #222), P3-02 ⚠️→✅ (PR #223), P0-09 ⚠️→✅ (PR #224), P2-06 ⚠️→✅ (PR #225).
+Every item below was checked against the code at this commit (P6-05, PR #220): the heading carries the status and an **Audit** note cites the file and line. Unmarked items no longer exist. Since then: P2-03 ⚠️→✅ (PR #221), P1-10 ⚠️→✅ (PR #222), P3-02 ⚠️→✅ (PR #223), P0-09 ⚠️→✅ (PR #224), P2-06 ⚠️→✅ (PR #225), P1-12 ❌→✅ (PR #226).
 
 | Status | Count |
 |---|---|
-| ✅ DONE (some shipped differently from the prescription — the note says how) | 39 |
+| ✅ DONE (some shipped differently from the prescription — the note says how) | 40 |
 | ⚠️ PARTIAL | 6 |
-| ❌ OPEN | 4 |
+| ❌ OPEN | 3 |
 | ⏸ DEFERRED | 2 |
 | **Total** | **51** |
 
@@ -31,7 +31,6 @@ Every item below was checked against the code at this commit (P6-05, PR #220): t
 | P0-13 FK constraints | ❌ | No foreign keys; `fills.order_id` is unconstrained (schema change on an existing table) |
 | P1-03 Client order id before submit | ❌ | KIS has no client order id; tied to P0-02 |
 | P1-08 Legacy bot removal | ⚠️ | `kis-bot` disabled, but `bot/` stays — `bot/notifier.py` is the worker's alert path |
-| P1-12 Quantity tolerance | ❌ | `_QTY_TOLERANCE = 1` fixed |
 | P2-01 Order event log | ⚠️ | Phase 1 (the log) done; deriving state from it and dropping `orders.status` is P6 |
 | P6-02 Deploy gated on tests | ⚠️ | `deploy.yml` is disabled; manual deploys are not gated |
 | P5-03 Risk system unification | ❌ | The app's quick-trade halt gate reads legacy Redis keys **nothing writes** — it never trips on losses |
@@ -730,9 +729,11 @@ Tasks that make the running system observable and resilient to common failure mo
 
 ---
 
-#### P1-12 — `_QTY_TOLERANCE` fractional: replace hardcoded `1` share with dynamic calculation — ❌ OPEN
+#### P1-12 — `_QTY_TOLERANCE` fractional: replace hardcoded `1` share with dynamic calculation — ✅ DONE (PR #226, differently from the prescription)
 
-> **Audit (2026-10-09):** `_QTY_TOLERANCE = 1` is still a fixed share count (`backend/execution/reconciler.py:96`).
+> **Audit (2026-10-09):** `_QTY_TOLERANCE = 1` was a fixed share count (`backend/execution/reconciler.py:96`): a quantity was repaired only when it differed by **more than one share**, so a one-share divergence was never repaired or reported (and if the average also drifted, only the average was fixed). A restart then restored the wrong row into the tracker (`_restore_positions`).
+>
+> **Done in PR #226 — tolerance 0, not the 0.5 % prescription** (operator decision). KIS quantities are whole shares on both sides (`int(hldg_qty)`/`int(ovrs_cblc_qty)`, `positions.qty` is `Integer`), and a difference from an order still filling is already deferred by `_has_pending_order` (`qty_mismatch_pending`) — so any remaining difference is a real divergence. On this account one share can be 30–100 % of a position; a percentage tolerance would hide even larger gaps on larger positions. A one-share gap now takes the existing mismatch path: open order → defer; otherwise corporate-action classification (a known split ratio with value preserved is CONFIRMED, anything else UNKNOWN → the symbol is gated, fail-closed), then the row is set to the broker's values under `_lock_unchanged` (#224) with a `reconcile_fix_qty` audit. The class attribute stays for a future fractional-share broker. Tests: `backend/execution/tests/test_reconciler.py::TestQtyToleranceExact`.
 
 | Field | Value |
 |---|---|
@@ -1208,7 +1209,7 @@ All sprints are 2 weeks. Exit criteria are binary: either all listed tasks pass 
 | P1-09 Single scheduler | Market open fires exactly once per day (verified by log count) |
 | P1-10 Fill exception surface | Fill DB failure enters SAFE_MODE and emits error alert |
 | P1-11 Mask HTS ID | `GET /credentials` response contains `"hts_id": "***"` |
-| P1-12 QTY tolerance | Tolerance is `max(1, round(qty * 0.005))` for all positions |
+| P1-12 QTY tolerance | Tolerance is 0 for whole-share brokers (PR #226 — not `max(1, round(qty * 0.005))`, which would hide larger gaps on larger positions) |
 
 **Sprint 2 Exit Gate**: System passes 1-week paper run with no anomalies.
 
