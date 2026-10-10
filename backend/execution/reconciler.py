@@ -341,8 +341,11 @@ class PositionReconciler:
         deleted would fail the commit and roll back every other repair."""
         from backend.database.models import lock_position
         row = lock_position(db, symbol, self._broker_name)
+        # ``updated_at`` too: a buy and a sell of the same size can leave qty and
+        # avg as they were, and the fill pipeline's write still moved the row on.
         if (row is None or row.id != snapshot["id"] or row.qty != snapshot["qty"]
-                or row.avg_price != snapshot["avg_price"]):
+                or row.avg_price != snapshot["avg_price"]
+                or row.updated_at != snapshot["updated_at"]):
             self._superseded(result, symbol, "position_changed_during_reconcile",
                              "재조정 중 다른 쓰기가 포지션을 바꿈 — 다음 회차에 비교")
             return None

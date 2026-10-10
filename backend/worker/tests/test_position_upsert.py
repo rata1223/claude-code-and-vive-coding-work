@@ -373,3 +373,26 @@ class TestReconciler:
         assert result.errors == []
         assert _rows(factory, "AAPL") == [(7, 201.0, "US")]
         assert not any(r["kind"] == "delete_position" for r in result.repairs)
+
+    def test_a_same_value_write_during_the_pass_still_counts_as_a_change(
+            self, monkeypatch, factory):
+        """A buy and a sell of the same size leave qty and avg as they were,
+        but the row was traded on during the pass — the stale delete must not
+        remove it (CodeRabbit)."""
+        from datetime import datetime, timedelta
+        with factory() as s:
+            s.add(DBPosition(symbol="AAPL", qty=5, avg_price=200.0, market="US", broker="kis",
+                             updated_at=datetime.utcnow() - timedelta(hours=5)))
+            s.commit()
+        real = models.lock_position
+
+        def _same_values_rewritten(sess, symbol, broker):
+            upsert_position(sess, symbol=symbol, broker="kis", qty=5, avg_price=200.0,
+                            market="US")
+            return real(sess, symbol, broker)
+
+        monkeypatch.setattr(models, "lock_position", _same_values_rewritten)
+        result = _reconciler(factory, []).reconcile("t")
+        assert result.errors == []
+        assert _rows(factory, "AAPL") == [(5, 200.0, "US")]
+        assert not any(r["kind"] == "delete_position" for r in result.repairs)
