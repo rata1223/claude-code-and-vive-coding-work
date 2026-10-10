@@ -11,8 +11,9 @@ get_order_status()를 호출해 체결 여부를 확인한다.
 - Terminal-state callbacks: on_canceled, on_rejected, on_expired
 - PollingHealthMonitor: in-memory metrics (fills, errors, timeouts, ...)
 - 회로 차단기(P2-06): 연속 폴링 실패 _BREAKER_THRESHOLD회면 조회를 멈추고
-  냉각 뒤 주문 하나로 시험 조회한다. 차단 중에는 타임아웃도 하지 않는다 —
-  상태를 모르는 주문을 취소로 수렴시키지 않게.
+  냉각 뒤 주문 하나로 시험 조회한다.
+- 타임아웃은 그 틱에 상태 조회가 성공한 주문에만 한다 — 상태를 모르는 주문을
+  취소로 수렴시키지 않게(차단 중에는 조회가 없으니 타임아웃도 없다).
 """
 import copy
 import dataclasses
@@ -210,6 +211,9 @@ class _PollEntry:
     # entry, so a resync() racing the poll loop on the same terminal event can't
     # re-run the terminal callback or re-write its audit rows.
     terminal_fired: bool = False
+    # P2-06: an expired entry whose status lookup failed is not timed out;
+    # reported once (ERROR + audit) so a stuck order is not silent.
+    timeout_deferred_reported: bool = False
 
     @property
     def is_timed_out(self) -> bool:
@@ -345,10 +349,15 @@ class OrderFillPoller:
             self._stop.wait(timeout=5)
 
     def _poll_due(self, now: float) -> None:
-        """One tick. With the breaker closed: poll every due entry, timing out
-        the expired ones. Open: nothing — no lookups and **no timeouts** (a
-        timeout cancels and converges an order whose status nobody could read).
-        Cooldown over: one lookup, the earliest-due entry, tests the broker."""
+        """One tick. With the breaker closed: poll every due entry. Open:
+        nothing — no lookups. Cooldown over: one lookup, the earliest-due
+        entry, tests the broker.
+
+        An expired entry is timed out only **after a lookup in this tick
+        succeeded** and left it open. A timeout cancels and converges the
+        order (the worker marks it CANCELED even when the cancel fails), so an
+        order whose current status nobody read — during an outage, right after
+        one, or because its own lookup keeps failing — must not reach it."""
         state = self._health.circuit_state(now)
         with self._lock:
             entries = list(self._entries.values())
@@ -360,11 +369,26 @@ class OrderFillPoller:
             return
         for entry in [e for e in entries if e.next_poll_at <= now]:
             if self._health.is_circuit_open():
-                return          # opened during this tick: stop here, time nothing out
-            if entry.is_timed_out:
-                self._handle_timeout(entry)
+                return          # opened during this tick: stop here
+            if not entry.is_timed_out:
+                self._poll_one(entry)
                 continue
-            self._poll_one(entry)
+            if not self._poll_one(entry):
+                self._report_timeout_deferred(entry)
+                continue
+            with self._lock:
+                still_open = self._entries.get(entry.order.id) is entry
+            if still_open:      # the fresh read did not fill or close it
+                self._handle_timeout(entry)
+
+    def _report_timeout_deferred(self, entry: _PollEntry) -> None:
+        if entry.timeout_deferred_reported:
+            return
+        entry.timeout_deferred_reported = True
+        logger.error("주문 타임아웃 보류 — 상태 조회 실패, 취소하지 않음 (수동 확인 필요): %s %s %s",
+                     entry.order.id, entry.order.side, entry.order.symbol)
+        self._audit("poller_timeout_deferred", entry.order,
+                    {"elapsed_minutes": _TIMEOUT_MINUTES, "reason": "status lookup failed"})
 
     def _poll_one(self, entry: _PollEntry, probe: bool = False) -> bool:
         try:

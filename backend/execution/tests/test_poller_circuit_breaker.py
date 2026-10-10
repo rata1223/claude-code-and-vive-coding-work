@@ -163,15 +163,66 @@ class TestWhileOpen:
         broker.down = True
         for _ in range(op._BREAKER_THRESHOLD - 1):
             poller._health.record_poll_error()     # one failure short of opening
-        _expire(poller, "O0", "O2", "O3")
+        _expire(poller)
         _tick(poller, clock)
-        # Entries go in registration order: O0 times out (breaker still closed,
-        # no lookup), O1's lookup fails and opens it, and the tick stops there —
-        # O2 and O3 are expired too but are not timed out.
-        assert sum(c["timeout"].call_count for c in cbs.values()) == 1
-        cbs["O2"]["timeout"].assert_not_called()
+        # O0 is expired, but its fresh lookup fails — no timeout; that failure
+        # opens the breaker and the tick stops.
+        assert sum(c["timeout"].call_count for c in cbs.values()) == 0
         assert len(broker.calls) == 1
-        assert len(poller._entries) == op._BREAKER_THRESHOLD
+        broker.cancel_order.assert_not_called()
+
+
+class TestTimeoutNeedsAFreshRead:
+    """A timeout cancels and converges the order, so it happens only after a
+    lookup in the same tick succeeded and left the order open (code-review)."""
+
+    def test_after_recovery_each_order_is_read_before_it_times_out(self, clock):
+        """The probe reads one order; the others were not read since the outage.
+        O1 filled at the broker meanwhile — it must arrive as a fill, not be
+        cancelled and closed."""
+        poller, broker, _, _, cbs = _setup(clock, n=3)
+        _open(poller, broker, clock)
+        _expire(poller)
+        broker.down = False
+        broker.status["O1"] = Order(id="O1", symbol="AAPL", side="buy", qty=10, price=100.0,
+                                    status=OrderStatus.FILLED, filled_qty=10,
+                                    avg_fill_price=100.0)
+        _tick(poller, clock, advance=op._BREAKER_COOLDOWN_SEC)   # probe (O0) closes it
+        _tick(poller, clock, advance=1)
+        cbs["O1"]["filled"].assert_called_once()
+        cbs["O1"]["timeout"].assert_not_called()
+        cbs["O0"]["timeout"].assert_called_once()                # read open → timed out
+        cbs["O2"]["timeout"].assert_called_once()
+
+    def test_an_order_whose_own_lookup_fails_is_not_timed_out(self, clock, caplog):
+        """Others answer (the breaker stays closed), this one never does."""
+        poller, broker, opened, _, cbs = _setup(clock, n=2)
+
+        def lookup(order_id, symbol=""):
+            broker.calls.append(order_id)
+            if order_id == "O0":
+                raise RuntimeError("route broken")
+            return None
+        broker.get_order_status = lookup
+        _expire(poller, "O0")
+        with caplog.at_level("ERROR", logger="backend.execution.order_poller"):
+            for _ in range(3):
+                _tick(poller, clock, advance=1)
+        cbs["O0"]["timeout"].assert_not_called()
+        broker.cancel_order.assert_not_called()
+        assert "O0" in poller._entries and opened == []
+        assert caplog.text.count("타임아웃 보류") == 1      # reported once, not every tick
+
+    def test_a_terminal_status_on_the_fresh_read_is_not_a_timeout(self, clock):
+        poller, broker, _, _, cbs = _setup(clock)
+        canceled = MagicMock()
+        poller._entries["O0"].on_canceled = canceled
+        _expire(poller)
+        broker.status["O0"] = Order(id="O0", symbol="AAPL", side="buy", qty=10, price=100.0,
+                                    status=OrderStatus.CANCELED)
+        _tick(poller, clock, advance=1)
+        canceled.assert_called_once()
+        cbs["O0"]["timeout"].assert_not_called()
 
 
 class TestProbe:
@@ -259,17 +310,38 @@ class TestCallbacks:
         assert poller.health.circuit_open
 
 
-def test_the_worker_alerts_on_both_transitions(monkeypatch):
+def test_the_worker_alerts_on_both_transitions_off_the_poller_thread(monkeypatch):
+    """Telegram is a blocking HTTP call — the poller thread must not wait on it."""
+    import threading
     import bot.notifier as notifier
     from backend.worker import runner
 
-    sent = []
-    monkeypatch.setattr(notifier, "alert_emergency", lambda m: sent.append(("emergency", m)))
-    monkeypatch.setattr(notifier, "send_alert", lambda m: sent.append(("info", m)))
+    sent, release, done = [], threading.Event(), threading.Event()
+
+    def _slow_emergency(m):
+        release.wait(5)
+        sent.append(("emergency", m))
+
+    def _info(m):
+        sent.append(("info", m))
+        done.set()
+
+    monkeypatch.setattr(notifier, "alert_emergency", _slow_emergency)
+    monkeypatch.setattr(notifier, "send_alert", _info)
+    import time
+    t0 = time.monotonic()
     runner._alert_poll_circuit_open(5, 60)
     runner._alert_poll_circuit_close(150.0)
-    assert sent[0][0] == "emergency" and "5회" in sent[0][1] and "타임아웃 보류" in sent[0][1]
-    assert sent[1][0] == "info" and "2.5분" in sent[1][1]
+    assert time.monotonic() - t0 < 1.0, "the caller waited on Telegram"
+    assert done.wait(5)
+    release.set()
+    for _ in range(50):
+        if len(sent) == 2:
+            break
+        time.sleep(0.05)
+    msgs = dict(sent)
+    assert "5회" in msgs["emergency"] and "타임아웃 보류" in msgs["emergency"]
+    assert "2.5분" in msgs["info"]
 
 
 def test_the_worker_wires_the_alerts_into_its_poller(monkeypatch):

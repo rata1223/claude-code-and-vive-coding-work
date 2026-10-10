@@ -466,14 +466,26 @@ class WorkerSession:
 def _alert_poll_circuit_open(consecutive: int, cooldown_sec: int) -> None:
     """P2-06: the fill poller stopped looking orders up. Fills and terminal
     events are not seen until it recovers, and no order is timed out."""
-    from bot.notifier import alert_emergency
-    alert_emergency(f"[체결 폴링 차단] KIS 주문 조회 {consecutive}회 연속 실패 — 조회 중단, "
-                    f"타임아웃 보류. {cooldown_sec}초 뒤 시험 조회")
+    _send_in_background("alert_emergency",
+                        f"[체결 폴링 차단] KIS 주문 조회 {consecutive}회 연속 실패 — 조회 중단, "
+                        f"타임아웃 보류. {cooldown_sec}초 뒤 시험 조회")
 
 
 def _alert_poll_circuit_close(down_sec: float) -> None:
-    from bot.notifier import send_alert
-    send_alert(f"[체결 폴링 복구] KIS 주문 조회 재개 (차단 {down_sec / 60:.1f}분)")
+    _send_in_background("send_alert",
+                        f"[체결 폴링 복구] KIS 주문 조회 재개 (차단 {down_sec / 60:.1f}분)")
+
+
+def _send_in_background(fn_name: str, message: str) -> None:
+    """Telegram is a synchronous HTTP call; the poller thread that reports the
+    breaker must not wait on it (it would stall polling and the shutdown join)."""
+    def _send():
+        try:
+            import bot.notifier as notifier
+            getattr(notifier, fn_name)(message)
+        except Exception as e:
+            logger.warning("회로 알림 전송 실패: %s", e)
+    threading.Thread(target=_send, daemon=True, name="poll-circuit-alert").start()
 
 
 class StrategyWorker:
