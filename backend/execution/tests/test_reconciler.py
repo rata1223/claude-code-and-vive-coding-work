@@ -566,3 +566,120 @@ class TestSilentChangeGuard:
 
         assert _count_audit(db_factory, "reconcile_delete") == 1, \
             "stale position deletion must write an AuditLog entry"
+
+
+# ── P1-12: exact quantity match ───────────────────────────────────────────────
+
+class TestQtyToleranceExact:
+    """KIS quantities are whole shares and an in-flight fill is deferred by the
+    open-order check, so any remaining difference is a real divergence. The old
+    one-share tolerance ignored it for ever — on a small account one share can be
+    most of a position, and a restart restored the wrong row into the tracker."""
+
+    def _reconcile(self, db_factory, broker_qty, broker_avg=100.0, ca_runtime=None):
+        broker = MagicMock()
+        broker.get_positions.return_value = [_broker_position("NVDA", qty=broker_qty,
+                                                              avg_price=broker_avg, market="US")]
+        broker.get_order_status = MagicMock(return_value=None)   # order reconciliation half
+        r = PositionReconciler(broker=broker, db_factory=db_factory, redis_client=None,
+                               broker_name="kis", ca_runtime=ca_runtime)
+        return r.reconcile("test")
+
+    def test_one_share_too_many_in_the_db_is_repaired(self, db_factory):
+        _insert_db_position(db_factory, "NVDA", qty=3, market="US")
+        result = self._reconcile(db_factory, broker_qty=2)
+        assert _get_position(db_factory, "NVDA").qty == 2
+        assert [g["kind"] for g in result.gaps] == ["qty_mismatch"]
+        assert [r["kind"] for r in result.repairs] == ["fix_qty"]
+        assert _count_audit(db_factory, "reconcile_fix_qty") == 1
+
+    def test_one_share_too_few_in_the_db_is_repaired(self, db_factory):
+        _insert_db_position(db_factory, "NVDA", qty=2, market="US")
+        self._reconcile(db_factory, broker_qty=3)
+        assert _get_position(db_factory, "NVDA").qty == 3
+
+    def test_a_one_share_gap_with_an_open_order_is_deferred(self, db_factory):
+        _insert_db_position(db_factory, "NVDA", qty=3, market="US")
+        _insert_pending_order(db_factory, "NVDA")
+        result = self._reconcile(db_factory, broker_qty=2)
+        assert _get_position(db_factory, "NVDA").qty == 3
+        assert [g["kind"] for g in result.gaps] == ["qty_mismatch_pending"]
+        assert result.repairs == []
+
+    def test_equal_quantities_with_avg_drift_fix_only_the_avg(self, db_factory):
+        _insert_db_position(db_factory, "NVDA", qty=2, avg_price=100.0, market="US")
+        result = self._reconcile(db_factory, broker_qty=2, broker_avg=110.0)
+        row = _get_position(db_factory, "NVDA")
+        assert (row.qty, row.avg_price) == (2, 110.0)
+        assert [r["kind"] for r in result.repairs] == ["fix_avg_price"]
+
+    def test_a_one_share_gap_with_avg_drift_fixes_the_qty_too(self, db_factory):
+        """Before, the avg was fixed and the one-share gap left in place."""
+        _insert_db_position(db_factory, "NVDA", qty=3, avg_price=100.0, market="US")
+        result = self._reconcile(db_factory, broker_qty=2, broker_avg=110.0)
+        row = _get_position(db_factory, "NVDA")
+        assert (row.qty, row.avg_price) == (2, 110.0)
+        assert [r["kind"] for r in result.repairs] == ["fix_qty"]
+
+    def test_matching_positions_are_left_alone(self, db_factory):
+        _insert_db_position(db_factory, "NVDA", qty=2, market="US")
+        result = self._reconcile(db_factory, broker_qty=2)
+        assert result.gaps == [] and result.repairs == []
+
+    def test_a_one_share_gap_goes_through_corporate_action_classification(self, db_factory):
+        """Same path as a larger gap: UNKNOWN is recorded (the symbol is gated,
+        fail-closed) and the quantity is still set to the broker's."""
+        from types import SimpleNamespace
+        _insert_db_position(db_factory, "NVDA", qty=3, market="US")
+        ca = MagicMock()
+        ca.classify_broker_jump.return_value = SimpleNamespace(
+            status=SimpleNamespace(value="unknown"), action_type=SimpleNamespace(value="unknown"))
+        result = self._reconcile(db_factory, broker_qty=2, ca_runtime=ca)
+        ca.classify_broker_jump.assert_called_once()
+        ca.record.assert_called_once()
+        assert _get_position(db_factory, "NVDA").qty == 2
+        assert [g["kind"] for g in result.gaps] == ["qty_corporate_action_unknown"]
+
+    def _order(self, db_factory, status, updated_at=None):
+        sess = db_factory()
+        sess.add(DBOrder(broker_order_id="X1", symbol="NVDA", side="buy", qty=1, price=100.0,
+                         status=status, market="US", broker="kis",
+                         updated_at=updated_at or datetime.utcnow()))
+        sess.commit()
+        sess.close()
+
+    def test_a_fill_whose_position_write_has_not_landed_is_deferred(self, db_factory):
+        """Order row FILLED (step 1), position not yet written (step 5): the
+        pass must not read the fill as a mismatch and gate the symbol."""
+        _insert_db_position(db_factory, "NVDA", qty=2, market="US")
+        self._order(db_factory, "filled")
+        ca = MagicMock()
+        result = self._reconcile(db_factory, broker_qty=3, ca_runtime=ca)
+        assert _get_position(db_factory, "NVDA").qty == 2
+        assert [g["kind"] for g in result.gaps] == ["qty_mismatch_pending"]
+        ca.record.assert_not_called()
+
+    def test_an_old_fill_does_not_defer(self, db_factory):
+        _insert_db_position(db_factory, "NVDA", qty=2, market="US")
+        self._order(db_factory, "filled", updated_at=datetime.utcnow() - timedelta(hours=1))
+        self._reconcile(db_factory, broker_qty=3)
+        assert _get_position(db_factory, "NVDA").qty == 3
+
+    def test_an_order_of_unknown_status_defers(self, db_factory):
+        """The order reconciliation treats ``unknown`` as open; a fill on it is
+        in flight like any other."""
+        _insert_db_position(db_factory, "NVDA", qty=2, market="US")
+        self._order(db_factory, "unknown")
+        result = self._reconcile(db_factory, broker_qty=3)
+        assert _get_position(db_factory, "NVDA").qty == 2
+        assert [g["kind"] for g in result.gaps] == ["qty_mismatch_pending"]
+
+    def test_a_recent_fill_on_another_symbol_does_not_defer(self, db_factory):
+        _insert_db_position(db_factory, "NVDA", qty=2, market="US")
+        sess = db_factory()
+        sess.add(DBOrder(broker_order_id="X2", symbol="AAPL", side="buy", qty=1, price=100.0,
+                         status="filled", market="US", broker="kis"))
+        sess.commit()
+        sess.close()
+        self._reconcile(db_factory, broker_qty=3)
+        assert _get_position(db_factory, "NVDA").qty == 3

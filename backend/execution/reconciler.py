@@ -92,8 +92,15 @@ class PositionReconciler:
         result = reconciler.reconcile("startup")
     """
 
-    # 포지션 수량 허용 오차: 브로커와 DB가 ±1주 이내면 무시
-    _QTY_TOLERANCE = 1
+    # 포지션 수량 허용 오차 (P1-12): 0 — 정확히 일치해야 한다. KIS 수량은 정수 주식이고
+    # (브로커·DB 모두 int), 체결 중인 차이는 `_has_pending_order`가 이미 보류한다. 남는
+    # 차이는 진짜 불일치다 — 예전 1주 허용은 그것을 영원히 덮었고(소량 보유에선 포지션의
+    # 30~100%), 비율 허용(ROADMAP 처방 0.5%)은 큰 포지션에서 더 큰 차이를 덮는다.
+    # 소수점 주식 브로커가 생기면 그 인스턴스에서 바꾼다.
+    _QTY_TOLERANCE = 0
+
+    # 막 체결된 주문은 이 시간 동안 아직 포지션을 움직이는 중으로 본다(_has_pending_order)
+    _RECENT_FILL_SEC = 600
 
     # 스테일 포지션(브로커에 없는 DB 포지션) 삭제 최소 나이
     _STALE_MIN_AGE_HOURS = 1.0
@@ -277,8 +284,8 @@ class PositionReconciler:
                                         "avg_before": dp["avg_price"], "qty_after": bp.qty,
                                         "avg_after": bp.avg_price,
                                     })
-                    elif price_changed and qty_diff <= self._QTY_TOLERANCE:
-                        # avg_price drift only — always safe to fix
+                    elif price_changed:
+                        # avg_price drift only (quantities within tolerance) — always safe to fix
                         row = None if dry_run else self._lock_unchanged(db, sym, dp, result)
                         if row is not None:
                             self._audit_position_change(
@@ -363,13 +370,24 @@ class PositionReconciler:
         result.gap(kind, symbol, detail)
 
     def _has_pending_order(self, symbol: str, db) -> bool:
-        """Return True if there is any open order for this symbol and broker."""
+        """True if an order for this symbol may still be moving its position:
+        an open one (``unknown`` included — the order reconciliation treats it
+        as open), or one that turned FILLED within ``_RECENT_FILL_SEC``.
+
+        The fill pipeline writes the order row FILLED (step 1) before it writes
+        the position (step 5, after a broker balance call) — a pass in between
+        would read the fill as a quantity mismatch and, with no tolerance
+        (P1-12), gate the symbol as an unknown corporate action (code-review)."""
+        from sqlalchemy import and_, or_
         from backend.database.models import Order as DBOrder
-        _open = [OrderStatus.PENDING.value, OrderStatus.SUBMITTED.value, OrderStatus.PARTIAL_FILLED.value]
+        _open = [OrderStatus.PENDING.value, OrderStatus.SUBMITTED.value,
+                 OrderStatus.PARTIAL_FILLED.value, OrderStatus.UNKNOWN.value]
+        recent = datetime.utcnow() - timedelta(seconds=self._RECENT_FILL_SEC)
         return db.query(DBOrder).filter(
             DBOrder.symbol == symbol,
             DBOrder.broker == self._broker_name,
-            DBOrder.status.in_(_open),
+            or_(DBOrder.status.in_(_open),
+                and_(DBOrder.status == OrderStatus.FILLED.value, DBOrder.updated_at >= recent)),
         ).first() is not None
 
     # ── Order reconciliation ────────────────────────────────────────────────
