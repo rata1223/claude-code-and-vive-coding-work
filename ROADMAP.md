@@ -13,12 +13,12 @@
 
 ## Status at a glance (2026-10-09, main `f02dbf7`)
 
-Every item below was checked against the code at this commit (P6-05, PR #220): the heading carries the status and an **Audit** note cites the file and line. Unmarked items no longer exist. Since then: P2-03 ⚠️→✅ (PR #221), P1-10 ⚠️→✅ (PR #222), P3-02 ⚠️→✅ (PR #223), P0-09 ⚠️→✅ (PR #224).
+Every item below was checked against the code at this commit (P6-05, PR #220): the heading carries the status and an **Audit** note cites the file and line. Unmarked items no longer exist. Since then: P2-03 ⚠️→✅ (PR #221), P1-10 ⚠️→✅ (PR #222), P3-02 ⚠️→✅ (PR #223), P0-09 ⚠️→✅ (PR #224), P2-06 ⚠️→✅ (PR #225).
 
 | Status | Count |
 |---|---|
-| ✅ DONE (some shipped differently from the prescription — the note says how) | 38 |
-| ⚠️ PARTIAL | 7 |
+| ✅ DONE (some shipped differently from the prescription — the note says how) | 39 |
+| ⚠️ PARTIAL | 6 |
 | ❌ OPEN | 4 |
 | ⏸ DEFERRED | 2 |
 | **Total** | **51** |
@@ -33,7 +33,6 @@ Every item below was checked against the code at this commit (P6-05, PR #220): t
 | P1-08 Legacy bot removal | ⚠️ | `kis-bot` disabled, but `bot/` stays — `bot/notifier.py` is the worker's alert path |
 | P1-12 Quantity tolerance | ❌ | `_QTY_TOLERANCE = 1` fixed |
 | P2-01 Order event log | ⚠️ | Phase 1 (the log) done; deriving state from it and dropping `orders.status` is P6 |
-| P2-06 Poller circuit breaker | ⚠️ | Poll failures only log CRITICAL after ten; nothing opens |
 | P6-02 Deploy gated on tests | ⚠️ | `deploy.yml` is disabled; manual deploys are not gated |
 | P5-03 Risk system unification | ❌ | The app's quick-trade halt gate reads legacy Redis keys **nothing writes** — it never trips on losses |
 | P6-01 State-machine tests | ⚠️ | No exhaustive all-pairs transition test |
@@ -854,11 +853,13 @@ Makes the execution layer correct-by-construction rather than correct-by-convent
 
 ---
 
-#### P2-06 — KIS polling loop: structured `OrderFillPoller` with exponential backoff and circuit breaker — ⚠️ PARTIAL
+#### P2-06 — KIS polling loop: structured `OrderFillPoller` with exponential backoff and circuit breaker — ✅ DONE (PR #225)
 
-> **Audit (2026-10-09):** Per-order escalating intervals 10 → 300 s (`backend/execution/order_poller.py:29`, `advance()`), a per-app-key rate limit (PR #154), and a circuit breaker on order placement (`backend/brokers/kis.py:130`, 5 failures / 10 min).
+> **Audit (2026-10-09):** Per-order escalating intervals 10 → 300 s (`advance()`), a per-app-key rate limit (PR #154), and a circuit breaker on order placement (`backend/brokers/kis.py:130` — `get_order_status` neither checks nor feeds it). Poll failures themselves tripped nothing: ten in a row only logged CRITICAL, and `PollingHealth.is_healthy` had no production reader.
 >
-> Poll failures themselves trip nothing: ten in a row only log CRITICAL (`backend/execution/order_poller.py:113`–`121`).
+> **Done in PR #225.** `backend/execution/order_poller.py`: `_BREAKER_THRESHOLD` (5) consecutive poll failures across all orders open a breaker in `PollingHealthMonitor` (`record_poll_error`). While open the loop (`_poll_due`) makes no lookups; after `_BREAKER_COOLDOWN_SEC` (60) one lookup — the earliest-due order — tests the broker, a failed probe doubles the cooldown up to `_BREAKER_MAX_COOLDOWN_SEC` (300), a success closes it and polling resumes. The tick stops as soon as the breaker opens. `is_healthy` reflects it. The worker wires `on_circuit_open` / `on_circuit_close` to Telegram (`backend/worker/runner.py` `_alert_poll_circuit_open`: emergency; close: info with the downtime). Callback errors (retried fills) do not count.
+>
+> **Found while doing it — no timeouts while open:** an order was timed out 30 minutes after registration whether or not its status could be read, and the worker's `on_timeout_cb` converges it to CANCELED even when the cancel fails (P3-02B H1). A KIS outage over 30 minutes therefore marked every pending order cancelled and released its symbol lock, though the broker may have filled it. Timeouts now happen only while the breaker is closed. **Remaining** (operator decision, left as is): with the breaker closed, a timeout whose cancel fails is still converged to CANCELED; and one order whose lookups keep failing while others succeed does not open the breaker and times out as before. Tests: `backend/execution/tests/test_poller_circuit_breaker.py`.
 
 | Field | Value |
 |---|---|

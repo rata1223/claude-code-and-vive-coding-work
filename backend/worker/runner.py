@@ -463,6 +463,19 @@ class WorkerSession:
             logger.warning("run 상태 업데이트 실패: %s", e)
 
 
+def _alert_poll_circuit_open(consecutive: int, cooldown_sec: int) -> None:
+    """P2-06: the fill poller stopped looking orders up. Fills and terminal
+    events are not seen until it recovers, and no order is timed out."""
+    from bot.notifier import alert_emergency
+    alert_emergency(f"[체결 폴링 차단] KIS 주문 조회 {consecutive}회 연속 실패 — 조회 중단, "
+                    f"타임아웃 보류. {cooldown_sec}초 뒤 시험 조회")
+
+
+def _alert_poll_circuit_close(down_sec: float) -> None:
+    from bot.notifier import send_alert
+    send_alert(f"[체결 폴링 복구] KIS 주문 조회 재개 (차단 {down_sec / 60:.1f}분)")
+
+
 class StrategyWorker:
     """Redis Pub/Sub 구독 + 전략 세션 관리."""
 
@@ -507,6 +520,8 @@ class StrategyWorker:
                 broker=_kis,
                 db_factory=_get_session_factory(),
                 semantic_mapper=BrokerSemanticMapper(_kis.capabilities),
+                on_circuit_open=_alert_poll_circuit_open,
+                on_circuit_close=_alert_poll_circuit_close,
             )
             self._poller.start()
             logger.info("OrderFillPoller 시작")
