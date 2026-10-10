@@ -2,7 +2,7 @@ import logging
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Callable, Iterable, Optional
 
 from backend.brokers.models import Position
 from backend.execution.order_machine import OrderStateMachine
@@ -10,6 +10,9 @@ from backend.execution.order_machine import OrderStateMachine
 logger = logging.getLogger(__name__)
 
 _PENDING_LOCK_TTL = 1800  # 30 minutes — auto-release stale locks
+
+#: ``claim_ca_exit`` reason when the symbol's pending lock is already held.
+CA_EXIT_PENDING = "pending"
 
 
 # Fill 데이터클래스가 brokers/models.py에 없으므로 여기서 정의
@@ -90,6 +93,59 @@ class PositionTracker:
                 return False
             self._pending_symbols[symbol] = time.monotonic()
             return True
+
+    def is_ca_blocked(self, symbol: str) -> bool:
+        """True if a corporate action gates this symbol (fail-closed on a
+        gate-check error)."""
+        return self._ca_blocked(symbol)
+
+    def claim_ca_exit(self, symbol: str, get_positions: Callable[[], Iterable]) -> tuple[Optional[int], str]:
+        """Claim the pending lock for an exit on a corporate-action-gated symbol
+        and return ``(qty_to_sell, "")``, or ``(None, reason)`` with no lock held.
+
+        The gate stops new risk, not its reduction — but while it holds, this
+        tracker's qty/avg may be wrong (an unrecorded 2:1 split doubles the
+        broker qty and halves the price). So the exit is sized from a live
+        broker lookup: the broker's sellable qty. The broker's held qty and avg
+        (KIS adjusts it for splits) are adopted into the tracker before the
+        order goes out, so the fill's realized P&L is measured against the
+        broker's cost basis and partial fills reduce the right quantity. A
+        failed lookup, no broker position, an unknown or zero sellable figure,
+        or an invalid avg refuses the exit (fail-closed).
+
+        This is the only way past the gate: there is no flag that skips it
+        without the broker sizing."""
+        from backend.risk.halt_policy import is_valid_execution_price
+        from backend.risk.sellable_qty import sellable_from_position
+        try:
+            positions = get_positions()
+        except Exception as e:  # noqa: BLE001 - no lookup, no exit
+            return None, f"브로커 포지션 조회 실패: {e}"
+        match = next((p for p in positions or [] if getattr(p, "symbol", None) == symbol), None)
+        if match is None:
+            return None, "브로커 보유 없음"
+        sellable = sellable_from_position(match)
+        if not sellable.known or sellable.qty <= 0:
+            return None, f"매도가능수량 없음 ({sellable.reason})"
+        if not is_valid_execution_price(match.avg_price):
+            return None, f"브로커 평단 이상 ({match.avg_price!r})"
+        with self._lock:
+            ts = self._pending_symbols.get(symbol)
+            if ts is not None and time.monotonic() - ts <= _PENDING_LOCK_TTL:
+                return None, CA_EXIT_PENDING
+            self._pending_symbols[symbol] = time.monotonic()
+            prev = self._positions.get(symbol)
+            self._positions[symbol] = Position(
+                symbol=symbol,
+                qty=int(match.qty),
+                avg_price=float(match.avg_price),
+                market=match.market,
+                current_price=prev.current_price if prev else 0.0,
+            )
+        logger.warning("기업행위 차단 중 청산 — 브로커 값 채택: %s 보유 %d(추적 %s) 평단 %.4f, 매도 %d",
+                       symbol, int(match.qty), prev.qty if prev else None,
+                       float(match.avg_price), sellable.qty)
+        return sellable.qty, ""
 
     def _ca_blocked(self, symbol: str) -> bool:
         """True if a corporate action gates this symbol. When no CA runtime is

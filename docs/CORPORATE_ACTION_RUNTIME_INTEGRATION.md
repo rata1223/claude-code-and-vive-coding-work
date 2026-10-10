@@ -266,3 +266,18 @@ so ownership is a queryable contract).
 
 > **Do not implement yet.** Each integration point above is a separate, paper-validated,
 > safety-critical change to be approved on its own.
+
+---
+
+## Addendum (PR #227) — the gate blocks entries, not exits
+
+The tracker gate (`PositionTracker._ca_blocked`) used to refuse every order on a gated symbol,
+stop-losses included. It now refuses **entries** only. The single way past it is
+`PositionTracker.claim_ca_exit(symbol, get_positions)`: a live broker lookup, a check of the
+broker's sellable qty and average, the duplicate-order lock, and then the broker's held qty and
+(split-adjusted) average are **adopted into the tracker** before the order goes out — so the fill's
+realized P&L is measured against the broker's cost basis and partial fills reduce the right
+quantity. It returns the broker's sellable qty to sell. The stop-loss on a gated symbol is measured
+against the broker's average. A failed lookup, no broker position, an unknown or zero sellable
+figure, or an invalid average refuses the exit (fail-closed) and leaves the tracker untouched.
+EmergencyFlatten never consulted the gate.
