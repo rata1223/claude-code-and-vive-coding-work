@@ -172,6 +172,27 @@ def test_corporate_action_blocks_order_entry(broker):
     assert ok.order is not None
 
 
+def test_corporate_action_gate_admits_exits_sized_from_the_broker(broker):
+    """기업행위 게이트는 신규 진입만 막는다 — 매도는 브로커 매도가능수량으로 청산."""
+    h = PaperHarness(broker, corporate_action_runtime=_StubCA({"SPY"}))
+    broker.set_position("SPY", 10, 50.0, market="US")
+    res = h.submit_order("SPY", "sell", 3, 100.0)          # 호출자 수량(3)은 쓰지 않는다
+    assert res.order is not None and res.order.qty == 10
+    assert h.metrics.corporate_action_events == 0
+    # 같은 종목 두 번째 매도는 중복 락으로 막히고, 중복으로 집계된다
+    again = h.submit_order("SPY", "sell", 10, 100.0)
+    assert again.order is None and again.blocked_by == "pending_or_ca"
+    assert h.metrics.corporate_action_events == 0
+
+
+def test_corporate_action_gated_exit_without_a_broker_position_is_blocked(broker):
+    h = PaperHarness(broker, corporate_action_runtime=_StubCA({"SPY"}))
+    res = h.submit_order("SPY", "sell", 10, 100.0)
+    assert res.order is None and res.blocked_by == "corporate_action"
+    assert h.tracker.can_place_order("SPY") is False        # 게이트는 그대로(진입 차단)
+    assert h.metrics.corporate_action_events == 1
+
+
 def test_corporate_action_gate_fails_closed_on_error(broker):
     class _Boom:
         def is_blocked(self, symbol):

@@ -3,6 +3,7 @@ from typing import TYPE_CHECKING, Callable, Optional
 
 from backend.brokers.models import OrderStatus
 from backend.execution.circuit_breaker import ConsecutiveFailureBreaker
+from backend.risk.halt_policy import is_valid_execution_price
 from backend.strategy.base import StrategyBase
 
 if TYPE_CHECKING:
@@ -72,8 +73,27 @@ class IndicatorStrategy(StrategyBase):
         if not symbol:
             return
         pos = self._tracker.get_position(symbol)
-        if pos:
+        if not pos:
+            return
+        if not self._tracker.is_ca_blocked(symbol):
             self._check_exit(symbol, bar["close"], pos.avg_price)
+            return
+        # The tracker's avg may predate a split the gate is holding — measure
+        # the stop against the broker's (split-adjusted) avg, and size the exit
+        # from the same lookup.
+        try:
+            positions = list(self._broker.get_positions() or [])
+        except Exception as e:  # noqa: BLE001 - no lookup, no stop this bar
+            logger.warning("[%s] 기업행위 차단 종목 브로커 조회 실패 — 손절 판정 보류: %s: %s",
+                           self.name, symbol, e)
+            return
+        match = next((p for p in positions if getattr(p, "symbol", None) == symbol), None)
+        if match is None or not is_valid_execution_price(match.avg_price):
+            logger.warning("[%s] 기업행위 차단 종목 브로커 평단 없음 — 손절 판정 보류: %s",
+                           self.name, symbol)
+            return
+        self._check_exit(symbol, bar["close"], float(match.avg_price),
+                         get_positions=lambda: positions)
 
     def on_stop(self):
         logger.info("[%s] 전략 중단", self.name)
@@ -184,14 +204,24 @@ class IndicatorStrategy(StrategyBase):
             self._tracker.unmark_pending(symbol)
             logger.warning("[%s] 매수 실패 %s: %s", self.name, symbol, e)
 
-    def _execute_sell(self, symbol: str, reason: str):
+    def _execute_sell(self, symbol: str, reason: str, get_positions=None):
         if self._breaker.is_open():
             return
         pos = self._tracker.get_position(symbol)
         if pos is None:
             return
-        # Atomically claim pending lock before broker call
-        if not self._tracker.try_mark_pending(symbol):
+        qty = pos.qty
+        if self._tracker.is_ca_blocked(symbol):
+            # A corporate-action gate blocks entries, not exits — but the exit
+            # is sized from the broker, not from this (possibly wrong) tracker.
+            qty, why = self._tracker.claim_ca_exit(
+                symbol, get_positions or self._broker.get_positions)
+            if qty is None:
+                logger.warning("[%s] 기업행위 차단 종목 청산 보류: %s (%s)", self.name, symbol, why)
+                return
+        # Atomically claim pending lock before broker call. Rechecks the gate,
+        # so one raised since the check above still blocks a tracker-sized sell.
+        elif not self._tracker.try_mark_pending(symbol):
             logger.debug("[%s] 매도 중복 주문 방지: %s", self.name, symbol)
             return
         # Unified freshness gate (R-11): block order sizing on stale data.
@@ -201,11 +231,11 @@ class IndicatorStrategy(StrategyBase):
             return
         try:
             price = self._broker.get_price(symbol)
-            order = self.sell(symbol, pos.qty, price)
+            order = self.sell(symbol, qty, price)
             if order and order.status != OrderStatus.REJECTED:
                 self._breaker.record_success()
                 self._register_order(order, symbol)
-                logger.info("[%s] 매도 실행: %s qty=%d @%.2f (%s)", self.name, symbol, pos.qty, price, reason)
+                logger.info("[%s] 매도 실행: %s qty=%d @%.2f (%s)", self.name, symbol, qty, price, reason)
             else:
                 self._breaker.record_failure()
                 self._tracker.unmark_pending(symbol)
@@ -248,10 +278,12 @@ class IndicatorStrategy(StrategyBase):
                 on_expired=self._on_terminal_cb,
             )
 
-    def _check_exit(self, symbol: str, current_price: float, entry_price: float):
+    def _check_exit(self, symbol: str, current_price: float, entry_price: float,
+                    get_positions=None):
         stop_pct = float(self._config.get("stop_loss_pct", 0.07))
         if current_price <= entry_price * (1 - stop_pct):
-            self._execute_sell(symbol, f"손절 {(current_price/entry_price - 1)*100:.1f}%")
+            self._execute_sell(symbol, f"손절 {(current_price/entry_price - 1)*100:.1f}%",
+                               get_positions=get_positions)
 
     def _default_timeout_handler(self, order):
         logger.warning("[%s] 주문 타임아웃 — 브로커 취소 시도: %s %s %s",

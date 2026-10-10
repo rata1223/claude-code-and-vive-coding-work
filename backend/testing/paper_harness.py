@@ -25,7 +25,7 @@ from backend.brokers.paper_broker import ScriptedPaperBroker
 from backend.execution.order_events import apply_terminal_event
 from backend.execution.order_machine import FillEvent, OrderStateMachine
 from backend.execution.order_poller import OrderFillPoller
-from backend.execution.position_tracker import Fill, PositionTracker
+from backend.execution.position_tracker import CA_EXIT_PENDING, Fill, PositionTracker
 from backend.risk.kill_switch import KillSwitch, OrderIntent, TradingState
 from backend.testing.metrics import ValidationMetrics
 
@@ -119,7 +119,18 @@ class PaperHarness:
                 return SubmitResult(order=None, blocked_by="stale_data")
 
         # 1. 중복주문 / 기업행위 게이트 (PositionTracker)
-        if not self.tracker.try_mark_pending(symbol):
+        #    기업행위 게이트는 신규 진입만 막는다 — 매도는 전략처럼 브로커 수량으로
+        #    청산한다(claim_ca_exit). 호출자가 준 수량은 쓰지 않는다.
+        if side == "sell" and self._ca_blocking(symbol):
+            exit_qty, why = self.tracker.claim_ca_exit(symbol, self.broker.get_positions)
+            if exit_qty is None:
+                if why == CA_EXIT_PENDING:
+                    setattr(self.metrics, _dup_metric, getattr(self.metrics, _dup_metric) + 1)
+                    return SubmitResult(order=None, blocked_by="pending_or_ca")
+                self.metrics.corporate_action_events += 1
+                return SubmitResult(order=None, blocked_by="corporate_action")
+            qty = exit_qty
+        elif not self.tracker.try_mark_pending(symbol):
             if self._ca_blocking(symbol):
                 self.metrics.corporate_action_events += 1
                 return SubmitResult(order=None, blocked_by="corporate_action")
