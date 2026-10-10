@@ -708,16 +708,18 @@ class StartupRecovery:
 
     def _apply_fill_to_position_db(self, sess, symbol: str, side: str,
                                     fill_qty: int, fill_price: float) -> None:
-        """Upsert or reduce position in DB for a recovery fill (B1/F1 fix).
+        """Apply a recovery fill to the position row (B1/F1 fix) as a delta.
         Uses the provided session; caller is responsible for commit.
+
+        P0-09: the row is locked before it is read (``lock_position``), and a
+        first buy creates it with ``INSERT … ON CONFLICT DO NOTHING`` — another
+        writer between the read and the commit can no longer lose this delta or
+        turn it into a duplicate-key error.
         """
-        from backend.database.models import Position as DBPosition
+        from backend.database.models import insert_position_if_missing, lock_position
         try:
-            row = sess.query(DBPosition).filter(
-                DBPosition.symbol == symbol,
-                DBPosition.broker == "kis",
-            ).first()
             if side == "sell":
+                row = lock_position(sess, symbol, "kis")
                 if row is not None:
                     row.qty = max(0, row.qty - fill_qty)
                     if row.qty <= 0:
@@ -726,18 +728,26 @@ class StartupRecovery:
                         row.updated_at = datetime.utcnow()
             else:  # buy
                 market = "KR" if (len(symbol) == 6 and symbol.isdigit()) else "US"
+                row = None
+                # DO NOTHING does not lock the row it ran into: a delete can
+                # commit before the lock below, which then finds nothing. Insert
+                # again in that case (code-review).
+                for _ in range(2):
+                    if insert_position_if_missing(sess, symbol=symbol, broker="kis",
+                                                  qty=fill_qty, avg_price=fill_price,
+                                                  market=market):
+                        return
+                    row = lock_position(sess, symbol, "kis")
+                    if row is not None:
+                        break
                 if row is None:
-                    sess.add(DBPosition(
-                        symbol=symbol, qty=fill_qty, avg_price=fill_price,
-                        market=market, broker="kis",
-                    ))
-                else:
-                    prev_val = row.avg_price * row.qty
-                    new_val = fill_price * fill_qty
-                    total_qty = row.qty + fill_qty
-                    row.avg_price = (prev_val + new_val) / total_qty
-                    row.qty = total_qty
-                    row.updated_at = datetime.utcnow()
+                    raise RuntimeError("position row kept vanishing between insert and lock")
+                prev_val = row.avg_price * row.qty
+                new_val = fill_price * fill_qty
+                total_qty = row.qty + fill_qty
+                row.avg_price = (prev_val + new_val) / total_qty
+                row.qty = total_qty
+                row.updated_at = datetime.utcnow()
         except Exception as e:
             logger.warning("복구 포지션 DB 갱신 실패 (%s): %s", symbol, e)
 

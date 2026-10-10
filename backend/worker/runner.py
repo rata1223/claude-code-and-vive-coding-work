@@ -27,7 +27,7 @@ from backend.brokers.kis import KISBroker, get_kis_broker
 from backend.brokers.models import Order, OrderStatus
 from backend.database.models import (
     Fill as DBFill, Order as DBOrder, Position as DBPosition,
-    StrategyRun, init_db_factory,
+    StrategyRun, init_db_factory, lock_position, upsert_position,
 )
 from backend.execution.order_events import apply_terminal_event
 from backend.execution.order_machine import FillEvent, OrderStateMachine
@@ -112,6 +112,19 @@ def _session():
 # never closed (a stuck `unknown` row, say) stays "open" forever, and without
 # this it would capture the next order to draw its number. Quantity is not
 # compared: KIS can omit `ord_qty`, and gating on it would drop a real fill.
+
+#: Serialises the fill pipeline's position writes per symbol
+#: (``_upsert_position_db``), so the last commit always carries the tracker's
+#: latest value. Per symbol, not one lock: a write can wait on a row lock (the
+#: reconciler holds one until its pass commits), and that wait must not stall
+#: fills on every other symbol.
+_POSITION_DB_LOCKS: dict[str, threading.Lock] = {}
+_POSITION_DB_LOCKS_GUARD = threading.Lock()
+
+
+def _position_db_lock(symbol: str) -> threading.Lock:
+    with _POSITION_DB_LOCKS_GUARD:
+        return _POSITION_DB_LOCKS.setdefault(symbol, threading.Lock())
 
 #: Non-terminal statuses. `unknown` is included because the state machine and
 #: the poller still treat such an order as live (`OrderStateMachine.active_orders`).
@@ -1591,7 +1604,7 @@ class StrategyWorker:
                               cumulative=order.cumulative_filled_qty)
 
             # 5. Upsert position in DB to reflect fill
-            self._upsert_position_db(fill.symbol, fill.market, tracker.get_position(fill.symbol))
+            self._upsert_position_db(fill.symbol, fill.market, tracker)
 
             # 6. WebSocket push — the order, then (off this path) the account's
             # positions and equity, which the fill just changed.
@@ -1995,27 +2008,26 @@ class StrategyWorker:
                               # fill pipeline has no other dedup for partials).
                               initial_reported_qty=p.get("filled_qty", 0) or 0)
 
-    def _upsert_position_db(self, symbol: str, market: str, pos):
-        """Upsert or delete position row in DB after a fill."""
+    def _upsert_position_db(self, symbol: str, market: str, tracker: PositionTracker):
+        """Write the tracker's position for ``symbol`` to the DB after a fill
+        (P0-09): the row is set to the tracker's absolute value in one
+        ``INSERT … ON CONFLICT DO UPDATE`` (no duplicate-key race on the first
+        insert), or deleted when the position is closed.
+
+        The tracker is read **inside** the symbol's write lock: its
+        pending lock is released at step 2, so two fills on one symbol can reach
+        this step together, and a value read before the lock could commit after
+        a newer one — leaving the DB behind the tracker until the next fill."""
         try:
-            with _session() as db:
-                row = db.query(DBPosition).filter(
-                    DBPosition.symbol == symbol,
-                    DBPosition.broker == "kis",
-                ).first()
+            with _position_db_lock(symbol), _session() as db:
+                pos = tracker.get_position(symbol)
                 if pos is None or pos.qty <= 0:
+                    row = lock_position(db, symbol, "kis")
                     if row is not None:
                         db.delete(row)
                 else:
-                    if row is not None:
-                        row.qty = pos.qty
-                        row.avg_price = pos.avg_price
-                        row.updated_at = datetime.utcnow()
-                    else:
-                        db.add(DBPosition(
-                            symbol=symbol, qty=pos.qty,
-                            avg_price=pos.avg_price, market=market, broker="kis",
-                        ))
+                    upsert_position(db, symbol=symbol, broker="kis", qty=pos.qty,
+                                    avg_price=pos.avg_price, market=market)
                 db.commit()
         except Exception as e:
             logger.warning("포지션 DB 갱신 실패 (%s): %s", symbol, e)

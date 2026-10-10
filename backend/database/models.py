@@ -192,6 +192,54 @@ class Position(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
+# ── Position writes (P0-09) ───────────────────────────────────────────────
+# **Every write to ``positions`` goes through these** (static guard:
+# ``backend/worker/tests/test_position_writers.py``). Three writers — the fill
+# pipeline, startup recovery and the reconciler — used to SELECT and then
+# UPDATE or INSERT. Two first inserts for one symbol raced to a duplicate-key
+# error that threw the loser's write away (and with the reconciler, its whole
+# pass); a delta applied between another writer's read and commit was lost.
+# The caller commits.
+
+def _position_values(symbol, broker, qty, avg_price, market) -> dict:
+    return dict(symbol=symbol, broker=broker, qty=qty, avg_price=avg_price,
+                market=market, updated_at=datetime.utcnow())
+
+
+def upsert_position(sess: Session, *, symbol: str, broker: str, qty: int,
+                    avg_price: float, market: str) -> None:
+    """Set the position to an absolute value: one statement, created or
+    replaced, never a duplicate-key error."""
+    insert = _dialect_insert(sess)
+    stmt = insert(Position).values(**_position_values(symbol, broker, qty, avg_price, market))
+    sess.execute(stmt.on_conflict_do_update(
+        index_elements=[Position.symbol, Position.broker],
+        set_={"qty": stmt.excluded.qty, "avg_price": stmt.excluded.avg_price,
+              "market": stmt.excluded.market, "updated_at": stmt.excluded.updated_at}))
+
+
+def insert_position_if_missing(sess: Session, *, symbol: str, broker: str, qty: int,
+                               avg_price: float, market: str) -> bool:
+    """Create the row unless one exists. True only if this call created it —
+    otherwise the existing row is left exactly as it was."""
+    insert = _dialect_insert(sess)
+    result = sess.execute(
+        insert(Position).values(**_position_values(symbol, broker, qty, avg_price, market))
+        .on_conflict_do_nothing(index_elements=[Position.symbol, Position.broker]))
+    return result.rowcount == 1
+
+
+def lock_position(sess: Session, symbol: str, broker: str) -> "Position | None":
+    """The row for ``(symbol, broker)``, locked (``SELECT … FOR UPDATE``) and
+    read as committed, or ``None``. For read-modify-write: a delta, a reduce, a
+    delete. Held until the caller commits; SQLite ignores the lock."""
+    return (sess.query(Position)
+            .filter(Position.symbol == symbol, Position.broker == broker)
+            .with_for_update()
+            .populate_existing()
+            .one_or_none())
+
+
 class DailyRiskState(Base):
     __tablename__ = "daily_risk_states"
     trade_date = Column(Date, primary_key=True)
@@ -271,14 +319,21 @@ def lock_risk_rows(sess: Session, days) -> list["DailyRiskState"]:
     return rows
 
 
-def _insert_risk_row_if_missing(sess: Session, day: date) -> bool:
+def _dialect_insert(sess: Session):
+    """``insert`` with ``on_conflict_*`` for the session's database. Only the
+    two this project runs on — Postgres in production, SQLite in tests."""
     dialect = sess.get_bind().dialect.name
     if dialect == "postgresql":
         from sqlalchemy.dialects.postgresql import insert
     elif dialect == "sqlite":
         from sqlalchemy.dialects.sqlite import insert
     else:
-        raise NotImplementedError(f"lock_risk_row: unsupported dialect {dialect!r}")
+        raise NotImplementedError(f"unsupported dialect {dialect!r}")
+    return insert
+
+
+def _insert_risk_row_if_missing(sess: Session, day: date) -> bool:
+    insert = _dialect_insert(sess)
     result = sess.execute(
         insert(DailyRiskState).values(trade_date=day).on_conflict_do_nothing(
             index_elements=[DailyRiskState.trade_date]))

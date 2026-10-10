@@ -13,12 +13,12 @@
 
 ## Status at a glance (2026-10-09, main `f02dbf7`)
 
-Every item below was checked against the code at this commit (P6-05, PR #220): the heading carries the status and an **Audit** note cites the file and line. Unmarked items no longer exist. Since then: P2-03 ⚠️→✅ (PR #221), P1-10 ⚠️→✅ (PR #222), P3-02 ⚠️→✅ (PR #223).
+Every item below was checked against the code at this commit (P6-05, PR #220): the heading carries the status and an **Audit** note cites the file and line. Unmarked items no longer exist. Since then: P2-03 ⚠️→✅ (PR #221), P1-10 ⚠️→✅ (PR #222), P3-02 ⚠️→✅ (PR #223), P0-09 ⚠️→✅ (PR #224).
 
 | Status | Count |
 |---|---|
-| ✅ DONE (some shipped differently from the prescription — the note says how) | 37 |
-| ⚠️ PARTIAL | 8 |
+| ✅ DONE (some shipped differently from the prescription — the note says how) | 38 |
+| ⚠️ PARTIAL | 7 |
 | ❌ OPEN | 4 |
 | ⏸ DEFERRED | 2 |
 | **Total** | **51** |
@@ -28,7 +28,6 @@ Every item below was checked against the code at this commit (P6-05, PR #220): t
 | Item | Status | Gap |
 |---|---|---|
 | P0-02 Pre-submission fence | ⚠️ | Worker strategy orders are recorded only after `place_order` returns (the app's quick-trade path reserves first) |
-| P0-09 Atomic position upsert | ⚠️ | SELECT-then-write without `ON CONFLICT`; a racing first insert leaves the row stale until the next fill |
 | P0-13 FK constraints | ❌ | No foreign keys; `fills.order_id` is unconstrained (schema change on an existing table) |
 | P1-03 Client order id before submit | ❌ | KIS has no client order id; tied to P0-02 |
 | P1-08 Legacy bot removal | ⚠️ | `kis-bot` disabled, but `bot/` stays — `bot/notifier.py` is the worker's alert path |
@@ -252,11 +251,16 @@ Any single incomplete P0 item is sufficient to block the paper→real transition
 
 ---
 
-#### P0-09 — Fix `db.merge()` → explicit upsert using `ON CONFLICT DO UPDATE` — ⚠️ PARTIAL
+#### P0-09 — Fix `db.merge()` → explicit upsert using `ON CONFLICT DO UPDATE` — ✅ DONE (PR #224)
 
-> **Audit (2026-10-09):** `db.merge()` is gone, and the unique constraint (P0-08) rules out duplicate rows. `_upsert_position_db` writes the tracker's absolute quantity (`backend/worker/runner.py:1910`).
+> **Audit (2026-10-09):** `db.merge()` was gone and the unique constraint (P0-08) ruled out duplicate rows, but all three writers still did SELECT then UPDATE/INSERT: a racing first insert threw its write away with an `IntegrityError`.
 >
-> Still a SELECT then UPDATE/INSERT, without `ON CONFLICT DO UPDATE` or a row lock: two first inserts for one symbol race, the loser's `IntegrityError` is logged and that row stays stale until the next fill.
+> **Done in PR #224.** The writers are not `position_tracker.py` (in-memory only) but the fill pipeline, startup recovery and the reconciler. Every write now goes through helpers in `backend/database/models.py` (`upsert_position` = `INSERT … ON CONFLICT (symbol, broker) DO UPDATE`, `insert_position_if_missing` = `DO NOTHING`, `lock_position` = `SELECT … FOR UPDATE`; same pattern as `lock_risk_row`, #164):
+> - **Fill pipeline** (`backend/worker/runner.py` `_upsert_position_db`): absolute upsert, delete via the locked row. The tracker is read inside a per-symbol lock (`_position_db_lock`) — the symbol's pending lock is released at step 2, so two fills on one symbol could otherwise commit an older tracker read last. Per symbol so a row-lock wait does not stall other symbols' fills (code-review).
+> - **Recovery** (`backend/worker/recovery.py` `_apply_fill_to_position_db`): a first buy creates the row with `DO NOTHING`; every delta is applied to a locked row. If the row is deleted between the conflict and the lock (DO NOTHING does not lock), it inserts again.
+> - **Reconciler** (`backend/execution/reconciler.py`, operator-approved): the pass reads the table first and commits once at the end. The missing-in-DB insert is `DO NOTHING`, and every update and delete first locks the row and checks it still holds what the pass read (`_lock_unchanged`). A row another writer inserted, changed or deleted in between is newer than the broker value the pass holds, so it is left for the next pass and reported as one gap (`position_appeared_during_reconcile` / `position_changed_during_reconcile`). Before, the pass overwrote a fresh fill with a stale broker value, and a plain add or an update of a deleted row failed the single commit and rolled back every other repair.
+>
+> Tests: `backend/worker/tests/test_position_upsert.py`, Postgres overlapping sessions `tests/postgres/test_position_upsert_db.py`, static guard `backend/worker/tests/test_position_writers.py`. A failed position write is still a warning (the fill itself is recorded, #222; recovery and the reconciler correct positions from the broker). **Left as is** (pre-existing, code-review): a recovery-poller fill adds a delta to the row while strategy trackers restored earlier do not know it, so the next strategy fill's absolute write can drop it until a reconcile; the reconciler's audit rows are written in their own session before the pass commits.
 
 | Field | Value |
 |---|---|
