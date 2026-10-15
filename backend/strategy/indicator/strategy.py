@@ -72,18 +72,72 @@ class IndicatorStrategy(StrategyBase):
         symbol = bar.get("symbol")
         if not symbol:
             return
+        self._evaluate_stop(symbol, bar["close"])
+
+    def check_stops(self, should_stop: Optional[Callable[[], bool]] = None):
+        """Stop-loss sweep over the tracked positions (known issue 17).
+
+        The stop lived only in ``on_bar``, and nothing in the worker feeds bars,
+        so it never ran: the only exits were the market-open signal scan and the
+        MDD flatten. The worker now calls this on a timer. Each held symbol whose
+        market is open for regular trading is priced from the broker and run
+        through the same ``_evaluate_stop`` ``on_bar`` uses; a stop that fires
+        sells at that same quote (``_execute_sell(quote=...)``).
+
+        Skipped per symbol, before any order: a closed market (an order there
+        would only be refused), a symbol with an order still open in the state
+        machine (the pending lock expires after 30 minutes, and a 5-minute sweep
+        must not send a second sell beside a live one), a failed or invalid
+        quote. ``should_stop`` is checked between symbols, so a worker shutting
+        down sends no further order."""
+        if self._breaker.is_open():
+            return
+        busy = {o.symbol for o in self._machine.active_orders()}
+        for pos in self._tracker.all_positions():
+            if should_stop is not None and should_stop():
+                return
+            symbol = pos.symbol
+            if symbol in busy or not self._market_open(symbol):
+                continue
+            try:
+                price = self._broker.get_price(symbol)
+            except Exception as e:  # noqa: BLE001 - one symbol's quote, not the sweep
+                logger.warning("[%s] 손절 점검 시세 조회 실패 — 건너뜀: %s: %s", self.name, symbol, e)
+                continue
+            if not is_valid_execution_price(price):
+                logger.warning("[%s] 손절 점검 시세 이상 — 건너뜀: %s (%r)", self.name, symbol, price)
+                continue
+            self._evaluate_stop(symbol, float(price), quote=float(price))
+
+    def _market_open(self, symbol: str) -> bool:
+        """Whether ``symbol``'s market takes a regular-session order now. Always
+        True for a non-live (backtest/sim) broker. A calendar error is False."""
+        if not getattr(self._broker, "is_live", True):
+            return True
+        from datetime import datetime, timezone
+        from backend.data.calendar import Market, get_calendar_service
+        from backend.quant.data.loader import _is_kr
+        market = Market.KRX if _is_kr(symbol) else Market.NYSE
+        try:
+            return get_calendar_service().check_order_permission(
+                market, datetime.now(timezone.utc)).allowed
+        except Exception as e:  # noqa: BLE001 - unknown session, no order
+            logger.warning("[%s] 장 운영 확인 실패 — 손절 점검 건너뜀: %s: %s", self.name, symbol, e)
+            return False
+
+    def _evaluate_stop(self, symbol: str, current_price: float, quote: Optional[float] = None):
         pos = self._tracker.get_position(symbol)
         if not pos:
             return
         if not self._tracker.is_ca_blocked(symbol):
-            self._check_exit(symbol, bar["close"], pos.avg_price)
+            self._check_exit(symbol, current_price, pos.avg_price, quote=quote)
             return
         # The tracker's avg may predate a split the gate is holding — measure
         # the stop against the broker's (split-adjusted) avg, and size the exit
         # from the same lookup.
         try:
             positions = list(self._broker.get_positions() or [])
-        except Exception as e:  # noqa: BLE001 - no lookup, no stop this bar
+        except Exception as e:  # noqa: BLE001 - no lookup, no stop this time
             logger.warning("[%s] 기업행위 차단 종목 브로커 조회 실패 — 손절 판정 보류: %s: %s",
                            self.name, symbol, e)
             return
@@ -92,8 +146,8 @@ class IndicatorStrategy(StrategyBase):
             logger.warning("[%s] 기업행위 차단 종목 브로커 평단 없음 — 손절 판정 보류: %s",
                            self.name, symbol)
             return
-        self._check_exit(symbol, bar["close"], float(match.avg_price),
-                         get_positions=lambda: positions)
+        self._check_exit(symbol, current_price, float(match.avg_price),
+                         get_positions=lambda: positions, quote=quote)
 
     def on_stop(self):
         logger.info("[%s] 전략 중단", self.name)
@@ -204,7 +258,18 @@ class IndicatorStrategy(StrategyBase):
             self._tracker.unmark_pending(symbol)
             logger.warning("[%s] 매수 실패 %s: %s", self.name, symbol, e)
 
-    def _execute_sell(self, symbol: str, reason: str, get_positions=None):
+    def _execute_sell(self, symbol: str, reason: str, get_positions=None,
+                      quote: Optional[float] = None):
+        """``quote`` is a validated live broker price the stop sweep already
+        judged the stop on. The sell then goes out at that price and skips the
+        daily-bar freshness gate: that gate guards sizing from daily bars, and
+        its record is written only by the market-open scan, so after a restart
+        it would hold every stop shut until the next day's scan. An exit at a
+        validated live price is what the P0-07 G2 rule allows on a stale feed.
+        Such a sell does not touch the strategy's breaker either — the sweep
+        retries on its own 5-minute timer, and a repeatedly refused stop (a
+        halt that blocks exits, shadow mode) must not trip the breaker that
+        guards the market-open scan."""
         if self._breaker.is_open():
             return
         pos = self._tracker.get_position(symbol)
@@ -225,22 +290,29 @@ class IndicatorStrategy(StrategyBase):
             logger.debug("[%s] 매도 중복 주문 방지: %s", self.name, symbol)
             return
         # Unified freshness gate (R-11): block order sizing on stale data.
-        if not self._is_feed_tradeable(symbol):
+        if quote is None and not self._is_feed_tradeable(symbol):
             logger.warning("[%s] 데이터 스테일 — 매도 차단: %s", self.name, symbol)
             self._tracker.unmark_pending(symbol)
             return
+        counts = quote is None
         try:
-            price = self._broker.get_price(symbol)
+            price = quote if quote is not None else self._broker.get_price(symbol)
             order = self.sell(symbol, qty, price)
             if order and order.status != OrderStatus.REJECTED:
-                self._breaker.record_success()
+                if counts:
+                    self._breaker.record_success()
                 self._register_order(order, symbol)
                 logger.info("[%s] 매도 실행: %s qty=%d @%.2f (%s)", self.name, symbol, qty, price, reason)
             else:
-                self._breaker.record_failure()
+                if counts:
+                    self._breaker.record_failure()
                 self._tracker.unmark_pending(symbol)
+                if not counts:
+                    logger.warning("[%s] 손절 매도 거부 — 다음 점검에 다시: %s (%s)",
+                                   self.name, symbol, reason)
         except Exception as e:
-            self._breaker.record_failure()
+            if counts:
+                self._breaker.record_failure()
             self._tracker.unmark_pending(symbol)
             logger.warning("[%s] 매도 실패 %s: %s", self.name, symbol, e)
 
@@ -279,11 +351,11 @@ class IndicatorStrategy(StrategyBase):
             )
 
     def _check_exit(self, symbol: str, current_price: float, entry_price: float,
-                    get_positions=None):
+                    get_positions=None, quote: Optional[float] = None):
         stop_pct = float(self._config.get("stop_loss_pct", 0.07))
         if current_price <= entry_price * (1 - stop_pct):
             self._execute_sell(symbol, f"손절 {(current_price/entry_price - 1)*100:.1f}%",
-                               get_positions=get_positions)
+                               get_positions=get_positions, quote=quote)
 
     def _default_timeout_handler(self, order):
         logger.warning("[%s] 주문 타임아웃 — 브로커 취소 시도: %s %s %s",
