@@ -58,6 +58,11 @@ class IndicatorStrategy(StrategyBase):
         # back with no broker id (untrackable orphan). Provided by the worker.
         self._on_orphan_cb = on_orphan_cb
         self._breaker = ConsecutiveFailureBreaker(threshold=3, cooldown_minutes=30)
+        #: Symbols with an order that came back with no broker id (an untrackable
+        #: orphan, see ``_register_order``). It never reaches the state machine,
+        #: and its pending lock expires after 30 minutes, so the stop sweep skips
+        #: these until a restart, whose recovery reconciles with the broker.
+        self._orphaned: set[str] = set()
 
     def on_start(self):
         logger.info("[%s] 인디케이터 전략 시작 (종목: %s)", self.name, self._universe)
@@ -86,13 +91,14 @@ class IndicatorStrategy(StrategyBase):
 
         Skipped per symbol, before any order: a closed market (an order there
         would only be refused), a symbol with an order still open in the state
-        machine (the pending lock expires after 30 minutes, and a 5-minute sweep
-        must not send a second sell beside a live one), a failed or invalid
-        quote. ``should_stop`` is checked between symbols, so a worker shutting
-        down sends no further order."""
+        machine or one that came back with no broker id (the pending lock
+        expires after 30 minutes, and a 5-minute sweep must not send a second
+        sell beside a live one), a failed or invalid quote. ``should_stop`` is
+        checked before each symbol and again after its quote, so a worker
+        shutting down sends no further order."""
         if self._breaker.is_open():
             return
-        busy = {o.symbol for o in self._machine.active_orders()}
+        busy = {o.symbol for o in self._machine.active_orders()} | self._orphaned
         for pos in self._tracker.all_positions():
             if should_stop is not None and should_stop():
                 return
@@ -107,6 +113,8 @@ class IndicatorStrategy(StrategyBase):
             if not is_valid_execution_price(price):
                 logger.warning("[%s] 손절 점검 시세 이상 — 건너뜀: %s (%r)", self.name, symbol, price)
                 continue
+            if should_stop is not None and should_stop():     # stopped during the quote
+                return
             self._evaluate_stop(symbol, float(price), quote=float(price))
 
     def _market_open(self, symbol: str) -> bool:
@@ -330,6 +338,7 @@ class IndicatorStrategy(StrategyBase):
         if not order.id:
             logger.error("[%s] 주문 ID 없음 — 오펀 위험(추적 불가), pending 유지(중복 방지): %s %s",
                          self.name, order.side, symbol)
+            self._orphaned.add(symbol)
             if self._on_orphan_cb is not None:
                 try:
                     self._on_orphan_cb(symbol, order)

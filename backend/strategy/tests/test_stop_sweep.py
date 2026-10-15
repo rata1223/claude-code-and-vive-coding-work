@@ -214,9 +214,9 @@ class TestSweepOrders:
         strat, _, sells = _two_positions(broker)
         asked = []
 
-        def should_stop():
+        def should_stop():                   # asked before and after each quote
             asked.append(1)
-            return len(asked) > 1
+            return len(asked) > 2
         strat.check_stops(should_stop=should_stop)
         assert len(sells) == 1 and len(broker.price_calls) == 1
 
@@ -228,3 +228,29 @@ def test_a_gated_stop_after_a_restart_still_sells_at_the_quote():
     strat.check_stops()
     assert sells == [("SPY", 10)]
     assert broker.price_calls.count("SPY") == 1
+
+
+def test_an_orphaned_order_keeps_the_sweep_off_that_symbol():
+    """An order with no broker id never reaches the state machine and its
+    pending lock expires after 30 minutes — the sweep must not sell beside it."""
+    from backend.brokers.models import Order, OrderStatus
+    broker = _PricedBroker({"SPY": 50.0, "QQQ": 100.0})
+    strat, tracker, sells = _two_positions(broker)
+    strat._register_order(Order(id="", symbol="SPY", side="sell", qty=5, price=50.0,
+                                status=OrderStatus.SUBMITTED), "SPY")
+    tracker.unmark_pending("SPY")                               # as if the lock had expired
+    strat.check_stops()
+    assert "SPY" not in broker.price_calls
+    assert sells == [("QQQ", 3)]
+
+
+def test_a_stop_requested_during_the_quote_sends_nothing():
+    broker = _PricedBroker({"SPY": 50.0, "QQQ": 200.0})
+    strat, _, sells = _two_positions(broker)
+    asked = []
+
+    def should_stop():                       # false before the quote, true after it
+        asked.append(1)
+        return len(asked) > 1
+    strat.check_stops(should_stop=should_stop)
+    assert broker.price_calls == ["SPY"] and sells == []
