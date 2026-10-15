@@ -278,6 +278,10 @@ _run_uptime_factory = None
 #: How often the worker checks for an operator's release (P0-12).
 RISK_RESUME_POLL_SEC = 60
 
+#: How often the worker sweeps held positions for the stop-loss (known issue 17).
+#: Each sweep prices only symbols whose market is open, so it is idle overnight.
+STOP_CHECK_SEC = 300
+
 
 def enable_run_uptime(db_factory) -> None:
     global _run_uptime_factory
@@ -364,29 +368,45 @@ class WorkerSession:
 
     def trigger_market_open(self, market: str):
         """Scheduler calls this when a market session opens."""
+        if self._callback(self.strategy.on_market_open, f"on_market_open (market={market})"):
+            logger.info("[run_id=%d] on_market_open 호출 완료 (market=%s)", self.run_id, market)
+
+    def trigger_stop_check(self):
+        """The worker's stop-loss timer calls this (known issue 17). A strategy
+        without ``check_stops`` has no stop to sweep."""
+        check = getattr(self.strategy, "check_stops", None)
+        if check is not None:
+            self._callback(lambda: check(should_stop=self._stop_event.is_set), "check_stops")
+
+    def _callback(self, fn, label: str) -> bool:
+        """Run a strategy callback unless the session is stopping, counted so
+        ``_drain_callbacks`` waits for it before the slot is released. True if
+        it ran and returned."""
         with self._callbacks_cv:
             if self._stop_event.is_set():
-                logger.info("[run_id=%d] 세션 중단 — on_market_open 스킵 (market=%s)", self.run_id, market)
-                return
+                logger.info("[run_id=%d] 세션 중단 — %s 스킵", self.run_id, label)
+                return False
             self._callbacks += 1
         try:
-            self.strategy.on_market_open()
-            logger.info("[run_id=%d] on_market_open 호출 완료 (market=%s)", self.run_id, market)
+            fn()
+            return True
         except Exception as e:
-            logger.exception("on_market_open 오류 run_id=%d: %s", self.run_id, e)
+            logger.exception("%s 오류 run_id=%d: %s", label, self.run_id, e)
+            return False
         finally:
             with self._callbacks_cv:
                 self._callbacks -= 1
                 self._callbacks_cv.notify_all()
 
     def _drain_callbacks(self):
-        """Wait for in-flight ``on_market_open`` calls. No timeout: until they
+        """Wait for in-flight strategy callbacks (``on_market_open``,
+        ``check_stops``). No timeout: until they
         return the old run can still be acting on the account, and releasing the
         slot would let a new run start beside it. A hung one keeps the slot
         occupied (fail-closed) and is logged."""
         with self._callbacks_cv:
             while self._callbacks:
-                logger.warning("[run_id=%d] 진행 중인 on_market_open %d건 대기 — 끝나야 슬롯을 푼다",
+                logger.warning("[run_id=%d] 진행 중인 전략 콜백 %d건 대기 — 끝나야 슬롯을 푼다",
                                self.run_id, self._callbacks)
                 self._callbacks_cv.wait(30)
 
@@ -694,6 +714,35 @@ class StrategyWorker:
         scheduler.add_job(self._resume_if_released, "interval",
                           seconds=RISK_RESUME_POLL_SEC, id="risk_resume",
                           coalesce=True, max_instances=1, replace_existing=True)
+        scheduler.add_job(self._check_stops, "interval",
+                          seconds=STOP_CHECK_SEC, id="stop_check",
+                          coalesce=True, max_instances=1, replace_existing=True)
+
+    def _check_stops(self) -> None:
+        """Start the stop-loss sweep (known issue 17) on a tracked thread, so a
+        shutdown waits for it before the poller stops — a sell it sends must be
+        polled. Sessions are swept one after another; a sweep still running
+        from the last tick is not doubled. Never raises."""
+        if self.shutdown_requested:
+            return
+        with self._lock:
+            running = getattr(self, "_stop_sweep", None)
+            if running is not None and running.is_alive():
+                logger.warning("이전 손절 점검이 아직 진행 중 — 이번 회차 건너뜀")
+                return
+            sessions = [s for s in self._sessions.values() if s is not None]
+            if not sessions:
+                return
+
+        def sweep():
+            for session in sessions:
+                if self.shutdown_requested:
+                    return
+                session.trigger_stop_check()
+
+        t = self._spawn_aux(sweep, name="stop-check")
+        with self._lock:
+            self._stop_sweep = t
 
     def allow_risk_resume(self, allowed: bool) -> None:
         self._risk_resume_allowed = bool(allowed)
