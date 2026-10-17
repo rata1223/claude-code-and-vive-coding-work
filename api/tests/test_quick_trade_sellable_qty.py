@@ -654,6 +654,15 @@ def test_a_derived_key_retry_is_not_blocked_by_its_own_reservation(monkeypatch, 
     orders, _, _ = _wire(monkeypatch,
                          portfolio=FakePortfolio(us=_us_row(held="10", orderable="10")),
                          market_data=FakeMarketData(price=175.5))
+    # The derived key carries a 10-second time bucket; two calls straddling a
+    # bucket edge derive different keys and are not a retry at all — the same
+    # flake #186 fixed in the replay test, seen here in CI on PR #230. Pin the
+    # clock so the two calls are the retry this test is about.
+    from datetime import datetime, timezone
+    from api.services.quick_trade_service import derive_idempotency_key
+    pinned = datetime(2026, 1, 5, 12, 0, 3, tzinfo=timezone.utc)
+    monkeypatch.setattr(quick_trade, "derive_idempotency_key",
+                        lambda **kw: derive_idempotency_key(_now=pinned, **kw))
 
     first = quick_trade.close_position(_body(qty=10), None, user, db, _allow())
     second = quick_trade.close_position(_body(qty=10), None, user, db, _allow())
