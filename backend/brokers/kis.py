@@ -2,7 +2,8 @@ import logging
 import threading
 import time
 from decimal import Decimal, InvalidOperation
-from .base import BrokerAdapter
+from typing import Optional
+from .base import BrokerAdapter, fx_rate_plausible
 from .capabilities import KIS_LIVE_CAPABILITIES, KIS_PAPER_CAPABILITIES
 from .models import Balance, BrokerCapabilities, Order, OrderStatus, Position
 from .semantic_mapper import KIS_DOMESTIC_MAPPER, KIS_OVERSEAS_MAPPER
@@ -64,8 +65,15 @@ def _order_excd(symbol: str) -> str:
 
 
 _FX_CACHE_LOCK = threading.Lock()
-_FX_CACHE: dict = {"rate": 1350.0, "ts": time.monotonic()}
+#: ``rate``/``ts``: the valuation rate and when it was last set (seeded with a
+#: default so balances can always be valued). ``ok_ts``: when a rate was last
+#: actually fetched — ``None`` until one is. ``tried_ts``: the last fetch
+#: attempt, so a failing source is retried at most every ``_FX_RETRY_SEC``.
+_FX_CACHE: dict = {"rate": 1350.0, "ts": time.monotonic(), "ok_ts": None, "tried_ts": None}
 _FX_TTL = 3600  # 1 hour
+_FX_RETRY_SEC = 300
+#: Sizing a US order needs a rate actually fetched within this window.
+_FX_SIZING_MAX_AGE = 6 * 3600
 
 # Process-level singleton — rate-limit tracking must be shared across all callers
 _KIS_BROKER_INSTANCE: "KISBroker | None" = None
@@ -469,20 +477,54 @@ class KISBroker(BrokerAdapter):
             self._breaker.record_failure()
             raise
 
+    def get_fx_rate(self) -> float:
+        """KRW per USD for sizing a US order — only a rate actually fetched
+        within ``_FX_SIZING_MAX_AGE``. Raises otherwise: the seeded default and
+        a long-stale rate value balances, they do not size orders."""
+        with _FX_CACHE_LOCK:
+            ok_ts = _FX_CACHE["ok_ts"]
+        if ok_ts is None or time.monotonic() - ok_ts >= _FX_TTL:
+            self._refresh_fx()
+        with _FX_CACHE_LOCK:
+            ok_ts, rate = _FX_CACHE["ok_ts"], _FX_CACHE["rate"]
+        if ok_ts is None or time.monotonic() - ok_ts >= _FX_SIZING_MAX_AGE:
+            raise RuntimeError("최근 환율 없음 — 미국 주문 수량을 정할 수 없다")
+        return rate
+
+    def valuation_fx_rate(self) -> float:
+        """KRW per USD for valuing USD amounts (balances, realized P&L). Never
+        raises: the last known rate, initially 1,350, with a stale warning."""
+        return self._get_fx()
+
+    def _refresh_fx(self) -> Optional[float]:
+        """Fetch the rate once, unless an attempt was made in the last
+        ``_FX_RETRY_SEC`` (a failing source is not hit on every call). Returns
+        the new rate, or ``None``."""
+        now = time.monotonic()
+        with _FX_CACHE_LOCK:
+            tried = _FX_CACHE["tried_ts"]
+            if tried is not None and now - tried < _FX_RETRY_SEC:
+                return None
+            _FX_CACHE["tried_ts"] = now
+        try:
+            import yfinance as yf
+            rate = yf.Ticker("KRW=X").fast_info["last_price"]
+            if fx_rate_plausible(rate):
+                with _FX_CACHE_LOCK:
+                    _FX_CACHE["rate"] = float(rate)
+                    _FX_CACHE["ts"] = _FX_CACHE["ok_ts"] = time.monotonic()
+                return float(rate)
+        except Exception:
+            pass
+        return None
+
     def _get_fx(self) -> float:
         with _FX_CACHE_LOCK:
             if time.monotonic() - _FX_CACHE["ts"] < _FX_TTL:
                 return _FX_CACHE["rate"]
-        try:
-            import yfinance as yf
-            rate = yf.Ticker("KRW=X").fast_info["last_price"]
-            if rate and 900 < rate < 2000:
-                with _FX_CACHE_LOCK:
-                    _FX_CACHE["rate"] = float(rate)
-                    _FX_CACHE["ts"] = time.monotonic()
-                return float(rate)
-        except Exception:
-            pass
+        rate = self._refresh_fx()
+        if rate is not None:
+            return rate
         age_min = (time.monotonic() - _FX_CACHE["ts"]) / 60
         if age_min > 30:
             logger.warning("FX 환율 오래됨 (%.0f분) — 킬스위치 계산 부정확 가능 (fallback=%.0f)", age_min, _FX_CACHE["rate"])

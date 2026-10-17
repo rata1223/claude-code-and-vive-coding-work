@@ -74,6 +74,10 @@ class MarketRouter(BrokerAdapter):
     def get_order_status(self, order_id: str, symbol: str = "") -> Optional[Order]:
         return self._route(symbol).get_order_status(order_id, symbol)
 
+    def get_fx_rate(self) -> float:
+        """US orders go to the US broker, so its rate sizes them."""
+        return self._us.get_fx_rate()
+
     def get_price(self, symbol: str) -> float:
         return self._route(symbol).get_price(symbol)
 

@@ -2,6 +2,18 @@ from abc import ABC, abstractmethod
 from typing import Optional
 from .models import Balance, BrokerCapabilities, Order, Position
 
+#: A KRW-per-USD rate outside this range is a misread, not a market move. The
+#: one bound shared by the KIS rate cache and the strategy's US buy sizing.
+FX_USDKRW_MIN = 900.0
+FX_USDKRW_MAX = 2000.0
+
+
+def fx_rate_plausible(rate) -> bool:
+    try:
+        return FX_USDKRW_MIN < float(rate) < FX_USDKRW_MAX
+    except (TypeError, ValueError):
+        return False
+
 
 class BrokerAdapter(ABC):
     is_live: bool = True  # False for SimulatedBroker — gates SAFE_MODE and shadow mode checks
@@ -34,3 +46,10 @@ class BrokerAdapter(ABC):
 
     @abstractmethod
     def get_price(self, symbol: str) -> float: ...
+
+    def get_fx_rate(self) -> float:
+        """KRW per USD for sizing a US order against capital valued in won.
+        Raises when no recent rate is known — callers must not size on a guess.
+        An adapter without a rate (the simulator, which prices everything in one
+        currency) raises ``NotImplementedError``."""
+        raise NotImplementedError
