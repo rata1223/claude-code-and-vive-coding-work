@@ -16,6 +16,13 @@ logger = logging.getLogger(__name__)
 
 MIN_POSITION_VALUE_KRW = 100_000  # skip orders below 100K KRW to avoid over-fragmentation
 
+#: History the scan loads for each symbol. The house signals need more than a
+#: year: ``TrendFollowingSignal`` returns nothing under 260 bars and
+#: ``MomentumSignal`` under 252, and a year is ~250 US / ~245 KR bars — with
+#: ``"1y"`` the trend half of the score was always 0 and KR symbols could never
+#: reach the ±0.25 threshold. Two years clears both with room to spare.
+SCAN_PERIOD = "2y"
+
 
 class IndicatorStrategy(StrategyBase):
     """
@@ -183,7 +190,7 @@ class IndicatorStrategy(StrategyBase):
 
         for symbol in symbols_to_scan:
             try:
-                df = loader.fetch(symbol, period="1y")
+                df = loader.fetch(symbol, period=SCAN_PERIOD)
             except Exception as e:
                 logger.warning("[%s] OHLCV 로드 실패 %s: %s", self.name, symbol, e)
                 continue
