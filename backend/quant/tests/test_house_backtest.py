@@ -98,6 +98,46 @@ def test_only_the_capital_aware_universe_is_bought():
     assert "005930" not in {t.symbol for t in res.trades}
 
 
+def test_a_daily_halt_holds_for_the_rest_of_the_run():
+    """No operator release is modelled: a halted account takes no new entries
+    afterwards, as the worker's kill switch until someone releases it."""
+    a = _bars([100] * 8, closes=[100, 100, 50, 100, 100, 100, 100, 100])
+    b = _bars([100.0] * 8)
+    cfg = HouseConfig(capital_krw=1_000_000, position_size_pct=0.5,
+                      stop_loss_pct=0.9, mdd_limit=0.99, **NO_COST)
+    res = run_house_backtest({"069500": a, "360750": b}, ["069500", "360750"], cfg,
+                             signals={"069500": _sig(a, {0: 1}), "360750": _sig(b, {5: 1})})
+    assert res.skipped["halted"] == 1
+    assert all(t.symbol != "360750" for t in res.trades)
+
+
+def test_a_slow_weekly_loss_halts_entries():
+    # −2 % a day: under the 3 % daily limit, past 6 % over the week.
+    closes = [100 * 0.98 ** i for i in range(10)]
+    a = _bars([100.0] + closes[:-1], closes=closes, lows=[c * 0.999 for c in closes])
+    b = _bars([100.0] * 10)
+    cfg = HouseConfig(capital_krw=1_000_000, position_size_pct=0.9,
+                      stop_loss_pct=0.9, mdd_limit=0.99, **NO_COST)
+    res = run_house_backtest({"069500": a, "360750": b}, ["069500", "360750"], cfg,
+                             signals={"069500": _sig(a, {0: 1}), "360750": _sig(b, {8: 1})})
+    assert res.skipped["halted"] == 1
+
+
+def test_an_mdd_flatten_waits_for_a_closed_market():
+    """A KR symbol with no bar on the flatten day is sold on its next bar."""
+    us = _bars([100, 100, 100, 100, 100, 100], closes=[100, 100, 40, 40, 40, 40],
+               lows=[99, 99, 40, 40, 40, 40])
+    kr_full = _bars([100.0] * 6)
+    kr = kr_full.drop(kr_full.index[3])                    # holiday on the flatten day
+    cfg = HouseConfig(capital_krw=10_000_000, position_size_pct=0.45, fx=1.0,
+                      stop_loss_pct=0.99, daily_loss_limit=0.99, **NO_COST)
+    res = run_house_backtest({"AAPL": us, "069500": kr}, ["AAPL", "069500"], cfg,
+                             signals={"AAPL": _sig(us, {0: 1}), "069500": _sig(kr, {0: 1})})
+    exits = {t.symbol: (t.exit_reason, t.exit_date) for t in res.trades}
+    assert exits["AAPL"] == ("mdd_flatten", str(us.index[3].date()))
+    assert exits["069500"] == ("mdd_flatten", str(kr_full.index[4].date()))
+
+
 def test_a_bad_day_blocks_the_next_days_entries():
     a = _bars([100, 100, 100, 100, 100], closes=[100, 100, 50, 100, 100])
     b = _bars([100.0] * 5)

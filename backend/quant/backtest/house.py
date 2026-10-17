@@ -19,9 +19,12 @@ worker's pieces rather than restating them:
 * the stop — intraday low at or below entry × (1 − ``stop_loss_pct``) exits at
   that price, or at the open when the day gaps through it (the worker's 5-minute
   ``check_stops`` sweep, #228); no trailing stop;
-* risk — a risk day that loses ``daily_loss_limit`` of its opening equity takes
-  no new entries the next day; a drawdown of ``mdd_limit`` from the peak exits
-  everything at the next open and stays halted (no operator release here).
+* risk — a day that loses ``daily_loss_limit`` of its opening equity, or a
+  rolling seven days that lose ``weekly_loss_limit``, halts new entries for the
+  rest of the run: the worker's halt holds until an operator releases it, and
+  no release is modelled (exits continue). A drawdown of ``mdd_limit`` from the
+  peak exits everything at the next open — retried on later days for a symbol
+  whose market was closed — and stops all trading.
 
 Simplifications, stated so the numbers are read correctly: one fixed FX rate;
 US and KR bars share one daily clock (a KR day and a US day with the same date
@@ -59,6 +62,7 @@ class HouseConfig:
     stop_loss_pct: float = 0.07
     fx: float = 1_350.0
     daily_loss_limit: float = 0.03
+    weekly_loss_limit: float = 0.06
     mdd_limit: float = 0.15
     commission: float = DEFAULT_COMMISSION
     slippage: float = DEFAULT_SLIPPAGE
@@ -142,7 +146,8 @@ def run_house_backtest(dfs: dict[str, pd.DataFrame], universe: list[str],
     last_close: dict[str, float] = {}
     peak = cfg.capital_krw
     equity_prev = cfg.capital_krw
-    no_entries_today = False
+    entries_halted = False
+    week = []                              # equity at the last 7 closes
     mdd_halted = False
     flatten_next_open = False
 
@@ -170,7 +175,7 @@ def run_house_backtest(dfs: dict[str, pd.DataFrame], universe: list[str],
         if flatten_next_open:
             for sym in [s for s in positions if s in today]:
                 sell(sym, today[sym]["Open"], date, "mdd_flatten")
-            flatten_next_open = False
+            flatten_next_open = bool(positions)   # a closed market: retry tomorrow
 
         if not mdd_halted:
             for sym in [s for s in positions if s in today]:
@@ -182,7 +187,7 @@ def run_house_backtest(dfs: dict[str, pd.DataFrame], universe: list[str],
             for sym in buys:
                 if sym in positions or sym not in today or _previous(signals.get(sym), date) != 1:
                     continue
-                if no_entries_today:
+                if entries_halted:
                     skipped["halted"] += 1
                     continue
                 amount = equity_prev * cfg.position_size_pct
@@ -219,7 +224,11 @@ def run_house_backtest(dfs: dict[str, pd.DataFrame], universe: list[str],
         equity_points.append(equity)
         exposure_points.append(invested / equity if equity > 0 else 0.0)
 
-        no_entries_today = equity <= equity_prev * (1 - cfg.daily_loss_limit)
+        week_start = week[0] if week else cfg.capital_krw   # the close seven days back
+        if (equity <= equity_prev * (1 - cfg.daily_loss_limit)
+                or equity <= week_start * (1 - cfg.weekly_loss_limit)):
+            entries_halted = True
+        week = (week + [equity])[-7:]
         peak = max(peak, equity)
         if not mdd_halted and equity <= peak * (1 - cfg.mdd_limit):
             mdd_halted = True

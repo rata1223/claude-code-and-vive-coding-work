@@ -48,6 +48,9 @@ def load_csv_dir(path, symbols):
 
 def load_online(symbols, start, end):
     from backend.quant.data.loader import DataLoader
+    # DataLoader honours a range only when both ends are set — otherwise it
+    # falls back to period="2y" and ignores start.
+    end = end or (pd.Timestamp.today() + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
     return DataLoader().fetch_multi(symbols, start=start, end=end)
 
 

@@ -15,7 +15,7 @@ worker's code, not from a restatement:
 | Allocation = equity (won) × `position_size_pct`; US price × FX; skip below `MIN_POSITION_VALUE_KRW` | `IndicatorStrategy._execute_buy`, PR #229 |
 | Fill at the next open ± slippage; commission; KR transaction tax on sells | `backend/quant/risk/position_sizer.py` |
 | −7 % stop on the intraday low (gap → open); no trailing stop | `IndicatorStrategy.check_stops`, PR #228 |
-| Daily loss 3 % → no new entries next day; MDD 15 % → flatten, stay halted | risk engine (no operator release modelled) |
+| Daily loss 3 % or rolling 7-day loss 6 % → no new entries for the rest of the run (exits continue); MDD 15 % → flatten (retried on a closed market's next bar), stop | risk engine — its halt holds until an operator releases it; no release is modelled, so after the first halt the run only exits |
 
 Simplifications: one fixed FX rate (default 1,350); KR and US bars share one daily
 clock; dividends only if the input bars are adjusted for them; survivorship — the
