@@ -248,7 +248,11 @@ class IndicatorStrategy(StrategyBase):
                 logger.info("[%s] 포지션 최소금액 미달 — 스킵: %s (%.0f원)", self.name, symbol, amount_krw)
                 self._tracker.unmark_pending(symbol)
                 return
-            qty = int(amount_krw / price)
+            unit_krw = self._price_in_krw(symbol, price)
+            if unit_krw is None:
+                self._tracker.unmark_pending(symbol)
+                return
+            qty = int(amount_krw / unit_krw)
             if qty <= 0:
                 logger.info("[%s] 매수 수량 0 — 자본 부족 스킵: %s", self.name, symbol)
                 self._tracker.unmark_pending(symbol)
@@ -265,6 +269,37 @@ class IndicatorStrategy(StrategyBase):
             self._breaker.record_failure()
             self._tracker.unmark_pending(symbol)
             logger.warning("[%s] 매수 실패 %s: %s", self.name, symbol, e)
+
+    def _price_in_krw(self, symbol: str, price: float) -> Optional[float]:
+        """One share's price in won, for sizing a buy against capital in won.
+
+        A US quote is in USD (KIS ``output.last``). Dividing a won amount by it
+        ordered ~1,400 times the intended size — 100,000 won against SPY at
+        $763 asked for 131 shares — which a small account can only have
+        refused. So a US price is converted at the broker's sizing rate
+        (``get_fx_rate``). A rate the broker cannot vouch for (it raises), or
+        one outside ``FX_USDKRW_MIN``–``FX_USDKRW_MAX``, skips the buy
+        (``None``): an order sized on a guessed currency is worse than no
+        order. A non-live adapter without a rate (the simulator) prices
+        everything in its own account currency, as before."""
+        from backend.brokers.base import fx_rate_plausible
+        from backend.market.symbols import is_kr
+        if is_kr(symbol):
+            return price
+        try:
+            rate = self._broker.get_fx_rate()
+        except NotImplementedError:
+            if not getattr(self._broker, "is_live", True):
+                return price
+            logger.warning("[%s] 브로커 환율 없음 — 미국 매수 스킵: %s", self.name, symbol)
+            return None
+        except Exception as e:  # noqa: BLE001 - no rate, no US sizing
+            logger.warning("[%s] 환율 없음 — 미국 매수 스킵: %s: %s", self.name, symbol, e)
+            return None
+        if not fx_rate_plausible(rate):
+            logger.warning("[%s] 환율 이상(%r) — 미국 매수 스킵: %s", self.name, rate, symbol)
+            return None
+        return price * float(rate)
 
     def _execute_sell(self, symbol: str, reason: str, get_positions=None,
                       quote: Optional[float] = None):

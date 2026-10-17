@@ -304,6 +304,15 @@ def _start_run_uptime(run_id: int):
         return None
 
 
+def _valuation_fx_rate() -> float:
+    """KRW per USD for valuing a US fill's realized P&L (the rate balances use)."""
+    try:
+        return float(get_kis_broker().valuation_fx_rate())
+    except Exception as e:  # noqa: BLE001 - value at the seed rate rather than not at all
+        logger.warning("환율 조회 실패 — 미국 손익을 기본 환율(1,350)로 환산: %s", e)
+        return 1350.0
+
+
 class WorkerSession:
     """하나의 전략 실행 세션."""
 
@@ -1616,6 +1625,13 @@ class StrategyWorker:
             if fill.side == "sell" and self._loss_tracker is not None:
                 if entry_price is not None:
                     realized_pnl = (fill.price - entry_price) * fill.qty
+                    if not is_kr:
+                        # A US fill is priced in USD; the loss tracker and its
+                        # limits are in won. Recorded raw, a $13 loss was a
+                        # 13-won loss and the daily/weekly limits never saw US
+                        # losses. Valued at the balance's rate — never raises,
+                        # since a loss must be recorded even on a stale rate.
+                        realized_pnl *= _valuation_fx_rate()
                 else:
                     # Sell with no tracked position: we cannot compute realized
                     # P&L, but we MUST still refresh equity so MDD/kill-switch

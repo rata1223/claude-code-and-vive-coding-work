@@ -184,6 +184,10 @@ class ScriptedPaperBroker(BrokerAdapter):
                 out.append(replace(p, current_price=price, sellable_qty=p.qty))
             return out
 
+    def get_fx_rate(self) -> float:
+        """KRW per USD — the fixed rate this broker values USD with."""
+        return self._fx
+
     def get_price(self, symbol: str) -> float:
         with self._lock:
             return self._prices.get(symbol, self._default_price)
